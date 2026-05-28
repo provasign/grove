@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package grove.v1;
+
+option go_package = "github.com/org/grove/proto/grovev1";
+
+service GroveService {
+  rpc Health(HealthRequest) returns (HealthResponse);
+  rpc Status(StatusRequest) returns (StatusResponse);
+  rpc Index(IndexRequest) returns (IndexResponse);
+  rpc Query(QueryRequest) returns (SymbolsResponse);
+  rpc Symbols(SymbolsRequest) returns (SymbolsResponse);
+  rpc Deps(DepsRequest) returns (EdgesResponse);
+  rpc Impact(ImpactRequest) returns (SymbolsResponse);
+  rpc Tests(TestsRequest) returns (SymbolsResponse);
+  rpc ICR(ICRRequest) returns (ICRResponse);
+}
+
+message HealthRequest {}
+message HealthResponse { string status = 1; string version = 2; }
+message StatusRequest {}
+message StatusResponse { int64 files_indexed = 1; int64 symbol_count = 2; int64 edge_count = 3; }
+message IndexRequest { string dir = 1; }
+message IndexResponse { string json = 1; }
+message QueryRequest { string intent = 1; int64 limit = 2; }
+message SymbolsRequest { string query = 1; int64 limit = 2; }
+message DepsRequest { string file = 1; }
+message ImpactRequest { string query = 1; string file = 2; int64 max_depth = 3; }
+message TestsRequest { string query = 1; string file = 2; }
+message ICRRequest { string intent = 1; }
+message SymbolsResponse { string json = 1; }
+message EdgesResponse { string json = 1; }
+message ICRResponse { string json = 1; }

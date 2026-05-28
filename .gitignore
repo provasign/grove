@@ -1,0 +1,35 @@
+# Binaries
+/grove
+/grove-*
+*.exe
+*.test
+
+# Build output
+/dist/
+/bin/
+
+# Go
+*.o
+*.a
+vendor/
+
+# Tree-sitter CGO artifacts
+*.so
+*.dylib
+
+# SQLite databases (test artifacts)
+.grove/
+*.db
+*.db-wal
+*.db-shm
+
+# ONNX model cache
+~/.grove/models/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
