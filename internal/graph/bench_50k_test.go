@@ -20,6 +20,13 @@ import (
 	"github.com/tabladrum/grove-suite/grove/internal/core"
 )
 
+// docstringVerbs gives each file a different action word so that no single
+// term appears in all 50K docstrings — otherwise TF-IDF IDF weights collapse
+// to zero and SemanticSearch returns nothing.
+var docstringVerbs = []string{
+	"handles", "processes", "validates", "transforms", "dispatches",
+}
+
 // generate50KSymbols builds 5000 files × 10 symbols/file with realistic
 // cross-file relationships: every Nth symbol imports the previous file and
 // calls one symbol in it via CallSites (giving us a connected graph).
@@ -47,7 +54,7 @@ func generate50KSymbols() []core.SymbolRecord {
 				Name:          name,
 				QualifiedName: name,
 				Signature:     fmt.Sprintf("func %s() error", name),
-				Docstring:     fmt.Sprintf("%s handles request %d of file %d.", name, i, f),
+				Docstring:     fmt.Sprintf("%s %s request %d of file %d.", name, docstringVerbs[f%len(docstringVerbs)], i, f),
 				Span:          core.LineRange{Start: i*5 + 1, End: i*5 + 4},
 				Imports:       fileImports,
 				Exports:       true,
