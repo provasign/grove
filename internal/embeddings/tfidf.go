@@ -119,9 +119,10 @@ func (t *TFIDF) Query(query string, limit int) []Scored {
 	for term, count := range qTF {
 		idf, ok := t.idf[term]
 		if !ok {
-			// Unseen terms still contribute via add-one smoothing weight,
-			// computed lazily here so we do not bloat the IDF table.
-			idf = math.Log(float64(len(t.symbols)+1) / 1.0)
+			// Skip terms absent from the corpus: they cannot appear in any
+			// document vector, so they contribute nothing to dot products but
+			// would inflate qNorm and suppress every real-term score.
+			continue
 		}
 		w := (1.0 + math.Log(float64(count))) * idf
 		qVec[term] = w

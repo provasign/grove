@@ -186,7 +186,8 @@ func (s *Store) ReplaceEdges(ctx context.Context, edges []core.Edge) error {
 	for _, edge := range edges {
 		id := fmt.Sprintf("%s::%s::%s", edge.From, edge.Type, edge.To)
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO edges (id, from_node, to_node, edge_type, confidence) VALUES (?, ?, ?, ?, ?)`,
+			`INSERT INTO edges (id, from_node, to_node, edge_type, confidence) VALUES (?, ?, ?, ?, ?)
+			 ON CONFLICT(id) DO UPDATE SET confidence = excluded.confidence`,
 			id, edge.From, edge.To, string(edge.Type), edge.Confidence,
 		); err != nil {
 			return err

@@ -78,9 +78,40 @@ func (g *CodeGraph) Snapshot() ([]core.SymbolRecord, []core.Edge) {
 
 	symbols := make([]core.SymbolRecord, 0, len(g.symbols))
 	for _, s := range g.symbols {
-		symbols = append(symbols, s)
+		symbols = append(symbols, deepCopySymbol(s))
 	}
 	return symbols, append([]core.Edge(nil), g.edges...)
+}
+
+// deepCopySymbol copies all slice fields so callers cannot corrupt the graph's
+// internal backing arrays via append-within-capacity.
+func deepCopySymbol(s core.SymbolRecord) core.SymbolRecord {
+	if s.Imports != nil {
+		c := make([]string, len(s.Imports))
+		copy(c, s.Imports)
+		s.Imports = c
+	}
+	if s.Modifiers != nil {
+		c := make([]string, len(s.Modifiers))
+		copy(c, s.Modifiers)
+		s.Modifiers = c
+	}
+	if s.TypeParameters != nil {
+		c := make([]string, len(s.TypeParameters))
+		copy(c, s.TypeParameters)
+		s.TypeParameters = c
+	}
+	if s.Annotations != nil {
+		c := make([]string, len(s.Annotations))
+		copy(c, s.Annotations)
+		s.Annotations = c
+	}
+	if s.CallSites != nil {
+		c := make([]core.CallSite, len(s.CallSites))
+		copy(c, s.CallSites)
+		s.CallSites = c
+	}
+	return s
 }
 
 func (g *CodeGraph) Status() core.Status {
@@ -429,15 +460,16 @@ func (g *CodeGraph) SemanticSearch(query string, limit int) []embeddings.Scored 
 	if limit <= 0 {
 		limit = 20
 	}
+	// Always acquire g.mu before g.semMu to match the order in Replace(),
+	// which holds g.mu.Lock then acquires g.semMu. Inverting the order
+	// (semMu then g.mu) creates a deadlock with a concurrent Replace().
+	g.mu.RLock()
 	g.semMu.Lock()
 	if g.semEngine == nil || g.semDirty {
-		// Snapshot symbols under the graph read lock to avoid contention.
-		g.mu.RLock()
 		syms := make([]core.SymbolRecord, 0, len(g.symbols))
 		for _, s := range g.symbols {
 			syms = append(syms, s)
 		}
-		g.mu.RUnlock()
 		eng := embeddings.NewTFIDF()
 		eng.Index(syms)
 		g.semEngine = eng
@@ -445,5 +477,6 @@ func (g *CodeGraph) SemanticSearch(query string, limit int) []embeddings.Scored 
 	}
 	eng := g.semEngine
 	g.semMu.Unlock()
+	g.mu.RUnlock()
 	return eng.Query(query, limit)
 }
