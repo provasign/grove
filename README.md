@@ -1,91 +1,208 @@
 # Grove
 
-Grove is a code intelligence graph exposed through a CLI and HTTP API. This repository now contains a runnable foundation: language detection, symbol extraction, SQLite persistence, delta-aware indexing, an in-memory graph, CLI commands, and HTTP endpoints matching the suite contract.
+Grove is a persistent code knowledge graph. It parses source files, extracts symbols, links them into a graph, and makes that graph queryable — over a CLI, an HTTP API, an MCP stdio server, and a gRPC service.
 
-## Build
+## Why a Knowledge Graph
 
-```bash
-make build
-make test
-make lint
-make install
+Static search (grep, ctags, a language server) answers "where is this symbol defined?" Graph traversal answers harder questions: "what does this function transitively call?", "which tests cover this method?", "what is the full blast radius of changing this interface?" Those are the questions that matter for AI agent task planning and merge conflict resolution.
+
+The graph is persistent (SQLite on disk), delta-aware (files whose git blob SHA hasn't changed are never re-parsed), and scoped (call and type-use edges are constrained to same-file and imported files to suppress false positives).
+
+## Architecture
+
+```
+Source files
+     │
+     ▼
+┌─────────────────────────────────────────────────────────┐
+│  internal/parser/                                       │
+│  Tree-sitter AST walkers (11 languages)                 │
+│  Regex fallback for syntax-error recovery               │
+│  All CGO is isolated to this package                    │
+└────────────────────────┬────────────────────────────────┘
+                         │ []SymbolRecord
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│  internal/store/                                        │
+│  SQLite WAL + FTS5                                      │
+│  Delta indexing by git blob SHA                         │
+│  Stale-file pruning                                     │
+└────────────────────────┬────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│  internal/graph/                                        │
+│  In-memory CodeGraph                                    │
+│  8 edge types                                           │
+│  BFS traversal                                          │
+└──────┬─────────────────┬───────────────────────────────┘
+       │                 │
+       ▼                 ▼
+┌────────────┐   ┌────────────────────┐
+│ internal/  │   │ internal/query/    │
+│ mcp/       │   │ Intent → symbols   │
+│ 8 tools    │   │ FTS5 + BFS         │
+│ JSON-RPC   │   │ Blast radius       │
+│ stdio      │   │ ICR computation    │
+└────────────┘   └────────┬───────────┘
+                          │
+                          ▼
+                 ┌────────────────────┐
+                 │ internal/api/      │
+                 │ HTTP :7777         │
+                 │ gRPC :7778         │
+                 └────────────────────┘
 ```
 
-## CLI
+## Design Decisions
+
+**Single binary, zero runtime dependencies.** SQLite is embedded via `modernc.org/sqlite` — a pure-Go port — which avoids a CGO linker conflict with tree-sitter. Tree-sitter itself (in `internal/parser/`) is the only CGO dependency.
+
+**Delta indexing by git blob SHA.** Grove calls `git hash-object` on each file before parsing. If the blob SHA matches what is stored, the file is skipped entirely. Indexing a 5000-file repo after a one-line change touches one file, not 5000.
+
+**AST-first with regex fallback.** Tree-sitter produces a complete AST even for files with syntax errors, but marks broken subtrees as `ERROR` nodes. When `root.HasError()` is true, Grove runs both the AST extractor and the regex fallback, then merges the results with AST taking precedence. Files that are actively being edited mid-keystroke are still indexed usefully.
+
+**Scoped edges prevent false positives.** `calls` and `uses-type` edges are only created between symbols in the same file or in files connected by an `imports` edge. Without this constraint, a function named `parse` in one package would appear to call a `parse` function in an unrelated package, producing roughly 5× the false-positive edges.
+
+**Symbol ID format.** Every symbol has a canonical ID: `{filePath}::{qualifiedName}@{blobSHA}`. The blob SHA component means that if you rename a function, the old symbol ID disappears and a new one is created — stale references in the graph don't survive a reindex.
+
+## Language Support
+
+| Language | Extension(s) | Extractor |
+|----------|-------------|-----------|
+| Go | `.go` | AST walker |
+| TypeScript | `.ts` | AST walker |
+| TSX | `.tsx` | AST walker (separate JSX grammar) |
+| JavaScript | `.js .jsx .mjs .cjs` | AST walker |
+| Python | `.py` | AST walker |
+| Java | `.java` | AST walker |
+| Rust | `.rs` | AST walker |
+| C | `.c .h` | AST walker |
+| C++ | `.cc .cpp .cxx .hh .hpp` | AST walker |
+| C# | `.cs` | AST walker |
+| PHP | `.php .phtml` | AST walker |
+
+## Graph Edge Types
+
+| Edge | Meaning |
+|------|---------|
+| `defines` | File defines this symbol |
+| `contains` | Class/namespace contains this member |
+| `imports` | File imports another file |
+| `extends` | Class extends/embeds another |
+| `implements` | Class implements an interface |
+| `calls` | Function calls another function (scoped) |
+| `uses-type` | Function/field uses a type (scoped) |
+| `tests` | Test function covers a named symbol |
+
+## Installation
 
 ```bash
-grove init .
-grove index .
-grove status .
-grove symbols AuthService .
-grove query "authentication" .
-grove impact Login .
-grove tests Login .
-grove serve --port 7777 .
+make build    # compile ./bin/grove
+make install  # install to $GOPATH/bin
+make test     # run all tests
+```
+
+## CLI Reference
+
+```bash
+# Set up a project (creates .grove/ directory and config)
+grove init [dir]
+
+# Index or reindex (skips unchanged files via delta SHA)
+grove index [dir]
+
+# Show index status (file count, symbol count, last index time)
+grove status [dir]
+
+# Symbol search
+grove symbols <query> [dir]
+
+# Intent-based query (FTS5 + BFS graph ranking)
+grove query <intent> [dir]
+
+# Blast radius: what would break if this symbol changed?
+grove impact <symbol> [dir]
+
+# Which tests cover a symbol?
+grove tests <symbol> [dir]
+
+# Start HTTP server (binds to 127.0.0.1:7777)
+grove serve [--port 7777] [dir]
+
+# Start MCP stdio server (primary AI agent integration)
+grove mcp [dir]
+
+# Start gRPC server
+grove grpc [--port 7778] [dir]
+```
+
+## HTTP API
+
+All endpoints require `Authorization: Bearer <token>` (token at `.grove/.token`) except `/health`.
+
+```bash
+GET  /health
+GET  /status
+POST /index     {"dir": string}
+POST /symbols   {"query": string}
+POST /query     {"intent": string, "limit": int}
+POST /impact    {"query": string, "maxDepth": int}
+POST /deps      {"file": string}
+POST /tests     {"query": string}
+POST /icr       {"intent": string}
+```
+
+## MCP Tools
+
+Grove exposes eight tools over JSON-RPC 2.0 stdio, accessible to any MCP-capable AI agent:
+
+| Tool | Purpose |
+|------|---------|
+| `grove_index` | Index or reindex a directory |
+| `grove_symbols` | Search for symbols by name |
+| `grove_query` | Retrieve ranked context for an intent |
+| `grove_impact` | Blast radius for a symbol or file |
+| `grove_deps` | Dependency tree for a file |
+| `grove_tests` | Tests that cover a symbol |
+| `grove_icr` | Intent complexity rating |
+| `grove_conflicts` | Potential conflict hotspots |
+
+Start the MCP server:
+
+```bash
 grove mcp .
-grove grpc --port 7778 .
 ```
 
-## HTTP
+HTTP/SSE mode (for tools that prefer HTTP over stdio):
 
 ```bash
-curl http://localhost:7777/health
-curl http://localhost:7777/status
-curl -X POST http://localhost:7777/index -d '{"dir":"."}'
-curl -X POST http://localhost:7777/symbols -d '{"query":"Auth"}'
-curl -X POST http://localhost:7777/query -d '{"intent":"auth","limit":10}'
-curl -X POST http://localhost:7777/impact -d '{"query":"Login","maxDepth":3}'
-curl -X POST http://localhost:7777/tests -d '{"query":"login"}'
-curl -X POST http://localhost:7777/icr -d '{"intent":"Login"}'
+grove serve .
 curl http://localhost:7777/mcp/sse
-curl -X POST http://localhost:7777/mcp/call -d '{"name":"grove_query","arguments":{"intent":"Login"}}'
+curl -X POST http://localhost:7777/mcp/call \
+  -H "Authorization: Bearer $(cat .grove/.token)" \
+  -d '{"name":"grove_query","arguments":{"intent":"authentication","limit":10}}'
 ```
 
-## MCP
+## Storage
 
-Grove exposes the 8 planned MCP tools over JSON-RPC stdio:
+Grove stores everything in `.grove/grove.db` (SQLite, WAL mode). The database is a single file — back it up, copy it, or delete it to force a full reindex. There is no migration tooling; delete and reindex if the schema changes.
+
+Key SQLite settings:
+- WAL mode for concurrent reads during indexing
+- FTS5 virtual table for full-text symbol search
+- `busy_timeout = 30s` to handle contention without immediate errors
+
+## Security
+
+Grove binds to `127.0.0.1` — not `0.0.0.0`. The shared secret token at `.grove/.token` (mode 0600) is required on all non-health requests. The token is 64 hex characters generated from `crypto/rand` on first start and is stable across restarts.
+
+## Testing
 
 ```bash
-grove mcp .
+make test                                          # all packages
+go test ./internal/parser/... -run TestGoExtractor # single extractor
+go test ./internal/parser/... -v                   # verbose parser tests
 ```
 
-Tools: `grove_index`, `grove_query`, `grove_impact`, `grove_deps`, `grove_tests`, `grove_icr`, `grove_conflicts`, `grove_symbols`.
-
-HTTP/SSE mode is available through the regular server:
-
-```bash
-grove serve --port 7777 .
-curl http://localhost:7777/mcp/sse
-curl -X POST http://localhost:7777/mcp/call -d '{"name":"grove_symbols","arguments":{"query":"Auth"}}'
-```
-
-## gRPC
-
-The gRPC contract is defined in [proto/grove.proto](proto/grove.proto). The current server is available with:
-
-```bash
-grove grpc --port 7778 .
-```
-
-The implementation registers `grove.v1.GroveService` with grpc-go and uses a JSON codec internally so the service is buildable without generated code during this pre-1.0 phase.
-
-## Current Scope
-
-Implemented now:
-
-- `.grove/grove.db` SQLite store using WAL mode
-- Delta-aware indexing by file content SHA
-- Stale-file pruning when indexed files are deleted
-- Tree-sitter parse validation for Go, TypeScript, JavaScript, Python, Java, and Rust before extraction
-- Symbol search and intent query over the current graph
-- Dependency edges for file definitions and imports
-- Test edges for common test naming patterns such as `TestLogin` → `Login`
-- Impact traversal over reverse graph edges
-- ICR computation, conflict detection, and SQLite-backed lock/unlock
-- MCP stdio and HTTP/SSE tool surfaces
-- gRPC service surface and checked-in proto contract
-
-Still intentionally next:
-
-- Replace conservative regex symbol extraction with full Tree-sitter AST walkers while keeping package/API boundaries stable
-- Add full SQLite FTS5 ranking and BFS query package
+Key test areas: language extractors (fixture-based), BFS traversal on known graph topologies, delta indexing (SHA skip), token middleware, FTS5 query ranking.
