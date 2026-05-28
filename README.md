@@ -95,6 +95,36 @@ Source files
 | `uses-type` | Function/field uses a type (scoped) |
 | `tests` | Test function covers a named symbol |
 
+## Performance
+
+Benchmarks run on macOS against synthetic Go projects (2026-05-27). Numbers reflect a cold index (no prior SHA cache). Subsequent runs on an unchanged project complete in milliseconds regardless of project size — only modified files are re-parsed.
+
+| Project | Files | Index time | Peak RSS | Query latency |
+|---------|------:|----------:|---------:|--------------:|
+| Small | 61 | 0.06 s | 30 MB | 6 ms |
+| Medium | 801 | 0.85 s | 55 MB | 6 ms |
+| Large | 4,501 | 11.6 s | 117 MB | 9 ms |
+| Monorepo | 9,901 | 34.0 s | 196 MB | 61 ms |
+
+Query latency is FTS5 full-text search + BFS graph traversal returning ranked results. RSS scales with project size because the in-memory graph is loaded at serve time.
+
+**Targets:** index 5,000 files < 5 s · BFS depth-3 on 50K nodes < 30 ms · FTS5 query < 10 ms
+
+## Tool and IDE Integration
+
+Grove is the backend for the entire suite. Direct AI agent integration is via MCP stdio or HTTP/SSE; Prism, Fuse, and Relay consume the HTTP API.
+
+| Integration | How | Use case |
+|-------------|-----|---------|
+| Claude Code CLI | `grove mcp .` → MCP stdio | Direct agent integration without Prism |
+| Cursor, Windsurf, Zed | `grove mcp .` → MCP stdio | Same |
+| Prism (all IDEs) | HTTP API `:7777` | Token-optimized context delivery |
+| Fuse (git merge) | HTTP API `:7777` | Blast radius + breaking change detection |
+| Relay | HTTP API + gRPC `:7778` | Intent lifecycle and certification |
+| Custom automation | HTTP API `:7777` | Any tool that can make HTTP requests |
+
+For most AI agent use cases, running Grove directly is only necessary for custom integrations. The normal path is `prism init` in your project, which starts Grove automatically.
+
 ## Installation
 
 ```bash
