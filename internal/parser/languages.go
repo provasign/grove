@@ -18,6 +18,14 @@ func DetectLanguage(path string) string {
 		return "java"
 	case ".rs":
 		return "rust"
+	case ".c", ".h":
+		return "c"
+	case ".cc", ".cpp", ".cxx", ".c++", ".hh", ".hpp", ".hxx":
+		return "cpp"
+	case ".cs":
+		return "csharp"
+	case ".php", ".php3", ".php4", ".php5", ".phtml":
+		return "php"
 	default:
 		return ""
 	}

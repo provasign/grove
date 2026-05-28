@@ -387,9 +387,16 @@ func serve(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
+	groveDir := filepath.Join(root, ".grove")
+	token, err := api.LoadOrCreateToken(groveDir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "token:", err)
+		return 1
+	}
+	handler := api.TokenMiddleware(token, api.NewServer(codeGraph, engine, st, root).Handler())
 	addr := api.Address(cfg.Port)
-	fmt.Fprintf(os.Stderr, "grove listening on %s\n", addr)
-	if err := api.Listen(addr, api.NewServer(codeGraph, engine, st, root).Handler()); err != nil {
+	fmt.Fprintf(os.Stderr, "grove listening on %s (token: %s…)\n", addr, token[:8])
+	if err := api.Listen(addr, handler); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}

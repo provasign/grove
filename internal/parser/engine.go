@@ -125,6 +125,19 @@ func extractImports(language string, content string) []string {
 		"rust": {
 			regexp.MustCompile(`^\s*use\s+([^;]+);`),
 		},
+		"c": {
+			regexp.MustCompile(`^\s*#\s*include\s+[<"]([^>"]+)[>"]`),
+		},
+		"cpp": {
+			regexp.MustCompile(`^\s*#\s*include\s+[<"]([^>"]+)[>"]`),
+		},
+		"csharp": {
+			regexp.MustCompile(`^\s*using\s+([A-Za-z0-9_\.]+)\s*;`),
+		},
+		"php": {
+			regexp.MustCompile(`^\s*(?:use|require_once|require|include_once|include)\s+['"']?([A-Za-z0-9_\\/\.]+)['"']?\s*;?`),
+			regexp.MustCompile(`^\s*namespace\s+([A-Za-z0-9_\\]+)\s*;`),
+		},
 	}
 
 	seen := map[string]bool{}
@@ -339,6 +352,32 @@ func symbolPatterns(language string) []symbolPattern {
 			{regexp.MustCompile(`^\s*(?:pub\s+)?enum\s+([A-Za-z_][A-Za-z0-9_]*)\b`), core.KindEnum, "", false},
 			{regexp.MustCompile(`^\s*(?:pub\s+)?trait\s+([A-Za-z_][A-Za-z0-9_]*)\b`), core.KindTrait, "", false},
 			{regexp.MustCompile(`^\s*type\s+([A-Za-z_][A-Za-z0-9_]*)\s*=`), core.KindType, "", false},
+		}
+	case "c", "cpp":
+		return []symbolPattern{
+			// Free function: return-type name(  — anchored to avoid matching variable decls
+			{regexp.MustCompile(`^(?:[\w*&:<>\s]+\s+)+\*?([A-Za-z_][A-Za-z0-9_:]*)\s*\([^;]*$`), core.KindFunction, "", false},
+			{regexp.MustCompile(`^\s*(?:typedef\s+)?struct\s+([A-Za-z_][A-Za-z0-9_]*)\s*[{;]`), core.KindStruct, "", false},
+			{regexp.MustCompile(`^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)\b`), core.KindClass, "", false},
+			{regexp.MustCompile(`^\s*enum\s+(?:class\s+)?([A-Za-z_][A-Za-z0-9_]*)\b`), core.KindEnum, "", false},
+			{regexp.MustCompile(`^\s*namespace\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{`), core.KindNamespace, "", false},
+		}
+	case "csharp":
+		return []symbolPattern{
+			{regexp.MustCompile(`^\s*(?:(?:public|private|protected|internal|static|abstract|virtual|override|sealed|async)\s+)*(?:[\w<>\[\],?]+\s+)+([A-Za-z_][A-Za-z0-9_]*)\s*\(`), core.KindMethod, "", false},
+			{regexp.MustCompile(`^\s*(?:(?:public|private|protected|internal|static|abstract|sealed)\s+)*class\s+([A-Za-z_][A-Za-z0-9_]*)\b`), core.KindClass, "", false},
+			{regexp.MustCompile(`^\s*(?:(?:public|private|protected|internal)\s+)*interface\s+([A-Za-z_][A-Za-z0-9_]*)\b`), core.KindInterface, "", false},
+			{regexp.MustCompile(`^\s*(?:(?:public|private|protected|internal)\s+)*(?:struct|record)\s+([A-Za-z_][A-Za-z0-9_]*)\b`), core.KindStruct, "", false},
+			{regexp.MustCompile(`^\s*(?:(?:public|private|protected|internal)\s+)*enum\s+([A-Za-z_][A-Za-z0-9_]*)\b`), core.KindEnum, "", false},
+			{regexp.MustCompile(`^\s*namespace\s+([A-Za-z_][A-Za-z0-9_.]*)\s*[{;]`), core.KindNamespace, "", false},
+		}
+	case "php":
+		return []symbolPattern{
+			{regexp.MustCompile(`^\s*(?:public|protected|private|static|abstract|final|\s)*function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(`), core.KindFunction, "", false},
+			{regexp.MustCompile(`^\s*(?:abstract\s+|final\s+)?class\s+([A-Za-z_][A-Za-z0-9_]*)\b`), core.KindClass, "", false},
+			{regexp.MustCompile(`^\s*interface\s+([A-Za-z_][A-Za-z0-9_]*)\b`), core.KindInterface, "", false},
+			{regexp.MustCompile(`^\s*trait\s+([A-Za-z_][A-Za-z0-9_]*)\b`), core.KindTrait, "", false},
+			{regexp.MustCompile(`^\s*enum\s+([A-Za-z_][A-Za-z0-9_]*)\b`), core.KindEnum, "", false},
 		}
 	default:
 		return nil

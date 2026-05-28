@@ -14,9 +14,13 @@ import (
 	"time"
 
 	sitter "github.com/smacker/go-tree-sitter"
+	tsc "github.com/smacker/go-tree-sitter/c"
+	"github.com/smacker/go-tree-sitter/cpp"
+	"github.com/smacker/go-tree-sitter/csharp"
 	"github.com/smacker/go-tree-sitter/golang"
 	"github.com/smacker/go-tree-sitter/java"
 	"github.com/smacker/go-tree-sitter/javascript"
+	"github.com/smacker/go-tree-sitter/php"
 	"github.com/smacker/go-tree-sitter/python"
 	"github.com/smacker/go-tree-sitter/rust"
 	tstsx "github.com/smacker/go-tree-sitter/typescript/tsx"
@@ -64,6 +68,14 @@ func treeSitterLanguage(language string) (*sitter.Language, bool) {
 		return java.GetLanguage(), true
 	case "rust":
 		return rust.GetLanguage(), true
+	case "c":
+		return tsc.GetLanguage(), true
+	case "cpp":
+		return cpp.GetLanguage(), true
+	case "csharp":
+		return csharp.GetLanguage(), true
+	case "php":
+		return php.GetLanguage(), true
 	default:
 		return nil, false
 	}
@@ -113,6 +125,12 @@ func extractSymbolsFromAST(language, filePath, blobSHA string, src []byte, fileI
 		syms = extractJavaNodes(root, filePath, blobSHA, src, fileImports)
 	case "rust":
 		syms = extractRustNodes(root, filePath, blobSHA, src, fileImports)
+	case "c", "cpp":
+		syms = extractCNodes(root, filePath, blobSHA, language, src, fileImports)
+	case "csharp":
+		syms = extractCSharpNodes(root, filePath, blobSHA, src, fileImports)
+	case "php":
+		syms = extractPHPNodes(root, filePath, blobSHA, src, fileImports)
 	}
 	if syms == nil {
 		syms = []core.SymbolRecord{} // non-nil signals "extraction succeeded with zero symbols"
@@ -1033,6 +1051,661 @@ func rustImplItem(n *sitter.Node, filePath, blobSHA string, src []byte, imports 
 		return
 	}
 	rustVisit(body, filePath, blobSHA, src, imports, typeName, out)
+}
+
+// ─── C / C++ ─────────────────────────────────────────────────────────────────
+//
+// C and C++ share the same extractor — the C++ grammar is a superset of C, and
+// both use identical node types for the constructs we care about (functions,
+// structs, enums, classes in C++).
+
+func extractCNodes(root *sitter.Node, filePath, blobSHA, language string, src []byte, imports []string) []core.SymbolRecord {
+	var out []core.SymbolRecord
+	for i := 0; i < int(root.ChildCount()); i++ {
+		n := root.Child(i)
+		if n == nil {
+			continue
+		}
+		switch n.Type() {
+		case "function_definition":
+			if sym := cFuncSym(n, filePath, blobSHA, language, src, imports, ""); sym != nil {
+				out = append(out, *sym)
+			}
+		case "declaration":
+			// Catches typedef struct, extern function declarations, etc.
+			out = append(out, cDeclarationSyms(n, filePath, blobSHA, language, src, imports)...)
+		case "struct_specifier", "union_specifier":
+			if sym := cTaggedTypeSym(n, core.KindStruct, filePath, blobSHA, language, src, imports); sym != nil {
+				out = append(out, *sym)
+			}
+		case "enum_specifier":
+			if sym := cTaggedTypeSym(n, core.KindEnum, filePath, blobSHA, language, src, imports); sym != nil {
+				out = append(out, *sym)
+			}
+		case "type_definition":
+			out = append(out, cTypedefSyms(n, filePath, blobSHA, language, src, imports)...)
+		// C++ only
+		case "class_specifier":
+			out = append(out, cppClassSym(n, filePath, blobSHA, language, src, imports)...)
+		case "namespace_definition":
+			if sym := cppNamespaceSym(n, filePath, blobSHA, language, src, imports); sym != nil {
+				out = append(out, *sym)
+			}
+			// Recurse into namespace body to find enclosed classes, functions, etc.
+			if body := n.ChildByFieldName("body"); body != nil {
+				out = append(out, extractCNodes(body, filePath, blobSHA, language, src, imports)...)
+			}
+		case "template_declaration":
+			out = append(out, cppTemplateDecl(n, filePath, blobSHA, language, src, imports)...)
+		}
+	}
+	return out
+}
+
+func cFuncSym(n *sitter.Node, filePath, blobSHA, language string, src []byte, imports []string, parentClass string) *core.SymbolRecord {
+	// function_definition: type declarator body
+	declarator := n.ChildByFieldName("declarator")
+	if declarator == nil {
+		return nil
+	}
+	name := cDeclaratorName(declarator, src)
+	if name == "" {
+		return nil
+	}
+	raw := n.Content(src)
+	kind := core.KindFunction
+	if parentClass != "" {
+		kind = core.KindMethod
+	}
+	return &core.SymbolRecord{
+		ID:            symID(filePath, name, blobSHA),
+		FilePath:      filePath,
+		BlobSHA:       blobSHA,
+		Language:      language,
+		Kind:          kind,
+		Name:          name,
+		QualifiedName: name,
+		Signature:     funcSig(n, src),
+		Span:          nodeSpan(n),
+		Exports:       !strings.HasPrefix(name, "_"),
+		RawText:       raw,
+		ParentSymbol:  parentClass,
+		Imports:       imports,
+		TokenEstimate: estimateTokens(raw),
+	}
+}
+
+// cDeclaratorName walks nested declarator nodes (pointer_declarator,
+// function_declarator, etc.) to extract the final identifier name.
+func cDeclaratorName(n *sitter.Node, src []byte) string {
+	if n == nil {
+		return ""
+	}
+	switch n.Type() {
+	case "identifier", "field_identifier":
+		return n.Content(src)
+	case "pointer_declarator", "function_declarator",
+		"abstract_pointer_declarator", "qualified_identifier":
+		for i := 0; i < int(n.ChildCount()); i++ {
+			if name := cDeclaratorName(n.Child(i), src); name != "" {
+				return name
+			}
+		}
+	case "destructor_name": // C++ ~ClassName
+		return n.Content(src)
+	case "operator_name": // C++ operator overload
+		return n.Content(src)
+	}
+	return ""
+}
+
+func cDeclarationSyms(n *sitter.Node, filePath, blobSHA, language string, src []byte, imports []string) []core.SymbolRecord {
+	// Pick up top-level variable/function declarations (e.g. extern declarations).
+	var out []core.SymbolRecord
+	for i := 0; i < int(n.ChildCount()); i++ {
+		child := n.Child(i)
+		if child == nil {
+			continue
+		}
+		if child.Type() == "function_declarator" {
+			name := cDeclaratorName(child, src)
+			if name == "" {
+				continue
+			}
+			raw := n.Content(src)
+			out = append(out, core.SymbolRecord{
+				ID:            symID(filePath, name, blobSHA),
+				FilePath:      filePath,
+				BlobSHA:       blobSHA,
+				Language:      language,
+				Kind:          core.KindFunction,
+				Name:          name,
+				QualifiedName: name,
+				Signature:     strings.TrimSpace(raw),
+				Span:          nodeSpan(n),
+				Exports:       !strings.HasPrefix(name, "_"),
+				RawText:       raw,
+				Imports:       imports,
+				TokenEstimate: estimateTokens(raw),
+			})
+		}
+	}
+	return out
+}
+
+// cTypedefSyms handles `typedef struct {...} Name` and similar typedef forms.
+// The alias name lives in the child with field "declarator".
+func cTypedefSyms(n *sitter.Node, filePath, blobSHA, language string, src []byte, imports []string) []core.SymbolRecord {
+	declaratorNode := n.ChildByFieldName("declarator")
+	if declaratorNode == nil {
+		return nil
+	}
+	name := ""
+	switch declaratorNode.Type() {
+	case "type_identifier":
+		name = declaratorNode.Content(src)
+	default:
+		// Pointer typedef: typedef struct {...} *PName — find type_identifier child.
+		for i := 0; i < int(declaratorNode.ChildCount()); i++ {
+			if c := declaratorNode.Child(i); c != nil && c.Type() == "type_identifier" {
+				name = c.Content(src)
+				break
+			}
+		}
+	}
+	if name == "" {
+		return nil
+	}
+	kind := core.KindType
+	if typeNode := n.ChildByFieldName("type"); typeNode != nil {
+		switch typeNode.Type() {
+		case "struct_specifier", "union_specifier":
+			kind = core.KindStruct
+		case "enum_specifier":
+			kind = core.KindEnum
+		}
+	}
+	raw := n.Content(src)
+	return []core.SymbolRecord{{
+		ID:            symID(filePath, name, blobSHA),
+		FilePath:      filePath,
+		BlobSHA:       blobSHA,
+		Language:      language,
+		Kind:          kind,
+		Name:          name,
+		QualifiedName: name,
+		Signature:     firstLine(raw),
+		Span:          nodeSpan(n),
+		Exports:       true,
+		RawText:       raw,
+		Imports:       imports,
+		TokenEstimate: estimateTokens(raw),
+	}}
+}
+
+func cTaggedTypeSym(n *sitter.Node, kind core.SymbolKind, filePath, blobSHA, language string, src []byte, imports []string) *core.SymbolRecord {
+	nameNode := n.ChildByFieldName("name")
+	if nameNode == nil {
+		return nil
+	}
+	name := nameNode.Content(src)
+	raw := n.Content(src)
+	return &core.SymbolRecord{
+		ID:            symID(filePath, name, blobSHA),
+		FilePath:      filePath,
+		BlobSHA:       blobSHA,
+		Language:      language,
+		Kind:          kind,
+		Name:          name,
+		QualifiedName: name,
+		Signature:     firstLine(raw),
+		Span:          nodeSpan(n),
+		Exports:       true,
+		RawText:       raw,
+		Imports:       imports,
+		TokenEstimate: estimateTokens(raw),
+	}
+}
+
+func cppClassSym(n *sitter.Node, filePath, blobSHA, language string, src []byte, imports []string) []core.SymbolRecord {
+	nameNode := n.ChildByFieldName("name")
+	if nameNode == nil {
+		return nil
+	}
+	className := nameNode.Content(src)
+	raw := n.Content(src)
+	out := []core.SymbolRecord{{
+		ID:            symID(filePath, className, blobSHA),
+		FilePath:      filePath,
+		BlobSHA:       blobSHA,
+		Language:      language,
+		Kind:          core.KindClass,
+		Name:          className,
+		QualifiedName: className,
+		Signature:     firstLine(raw),
+		Span:          nodeSpan(n),
+		Exports:       true,
+		RawText:       raw,
+		Imports:       imports,
+		TokenEstimate: estimateTokens(raw),
+	}}
+	// Extract member functions from the class body.
+	body := n.ChildByFieldName("body")
+	if body == nil {
+		return out
+	}
+	for i := 0; i < int(body.ChildCount()); i++ {
+		child := body.Child(i)
+		if child == nil {
+			continue
+		}
+		if child.Type() == "function_definition" {
+			if sym := cFuncSym(child, filePath, blobSHA, language, src, imports, className); sym != nil {
+				out = append(out, *sym)
+			}
+		}
+	}
+	return out
+}
+
+func cppNamespaceSym(n *sitter.Node, filePath, blobSHA, language string, src []byte, imports []string) *core.SymbolRecord {
+	nameNode := n.ChildByFieldName("name")
+	if nameNode == nil {
+		return nil
+	}
+	name := nameNode.Content(src)
+	raw := n.Content(src)
+	return &core.SymbolRecord{
+		ID:            symID(filePath, name, blobSHA),
+		FilePath:      filePath,
+		BlobSHA:       blobSHA,
+		Language:      language,
+		Kind:          core.KindNamespace,
+		Name:          name,
+		QualifiedName: name,
+		Signature:     firstLine(raw),
+		Span:          nodeSpan(n),
+		Exports:       true,
+		RawText:       raw,
+		Imports:       imports,
+		TokenEstimate: estimateTokens(raw),
+	}
+}
+
+func cppTemplateDecl(n *sitter.Node, filePath, blobSHA, language string, src []byte, imports []string) []core.SymbolRecord {
+	// template<...> function_definition | class_specifier
+	for i := 0; i < int(n.ChildCount()); i++ {
+		child := n.Child(i)
+		if child == nil {
+			continue
+		}
+		switch child.Type() {
+		case "function_definition":
+			if sym := cFuncSym(child, filePath, blobSHA, language, src, imports, ""); sym != nil {
+				return []core.SymbolRecord{*sym}
+			}
+		case "class_specifier":
+			return cppClassSym(child, filePath, blobSHA, language, src, imports)
+		}
+	}
+	return nil
+}
+
+// ─── C# ───────────────────────────────────────────────────────────────────────
+
+func extractCSharpNodes(root *sitter.Node, filePath, blobSHA string, src []byte, imports []string) []core.SymbolRecord {
+	var out []core.SymbolRecord
+	csVisit(root, filePath, blobSHA, src, imports, "", &out)
+	return out
+}
+
+func csVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentClass string, out *[]core.SymbolRecord) {
+	for i := 0; i < int(node.ChildCount()); i++ {
+		n := node.Child(i)
+		if n == nil {
+			continue
+		}
+		switch n.Type() {
+		case "namespace_declaration":
+			nameNode := n.ChildByFieldName("name")
+			if nameNode == nil {
+				break
+			}
+			nsName := nameNode.Content(src)
+			raw := n.Content(src)
+			*out = append(*out, core.SymbolRecord{
+				ID:            symID(filePath, nsName, blobSHA),
+				FilePath:      filePath,
+				BlobSHA:       blobSHA,
+				Language:      "csharp",
+				Kind:          core.KindNamespace,
+				Name:          nsName,
+				QualifiedName: nsName,
+				Signature:     firstLine(raw),
+				Span:          nodeSpan(n),
+				Exports:       true,
+				RawText:       raw,
+				Imports:       imports,
+				TokenEstimate: estimateTokens(raw),
+			})
+			if body := n.ChildByFieldName("body"); body != nil {
+				csVisit(body, filePath, blobSHA, src, imports, "", out)
+			}
+		case "class_declaration", "record_declaration":
+			csTypeDecl(n, core.KindClass, filePath, blobSHA, src, imports, parentClass, out)
+		case "struct_declaration":
+			csTypeDecl(n, core.KindStruct, filePath, blobSHA, src, imports, parentClass, out)
+		case "interface_declaration":
+			csTypeDecl(n, core.KindInterface, filePath, blobSHA, src, imports, parentClass, out)
+		case "enum_declaration":
+			csTypeDecl(n, core.KindEnum, filePath, blobSHA, src, imports, parentClass, out)
+		case "method_declaration", "constructor_declaration", "destructor_declaration":
+			csMethodDecl(n, filePath, blobSHA, src, imports, parentClass, out)
+		case "property_declaration":
+			csPropertyDecl(n, filePath, blobSHA, src, imports, parentClass, out)
+		case "field_declaration":
+			csFieldDecl(n, filePath, blobSHA, src, imports, parentClass, out)
+		}
+	}
+}
+
+func csTypeDecl(n *sitter.Node, kind core.SymbolKind, filePath, blobSHA string, src []byte, imports []string, parentClass string, out *[]core.SymbolRecord) {
+	nameNode := n.ChildByFieldName("name")
+	if nameNode == nil {
+		return
+	}
+	name := nameNode.Content(src)
+	raw := n.Content(src)
+	modifiers := csModifiers(n, src)
+	*out = append(*out, core.SymbolRecord{
+		ID:             symID(filePath, name, blobSHA),
+		FilePath:       filePath,
+		BlobSHA:        blobSHA,
+		Language:       "csharp",
+		Kind:           kind,
+		Name:           name,
+		QualifiedName:  name,
+		Signature:      firstLine(raw),
+		Span:           nodeSpan(n),
+		Exports:        csIsExported(modifiers),
+		RawText:        raw,
+		ParentSymbol:   parentClass,
+		Imports:        imports,
+		TokenEstimate:  estimateTokens(raw),
+		Modifiers:      modifiers,
+		TypeParameters: csTypeParams(n, src),
+		Annotations:    csAttributes(n, src),
+	})
+	if body := n.ChildByFieldName("body"); body != nil {
+		csVisit(body, filePath, blobSHA, src, imports, name, out)
+	}
+}
+
+func csMethodDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentClass string, out *[]core.SymbolRecord) {
+	nameNode := n.ChildByFieldName("name")
+	if nameNode == nil {
+		return
+	}
+	name := nameNode.Content(src)
+	raw := n.Content(src)
+	modifiers := csModifiers(n, src)
+	kind := core.KindMethod
+	if n.Type() == "constructor_declaration" {
+		kind = core.KindConstructor
+	}
+	*out = append(*out, core.SymbolRecord{
+		ID:             symID(filePath, name, blobSHA),
+		FilePath:       filePath,
+		BlobSHA:        blobSHA,
+		Language:       "csharp",
+		Kind:           kind,
+		Name:           name,
+		QualifiedName:  name,
+		Signature:      funcSig(n, src),
+		Span:           nodeSpan(n),
+		Exports:        csIsExported(modifiers),
+		RawText:        raw,
+		ParentSymbol:   parentClass,
+		Imports:        imports,
+		TokenEstimate:  estimateTokens(raw),
+		Modifiers:      modifiers,
+		TypeParameters: csTypeParams(n, src),
+		Annotations:    csAttributes(n, src),
+	})
+}
+
+func csPropertyDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentClass string, out *[]core.SymbolRecord) {
+	nameNode := n.ChildByFieldName("name")
+	if nameNode == nil {
+		return
+	}
+	name := nameNode.Content(src)
+	raw := n.Content(src)
+	modifiers := csModifiers(n, src)
+	*out = append(*out, core.SymbolRecord{
+		ID:            symID(filePath, name, blobSHA),
+		FilePath:      filePath,
+		BlobSHA:       blobSHA,
+		Language:      "csharp",
+		Kind:          core.KindField,
+		Name:          name,
+		QualifiedName: name,
+		Signature:     firstLine(raw),
+		Span:          nodeSpan(n),
+		Exports:       csIsExported(modifiers),
+		RawText:       raw,
+		ParentSymbol:  parentClass,
+		Imports:       imports,
+		TokenEstimate: estimateTokens(raw),
+		Modifiers:     modifiers,
+		Annotations:   csAttributes(n, src),
+	})
+}
+
+func csFieldDecl(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentClass string, out *[]core.SymbolRecord) {
+	modifiers := csModifiers(n, src)
+	for i := 0; i < int(n.ChildCount()); i++ {
+		child := n.Child(i)
+		if child == nil || child.Type() != "variable_declaration" {
+			continue
+		}
+		nameNode := child.ChildByFieldName("name")
+		if nameNode == nil {
+			continue
+		}
+		name := nameNode.Content(src)
+		raw := child.Content(src)
+		*out = append(*out, core.SymbolRecord{
+			ID:            symID(filePath, name, blobSHA),
+			FilePath:      filePath,
+			BlobSHA:       blobSHA,
+			Language:      "csharp",
+			Kind:          core.KindField,
+			Name:          name,
+			QualifiedName: name,
+			Signature:     firstLine(raw),
+			Span:          nodeSpan(child),
+			Exports:       csIsExported(modifiers),
+			RawText:       raw,
+			ParentSymbol:  parentClass,
+			Imports:       imports,
+			TokenEstimate: estimateTokens(raw),
+			Modifiers:     modifiers,
+		})
+	}
+}
+
+func csModifiers(n *sitter.Node, src []byte) []string {
+	var mods []string
+	for i := 0; i < int(n.ChildCount()); i++ {
+		child := n.Child(i)
+		if child != nil && child.Type() == "modifier" {
+			mods = append(mods, child.Content(src))
+		}
+	}
+	return mods
+}
+
+func csIsExported(modifiers []string) bool {
+	for _, m := range modifiers {
+		if m == "public" || m == "protected" || m == "internal" {
+			return true
+		}
+	}
+	return false
+}
+
+func csTypeParams(n *sitter.Node, src []byte) []string {
+	tp := findChildByType(n, "type_parameter_list")
+	if tp == nil {
+		return nil
+	}
+	var params []string
+	for i := 0; i < int(tp.ChildCount()); i++ {
+		child := tp.Child(i)
+		if child != nil && child.Type() == "type_parameter" {
+			params = append(params, child.Content(src))
+		}
+	}
+	return params
+}
+
+func csAttributes(n *sitter.Node, src []byte) []string {
+	var attrs []string
+	for i := 0; i < int(n.ChildCount()); i++ {
+		child := n.Child(i)
+		if child != nil && child.Type() == "attribute_list" {
+			attrs = append(attrs, child.Content(src))
+		}
+	}
+	return attrs
+}
+
+// ─── PHP ─────────────────────────────────────────────────────────────────────
+
+func extractPHPNodes(root *sitter.Node, filePath, blobSHA string, src []byte, imports []string) []core.SymbolRecord {
+	var out []core.SymbolRecord
+	// PHP files have a program node; sometimes wrapped in php_tag + program.
+	phpVisit(root, filePath, blobSHA, src, imports, "", &out)
+	return out
+}
+
+func phpVisit(node *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentClass string, out *[]core.SymbolRecord) {
+	for i := 0; i < int(node.ChildCount()); i++ {
+		n := node.Child(i)
+		if n == nil {
+			continue
+		}
+		switch n.Type() {
+		case "function_definition":
+			if sym := phpFuncSym(n, filePath, blobSHA, src, imports, parentClass); sym != nil {
+				*out = append(*out, *sym)
+			}
+		case "class_declaration":
+			phpClassDecl(n, core.KindClass, filePath, blobSHA, src, imports, out)
+		case "interface_declaration":
+			phpClassDecl(n, core.KindInterface, filePath, blobSHA, src, imports, out)
+		case "trait_declaration":
+			phpClassDecl(n, core.KindTrait, filePath, blobSHA, src, imports, out)
+		case "enum_declaration":
+			phpClassDecl(n, core.KindEnum, filePath, blobSHA, src, imports, out)
+		case "method_declaration":
+			if sym := phpFuncSym(n, filePath, blobSHA, src, imports, parentClass); sym != nil {
+				*out = append(*out, *sym)
+			}
+		default:
+			// Recurse into program, namespace_definition, compound_statement, etc.
+			phpVisit(n, filePath, blobSHA, src, imports, parentClass, out)
+		}
+	}
+}
+
+func phpFuncSym(n *sitter.Node, filePath, blobSHA string, src []byte, imports []string, parentClass string) *core.SymbolRecord {
+	nameNode := n.ChildByFieldName("name")
+	if nameNode == nil {
+		return nil
+	}
+	name := nameNode.Content(src)
+	raw := n.Content(src)
+	kind := core.KindFunction
+	if parentClass != "" {
+		kind = core.KindMethod
+		if strings.EqualFold(name, "__construct") {
+			kind = core.KindConstructor
+		}
+	}
+	return &core.SymbolRecord{
+		ID:            symID(filePath, name, blobSHA),
+		FilePath:      filePath,
+		BlobSHA:       blobSHA,
+		Language:      "php",
+		Kind:          kind,
+		Name:          name,
+		QualifiedName: name,
+		Signature:     funcSig(n, src),
+		Span:          nodeSpan(n),
+		Exports:       phpIsExported(n, src),
+		RawText:       raw,
+		ParentSymbol:  parentClass,
+		Imports:       imports,
+		TokenEstimate: estimateTokens(raw),
+		Modifiers:     phpModifiers(n, src),
+	}
+}
+
+func phpClassDecl(n *sitter.Node, kind core.SymbolKind, filePath, blobSHA string, src []byte, imports []string, out *[]core.SymbolRecord) {
+	nameNode := n.ChildByFieldName("name")
+	if nameNode == nil {
+		return
+	}
+	className := nameNode.Content(src)
+	raw := n.Content(src)
+	*out = append(*out, core.SymbolRecord{
+		ID:            symID(filePath, className, blobSHA),
+		FilePath:      filePath,
+		BlobSHA:       blobSHA,
+		Language:      "php",
+		Kind:          kind,
+		Name:          className,
+		QualifiedName: className,
+		Signature:     firstLine(raw),
+		Span:          nodeSpan(n),
+		Exports:       true,
+		RawText:       raw,
+		Imports:       imports,
+		TokenEstimate: estimateTokens(raw),
+		Modifiers:     phpModifiers(n, src),
+	})
+	body := n.ChildByFieldName("body")
+	if body == nil {
+		return
+	}
+	phpVisit(body, filePath, blobSHA, src, imports, className, out)
+}
+
+func phpModifiers(n *sitter.Node, src []byte) []string {
+	var mods []string
+	for i := 0; i < int(n.ChildCount()); i++ {
+		child := n.Child(i)
+		if child == nil {
+			continue
+		}
+		switch child.Type() {
+		case "visibility_modifier", "static_modifier", "abstract_modifier", "final_modifier":
+			mods = append(mods, child.Content(src))
+		}
+	}
+	return mods
+}
+
+func phpIsExported(n *sitter.Node, src []byte) bool {
+	for _, m := range phpModifiers(n, src) {
+		if m == "public" {
+			return true
+		}
+	}
+	// Top-level functions (no class parent) are always accessible.
+	return true
 }
 
 // ─── Shared helpers ───────────────────────────────────────────────────────────

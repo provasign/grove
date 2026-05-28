@@ -973,3 +973,197 @@ func TestMergeSymbolsPreservesASTOverRegex(t *testing.T) {
 		t.Error("Bar (regex-only) should be present in merged result")
 	}
 }
+
+// ─── New language tests ───────────────────────────────────────────────────────
+
+func TestCFunctionAndStructExtraction(t *testing.T) {
+	src := `#include <stdio.h>
+
+typedef struct {
+    int x;
+    int y;
+} Point;
+
+int add(int a, int b) {
+    return a + b;
+}
+
+static void _internal(void) {}
+`
+	syms, err := extractSymbolsFromString("c", "demo.c", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := nameIndex(syms)
+	if _, ok := byName["add"]; !ok {
+		t.Error("add function missing")
+	}
+	if _, ok := byName["Point"]; !ok {
+		t.Error("Point struct missing")
+	}
+	// Imports: #include should be captured.
+	imports := extractImports("c", src)
+	found := false
+	for _, imp := range imports {
+		if imp == "stdio.h" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("#include <stdio.h> not captured as import")
+	}
+}
+
+func TestCppClassAndMethodExtraction(t *testing.T) {
+	src := `#include <string>
+
+namespace net {
+
+class Server {
+public:
+    Server(int port);
+    void Start();
+    void Stop();
+private:
+    int port_;
+};
+
+Server::Server(int port) : port_(port) {}
+
+void Server::Start() {
+    // listen
+}
+
+} // namespace net
+`
+	syms, err := extractSymbolsFromString("cpp", "server.cpp", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := nameIndex(syms)
+	if _, ok := byName["Server"]; !ok {
+		t.Error("Server class missing")
+	}
+	if _, ok := byName["net"]; !ok {
+		t.Error("net namespace missing")
+	}
+}
+
+func TestCSharpClassAndMethodExtraction(t *testing.T) {
+	src := `using System;
+using System.Collections.Generic;
+
+namespace MyApp.Services {
+
+    public class UserService {
+        private readonly IUserRepository _repo;
+
+        public UserService(IUserRepository repo) {
+            _repo = repo;
+        }
+
+        public async Task<User> GetByIdAsync(int id) {
+            return await _repo.FindAsync(id);
+        }
+
+        private void Validate(User user) {}
+    }
+
+    public interface IUserRepository {
+        Task<User> FindAsync(int id);
+    }
+}
+`
+	syms, err := extractSymbolsFromString("csharp", "UserService.cs", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := nameIndex(syms)
+	if _, ok := byName["UserService"]; !ok {
+		t.Error("UserService class missing")
+	}
+	if _, ok := byName["IUserRepository"]; !ok {
+		t.Error("IUserRepository interface missing")
+	}
+	imports := extractImports("csharp", src)
+	foundSystem := false
+	for _, imp := range imports {
+		if imp == "System" {
+			foundSystem = true
+		}
+	}
+	if !foundSystem {
+		t.Error("'using System' not captured as import")
+	}
+}
+
+func TestPHPClassAndFunctionExtraction(t *testing.T) {
+	src := `<?php
+
+namespace App\Services;
+
+use App\Models\User;
+
+class AuthService {
+    private UserRepository $repo;
+
+    public function __construct(UserRepository $repo) {
+        $this->repo = $repo;
+    }
+
+    public function login(string $email, string $password): ?User {
+        return $this->repo->findByEmail($email);
+    }
+}
+
+interface Authenticatable {
+    public function authenticate(): bool;
+}
+
+function hashPassword(string $password): string {
+    return password_hash($password, PASSWORD_BCRYPT);
+}
+`
+	syms, err := extractSymbolsFromString("php", "AuthService.php", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := nameIndex(syms)
+	if _, ok := byName["AuthService"]; !ok {
+		t.Error("AuthService class missing")
+	}
+	if _, ok := byName["Authenticatable"]; !ok {
+		t.Error("Authenticatable interface missing")
+	}
+	if _, ok := byName["hashPassword"]; !ok {
+		t.Error("hashPassword function missing")
+	}
+}
+
+func TestLanguageDetectionNewLanguages(t *testing.T) {
+	cases := map[string]string{
+		"main.c":     "c",
+		"util.h":     "c",
+		"engine.cpp": "cpp",
+		"server.cc":  "cpp",
+		"types.hpp":  "cpp",
+		"Service.cs": "csharp",
+		"index.php":  "php",
+		"page.phtml": "php",
+	}
+	for path, want := range cases {
+		got := DetectLanguage(path)
+		if got != want {
+			t.Errorf("DetectLanguage(%q) = %q, want %q", path, got, want)
+		}
+	}
+}
+
+// nameIndex builds a map[name]SymbolRecord for assertion helpers.
+func nameIndex(syms []core.SymbolRecord) map[string]core.SymbolRecord {
+	m := make(map[string]core.SymbolRecord, len(syms))
+	for _, s := range syms {
+		m[s.Name] = s
+	}
+	return m
+}

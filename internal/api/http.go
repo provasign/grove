@@ -399,8 +399,11 @@ func Listen(addr string, handler http.Handler) error {
 	return server.ListenAndServe()
 }
 
+// Address returns a localhost-only listen address for the given port.
+// Binding to 127.0.0.1 (not 0.0.0.0) prevents remote machines on the same
+// LAN from reaching the Grove API and exfiltrating source code.
 func Address(port int) string {
-	return fmt.Sprintf(":%d", port)
+	return fmt.Sprintf("127.0.0.1:%d", port)
 }
 
 func (s *Server) currentGraph() *graph.CodeGraph {
