@@ -900,3 +900,76 @@ func extractSymbolsFromString(language, filePath, src string) ([]core.SymbolReco
 	imports := extractImports(language, src)
 	return extractSymbols(language, filePath, blobSHA, src, imports), nil
 }
+
+// TestExtractSymbolsWithSyntaxError verifies that a file with an AST syntax
+// error (e.g. a function being actively typed) still yields the well-formed
+// symbols before the error AND recovers the partially-declared symbol via the
+// regex fallback merge.
+func TestExtractSymbolsWithSyntaxError(t *testing.T) {
+	// Valid function followed by a function whose closing brace is missing —
+	// tree-sitter will mark the second declaration (and beyond) as an ERROR node.
+	src := `package demo
+
+func Stable() string {
+	return "ok"
+}
+
+func InProgress( // syntax error: missing closing paren + body
+`
+	syms, err := extractSymbolsFromString("go", "demo.go", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	byName := make(map[string]core.SymbolRecord, len(syms))
+	for _, s := range syms {
+		byName[s.Name] = s
+	}
+
+	// The well-formed function must always be present.
+	if _, ok := byName["Stable"]; !ok {
+		t.Error("Stable (syntactically valid) is missing from extraction result")
+	}
+
+	// The in-progress function must appear via the regex fallback merge.
+	if _, ok := byName["InProgress"]; !ok {
+		t.Error("InProgress (inside ERROR subtree) should be recovered via regex merge")
+	}
+}
+
+// TestMergeSymbolsPreservesASTOverRegex verifies that when the same name
+// appears in both AST and regex results, the AST version (more accurate) wins.
+func TestMergeSymbolsPreservesASTOverRegex(t *testing.T) {
+	ast := []core.SymbolRecord{
+		{Name: "Foo", Signature: "ast-sig", Kind: core.KindFunction},
+	}
+	regex := []core.SymbolRecord{
+		{Name: "Foo", Signature: "regex-sig", Kind: core.KindFunction},
+		{Name: "Bar", Signature: "regex-only", Kind: core.KindFunction},
+	}
+	merged := mergeSymbols(ast, regex)
+	if len(merged) != 2 {
+		t.Fatalf("want 2 merged symbols, got %d: %v", len(merged), merged)
+	}
+	fooIdx := -1
+	for i, s := range merged {
+		if s.Name == "Foo" {
+			fooIdx = i
+		}
+	}
+	if fooIdx < 0 {
+		t.Fatal("Foo missing from merged result")
+	}
+	if merged[fooIdx].Signature != "ast-sig" {
+		t.Errorf("Foo.Signature = %q, want AST version %q", merged[fooIdx].Signature, "ast-sig")
+	}
+	barFound := false
+	for _, s := range merged {
+		if s.Name == "Bar" {
+			barFound = true
+		}
+	}
+	if !barFound {
+		t.Error("Bar (regex-only) should be present in merged result")
+	}
+}

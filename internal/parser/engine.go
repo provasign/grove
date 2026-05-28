@@ -347,16 +347,50 @@ func symbolPatterns(language string) []symbolPattern {
 
 // extractSymbols returns symbols for the given source file.
 // Tree-sitter AST extraction is tried first; the regex extractor is used as
-// a fallback (e.g. for languages not yet covered or for parse timeouts).
+// a fallback for languages not yet covered or for parse timeouts.
+//
+// When tree-sitter reports syntax errors (file actively being edited), both
+// extractors are run and their results are merged: AST symbols take precedence
+// (more accurate), but any symbol name the regex extractor found that the AST
+// missed is added. This prevents a partially-typed function from disappearing
+// from the index entirely while the developer is writing it.
 func extractSymbols(language, filePath, blobSHA, content string, fileImports []string) []core.SymbolRecord {
-	var symbols []core.SymbolRecord
-	if syms, ok := extractSymbolsFromAST(language, filePath, blobSHA, []byte(content), fileImports); ok {
-		symbols = syms
-	} else {
-		symbols = extractSymbolsRegex(language, filePath, blobSHA, content, fileImports)
+	astSyms, ok, hasErrors := extractSymbolsFromAST(language, filePath, blobSHA, []byte(content), fileImports)
+	if !ok {
+		syms := extractSymbolsRegex(language, filePath, blobSHA, content, fileImports)
+		attachDocstrings(language, content, syms)
+		return syms
 	}
-	attachDocstrings(language, content, symbols)
-	return symbols
+	if !hasErrors {
+		attachDocstrings(language, content, astSyms)
+		return astSyms
+	}
+	// Syntax errors present — supplement AST results with regex to recover symbols
+	// that fell inside ERROR subtrees (e.g. a function being actively typed).
+	regexSyms := extractSymbolsRegex(language, filePath, blobSHA, content, fileImports)
+	merged := mergeSymbols(astSyms, regexSyms)
+	attachDocstrings(language, content, merged)
+	return merged
+}
+
+// mergeSymbols returns the union of astSyms and regexSyms, preferring AST
+// results for any symbol name that appears in both. Regex-only symbols are
+// appended at the end — they cover declarations inside ERROR subtrees.
+func mergeSymbols(astSyms, regexSyms []core.SymbolRecord) []core.SymbolRecord {
+	if len(regexSyms) == 0 {
+		return astSyms
+	}
+	seen := make(map[string]bool, len(astSyms))
+	for _, s := range astSyms {
+		seen[s.Name] = true
+	}
+	merged := append([]core.SymbolRecord(nil), astSyms...)
+	for _, s := range regexSyms {
+		if !seen[s.Name] {
+			merged = append(merged, s)
+		}
+	}
+	return merged
 }
 
 // attachDocstrings fills SymbolRecord.Docstring by looking at the source.

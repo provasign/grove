@@ -70,14 +70,17 @@ func treeSitterLanguage(language string) (*sitter.Language, bool) {
 }
 
 // extractSymbolsFromAST parses src with Tree-sitter and extracts symbols.
-// Returns (symbols, true) on success — even if the file has zero top-level
-// symbols (e.g. a file with only imports).
-// Returns (nil, false) when the language is unsupported or parsing times out,
-// allowing callers to fall back to the regex extractor.
-func extractSymbolsFromAST(language, filePath, blobSHA string, src []byte, fileImports []string) ([]core.SymbolRecord, bool) {
-	lang, ok := treeSitterLanguage(language)
-	if !ok {
-		return nil, false
+// Returns (symbols, ok, hasErrors):
+//   - ok=false when the language is unsupported or parsing times out; callers
+//     must fall back to the regex extractor.
+//   - ok=true, hasErrors=false: clean parse; symbols are complete.
+//   - ok=true, hasErrors=true: tree-sitter recovered from one or more syntax
+//     errors; symbols inside ERROR subtrees are absent from the AST result.
+//     Callers should merge in the regex fallback for those gaps.
+func extractSymbolsFromAST(language, filePath, blobSHA string, src []byte, fileImports []string) (syms []core.SymbolRecord, ok bool, hasErrors bool) {
+	lang, supported := treeSitterLanguage(language)
+	if !supported {
+		return nil, false, false
 	}
 
 	parser := sitter.NewParser()
@@ -86,16 +89,17 @@ func extractSymbolsFromAST(language, filePath, blobSHA string, src []byte, fileI
 	defer cancel()
 	tree, err := parser.ParseCtx(ctx, nil, src)
 	if err != nil || tree == nil {
-		return nil, false
+		return nil, false, false
 	}
 	defer tree.Close()
 
 	root := tree.RootNode()
 	if root == nil {
-		return nil, false
+		return nil, false, false
 	}
 
-	var syms []core.SymbolRecord
+	hasErrors = root.HasError()
+
 	switch language {
 	case "go":
 		syms = extractGoNodes(root, filePath, blobSHA, src, fileImports)
@@ -113,7 +117,7 @@ func extractSymbolsFromAST(language, filePath, blobSHA string, src []byte, fileI
 	if syms == nil {
 		syms = []core.SymbolRecord{} // non-nil signals "extraction succeeded with zero symbols"
 	}
-	return syms, true
+	return syms, true, hasErrors
 }
 
 // ─── Go ───────────────────────────────────────────────────────────────────────

@@ -28,11 +28,23 @@ func Open(root string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Single writer connection prevents "database is locked" errors from
+	// concurrent agents (Copilot + Claude Code CLI + Relay) racing on writes.
+	// WAL mode (set in schema) allows concurrent reads alongside this writer.
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	if _, err := db.Exec(`PRAGMA busy_timeout=5000`); err != nil {
-		_ = db.Close()
-		return nil, err
+	pragmas := []string{
+		// 30 s retry window covers slow Relay pipelines and multi-agent bursts.
+		`PRAGMA busy_timeout=30000`,
+		// Cap WAL file at ~1 000 pages (~4 MB) to avoid unbounded WAL growth
+		// when long-running agents issue many small writes without checkpoints.
+		`PRAGMA wal_autocheckpoint=1000`,
+	}
+	for _, p := range pragmas {
+		if _, err := db.Exec(p); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
 	}
 	store := &Store{db: db}
 	if err := store.Migrate(context.Background()); err != nil {
