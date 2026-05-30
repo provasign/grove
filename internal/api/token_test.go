@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -17,13 +18,15 @@ func TestLoadOrCreateTokenCreatesOnFirstRun(t *testing.T) {
 	if len(tok) != 64 {
 		t.Errorf("token length: got %d want 64", len(tok))
 	}
-	// File must be created with mode 0600.
+	// File must be created with mode 0600 (Unix only — Windows ignores chmod).
 	info, err := os.Stat(filepath.Join(dir, ".token"))
 	if err != nil {
 		t.Fatalf("token file missing: %v", err)
 	}
-	if perm := info.Mode().Perm(); perm != 0o600 {
-		t.Errorf("token file perm: got %o want 600", perm)
+	if runtime.GOOS != "windows" {
+		if perm := info.Mode().Perm(); perm != 0o600 {
+			t.Errorf("token file perm: got %o want 600", perm)
+		}
 	}
 }
 

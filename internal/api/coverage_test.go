@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -253,7 +254,8 @@ func TestMapToStruct(t *testing.T) {
 
 func TestHTTP_MCPCallReindex(t *testing.T) {
 	_, h, root := newAPITestEnv(t)
-	rec, _ := postJSON(t, h, "/mcp/call", `{"name":"grove_index","arguments":{"dir":"`+root+`"}}`)
+	dirJSON, _ := json.Marshal(root)
+	rec, _ := postJSON(t, h, "/mcp/call", `{"name":"grove_index","arguments":{"dir":`+string(dirJSON)+`}}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("got %d %s", rec.Code, rec.Body.String())
 	}

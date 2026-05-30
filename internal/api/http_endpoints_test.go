@@ -201,7 +201,8 @@ func TestHTTPMCPSSEReadyEvent(t *testing.T) {
 
 func TestHTTPIndexReindex(t *testing.T) {
 	handler, root := newTestServer(t)
-	rec, out := postJSON(t, handler, "/index", `{"dir":"`+root+`"}`)
+	dirJSON, _ := json.Marshal(root)
+	rec, out := postJSON(t, handler, "/index", `{"dir":`+string(dirJSON)+`}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("/index: %d %s", rec.Code, rec.Body.String())
 	}
