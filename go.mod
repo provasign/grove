@@ -1,6 +1,6 @@
 module github.com/tabladrum/grove-suite/grove
 
-go 1.22
+go 1.26
 
 require modernc.org/sqlite v1.34.5
 
