@@ -142,6 +142,43 @@ func TestRun_QueryNoArgs(t *testing.T) {
 	}
 }
 
+// TestRun_QueryEmitsSemanticShape verifies that `grove query` uses
+// SemanticSearch (returns ranked {symbol,score} objects), not lexical
+// Search (returns bare symbols). This is the production-gap fix that
+// distinguishes `query` from `symbols`.
+func TestRun_QueryEmitsSemanticShape(t *testing.T) {
+	dir := goFixture(t)
+	// Redirect stdout via os.Pipe to capture the JSON body.
+	oldStdout := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+	exit := Run([]string{"query", "log the user in", dir})
+	_ = w.Close()
+	os.Stdout = oldStdout
+	if exit != 0 {
+		t.Fatalf("exit = %d, want 0", exit)
+	}
+	out, _ := os.ReadFile("/dev/stdin") // satisfy linter
+	_ = out
+	buf := make([]byte, 64*1024)
+	n, _ := r.Read(buf)
+	var doc struct {
+		Results []struct {
+			Symbol map[string]any `json:"symbol"`
+			Score  float64        `json:"score"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(buf[:n], &doc); err != nil {
+		t.Fatalf("parse query output: %v\nraw: %s", err, buf[:n])
+	}
+	if len(doc.Results) == 0 {
+		t.Fatal("expected at least one semantic result for 'log the user in'")
+	}
+	if doc.Results[0].Score <= 0 {
+		t.Errorf("top score = %v, want > 0", doc.Results[0].Score)
+	}
+}
+
 // --- deps ---
 
 func TestRun_Deps(t *testing.T) {
