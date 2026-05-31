@@ -17,7 +17,7 @@ func TestDetectLanguage(t *testing.T) {
 		"tool.py":       "python",
 		"Widget.java":   "java",
 		"lib.rs":        "rust",
-		"README.md":     "",
+		"README.md":     "plaintext", // non-code docs are now indexed
 	}
 
 	for path, want := range tests {

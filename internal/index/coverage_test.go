@@ -38,14 +38,15 @@ func TestIndex_SkipsUnsupportedAndDirs(t *testing.T) {
 	_ = os.MkdirAll(filepath.Join(root, "dist"), 0o755)
 	_ = os.MkdirAll(filepath.Join(root, ".grove"), 0o755)
 	_ = os.WriteFile(filepath.Join(root, "node_modules", "x", "a.go"), []byte("package x"), 0o644)
-	_ = os.WriteFile(filepath.Join(root, "readme.txt"), []byte("hi"), 0o644)
+	_ = os.WriteFile(filepath.Join(root, "image.png"), []byte("\x89PNG\r\n"), 0o644) // binary — unsupported
 	_ = os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\nfunc M(){}\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(root, "readme.md"), []byte("# Project\n"), 0o644) // plaintext — indexed
 	_, res, err := idx.Index(context.Background(), root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.FilesUpdated != 1 {
-		t.Errorf("want 1 updated, got %d", res.FilesUpdated)
+	if res.FilesUpdated != 2 { // main.go + readme.md
+		t.Errorf("want 2 updated, got %d", res.FilesUpdated)
 	}
 }
 

@@ -20,6 +20,7 @@ const (
 	KindDecorator   SymbolKind = "decorator"
 	KindAnnotation  SymbolKind = "annotation"
 	KindFile        SymbolKind = "file"
+	KindDocument    SymbolKind = "document"
 )
 
 type LineRange struct {

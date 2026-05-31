@@ -46,6 +46,11 @@ func (e *Engine) ExtractFile(path string, root string) ([]core.SymbolRecord, err
 	relPath = filepath.ToSlash(relPath)
 
 	blobSHA := sha1Hex(content)
+
+	if language == PlaintextLanguage {
+		return ExtractPlaintext(relPath, blobSHA, content), nil
+	}
+
 	src := string(content)
 	imports := extractImports(language, src)
 	symbols := extractSymbols(language, relPath, blobSHA, src, imports)
@@ -62,7 +67,7 @@ func (e *Engine) Walk(root string) ([]core.SymbolRecord, int, error) {
 		}
 		if entry.IsDir() {
 			name := entry.Name()
-			if name == ".git" || name == "node_modules" || name == "vendor" || name == "dist" || name == "bin" {
+			if name == ".git" || name == ".grove" || name == "node_modules" || name == "vendor" || name == "dist" || name == "bin" {
 				return filepath.SkipDir
 			}
 			return nil
