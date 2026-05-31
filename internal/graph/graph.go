@@ -3,6 +3,7 @@ package graph
 import (
 	"crypto/sha1"
 	"encoding/hex"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -10,7 +11,27 @@ import (
 
 	"github.com/tabladrum/grove-suite/grove/internal/core"
 	"github.com/tabladrum/grove-suite/grove/internal/embeddings"
+	"github.com/tabladrum/grove-suite/grove/internal/embeddings/model2vec"
 )
+
+// newSemanticEngine selects the embedding backend per process. Model2Vec is
+// the default — it ships embedded in the binary and delivers true semantic
+// similarity (synonym/paraphrase matching). TF-IDF is the lexical fallback
+// for users who explicitly opt out via GROVE_EMBEDDINGS=tfidf, and the
+// automatic fallback if Model2Vec initialisation ever fails.
+func newSemanticEngine() embeddings.Engine {
+	if os.Getenv("GROVE_EMBEDDINGS") == "tfidf" {
+		return embeddings.NewTFIDF()
+	}
+	eng, err := model2vec.Default()
+	if err != nil {
+		// Defensive: the model is //go:embed'd so this should never fail
+		// in practice, but if it ever does we want search to keep working
+		// rather than crash. TF-IDF retains the lexical baseline.
+		return embeddings.NewTFIDF()
+	}
+	return eng
+}
 
 type CodeGraph struct {
 	mu           sync.RWMutex
@@ -451,11 +472,11 @@ func confidenceForSeeds(count int) float64 {
 	}
 }
 
-// SemanticSearch ranks symbols against a free-text intent using a TF-IDF
-// engine over (name + qualifiedName + signature + docstring + parent). It is
-// the local, dependency-free implementation of the semantic-similarity signal
-// in the 5-signal composite ranker. The engine is built lazily and cached
-// until the next Replace().
+// SemanticSearch ranks symbols against a free-text intent using the
+// configured embedding backend (Model2Vec by default; TF-IDF if
+// GROVE_EMBEDDINGS=tfidf). Documents are constructed from
+// (name + qualifiedName + signature + docstring + parent). The engine is
+// built lazily and cached until the next Replace().
 func (g *CodeGraph) SemanticSearch(query string, limit int) []embeddings.Scored {
 	if limit <= 0 {
 		limit = 20
@@ -470,7 +491,7 @@ func (g *CodeGraph) SemanticSearch(query string, limit int) []embeddings.Scored 
 		for _, s := range g.symbols {
 			syms = append(syms, s)
 		}
-		eng := embeddings.NewTFIDF()
+		eng := newSemanticEngine()
 		eng.Index(syms)
 		g.semEngine = eng
 		g.semDirty = false
