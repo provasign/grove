@@ -138,7 +138,7 @@ func TestHTTPLockAndUnlock(t *testing.T) {
 		t.Fatalf("/lock should return 1 lock, got %v", out)
 	}
 
-	rec, out = postJSON(t, handler, "/lock", `{"intentId":"i2","lockKeys":["grove:lock:file:auth.go"],"ttlSeconds":60}`)
+	rec, _ = postJSON(t, handler, "/lock", `{"intentId":"i2","lockKeys":["grove:lock:file:auth.go"],"ttlSeconds":60}`)
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("/lock should conflict for second intent, got %d %s", rec.Code, rec.Body.String())
 	}

@@ -118,10 +118,13 @@ Grove is the backend for the entire suite. Direct AI agent integration is via MC
 |-------------|-----|---------|
 | Claude Code CLI | `grove mcp .` → MCP stdio | Direct agent integration without Prism |
 | Cursor, Windsurf, Zed | `grove mcp .` → MCP stdio | Same |
+| VS Code (Copilot Agent) | Prism extension → HTTP API `:7777` | All 8 `grove_*` tools via `#groveIndex`, `#groveQuery`, etc. |
 | Prism (all IDEs) | HTTP API `:7777` | Token-optimized context delivery |
 | Fuse (git merge) | HTTP API `:7777` | Blast radius + breaking change detection |
 | Relay | HTTP API + gRPC `:7778` | Intent lifecycle and certification |
 | Custom automation | HTTP API `:7777` | Any tool that can make HTTP requests |
+
+**VS Code note:** Grove status (symbol count) is displayed in VS Code via the Prism extension's left status bar item. The standalone Grove VS Code extension has been retired — the Prism extension is the single VS Code integration point for both Grove and Prism.
 
 For most AI agent use cases, running Grove directly is only necessary for custom integrations. The normal path is `prism init` in your project, which starts Grove automatically.
 

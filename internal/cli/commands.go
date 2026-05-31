@@ -73,7 +73,7 @@ func Run(args []string) int {
 	}
 }
 
-func mcpCommand(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int {
+func mcpCommand(engine *parser.Engine, _ *graph.CodeGraph, args []string) int {
 	cfg, err := config.Resolve(argOrDefault(args, 0, "."), 0)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -85,7 +85,7 @@ func mcpCommand(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string
 		return 1
 	}
 	defer st.Close()
-	codeGraph, _, err = index.New(engine, st).Index(context.Background(), cfg.Root)
+	codeGraph, _, err := index.New(engine, st).Index(context.Background(), cfg.Root)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -97,7 +97,7 @@ func mcpCommand(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string
 	return 0
 }
 
-func grpcCommand(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int {
+func grpcCommand(engine *parser.Engine, _ *graph.CodeGraph, args []string) int {
 	flags := flag.NewFlagSet("grpc", flag.ContinueOnError)
 	port := flags.Int("port", 7778, "gRPC port")
 	if err := flags.Parse(args); err != nil {
@@ -107,6 +107,12 @@ func grpcCommand(engine *parser.Engine, codeGraph *graph.CodeGraph, args []strin
 	if flags.NArg() > 0 {
 		root = flags.Arg(0)
 	}
+	chosen, err := pickPort(*port)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "port:", err)
+		return 1
+	}
+	*port = chosen
 	cfg, err := config.Resolve(root, *port)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -118,7 +124,7 @@ func grpcCommand(engine *parser.Engine, codeGraph *graph.CodeGraph, args []strin
 		return 1
 	}
 	defer st.Close()
-	codeGraph, _, err = index.New(engine, st).Index(context.Background(), cfg.Root)
+	codeGraph, _, err := index.New(engine, st).Index(context.Background(), cfg.Root)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -391,7 +397,7 @@ func unlockCommand(args []string) int {
 	return printJSON(map[string]any{"released": count})
 }
 
-func serve(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int {
+func serve(engine *parser.Engine, _ *graph.CodeGraph, args []string) int {
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 	port := flags.Int("port", config.DefaultPort, "HTTP port")
 	if err := flags.Parse(args); err != nil {
@@ -401,6 +407,12 @@ func serve(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int
 	if flags.NArg() > 0 {
 		root = flags.Arg(0)
 	}
+	chosen, err := pickPort(*port)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "port:", err)
+		return 1
+	}
+	*port = chosen
 	cfg, err := config.Resolve(root, *port)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -413,7 +425,7 @@ func serve(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int
 		return 1
 	}
 	defer st.Close()
-	codeGraph, _, err = index.New(engine, st).Index(context.Background(), root)
+	codeGraph, _, err := index.New(engine, st).Index(context.Background(), root)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
