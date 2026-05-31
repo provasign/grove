@@ -1,12 +1,21 @@
 # Grove
 
-Grove is a persistent code knowledge graph. It parses source files, extracts symbols, links them into a graph, and makes that graph queryable — over a CLI, an HTTP API, an MCP stdio server, and a gRPC service.
+> **Your codebase's persistent long-term memory — queryable by any AI agent.**
 
-## Why a Knowledge Graph
+---
 
-Static search (grep, ctags, a language server) answers "where is this symbol defined?" Graph traversal answers harder questions: "what does this function transitively call?", "which tests cover this method?", "what is the full blast radius of changing this interface?" Those are the questions that matter for AI agent task planning and merge conflict resolution.
+Grep answers "does this string appear somewhere?" A language server answers "where is this symbol defined?" Grove answers the harder questions AI agents actually need:
 
-The graph is persistent (SQLite on disk), delta-aware (files whose git blob SHA hasn't changed are never re-parsed), and scoped (call and type-use edges are constrained to same-file and imported files to suppress false positives).
+- *What does changing this function break — across the entire codebase?*
+- *Which tests cover this method, directly or transitively?*
+- *What is the full dependency chain from this file?*
+- *What symbols are semantically related to this task description?*
+
+The difference is a graph. Grove indexes your source files into a persistent SQLite graph — 11 languages, 8 edge types, BFS traversal — and keeps it live with delta indexing (files whose git blob SHA hasn't changed are never re-parsed). The graph is queryable over CLI, HTTP API, MCP stdio, and gRPC.
+
+Grove is the foundation all other Grove Suite tools are built on. Prism uses it to focus context. Fuse uses it to resolve conflicts. Relay uses it to certify agent output. Without Grove, all three fall back to line-level operations.
+
+---
 
 ## Architecture
 
@@ -54,6 +63,8 @@ Source files
                  └────────────────────┘
 ```
 
+---
+
 ## Design Decisions
 
 **Single binary, zero runtime dependencies.** SQLite is embedded via `modernc.org/sqlite` — a pure-Go port — which avoids a CGO linker conflict with tree-sitter. Tree-sitter itself (in `internal/parser/`) is the only CGO dependency.
@@ -65,6 +76,8 @@ Source files
 **Scoped edges prevent false positives.** `calls` and `uses-type` edges are only created between symbols in the same file or in files connected by an `imports` edge. Without this constraint, a function named `parse` in one package would appear to call a `parse` function in an unrelated package, producing roughly 5× the false-positive edges.
 
 **Symbol ID format.** Every symbol has a canonical ID: `{filePath}::{qualifiedName}@{blobSHA}`. The blob SHA component means that if you rename a function, the old symbol ID disappears and a new one is created — stale references in the graph don't survive a reindex.
+
+---
 
 ## Language Support
 
@@ -82,6 +95,10 @@ Source files
 | C# | `.cs` | AST walker |
 | PHP | `.php .phtml` | AST walker |
 
+Non-code files (`.md`, `.yaml`, `.json`, `.xml`, `.sh`, `.toml`, `.proto`, `.sql`, `Makefile`, `Dockerfile`, and more) are indexed as `document` symbols with their content in the FTS5 full-text index. Agents can query them semantically alongside code symbols.
+
+---
+
 ## Graph Edge Types
 
 | Edge | Meaning |
@@ -94,6 +111,8 @@ Source files
 | `calls` | Function calls another function (scoped) |
 | `uses-type` | Function/field uses a type (scoped) |
 | `tests` | Test function covers a named symbol |
+
+---
 
 ## Performance
 
@@ -110,6 +129,8 @@ Query latency is FTS5 full-text search + BFS graph traversal returning ranked re
 
 **Targets:** index 5,000 files < 5 s · BFS depth-3 on 50K nodes < 30 ms · FTS5 query < 10 ms
 
+---
+
 ## Tool and IDE Integration
 
 Grove is the backend for the entire suite. Direct AI agent integration is via MCP stdio or HTTP/SSE; Prism, Fuse, and Relay consume the HTTP API.
@@ -124,9 +145,9 @@ Grove is the backend for the entire suite. Direct AI agent integration is via MC
 | Relay | HTTP API + gRPC `:7778` | Intent lifecycle and certification |
 | Custom automation | HTTP API `:7777` | Any tool that can make HTTP requests |
 
-**VS Code note:** Grove status (symbol count) is displayed in VS Code via the Prism extension's left status bar item. The standalone Grove VS Code extension has been retired — the Prism extension is the single VS Code integration point for both Grove and Prism.
-
 For most AI agent use cases, running Grove directly is only necessary for custom integrations. The normal path is `prism init` in your project, which starts Grove automatically.
+
+---
 
 ## Installation
 
@@ -135,6 +156,8 @@ make build    # compile ./bin/grove
 make install  # install to $GOPATH/bin
 make test     # run all tests
 ```
+
+---
 
 ## CLI Reference
 
@@ -151,7 +174,7 @@ grove status [dir]
 # Symbol search
 grove symbols <query> [dir]
 
-# Intent-based query (FTS5 + BFS graph ranking)
+# Intent-based semantic query (Model2Vec embeddings + BFS graph ranking)
 grove query <intent> [dir]
 
 # Blast radius: what would break if this symbol changed?
@@ -170,6 +193,8 @@ grove mcp [dir]
 grove grpc [--port 7778] [dir]
 ```
 
+---
+
 ## HTTP API
 
 All endpoints require `Authorization: Bearer <token>` (token at `.grove/.token`) except `/health`.
@@ -185,6 +210,8 @@ POST /deps      {"file": string}
 POST /tests     {"query": string}
 POST /icr       {"intent": string}
 ```
+
+---
 
 ## MCP Tools
 
@@ -217,6 +244,8 @@ curl -X POST http://localhost:7777/mcp/call \
   -d '{"name":"grove_query","arguments":{"intent":"authentication","limit":10}}'
 ```
 
+---
+
 ## Storage
 
 Grove stores everything in `.grove/grove.db` (SQLite, WAL mode). The database is a single file — back it up, copy it, or delete it to force a full reindex. There is no migration tooling; delete and reindex if the schema changes.
@@ -226,9 +255,13 @@ Key SQLite settings:
 - FTS5 virtual table for full-text symbol search
 - `busy_timeout = 30s` to handle contention without immediate errors
 
+---
+
 ## Security
 
 Grove binds to `127.0.0.1` — not `0.0.0.0`. The shared secret token at `.grove/.token` (mode 0600) is required on all non-health requests. The token is 64 hex characters generated from `crypto/rand` on first start and is stable across restarts.
+
+---
 
 ## Testing
 
