@@ -4,13 +4,10 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 
-	"github.com/tabladrum/grove-suite/grove/internal/api"
 	"github.com/tabladrum/grove-suite/grove/internal/config"
 	"github.com/tabladrum/grove-suite/grove/internal/core"
 	"github.com/tabladrum/grove-suite/grove/internal/graph"
@@ -57,12 +54,8 @@ func Run(args []string) int {
 		return lockCommand(args[1:])
 	case "unlock":
 		return unlockCommand(args[1:])
-	case "serve":
-		return serve(engine, codeGraph, args[1:])
 	case "mcp":
 		return mcpCommand(engine, codeGraph, args[1:])
-	case "grpc":
-		return grpcCommand(engine, codeGraph, args[1:])
 	case "help", "--help", "-h":
 		usage()
 		return 0
@@ -91,47 +84,6 @@ func mcpCommand(engine *parser.Engine, _ *graph.CodeGraph, args []string) int {
 		return 1
 	}
 	if err := mcp.NewServer(cfg.Root, codeGraph, engine, st).Serve(os.Stdin, os.Stdout); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	return 0
-}
-
-func grpcCommand(engine *parser.Engine, _ *graph.CodeGraph, args []string) int {
-	flags := flag.NewFlagSet("grpc", flag.ContinueOnError)
-	port := flags.Int("port", 7778, "gRPC port")
-	if err := flags.Parse(args); err != nil {
-		return 2
-	}
-	root := "."
-	if flags.NArg() > 0 {
-		root = flags.Arg(0)
-	}
-	chosen, err := pickPort(*port)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "port:", err)
-		return 1
-	}
-	*port = chosen
-	cfg, err := config.Resolve(root, *port)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	st, err := store.Open(cfg.Root)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	defer st.Close()
-	codeGraph, _, err := index.New(engine, st).Index(context.Background(), cfg.Root)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	addr := api.Address(cfg.Port)
-	fmt.Fprintf(os.Stderr, "grove grpc listening on %s\n", addr)
-	if err := api.ListenGRPC(addr, api.NewGRPCService(codeGraph, engine, st, cfg.Root)); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
@@ -397,55 +349,6 @@ func unlockCommand(args []string) int {
 	return printJSON(map[string]any{"released": count})
 }
 
-func serve(engine *parser.Engine, _ *graph.CodeGraph, args []string) int {
-	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
-	port := flags.Int("port", config.DefaultPort, "HTTP port")
-	if err := flags.Parse(args); err != nil {
-		return 2
-	}
-	root := "."
-	if flags.NArg() > 0 {
-		root = flags.Arg(0)
-	}
-	chosen, err := pickPort(*port)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "port:", err)
-		return 1
-	}
-	*port = chosen
-	cfg, err := config.Resolve(root, *port)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	root = cfg.Root
-	st, err := store.Open(root)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	defer st.Close()
-	codeGraph, _, err := index.New(engine, st).Index(context.Background(), root)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	groveDir := filepath.Join(root, ".grove")
-	token, err := api.LoadOrCreateToken(groveDir)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "token:", err)
-		return 1
-	}
-	handler := api.TokenMiddleware(token, api.NewServer(codeGraph, engine, st, root).Handler())
-	addr := api.Address(cfg.Port)
-	fmt.Fprintf(os.Stderr, "grove listening on %s (token: %s…)\n", addr, token[:8])
-	if err := api.Listen(addr, handler); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	return 0
-}
-
 func indexRoot(engine *parser.Engine, codeGraph *graph.CodeGraph, root string) (any, error) {
 	store, err := store.Open(root)
 	if err != nil {
@@ -487,23 +390,23 @@ func printJSON(value any) int {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `grove - code intelligence graph
+	fmt.Fprint(os.Stderr, `grove - code intelligence graph
 
 Usage:
-	grove version
-	grove init [dir]
+  grove version
+  grove init [dir]
   grove index [dir]
   grove status [dir]
   grove symbols <query> [dir]        lexical substring search over names/paths/signatures
   grove query <intent> [dir]         semantic search (Model2Vec embeddings)
   grove deps <file> [dir]
-	grove impact <symbol-or-file-query> [dir]
-	grove tests <file> [dir]
-	grove icr <intent>
-	grove conflicts <icr-a> <icr-b>
-  grove serve [--port %s] [dir]
-	grove mcp [dir]
-	grove grpc [--port 7778] [dir]
+  grove impact <symbol-or-file-query> [dir]
+  grove tests <file> [dir]
+  grove icr <intent>
+  grove conflicts <icr-a> <icr-b>
+  grove mcp [dir]                    stdio MCP server
 
-`, strconv.Itoa(7777))
+Grove is an embedded library: Prism, Fuse, and Relay link against it
+directly. No HTTP daemon, no ports, no tokens.
+`)
 }

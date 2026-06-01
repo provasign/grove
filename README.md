@@ -2,6 +2,8 @@
 
 > **Your codebase's persistent long-term memory — queryable by any AI agent.**
 
+> **Embedded mode (current):** Grove is a Go library at `github.com/tabladrum/grove-suite/grove/pkg/grove`. Prism, Fuse, and Relay link it directly and open the on-disk index in-process. There is no `grove serve` daemon, no port (7777/7778), and no `.grove/.token`. The CLI is still available for one-shot queries (`grove index .`, `grove symbols main`) and stdio MCP (`grove mcp`).
+
 ---
 
 Grep answers "does this string appear somewhere?" A language server answers "where is this symbol defined?" Grove answers the harder questions AI agents actually need:
