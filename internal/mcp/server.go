@@ -61,10 +61,34 @@ func (s *Server) Serve(r io.Reader, w io.Writer) error {
 	}
 }
 
+// defaultProtocolVersion is the latest MCP revision these servers target.
+const defaultProtocolVersion = "2025-03-26"
+
+// supportedProtocolVersions are the MCP revisions this server can speak.
+var supportedProtocolVersions = map[string]bool{
+	"2024-11-05": true,
+	"2025-03-26": true,
+	"2025-06-18": true,
+}
+
+// negotiateProtocolVersion echoes the client's requested protocolVersion when
+// it is one we support (required by the MCP spec), otherwise falls back to our
+// latest. Maximizes compatibility across clients (Claude Code, Cursor, VS Code,
+// Copilot) that each pin different revisions.
+func negotiateProtocolVersion(params json.RawMessage) string {
+	var p struct {
+		ProtocolVersion string `json:"protocolVersion"`
+	}
+	if err := json.Unmarshal(params, &p); err == nil && supportedProtocolVersions[p.ProtocolVersion] {
+		return p.ProtocolVersion
+	}
+	return defaultProtocolVersion
+}
+
 func (s *Server) handle(method string, params json.RawMessage) (any, *rpcError) {
 	switch method {
 	case "initialize":
-		return map[string]any{"protocolVersion": "2024-11-05", "serverInfo": map[string]string{"name": "grove", "version": version.Version}, "capabilities": map[string]any{"tools": map[string]any{}}}, nil
+		return map[string]any{"protocolVersion": negotiateProtocolVersion(params), "serverInfo": map[string]string{"name": "grove", "version": version.Version}, "capabilities": map[string]any{"tools": map[string]any{}}}, nil
 	case "tools/list":
 		return map[string]any{"tools": tools()}, nil
 	case "tools/call":
@@ -185,7 +209,13 @@ func writeMessage(w io.Writer, id any, result any, rpcErr *rpcError) error {
 	if err != nil {
 		return err
 	}
-	_, err = fmt.Fprintf(w, "Content-Length: %d\r\n\r\n%s", len(payload), payload)
+	// MCP stdio transport requires newline-delimited JSON (one compact JSON
+	// object per line, no embedded newlines). json.Marshal already produces a
+	// compact, newline-free payload. Emitting LSP-style "Content-Length"
+	// framing here makes every newline-delimited MCP client (Claude Code,
+	// Cursor, VS Code, Copilot) block waiting for a terminating newline and
+	// time out the connection.
+	_, err = fmt.Fprintf(w, "%s\n", payload)
 	return err
 }
 
