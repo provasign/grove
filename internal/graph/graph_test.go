@@ -3,7 +3,7 @@ package graph
 import (
 	"testing"
 
-	"github.com/tabladrum/grove-suite/grove/internal/core"
+	"github.com/provasign/grove/internal/core"
 )
 
 func TestReplaceStatusAndSearch(t *testing.T) {

@@ -17,8 +17,8 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/tabladrum/grove-suite/grove/internal/core"
-	"github.com/tabladrum/grove-suite/grove/internal/embeddings"
+	"github.com/provasign/grove/internal/core"
+	"github.com/provasign/grove/internal/embeddings"
 )
 
 // Engine is a Model2Vec semantic-similarity backend. It implements the

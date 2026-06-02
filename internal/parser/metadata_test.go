@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/tabladrum/grove-suite/grove/internal/core"
+	"github.com/provasign/grove/internal/core"
 )
 
 func bySymbol(t *testing.T, syms []core.SymbolRecord, name string) core.SymbolRecord {

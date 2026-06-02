@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/tabladrum/grove-suite/grove/internal/core"
+	"github.com/provasign/grove/internal/core"
 )
 
 func TestFileBlobSHA(t *testing.T) {

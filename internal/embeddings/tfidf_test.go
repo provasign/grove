@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/tabladrum/grove-suite/grove/internal/core"
+	"github.com/provasign/grove/internal/core"
 )
 
 func makeSymbol(name, qualified, sig, doc string) core.SymbolRecord {

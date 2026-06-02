@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/tabladrum/grove-suite/grove/internal/core"
+	"github.com/provasign/grove/internal/core"
 )
 
 // ─── DetectLanguage — plaintext extensions ────────────────────────────────────
@@ -157,7 +157,7 @@ func TestExtractPlaintext_BasicMarkdown(t *testing.T) {
 
 func TestExtractPlaintext_YAML(t *testing.T) {
 	content := []byte("name: my-policy\nrules:\n  - allow_all\n")
-	records := ExtractPlaintext(".relay/policies/default.yaml", "def456", content)
+	records := ExtractPlaintext(".provasign/policies/default.yaml", "def456", content)
 	if len(records) != 1 {
 		t.Fatalf("expected 1 record")
 	}

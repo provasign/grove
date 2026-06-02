@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/tabladrum/grove-suite/grove/internal/parser"
-	"github.com/tabladrum/grove-suite/grove/internal/store"
+	"github.com/provasign/grove/internal/parser"
+	"github.com/provasign/grove/internal/store"
 )
 
 // helper to build an Indexer with isolated store

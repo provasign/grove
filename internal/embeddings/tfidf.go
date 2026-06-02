@@ -18,7 +18,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/tabladrum/grove-suite/grove/internal/core"
+	"github.com/provasign/grove/internal/core"
 )
 
 // Engine is the contract any embedding backend must satisfy.

@@ -3,7 +3,7 @@ package main
 import (
 	"os"
 
-	"github.com/tabladrum/grove-suite/grove/internal/cli"
+	"github.com/provasign/grove/internal/cli"
 )
 
 func main() {

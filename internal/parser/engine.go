@@ -10,7 +10,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/tabladrum/grove-suite/grove/internal/core"
+	"github.com/provasign/grove/internal/core"
 )
 
 type Engine struct{}

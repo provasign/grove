@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tabladrum/grove-suite/grove/internal/core"
+	"github.com/provasign/grove/internal/core"
 )
 
 // docstringVerbs gives each file a different action word so that no single

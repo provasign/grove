@@ -4,7 +4,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/tabladrum/grove-suite/grove/internal/core"
+	"github.com/provasign/grove/internal/core"
 )
 
 // edgeIndex holds per-build symbol indexes used by the edge constructors.

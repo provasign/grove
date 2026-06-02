@@ -12,7 +12,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
-	"github.com/tabladrum/grove-suite/grove/internal/core"
+	"github.com/provasign/grove/internal/core"
 )
 
 type Store struct {

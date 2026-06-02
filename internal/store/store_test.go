@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tabladrum/grove-suite/grove/internal/core"
+	"github.com/provasign/grove/internal/core"
 )
 
 func openStore(t *testing.T) *Store {
