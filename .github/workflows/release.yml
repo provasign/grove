@@ -1,0 +1,43 @@
+name: Release
+on:
+  push:
+    tags: ["v*.*.*"]
+permissions:
+  contents: write
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  GO_VERSION: "1.26.3"
+jobs:
+  release:
+    name: Build ${{ matrix.os }}/${{ matrix.goarch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - os: linux;   goarch: amd64; runner: ubuntu-latest
+          - os: linux;   goarch: arm64; runner: ubuntu-latest
+          - os: darwin;  goarch: arm64; runner: macos-latest
+          - os: darwin;  goarch: amd64; runner: macos-latest
+          - os: windows; goarch: amd64; runner: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Build
+        shell: bash
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "1"
+        run: |
+          mkdir -p dist
+          EXT=$([ "${{ matrix.os }}" = "windows" ] && echo ".exe" || echo "")
+          go build -ldflags="-s -w" -o "dist/grove-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.goarch }}${EXT}" ./cmd/grove
+      - uses: actions/upload-artifact@v5
+        with:
+          name: grove-${{ matrix.os }}-${{ matrix.goarch }}
+          path: dist/
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
