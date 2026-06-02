@@ -7,10 +7,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/tabladrum/grove-suite/grove/internal/graph"
-	"github.com/tabladrum/grove-suite/grove/internal/index"
-	"github.com/tabladrum/grove-suite/grove/internal/parser"
-	"github.com/tabladrum/grove-suite/grove/internal/store"
+	"github.com/provasign/grove/internal/graph"
+	"github.com/provasign/grove/internal/index"
+	"github.com/provasign/grove/internal/parser"
+	"github.com/provasign/grove/internal/store"
 )
 
 func TestMCPToolsList(t *testing.T) {

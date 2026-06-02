@@ -10,9 +10,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/tabladrum/grove-suite/grove/internal/index"
-	"github.com/tabladrum/grove-suite/grove/internal/parser"
-	"github.com/tabladrum/grove-suite/grove/internal/store"
+	"github.com/provasign/grove/internal/index"
+	"github.com/provasign/grove/internal/parser"
+	"github.com/provasign/grove/internal/store"
 )
 
 // newMCPTestServer indexes a small fixture and returns a ready server.

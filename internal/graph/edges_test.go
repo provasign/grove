@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/tabladrum/grove-suite/grove/internal/core"
+	"github.com/provasign/grove/internal/core"
 )
 
 // ─── extends / implements / uses-type ────────────────────────────────────────
@@ -121,7 +121,7 @@ func TestCallsAcrossImportedFiles(t *testing.T) {
 	g := New()
 	g.Replace([]core.SymbolRecord{
 		{ID: "cmd/main.go::Run@sha", FilePath: "cmd/main.go", Language: "go", Kind: core.KindFunction, Name: "Run", QualifiedName: "Run",
-			RawText: "func Run() { Login() }", Imports: []string{"github.com/tabladrum/grove-suite/grove/internal/auth"}},
+			RawText: "func Run() { Login() }", Imports: []string{"github.com/provasign/grove/internal/auth"}},
 		{ID: "internal/auth/auth.go::Login@sha", FilePath: "internal/auth/auth.go", Language: "go", Kind: core.KindFunction, Name: "Login", QualifiedName: "Login",
 			RawText: "func Login() {}"},
 		// Same name in a non-imported file: must NOT be linked.
@@ -158,7 +158,7 @@ func TestTestsForTransitiveCaller(t *testing.T) {
 		{ID: "auth.go::Login@sha", FilePath: "auth.go", Language: "go", Kind: core.KindFunction, Name: "Login", QualifiedName: "Login",
 			RawText: "func Login() {}"},
 		{ID: "handler.go::Handle@sha", FilePath: "handler.go", Language: "go", Kind: core.KindFunction, Name: "Handle", QualifiedName: "Handle",
-			RawText: "func Handle() { Login() }", Imports: []string{"github.com/tabladrum/grove-suite/grove/auth"}},
+			RawText: "func Handle() { Login() }", Imports: []string{"github.com/provasign/grove/auth"}},
 		{ID: "handler_test.go::TestHandle@sha", FilePath: "handler_test.go", Language: "go", Kind: core.KindFunction, Name: "TestHandle", QualifiedName: "TestHandle"},
 	}, 3)
 

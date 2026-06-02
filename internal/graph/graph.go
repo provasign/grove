@@ -9,9 +9,9 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/tabladrum/grove-suite/grove/internal/core"
-	"github.com/tabladrum/grove-suite/grove/internal/embeddings"
-	"github.com/tabladrum/grove-suite/grove/internal/embeddings/model2vec"
+	"github.com/provasign/grove/internal/core"
+	"github.com/provasign/grove/internal/embeddings"
+	"github.com/provasign/grove/internal/embeddings/model2vec"
 )
 
 // newSemanticEngine selects the embedding backend per process. Model2Vec is

@@ -7,7 +7,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/tabladrum/grove-suite/grove/internal/core"
+	"github.com/provasign/grove/internal/core"
 )
 
 // newTinyEngine constructs an Engine wired to a 6-entry vocab with a

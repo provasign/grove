@@ -15,9 +15,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tabladrum/grove-suite/astkit"
-	"github.com/tabladrum/grove-suite/astkit/strategies"
-	"github.com/tabladrum/grove-suite/grove/internal/core"
+	"github.com/provasign/astkit"
+	"github.com/provasign/astkit/strategies"
+	"github.com/provasign/grove/internal/core"
 )
 
 const parseTimeout = 5 * time.Second

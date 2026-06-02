@@ -2,7 +2,7 @@
 
 > **Your codebase's persistent long-term memory — queryable by any AI agent.**
 
-> **Embedded mode (current):** Grove is a Go library at `github.com/tabladrum/grove-suite/grove/pkg/grove`. Prism, Fuse, and Relay link it directly and open the on-disk index in-process. There is no `grove serve` daemon, no port (7777/7778), and no `.grove/.token`. The CLI is still available for one-shot queries (`grove index .`, `grove symbols main`) and stdio MCP (`grove mcp`).
+> **Embedded mode (current):** Grove is a Go library at `github.com/tabladrum/grove-suite/grove/pkg/grove`. Prism, Fuse, and Provasign link it directly and open the on-disk index in-process. There is no `grove serve` daemon, no port (7777/7778), and no `.grove/.token`. The CLI is still available for one-shot queries (`grove index .`, `grove symbols main`) and stdio MCP (`grove mcp`).
 
 ---
 
@@ -15,7 +15,7 @@ Grep answers "does this string appear somewhere?" A language server answers "whe
 
 The difference is a graph. Grove indexes your source files into a persistent SQLite graph — 11 languages, 8 edge types, BFS traversal — and keeps it live with delta indexing (files whose git blob SHA hasn't changed are never re-parsed). The graph is queryable over CLI, HTTP API, MCP stdio, and gRPC.
 
-Grove is the foundation all other Grove Suite tools are built on. Prism uses it to focus context. Fuse uses it to resolve conflicts. Relay uses it to certify agent output. Without Grove, all three fall back to line-level operations.
+Grove is the foundation all other Grove Suite tools are built on. Prism uses it to focus context. Fuse uses it to resolve conflicts. Provasign uses it to certify agent output. Without Grove, all three fall back to line-level operations.
 
 ---
 
@@ -135,7 +135,7 @@ Query latency is FTS5 full-text search + BFS graph traversal returning ranked re
 
 ## Tool and IDE Integration
 
-Grove is the backend for the entire suite. Direct AI agent integration is via MCP stdio or HTTP/SSE; Prism, Fuse, and Relay consume the HTTP API.
+Grove is the backend for the entire suite. Direct AI agent integration is via MCP stdio or HTTP/SSE; Prism, Fuse, and Provasign consume the HTTP API.
 
 | Integration | How | Use case |
 |-------------|-----|---------|
@@ -144,7 +144,7 @@ Grove is the backend for the entire suite. Direct AI agent integration is via MC
 | VS Code (Copilot Agent) | Prism extension → HTTP API `:7777` | All 8 `grove_*` tools via `#groveIndex`, `#groveQuery`, etc. |
 | Prism (all IDEs) | HTTP API `:7777` | Token-optimized context delivery |
 | Fuse (git merge) | HTTP API `:7777` | Blast radius + breaking change detection |
-| Relay | HTTP API + gRPC `:7778` | Intent lifecycle and certification |
+| Provasign | HTTP API + gRPC `:7778` | Intent lifecycle and certification |
 | Custom automation | HTTP API `:7777` | Any tool that can make HTTP requests |
 
 For most AI agent use cases, running Grove directly is only necessary for custom integrations. The normal path is `prism init` in your project, which starts Grove automatically.

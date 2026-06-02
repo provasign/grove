@@ -15,9 +15,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/tabladrum/grove-suite/grove/internal/core"
-	"github.com/tabladrum/grove-suite/grove/internal/parser"
-	"github.com/tabladrum/grove-suite/grove/internal/store"
+	"github.com/provasign/grove/internal/core"
+	"github.com/provasign/grove/internal/parser"
+	"github.com/provasign/grove/internal/store"
 )
 
 type fixture struct {

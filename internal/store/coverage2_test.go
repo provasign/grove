@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/tabladrum/grove-suite/grove/internal/core"
+	"github.com/provasign/grove/internal/core"
 )
 
 func TestUpsert_ReplaceEdges_Delete_AllSymbols_FTS(t *testing.T) {
