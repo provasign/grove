@@ -30,7 +30,7 @@ jobs:
           CC: ${{ matrix.goarch == 'arm64' && 'aarch64-linux-gnu-gcc' || 'gcc' }}
         run: |
           mkdir -p dist
-          go build -ldflags="-s -w" -o "dist/grove-${{ github.ref_name }}-linux-${{ matrix.goarch }}" ./cmd/grove
+          go build -ldflags="-s -w -X github.com/provasign/grove/internal/version.Version=${{ github.ref_name }}" -o "dist/grove-${{ github.ref_name }}-linux-${{ matrix.goarch }}" ./cmd/grove
       - uses: actions/upload-artifact@v5
         with:
           name: grove-linux-${{ matrix.goarch }}
@@ -58,7 +58,7 @@ jobs:
           CC: ${{ matrix.goarch == 'amd64' && 'clang -arch x86_64' || 'clang -arch arm64' }}
         run: |
           mkdir -p dist
-          go build -ldflags="-s -w" -o "dist/grove-${{ github.ref_name }}-darwin-${{ matrix.goarch }}" ./cmd/grove
+          go build -ldflags="-s -w -X github.com/provasign/grove/internal/version.Version=${{ github.ref_name }}" -o "dist/grove-${{ github.ref_name }}-darwin-${{ matrix.goarch }}" ./cmd/grove
       - uses: actions/upload-artifact@v5
         with:
           name: grove-darwin-${{ matrix.goarch }}
@@ -82,7 +82,7 @@ jobs:
           CGO_ENABLED: "1"
         run: |
           mkdir dist
-          go build -ldflags="-s -w" -o "dist/grove-${{ github.ref_name }}-windows-amd64.exe" ./cmd/grove
+          go build -ldflags="-s -w -X github.com/provasign/grove/internal/version.Version=${{ github.ref_name }}" -o "dist/grove-${{ github.ref_name }}-windows-amd64.exe" ./cmd/grove
         shell: bash
       - uses: actions/upload-artifact@v5
         with:
