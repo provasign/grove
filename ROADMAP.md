@@ -57,4 +57,4 @@ Grove's symbol count and graph stats are surfaced in VS Code via the **Prism ext
 - [ ] Homebrew tap: `brew install grove`
 - [ ] `curl | sh` installer for Linux
 - [ ] API stability guarantee for HTTP/gRPC contracts
-- [ ] Published Go module: `github.com/tabladrum/grove-suite/grove`
+- [ ] Published Go module: `github.com/provasign/grove`

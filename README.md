@@ -2,7 +2,7 @@
 
 > **Your codebase's persistent long-term memory — queryable by any AI agent.**
 
-> **Embedded mode (current):** Grove is a Go library at `github.com/tabladrum/grove-suite/grove/pkg/grove`. Prism, Fuse, and Provasign link it directly and open the on-disk index in-process. There is no `grove serve` daemon, no port (7777/7778), and no `.grove/.token`. The CLI is still available for one-shot queries (`grove index .`, `grove symbols main`) and stdio MCP (`grove mcp`).
+> **Embedded mode (current):** Grove is a Go library at `github.com/provasign/grove/pkg/grove`. Prism, Fuse, and Provasign link it directly and open the on-disk index in-process. There is no `grove serve` daemon, no port (7777/7778), and no `.grove/.token`. The CLI is still available for one-shot queries (`grove index .`, `grove symbols main`) and stdio MCP (`grove mcp`).
 
 ---
 
@@ -15,7 +15,7 @@ Grep answers "does this string appear somewhere?" A language server answers "whe
 
 The difference is a graph. Grove indexes your source files into a persistent SQLite graph — 11 languages, 8 edge types, BFS traversal — and keeps it live with delta indexing (files whose git blob SHA hasn't changed are never re-parsed). The graph is queryable over CLI, HTTP API, MCP stdio, and gRPC.
 
-Grove is the foundation all other Grove Suite tools are built on. Prism uses it to focus context. Fuse uses it to resolve conflicts. Provasign uses it to certify agent output. Without Grove, all three fall back to line-level operations.
+Grove is the foundation all other Provasign tools are built on. Prism uses it to focus context. Fuse uses it to resolve conflicts. Provasign uses it to certify agent output. Without Grove, all three fall back to line-level operations.
 
 ---
 
