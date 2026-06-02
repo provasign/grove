@@ -153,6 +153,23 @@ For most AI agent use cases, running Grove directly is only necessary for custom
 
 ## Installation
 
+**Binary install (fastest):**
+
+```bash
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/provasign/grove/main/install.sh | bash
+
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/provasign/grove/main/install.ps1 | iex
+
+# Pin a specific version
+VERSION=v0.4.0 curl -fsSL https://raw.githubusercontent.com/provasign/grove/main/install.sh | bash
+```
+
+Installs to `~/bin` by default. Set `INSTALL_DIR=/usr/local/bin` to override.
+
+**Build from source:**
+
 ```bash
 make build    # compile ./bin/grove
 make install  # install to $GOPATH/bin
