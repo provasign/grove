@@ -159,18 +159,25 @@ func TestTestsForTransitiveCaller(t *testing.T) {
 			RawText: "func Login() {}"},
 		{ID: "handler.go::Handle@sha", FilePath: "handler.go", Language: "go", Kind: core.KindFunction, Name: "Handle", QualifiedName: "Handle",
 			RawText: "func Handle() { Login() }", Imports: []string{"github.com/provasign/grove/auth"}},
+		{ID: "service.go::Serve@sha", FilePath: "service.go", Language: "go", Kind: core.KindFunction, Name: "Serve", QualifiedName: "Serve",
+			RawText: "func Serve() { Handle() }", Imports: []string{"github.com/provasign/grove/handler"}},
 		{ID: "handler_test.go::TestHandle@sha", FilePath: "handler_test.go", Language: "go", Kind: core.KindFunction, Name: "TestHandle", QualifiedName: "TestHandle"},
+		{ID: "service_test.go::TestServe@sha", FilePath: "service_test.go", Language: "go", Kind: core.KindFunction, Name: "TestServe", QualifiedName: "TestServe"},
 	}, 3)
 
 	tests := g.TestsFor("Login")
-	found := false
+	foundHandle := false
+	foundServe := false
 	for _, t2 := range tests {
 		if t2.Name == "TestHandle" {
-			found = true
+			foundHandle = true
+		}
+		if t2.Name == "TestServe" {
+			foundServe = true
 		}
 	}
-	if !found {
-		t.Fatalf("expected TestHandle to cover Login via transitive call, got: %+v", tests)
+	if !foundHandle || !foundServe {
+		t.Fatalf("expected transitive downstream tests for Login, got: %+v", tests)
 	}
 }
 

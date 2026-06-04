@@ -277,8 +277,9 @@ func (g *CodeGraph) Impact(query string, maxDepth int) []core.SymbolRecord {
 
 // TestsFor returns all test symbols that cover the given query target.
 // Resolution order:
-//  1. If the query matches an existing symbol name, follow inbound `tests`
-//     edges (and inbound `calls` one hop further) to gather covering tests.
+//  1. If the query matches an existing symbol name, walk the full inbound
+//     dependency closure (calls/contains/implements/extends/uses-type/tests)
+//     and gather every test symbol that reaches any node in that closure.
 //  2. Fallback: substring search in test files (for free-text queries).
 func (g *CodeGraph) TestsFor(query string) []core.SymbolRecord {
 	g.mu.RLock()
@@ -299,31 +300,34 @@ func (g *CodeGraph) TestsFor(query string) []core.SymbolRecord {
 		}
 	}
 
-	// Phase 2: walk inbound `tests` edges from each target. If a caller has
-	// its own inbound `tests` edges, include those (transitive coverage,
-	// depth 1).
+	// Phase 2: walk the full inbound dependency closure from each target.
+	// Any test symbol that reaches any node in that closure is included.
 	tests := make(map[string]core.SymbolRecord)
 	if len(targets) > 0 {
-		callers := make(map[string]bool)
-		for _, edge := range g.edges {
-			if !targets[edge.To] {
-				continue
-			}
-			if edge.Type == core.EdgeTests {
-				if t, ok := g.symbols[edge.From]; ok {
-					tests[t.ID] = t
-				}
-			}
-			if edge.Type == core.EdgeCalls {
-				callers[edge.From] = true
-			}
+		visited := make(map[string]bool, len(targets))
+		queue := make([]string, 0, len(targets))
+		for id := range targets {
+			visited[id] = true
+			queue = append(queue, id)
 		}
-		for _, edge := range g.edges {
-			if edge.Type != core.EdgeTests || !callers[edge.To] {
-				continue
-			}
-			if t, ok := g.symbols[edge.From]; ok {
-				tests[t.ID] = t
+		for len(queue) > 0 {
+			node := queue[0]
+			queue = queue[1:]
+			for _, edge := range g.edges {
+				if edge.To != node {
+					continue
+				}
+				switch edge.Type {
+				case core.EdgeTests:
+					if t, ok := g.symbols[edge.From]; ok {
+						tests[t.ID] = t
+					}
+				case core.EdgeCalls, core.EdgeContains, core.EdgeImplements, core.EdgeExtends, core.EdgeUsesType:
+					if !visited[edge.From] {
+						visited[edge.From] = true
+						queue = append(queue, edge.From)
+					}
+				}
 			}
 		}
 	}
