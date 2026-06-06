@@ -23,12 +23,11 @@ Grove is the core code intelligence graph used by Prism, Fuse, and Provasign. MI
 - [x] Dependency resolution: transitive deps + dependents
 - [x] Test mapping: `tests` edge traversal
 - [x] ICR (Intent Complexity Rating): symbol count + connected-component decomposition
-- [x] CLI: `grove index`, `grove query`, `grove impact`, `grove deps`, `grove tests`, `grove symbols`, `grove status`, `grove serve`, `grove mcp`, `grove grpc`
-- [x] MCP server: 8 tools (`grove_index`, `grove_query`, `grove_impact`, `grove_deps`, `grove_tests`, `grove_icr`, `grove_conflicts`, `grove_symbols`) over JSON-RPC 2.0 stdio + HTTP/SSE
-- [x] HTTP API: REST endpoints at `:7777` with Bearer token auth
-- [x] gRPC API: Protobuf service at `:7778`
-- [x] Bearer token at `.grove/.token` (mode 0600, generated from `crypto/rand`)
-- [x] `127.0.0.1`-only binding (no LAN exposure)
+- [x] CLI: `grove index`, `grove query`, `grove impact`, `grove deps`, `grove tests`, `grove symbols`, `grove status`, `grove mcp`
+- [x] MCP server: 8 tools (`grove_index`, `grove_query`, `grove_impact`, `grove_deps`, `grove_tests`, `grove_icr`, `grove_conflicts`, `grove_symbols`) over JSON-RPC 2.0 stdio
+- [x] Embedded Go API at `github.com/provasign/grove/pkg/grove`
+- [x] Read commands load the persisted index by default; explicit `index` or `--refresh` updates it
+- [x] Ignore-file and secret-safe indexing defaults (`.groveignore`, `.gitignore`, cache/build dirs, common credential paths)
 
 ---
 

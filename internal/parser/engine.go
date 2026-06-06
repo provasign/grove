@@ -103,6 +103,10 @@ func FileBlobSHA(path string) (string, error) {
 // extractImports returns the list of import paths declared in the file.
 // For Go, scoped strictly to the import block. For other languages, regex-based.
 func extractImports(language string, content string) []string {
+	if imports, ok := extractImportsFromAST(language, []byte(content)); ok {
+		return imports
+	}
+
 	if language == "go" {
 		return extractGoImports(content)
 	}

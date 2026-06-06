@@ -118,6 +118,9 @@ func TestRun_Status(t *testing.T) {
 
 func TestRun_Symbols(t *testing.T) {
 	dir := goFixture(t)
+	if got := Run([]string{"index", dir}); got != 0 {
+		t.Fatalf("index: want 0, got %d", got)
+	}
 	if got := Run([]string{"symbols", "Login", dir}); got != 0 {
 		t.Fatalf("want 0, got %d", got)
 	}
@@ -131,7 +134,7 @@ func TestRun_SymbolsNoArgs(t *testing.T) {
 
 func TestRun_Query(t *testing.T) {
 	dir := goFixture(t)
-	if got := Run([]string{"query", "auth", dir}); got != 0 {
+	if got := Run([]string{"query", "auth", dir, "--refresh"}); got != 0 {
 		t.Fatalf("want 0, got %d", got)
 	}
 }
@@ -148,6 +151,9 @@ func TestRun_QueryNoArgs(t *testing.T) {
 // distinguishes `query` from `symbols`.
 func TestRun_QueryEmitsSemanticShape(t *testing.T) {
 	dir := goFixture(t)
+	if got := Run([]string{"index", dir}); got != 0 {
+		t.Fatalf("index: want 0, got %d", got)
+	}
 	// Redirect stdout via os.Pipe to capture the JSON body.
 	oldStdout := os.Stdout
 	r, w, _ := os.Pipe()
@@ -183,6 +189,9 @@ func TestRun_QueryEmitsSemanticShape(t *testing.T) {
 
 func TestRun_Deps(t *testing.T) {
 	dir := goFixture(t)
+	if got := Run([]string{"index", dir}); got != 0 {
+		t.Fatalf("index: want 0, got %d", got)
+	}
 	if got := Run([]string{"deps", "auth.go", dir}); got != 0 {
 		t.Fatalf("want 0, got %d", got)
 	}
@@ -198,6 +207,9 @@ func TestRun_DepsNoArgs(t *testing.T) {
 
 func TestRun_Impact(t *testing.T) {
 	dir := goFixture(t)
+	if got := Run([]string{"index", dir}); got != 0 {
+		t.Fatalf("index: want 0, got %d", got)
+	}
 	if got := Run([]string{"impact", "Login", dir}); got != 0 {
 		t.Fatalf("want 0, got %d", got)
 	}
@@ -213,6 +225,9 @@ func TestRun_ImpactNoArgs(t *testing.T) {
 
 func TestRun_Tests(t *testing.T) {
 	dir := goFixture(t)
+	if got := Run([]string{"index", dir}); got != 0 {
+		t.Fatalf("index: want 0, got %d", got)
+	}
 	if got := Run([]string{"tests", "Login", dir}); got != 0 {
 		t.Fatalf("want 0, got %d", got)
 	}
@@ -229,8 +244,18 @@ func TestRun_TestsNoQuery(t *testing.T) {
 
 func TestRun_ICR(t *testing.T) {
 	dir := goFixture(t)
-	if got := Run([]string{"icr", "add authentication", dir}); got != 0 {
+	if got := Run([]string{"icr", "add authentication", dir, "--refresh"}); got != 0 {
 		t.Fatalf("want 0, got %d", got)
+	}
+}
+
+func TestRun_ReadWithoutIndexDoesNotCreateStore(t *testing.T) {
+	dir := goFixture(t)
+	if got := Run([]string{"symbols", "Login", dir}); got != 0 {
+		t.Fatalf("want 0, got %d", got)
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".grove", "grove.db")); !os.IsNotExist(err) {
+		t.Fatalf("read command created store, err=%v", err)
 	}
 }
 

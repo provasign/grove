@@ -144,6 +144,33 @@ func TestMCPCallEveryTool(t *testing.T) {
 	}
 }
 
+func TestMCPQueryUsesSemanticResultShape(t *testing.T) {
+	s, _ := newMCPTestServer(t)
+	resp := rpcCall(t, s, "tools/call", map[string]any{
+		"name":      "grove_query",
+		"arguments": map[string]any{"intent": "login user", "limit": 5},
+	})
+	result, _ := resp["result"].(map[string]any)
+	content, _ := result["content"].([]any)
+	first, _ := content[0].(map[string]any)
+	text, _ := first["text"].(string)
+	var doc struct {
+		Results []struct {
+			Symbol map[string]any `json:"symbol"`
+			Score  float64        `json:"score"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(text), &doc); err != nil {
+		t.Fatalf("parse query output: %v\nraw: %s", err, text)
+	}
+	if len(doc.Results) == 0 {
+		t.Fatal("expected semantic results")
+	}
+	if doc.Results[0].Score <= 0 {
+		t.Fatalf("score = %v, want > 0", doc.Results[0].Score)
+	}
+}
+
 func TestMCPCallUnknownToolReturnsRPCError(t *testing.T) {
 	s, _ := newMCPTestServer(t)
 	resp := rpcCall(t, s, "tools/call", map[string]any{"name": "does_not_exist"})

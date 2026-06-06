@@ -78,8 +78,8 @@ func mcpCommand(engine *parser.Engine, _ *graph.CodeGraph, args []string) int {
 		return 1
 	}
 	defer st.Close()
-	codeGraph, _, err := index.New(engine, st).Index(context.Background(), cfg.Root)
-	if err != nil {
+	codeGraph := graph.New()
+	if err := loadGraphFromStore(codeGraph, st); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
@@ -130,15 +130,21 @@ func indexCommand(engine *parser.Engine, codeGraph *graph.CodeGraph, args []stri
 }
 
 func status(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int {
+	args, refresh := stripRefresh(args)
 	cfg, err := config.Resolve(argOrDefault(args, 0, "."), 0)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
 	root := cfg.Root
-	if _, err := indexRoot(engine, codeGraph, root); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
+	if refresh {
+		if _, err := indexRoot(engine, codeGraph, root); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+	}
+	if !refresh && !storeExists(root) {
+		return printJSON(core.Status{})
 	}
 	store, err := store.Open(root)
 	if err != nil {
@@ -155,8 +161,9 @@ func status(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) in
 }
 
 func symbols(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int {
+	args, refresh := stripRefresh(args)
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: grove symbols <query> [dir]")
+		fmt.Fprintln(os.Stderr, "usage: grove symbols <query> [dir] [--refresh]")
 		return 2
 	}
 	query := args[0]
@@ -166,7 +173,7 @@ func symbols(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) i
 		return 1
 	}
 	root := cfg.Root
-	if _, err := indexRoot(engine, codeGraph, root); err != nil {
+	if err := prepareReadGraph(engine, codeGraph, root, refresh); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
@@ -178,8 +185,9 @@ func symbols(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) i
 // across name/qualifiedName/filePath/signature. The two commands map to
 // the two distinct retrieval surfaces Grove exposes.
 func query(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int {
+	args, refresh := stripRefresh(args)
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: grove query <intent> [dir]")
+		fmt.Fprintln(os.Stderr, "usage: grove query <intent> [dir] [--refresh]")
 		return 2
 	}
 	intent := args[0]
@@ -189,7 +197,7 @@ func query(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int
 		return 1
 	}
 	root := cfg.Root
-	if _, err := indexRoot(engine, codeGraph, root); err != nil {
+	if err := prepareReadGraph(engine, codeGraph, root, refresh); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
@@ -205,8 +213,9 @@ func query(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int
 }
 
 func deps(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int {
+	args, refresh := stripRefresh(args)
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: grove deps <file> [dir]")
+		fmt.Fprintln(os.Stderr, "usage: grove deps <file> [dir] [--refresh]")
 		return 2
 	}
 	filePath := args[0]
@@ -216,7 +225,7 @@ func deps(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int 
 		return 1
 	}
 	root := cfg.Root
-	if _, err := indexRoot(engine, codeGraph, root); err != nil {
+	if err := prepareReadGraph(engine, codeGraph, root, refresh); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
@@ -224,8 +233,9 @@ func deps(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int 
 }
 
 func impact(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int {
+	args, refresh := stripRefresh(args)
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: grove impact <symbol-or-file-query> [dir]")
+		fmt.Fprintln(os.Stderr, "usage: grove impact <symbol-or-file-query> [dir] [--refresh]")
 		return 2
 	}
 	query := args[0]
@@ -235,7 +245,7 @@ func impact(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) in
 		return 1
 	}
 	root := cfg.Root
-	if _, err := indexRoot(engine, codeGraph, root); err != nil {
+	if err := prepareReadGraph(engine, codeGraph, root, refresh); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
@@ -243,6 +253,7 @@ func impact(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) in
 }
 
 func tests(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int {
+	args, refresh := stripRefresh(args)
 	query := ""
 	root := "."
 	if len(args) > 0 {
@@ -257,7 +268,7 @@ func tests(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int
 		return 1
 	}
 	root = cfg.Root
-	if _, err := indexRoot(engine, codeGraph, root); err != nil {
+	if err := prepareReadGraph(engine, codeGraph, root, refresh); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
@@ -265,8 +276,9 @@ func tests(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int
 }
 
 func icr(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int {
+	args, refresh := stripRefresh(args)
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: grove icr <intent> [dir]")
+		fmt.Fprintln(os.Stderr, "usage: grove icr <intent> [dir] [--refresh]")
 		return 2
 	}
 	intent := args[0]
@@ -276,7 +288,7 @@ func icr(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	if _, err := indexRoot(engine, codeGraph, cfg.Root); err != nil {
+	if err := prepareReadGraph(engine, codeGraph, cfg.Root, refresh); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
@@ -364,6 +376,53 @@ func indexRoot(engine *parser.Engine, codeGraph *graph.CodeGraph, root string) (
 	return result, nil
 }
 
+func prepareReadGraph(engine *parser.Engine, codeGraph *graph.CodeGraph, root string, refresh bool) error {
+	if refresh {
+		_, err := indexRoot(engine, codeGraph, root)
+		return err
+	}
+	if !storeExists(root) {
+		codeGraph.Replace(nil, 0)
+		return nil
+	}
+	st, err := store.Open(root)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	return loadGraphFromStore(codeGraph, st)
+}
+
+func storeExists(root string) bool {
+	_, err := os.Stat(filepath.Join(root, ".grove", "grove.db"))
+	return err == nil
+}
+
+func loadGraphFromStore(codeGraph *graph.CodeGraph, st *store.Store) error {
+	symbols, err := st.AllSymbols(context.Background())
+	if err != nil {
+		return err
+	}
+	codeGraph.Replace(symbols, len(symbols))
+	return nil
+}
+
+func stripRefresh(args []string) ([]string, bool) {
+	if len(args) == 0 {
+		return args, false
+	}
+	out := make([]string, 0, len(args))
+	refresh := false
+	for _, arg := range args {
+		if arg == "--refresh" {
+			refresh = true
+			continue
+		}
+		out = append(out, arg)
+	}
+	return out, refresh
+}
+
 func decodeICR(input string, value *core.IsolatedChangeRegion) error {
 	data := []byte(input)
 	if decoded, err := base64.StdEncoding.DecodeString(input); err == nil {
@@ -396,13 +455,13 @@ Usage:
   grove version
   grove init [dir]
   grove index [dir]
-  grove status [dir]
-  grove symbols <query> [dir]        lexical substring search over names/paths/signatures
-  grove query <intent> [dir]         semantic search (Model2Vec embeddings)
-  grove deps <file> [dir]
-  grove impact <symbol-or-file-query> [dir]
-  grove tests <file> [dir]
-  grove icr <intent>
+  grove status [dir] [--refresh]
+  grove symbols <query> [dir] [--refresh]        lexical substring search over names/paths/signatures
+  grove query <intent> [dir] [--refresh]         semantic search (Model2Vec embeddings)
+  grove deps <file> [dir] [--refresh]
+  grove impact <symbol-or-file-query> [dir] [--refresh]
+  grove tests <file> [dir] [--refresh]
+  grove icr <intent> [dir] [--refresh]
   grove conflicts <icr-a> <icr-b>
   grove mcp [dir]                    stdio MCP server
 

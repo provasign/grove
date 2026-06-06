@@ -120,6 +120,38 @@ func extractSymbolsFromAST(language, filePath, blobSHA string, src []byte, fileI
 	return syms, true, hasErrors
 }
 
+// extractImportsFromAST parses imports through astkit when a strategy exists.
+// Regex extraction remains the fallback for unsupported languages or parse
+// failures.
+func extractImportsFromAST(language string, src []byte) ([]string, bool) {
+	key, supported := languageToKey(language)
+	if !supported {
+		return nil, false
+	}
+	eng, reg := bridge()
+	ctx, cancel := context.WithTimeout(context.Background(), parseTimeout)
+	defer cancel()
+	tree, err := eng.Parse(ctx, key, src)
+	if err != nil || tree == nil {
+		return nil, false
+	}
+	defer tree.Close()
+	akImports, err := reg.ExtractImports(key, tree, src)
+	if err != nil {
+		return nil, false
+	}
+	seen := make(map[string]bool, len(akImports))
+	imports := make([]string, 0, len(akImports))
+	for _, imp := range akImports {
+		if imp.Path == "" || seen[imp.Path] {
+			continue
+		}
+		seen[imp.Path] = true
+		imports = append(imports, imp.Path)
+	}
+	return imports, true
+}
+
 // projectSymbol converts an astkit.Symbol into a Grove SymbolRecord by adding
 // storage-aware identifiers and per-file import context.
 func projectSymbol(s astkit.Symbol, filePath, blobSHA, language string, fileImports []string) core.SymbolRecord {

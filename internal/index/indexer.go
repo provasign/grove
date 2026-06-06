@@ -30,17 +30,27 @@ func (i *Indexer) Index(ctx context.Context, root string) (*graph.CodeGraph, cor
 	root = absRoot
 	result.Root = root
 	currentFiles := map[string]bool{}
+	ignoreRules := loadIgnoreRules(root)
 
 	err = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			result.Errors = append(result.Errors, walkErr.Error())
 			return nil
 		}
+		relPath, err := filepath.Rel(root, path)
+		if err != nil {
+			relPath = path
+		}
+		relPath = filepath.ToSlash(relPath)
+
 		if entry.IsDir() {
-			name := entry.Name()
-			if name == ".git" || name == ".grove" || name == "node_modules" || name == "vendor" || name == "dist" || name == "bin" {
+			if path != root && (shouldSkipDirName(entry.Name()) ||
+				ignoredByRules(relPath, true, ignoreRules)) {
 				return filepath.SkipDir
 			}
+			return nil
+		}
+		if isSensitivePath(relPath) || ignoredByRules(relPath, false, ignoreRules) {
 			return nil
 		}
 		if !parser.Supported(path) {
@@ -48,11 +58,6 @@ func (i *Indexer) Index(ctx context.Context, root string) (*graph.CodeGraph, cor
 		}
 
 		result.FilesSeen++
-		relPath, err := filepath.Rel(root, path)
-		if err != nil {
-			relPath = path
-		}
-		relPath = filepath.ToSlash(relPath)
 		currentFiles[relPath] = true
 
 		blobSHA, err := parser.FileBlobSHA(path)

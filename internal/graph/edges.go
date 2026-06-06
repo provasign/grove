@@ -18,6 +18,19 @@ type edgeIndex struct {
 	// Imports per-symbol from the same file-level import list.
 	fileImports map[string]map[string]struct{}
 
+	// dirToFiles maps directory → []filePath for O(1) Go same-package lookup.
+	// Without this index, importedFiles would scan byFile (O(n)) for every
+	// file in the same directory, yielding O(n²) total for a repo with many
+	// same-directory files (e.g. a 50-file package).
+	dirToFiles map[string][]string
+
+	// importPathToFiles maps a slash-separated import path without extension to
+	// files whose path matches that import exactly or by package directory.
+	importPathToFiles map[string][]string
+
+	// baseToFiles maps lowercase basename without extension to files.
+	baseToFiles map[string][]string
+
 	// importedFilesCache memoizes the result of importedFiles() per file.
 	importedFilesCache map[string]map[string]struct{}
 }
@@ -28,6 +41,9 @@ func newEdgeIndex(symbols []core.SymbolRecord) *edgeIndex {
 		byFile:             make(map[string][]*core.SymbolRecord),
 		byID:               make(map[string]*core.SymbolRecord),
 		fileImports:        make(map[string]map[string]struct{}),
+		dirToFiles:         make(map[string][]string),
+		importPathToFiles:  make(map[string][]string),
+		baseToFiles:        make(map[string][]string),
 		importedFilesCache: make(map[string]map[string]struct{}),
 	}
 	for i := range symbols {
@@ -42,6 +58,14 @@ func newEdgeIndex(symbols []core.SymbolRecord) *edgeIndex {
 			idx.fileImports[s.FilePath][imp] = struct{}{}
 		}
 	}
+	// Build dirToFiles after byFile is populated so each directory maps to
+	// all its files in one pass (O(n) total, vs O(n) per-file scan later).
+	for f := range idx.byFile {
+		d := dirOf(f)
+		idx.dirToFiles[d] = append(idx.dirToFiles[d], f)
+		idx.importPathToFiles[strings.ToLower(trimExt(f))] = append(idx.importPathToFiles[strings.ToLower(trimExt(f))], f)
+		idx.baseToFiles[strings.ToLower(baseNameNoExt(f))] = append(idx.baseToFiles[strings.ToLower(baseNameNoExt(f))], f)
+	}
 	return idx
 }
 
@@ -54,20 +78,40 @@ func (idx *edgeIndex) importedFiles(fromFile string) map[string]struct{} {
 		return cached
 	}
 	out := map[string]struct{}{fromFile: {}}
+
+	// Same-package scope (Go only): a Go file does not import its own package,
+	// yet calls between files in the same directory are extremely common
+	// (compressor.go ↔ compressor_test.go, split implementation files). In Go a
+	// directory IS a package, so every file sharing fromFile's directory is in
+	// scope. This is NOT true for TS/JS/Java/Python, where imports are always
+	// explicit per file regardless of directory — so we gate on language to
+	// avoid linking unrelated same-folder modules there.
+	if fileLanguage(idx, fromFile) == "go" {
+		fromDir := dirOf(fromFile)
+		for _, f := range idx.dirToFiles[fromDir] {
+			if f != fromFile {
+				out[f] = struct{}{}
+			}
+		}
+	}
+
 	imports, ok := idx.fileImports[fromFile]
 	if !ok {
 		idx.importedFilesCache[fromFile] = out
 		return out
 	}
-	// Build candidate set: every other indexed file.
-	candidates := make([]string, 0, len(idx.byFile))
-	for f := range idx.byFile {
-		if f == fromFile {
-			continue
-		}
-		candidates = append(candidates, f)
-	}
 	for imp := range imports {
+		impNorm := strings.ToLower(strings.Trim(imp, "\"' ;"))
+		impNorm = strings.TrimPrefix(impNorm, "./")
+		impNorm = strings.TrimSuffix(impNorm, ".go")
+		impNorm = strings.TrimSuffix(impNorm, ".py")
+		impNorm = strings.TrimSuffix(impNorm, ".ts")
+		impNorm = strings.TrimSuffix(impNorm, ".tsx")
+		impNorm = strings.TrimSuffix(impNorm, ".js")
+		impNorm = strings.TrimSuffix(impNorm, ".jsx")
+		impNorm = strings.TrimSuffix(impNorm, ".java")
+		impNorm = strings.TrimSuffix(impNorm, ".rs")
+
 		// Last path segment of the import (e.g., "lodash/fp" → "fp",
 		// "./auth" → "auth", "fmt" → "fmt", "com.example.Auth" → "Auth").
 		seg := lastImportSegment(imp)
@@ -75,9 +119,47 @@ func (idx *edgeIndex) importedFiles(fromFile string) map[string]struct{} {
 			continue
 		}
 		segLower := strings.ToLower(seg)
-		for _, c := range candidates {
+
+		candidateSet := make(map[string]struct{})
+		for _, f := range idx.importPathToFiles[impNorm] {
+			if f != fromFile {
+				candidateSet[f] = struct{}{}
+			}
+		}
+		if d := dirOf(impNorm); d != "" {
+			for _, f := range idx.dirToFiles[d] {
+				if f != fromFile {
+					candidateSet[f] = struct{}{}
+				}
+			}
+		}
+		for _, f := range idx.baseToFiles[segLower] {
+			if f != fromFile {
+				candidateSet[f] = struct{}{}
+			}
+		}
+
+		for c := range candidateSet {
 			lower := strings.ToLower(c)
 			base := strings.ToLower(baseNameNoExt(c))
+
+			// (1) Package / directory imports — the common case for Go, Rust,
+			// and Python, where one import names a DIRECTORY and pulls in every
+			// file under it. Resolve by directory, not by a file that happens to
+			// be named after the package. Without this, every cross-package call
+			// edge in a Go repo is dropped: import ".../internal/ranking" never
+			// matches the file "internal/ranking/budget.go", so the call graph
+			// collapses to same-file only.
+			dir := strings.ToLower(dirOf(c)) // e.g. "internal/ranking"
+			if dir != "" && dir != "." &&
+				(impNorm == dir || strings.HasSuffix(impNorm, "/"+dir) ||
+					baseOf(dir) == segLower) {
+				out[c] = struct{}{}
+				continue
+			}
+
+			// (2) File-name imports — e.g. a JS/TS relative import "./auth"
+			// resolving to "auth.ts".
 			if base == segLower || strings.HasSuffix(lower, "/"+segLower) ||
 				strings.HasSuffix(lower, "/"+segLower+".go") ||
 				strings.HasSuffix(lower, "/"+segLower+".py") ||
@@ -109,12 +191,47 @@ func lastImportSegment(imp string) string {
 	return imp
 }
 
+// fileLanguage returns the language recorded for any symbol in fromFile.
+func fileLanguage(idx *edgeIndex, fromFile string) string {
+	for _, s := range idx.byFile[fromFile] {
+		if s.Language != "" {
+			return strings.ToLower(s.Language)
+		}
+	}
+	return ""
+}
+
+// dirOf returns the directory portion of a slash-separated file path
+// ("internal/ranking/budget.go" → "internal/ranking"; "main.go" → "").
+func dirOf(path string) string {
+	if i := strings.LastIndexByte(path, '/'); i >= 0 {
+		return path[:i]
+	}
+	return ""
+}
+
+// baseOf returns the last segment of a slash-separated path
+// ("internal/ranking" → "ranking").
+func baseOf(path string) string {
+	if i := strings.LastIndexByte(path, '/'); i >= 0 {
+		return path[i+1:]
+	}
+	return path
+}
+
 func baseNameNoExt(path string) string {
 	if i := strings.LastIndexByte(path, '/'); i >= 0 {
 		path = path[i+1:]
 	}
 	if i := strings.LastIndexByte(path, '.'); i > 0 {
 		path = path[:i]
+	}
+	return path
+}
+
+func trimExt(path string) string {
+	if i := strings.LastIndexByte(path, '.'); i > 0 {
+		return path[:i]
 	}
 	return path
 }

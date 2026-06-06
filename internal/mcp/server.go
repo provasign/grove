@@ -123,7 +123,7 @@ func (s *Server) callTool(name string, args map[string]any) (any, error) {
 		s.mu.Unlock()
 		return result, nil
 	case "grove_query":
-		return map[string]any{"symbols": s.currentGraph().Search(stringArg(args, "intent", ""), intArg(args, "limit", 50))}, nil
+		return map[string]any{"results": semanticResults(s.currentGraph(), stringArg(args, "intent", ""), intArg(args, "limit", 50))}, nil
 	case "grove_symbols":
 		return map[string]any{"symbols": s.currentGraph().Search(stringArg(args, "query", ""), intArg(args, "limit", 50))}, nil
 	case "grove_deps":
@@ -147,6 +147,21 @@ func (s *Server) callTool(name string, args map[string]any) (any, error) {
 	default:
 		return nil, fmt.Errorf("unknown tool: %s", name)
 	}
+}
+
+func semanticResults(codeGraph *graph.CodeGraph, intent string, limit int) []map[string]any {
+	if limit <= 0 {
+		limit = 50
+	}
+	scored := codeGraph.SemanticSearch(intent, limit)
+	results := make([]map[string]any, 0, len(scored))
+	for _, s := range scored {
+		results = append(results, map[string]any{
+			"symbol": s.Symbol,
+			"score":  s.Score,
+		})
+	}
+	return results
 }
 
 func (s *Server) currentGraph() *graph.CodeGraph {

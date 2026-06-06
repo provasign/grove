@@ -2,7 +2,7 @@
 
 > **Your codebase's persistent long-term memory — queryable by any AI agent.**
 
-> **Embedded mode (current):** Grove is a Go library at `github.com/provasign/grove/pkg/grove`. Prism, Fuse, and Provasign link it directly and open the on-disk index in-process. There is no `grove serve` daemon, no port (7777/7778), and no `.grove/.token`. The CLI is still available for one-shot queries (`grove index .`, `grove symbols main`) and stdio MCP (`grove mcp`).
+> **Embedded mode (current):** Grove is a Go library at `github.com/provasign/grove/pkg/grove`. Prism, Fuse, and Provasign link it directly and open the on-disk index in-process. There is no `grove serve` daemon, no port (7777/7778), and no `.grove/.token`. The CLI is available for explicit indexing plus read queries (`grove index .`, `grove symbols main`) and stdio MCP (`grove mcp`).
 
 ---
 
@@ -13,7 +13,7 @@ Grep answers "does this string appear somewhere?" A language server answers "whe
 - *What is the full dependency chain from this file?*
 - *What symbols are semantically related to this task description?*
 
-The difference is a graph. Grove indexes your source files into a persistent SQLite graph — 11 languages, 8 edge types, BFS traversal — and keeps it live with delta indexing (files whose git blob SHA hasn't changed are never re-parsed). The graph is queryable over CLI, HTTP API, MCP stdio, and gRPC.
+The difference is a graph. Grove indexes your source files into a persistent SQLite graph — 11 languages, 8 edge types, BFS traversal — and keeps it live with delta indexing (files whose content hash hasn't changed are never re-parsed). The graph is queryable through the embedded Go API, CLI, and MCP stdio.
 
 Grove is the foundation all other Provasign tools are built on. Prism uses it to focus context. Fuse uses it to resolve conflicts. Provasign uses it to certify agent output. Without Grove, all three fall back to line-level operations.
 
@@ -47,22 +47,16 @@ Source files
 │  8 edge types                                           │
 │  BFS traversal                                          │
 └──────┬─────────────────┬───────────────────────────────┘
-       │                 │
-       ▼                 ▼
-┌────────────┐   ┌────────────────────┐
-│ internal/  │   │ internal/query/    │
-│ mcp/       │   │ Intent → symbols   │
-│ 8 tools    │   │ FTS5 + BFS         │
-│ JSON-RPC   │   │ Blast radius       │
-│ stdio      │   │ ICR computation    │
-└────────────┘   └────────┬───────────┘
-                          │
-                          ▼
-                 ┌────────────────────┐
-                 │ internal/api/      │
-                 │ HTTP :7777         │
-                 │ gRPC :7778         │
-                 └────────────────────┘
+       │
+       ├───────────────────────┐
+       ▼                       ▼
+┌────────────┐        ┌────────────────────┐
+│ internal/  │        │ pkg/grove          │
+│ mcp/       │        │ Embedded Go API    │
+│ 8 tools    │        │ Query / impact /   │
+│ JSON-RPC   │        │ deps / tests / ICR │
+│ stdio      │        └────────────────────┘
+└────────────┘
 ```
 
 ---
@@ -71,7 +65,7 @@ Source files
 
 **Single binary, zero runtime dependencies.** SQLite is embedded via `modernc.org/sqlite` — a pure-Go port — which avoids a CGO linker conflict with tree-sitter. Tree-sitter itself (in `internal/parser/`) is the only CGO dependency.
 
-**Delta indexing by git blob SHA.** Grove calls `git hash-object` on each file before parsing. If the blob SHA matches what is stored, the file is skipped entirely. Indexing a 5000-file repo after a one-line change touches one file, not 5000.
+**Delta indexing by content hash.** Grove hashes each file before parsing. If the stored hash matches, the file is skipped entirely. Indexing a 5000-file repo after a one-line change touches one file, not 5000.
 
 **AST-first with regex fallback.** Tree-sitter produces a complete AST even for files with syntax errors, but marks broken subtrees as `ERROR` nodes. When `root.HasError()` is true, Grove runs both the AST extractor and the regex fallback, then merges the results with AST taking precedence. Files that are actively being edited mid-keystroke are still indexed usefully.
 
@@ -135,17 +129,17 @@ Query latency is FTS5 full-text search + BFS graph traversal returning ranked re
 
 ## Tool and IDE Integration
 
-Grove is the backend for the entire suite. Direct AI agent integration is via MCP stdio or HTTP/SSE; Prism, Fuse, and Provasign consume the HTTP API.
+Grove is the backend for the Provasign suite. Prism, Fuse, and Provasign consume the embedded Go API directly. Direct AI agent integration is available through MCP stdio.
 
 | Integration | How | Use case |
 |-------------|-----|---------|
 | Claude Code CLI | `grove mcp .` → MCP stdio | Direct agent integration without Prism |
 | Cursor, Windsurf, Zed | `grove mcp .` → MCP stdio | Same |
-| VS Code (Copilot Agent) | Prism extension → HTTP API `:7777` | All 8 `grove_*` tools via `#groveIndex`, `#groveQuery`, etc. |
-| Prism (all IDEs) | HTTP API `:7777` | Token-optimized context delivery |
-| Fuse (git merge) | HTTP API `:7777` | Blast radius + breaking change detection |
-| Provasign | HTTP API + gRPC `:7778` | Intent lifecycle and certification |
-| Custom automation | HTTP API `:7777` | Any tool that can make HTTP requests |
+| VS Code (Copilot Agent) | Prism extension → embedded Grove | Grove-backed context through Prism |
+| Prism (all IDEs) | Embedded Go API | Token-optimized context delivery |
+| Fuse (git merge) | Embedded Go API | Blast radius + conflict hints |
+| Provasign | Embedded Go API | Intent and certification inputs |
+| Custom automation | `pkg/grove` | In-process Go integration |
 
 For most AI agent use cases, running Grove directly is only necessary for custom integrations. The normal path is `prism init` in your project, which starts Grove automatically.
 
@@ -187,48 +181,31 @@ grove init [dir]
 # Index or reindex (skips unchanged files via delta SHA)
 grove index [dir]
 
-# Show index status (file count, symbol count, last index time)
-grove status [dir]
+# Show persisted index status without refreshing
+grove status [dir] [--refresh]
 
 # Symbol search
-grove symbols <query> [dir]
+grove symbols <query> [dir] [--refresh]
 
 # Intent-based semantic query (Model2Vec embeddings + BFS graph ranking)
-grove query <intent> [dir]
+grove query <intent> [dir] [--refresh]
 
 # Blast radius: what would break if this symbol changed?
-grove impact <symbol> [dir]
+grove impact <symbol> [dir] [--refresh]
 
 # Which tests cover a symbol?
-grove tests <symbol> [dir]
-
-# Start HTTP server (binds to 127.0.0.1:7777)
-grove serve [--port 7777] [dir]
+grove tests <symbol> [dir] [--refresh]
 
 # Start MCP stdio server (primary AI agent integration)
 grove mcp [dir]
 
-# Start gRPC server
-grove grpc [--port 7778] [dir]
 ```
 
 ---
 
 ## HTTP API
 
-All endpoints require `Authorization: Bearer <token>` (token at `.grove/.token`) except `/health`.
-
-```bash
-GET  /health
-GET  /status
-POST /index     {"dir": string}
-POST /symbols   {"query": string}
-POST /query     {"intent": string, "limit": int}
-POST /impact    {"query": string, "maxDepth": int}
-POST /deps      {"file": string}
-POST /tests     {"query": string}
-POST /icr       {"intent": string}
-```
+There is no HTTP or gRPC daemon in the current embedded mode. Use `pkg/grove` for in-process integration, the CLI for local commands, or `grove mcp` for stdio MCP.
 
 ---
 
@@ -253,21 +230,9 @@ Start the MCP server:
 grove mcp .
 ```
 
-HTTP/SSE mode (for tools that prefer HTTP over stdio):
-
-```bash
-grove serve .
-curl http://localhost:7777/mcp/sse
-curl -X POST http://localhost:7777/mcp/call \
-  -H "Authorization: Bearer $(cat .grove/.token)" \
-  -d '{"name":"grove_query","arguments":{"intent":"authentication","limit":10}}'
-```
-
----
-
 ## Storage
 
-Grove stores everything in `.grove/grove.db` (SQLite, WAL mode). The database is a single file — back it up, copy it, or delete it to force a full reindex. There is no migration tooling; delete and reindex if the schema changes.
+Grove stores everything in `.grove/grove.db` (SQLite, WAL mode). The database is a single file — back it up, copy it, or delete it to force a full reindex. Schema migrations are applied when the store opens.
 
 Key SQLite settings:
 - WAL mode for concurrent reads during indexing
@@ -278,7 +243,7 @@ Key SQLite settings:
 
 ## Security
 
-Grove binds to `127.0.0.1` — not `0.0.0.0`. The shared secret token at `.grove/.token` (mode 0600) is required on all non-health requests. The token is 64 hex characters generated from `crypto/rand` on first start and is stable across restarts.
+Grove does not expose a network listener in embedded mode. Indexing skips dependency/build/cache directories, honors `.groveignore` and `.gitignore`, and avoids common secret-bearing filenames and credential/key extensions.
 
 ---
 
@@ -290,4 +255,4 @@ go test ./internal/parser/... -run TestGoExtractor # single extractor
 go test ./internal/parser/... -v                   # verbose parser tests
 ```
 
-Key test areas: language extractors (fixture-based), BFS traversal on known graph topologies, delta indexing (SHA skip), token middleware, FTS5 query ranking.
+Key test areas: language extractors (fixture-based), BFS traversal on known graph topologies, delta indexing, ignore/secret-safe indexing, MCP stdio framing, and FTS5 query ranking.
