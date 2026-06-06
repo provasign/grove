@@ -121,18 +121,32 @@ func (idx *edgeIndex) importedFiles(fromFile string) map[string]struct{} {
 		segLower := strings.ToLower(seg)
 
 		candidateSet := make(map[string]struct{})
+		// Fast path: direct file-path match (e.g. relative imports, or same-depth imports
+		// where the import string matches the file path exactly after extension strip).
 		for _, f := range idx.importPathToFiles[impNorm] {
 			if f != fromFile {
 				candidateSet[f] = struct{}{}
 			}
 		}
-		if d := dirOf(impNorm); d != "" {
-			for _, f := range idx.dirToFiles[d] {
-				if f != fromFile {
-					candidateSet[f] = struct{}{}
+		// Package/directory match: scan dirToFiles keys for suffix/base matches.
+		// This handles module-prefixed imports (e.g. "github.com/foo/internal/calc"
+		// must match files under "internal/calc/") where the module path prefix is
+		// not present in the file paths. O(|dirs|) per import, offset by the
+		// per-file importedFilesCache so each file's imports are resolved only once.
+		for d, dFiles := range idx.dirToFiles {
+			dLower := strings.ToLower(d)
+			if dLower == "" || dLower == "." {
+				continue
+			}
+			if impNorm == dLower || strings.HasSuffix(impNorm, "/"+dLower) || baseOf(dLower) == segLower {
+				for _, f := range dFiles {
+					if f != fromFile {
+						candidateSet[f] = struct{}{}
+					}
 				}
 			}
 		}
+		// Basename match: for JS/TS file-name imports (e.g. "./auth" → "auth.ts").
 		for _, f := range idx.baseToFiles[segLower] {
 			if f != fromFile {
 				candidateSet[f] = struct{}{}
