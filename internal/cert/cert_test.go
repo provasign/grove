@@ -127,3 +127,72 @@ deleted file mode 100644
 		t.Fatalf("unknowns = %+v", report.Unknowns)
 	}
 }
+
+func TestCertifyDiffManualReviewForBinaryFile(t *testing.T) {
+	report := CertifyDiff(graph.New(), core.DiffInput{UnifiedDiff: `diff --git a/logo.png b/logo.png
+Binary files a/logo.png and b/logo.png differ
+`})
+
+	if report.Verdict != core.VerdictManualReview {
+		t.Fatalf("verdict = %q, want manual_review", report.Verdict)
+	}
+	if len(report.Unknowns) != 1 || report.Unknowns[0].Code != "binary_change" {
+		t.Fatalf("unknowns = %+v", report.Unknowns)
+	}
+}
+
+func TestCertifyDiffManualReviewForMissingTestEvidence(t *testing.T) {
+	cg := graph.New()
+	cg.Replace([]core.SymbolRecord{
+		{
+			ID:            "auth.go::Login@sha",
+			FilePath:      "auth.go",
+			BlobSHA:       "sha",
+			Language:      "go",
+			Kind:          core.KindFunction,
+			Name:          "Login",
+			QualifiedName: "Login",
+			Span:          core.LineRange{Start: 3, End: 6},
+		},
+	}, 1)
+
+	report := CertifyDiff(cg, core.DiffInput{UnifiedDiff: `diff --git a/auth.go b/auth.go
+--- a/auth.go
++++ b/auth.go
+@@ -3,4 +3,4 @@
+ func Login() bool {
+-	return false
++	return true
+ }
+`})
+
+	if report.Verdict != core.VerdictManualReview {
+		t.Fatalf("verdict = %q, want manual_review", report.Verdict)
+	}
+	if len(report.Unknowns) != 1 || report.Unknowns[0].Code != "tests_unknown" {
+		t.Fatalf("unknowns = %+v", report.Unknowns)
+	}
+}
+
+func TestParseUnifiedDiffEmpty(t *testing.T) {
+	files, err := ParseUnifiedDiff("\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 0 {
+		t.Fatalf("files = %+v, want none", files)
+	}
+}
+
+func TestParseUnifiedDiffRejectsInvalidRange(t *testing.T) {
+	_, err := ParseUnifiedDiff(`diff --git a/auth.go b/auth.go
+--- a/auth.go
++++ b/auth.go
+@@ -1,1 +0,2 @@
+-package auth
++package login
+`)
+	if err == nil {
+		t.Fatal("expected invalid range error")
+	}
+}
