@@ -12,7 +12,10 @@ import (
 	"github.com/provasign/grove/internal/parser"
 )
 
-const reportVersion = 1
+const (
+	reportVersion         = 1
+	invalidHunkRangeError = "diff_malformed: invalid hunk range %q"
+)
 
 // CertifyDiff maps a unified diff onto the indexed graph and emits a
 // conservative report. It only certifies structural facts Grove can observe;
@@ -41,48 +44,8 @@ func CertifyDiff(codeGraph *graph.CodeGraph, input core.DiffInput) core.Certific
 	}
 
 	symbols, edges := codeGraph.Snapshot()
-	byFile := symbolsByFile(symbols)
-	changedByID := map[string]core.SymbolRecord{}
-
-	for _, file := range files {
-		fileSymbols := byFile[file.Path]
-		if file.Binary {
-			report.Unknowns = append(report.Unknowns, fileUnknown(file.Path, "binary_change", "binary diff cannot be mapped to indexed symbols"))
-			continue
-		}
-		if file.Deleted {
-			report.Unknowns = append(report.Unknowns, fileUnknown(file.Path, "deleted_file", "deleted file cannot be certified against the current index"))
-			continue
-		}
-		if len(file.Hunks) == 0 {
-			report.Unknowns = append(report.Unknowns, fileUnknown(file.Path, "diff_no_hunks", "changed file has no parseable hunks"))
-			continue
-		}
-		if len(fileSymbols) == 0 {
-			report.Unknowns = append(report.Unknowns, fileUnknown(file.Path, "file_not_indexed", "changed file is unsupported, ignored, sensitive, or missing from the Grove index"))
-			continue
-		}
-		matched := false
-		for _, hunk := range file.Hunks {
-			for _, symbol := range fileSymbols {
-				if rangesOverlap(hunk.NewRange, symbol.Span) {
-					changedByID[symbol.ID] = symbol
-					matched = true
-				}
-			}
-		}
-		if !matched {
-			report.Unknowns = append(report.Unknowns, fileUnknown(file.Path, "hunk_unmapped", "changed lines did not intersect any indexed symbol span"))
-		}
-	}
-
-	report.ChangedSymbols = sortedSymbols(changedByID)
-	impactedByID := impactedSymbols(report.ChangedSymbols, symbols, edges, 3)
-	for _, changed := range report.ChangedSymbols {
-		delete(impactedByID, changed.ID)
-	}
-	report.ImpactedSymbols = sortedSymbols(impactedByID)
-	report.Tests = sortedSymbols(coveringTests(report.ChangedSymbols, symbols, edges))
+	report.ChangedSymbols = sortedSymbols(collectChangedSymbols(files, symbolsByFile(symbols), &report))
+	addDerivedGraphFacts(&report, symbols, edges)
 
 	if policy.RequireTestsForCode {
 		report.Unknowns = append(report.Unknowns, missingTestFindings(report.ChangedSymbols, report.Tests)...)
@@ -92,6 +55,59 @@ func CertifyDiff(codeGraph *graph.CodeGraph, input core.DiffInput) core.Certific
 		report.Verdict = core.VerdictManualReview
 	}
 	return report
+}
+
+func collectChangedSymbols(files []DiffFile, byFile map[string][]core.SymbolRecord, report *core.CertificationReport) map[string]core.SymbolRecord {
+	changedByID := map[string]core.SymbolRecord{}
+	for _, file := range files {
+		fileSymbols := byFile[file.Path]
+		unknown, ok := fileLevelUnknown(file, fileSymbols)
+		if ok {
+			report.Unknowns = append(report.Unknowns, unknown)
+			continue
+		}
+		if !addChangedSymbolsForFile(file, fileSymbols, changedByID) {
+			report.Unknowns = append(report.Unknowns, fileUnknown(file.Path, "hunk_unmapped", "changed lines did not intersect any indexed symbol span"))
+		}
+	}
+	return changedByID
+}
+
+func fileLevelUnknown(file DiffFile, fileSymbols []core.SymbolRecord) (core.CertificationFinding, bool) {
+	switch {
+	case file.Binary:
+		return fileUnknown(file.Path, "binary_change", "binary diff cannot be mapped to indexed symbols"), true
+	case file.Deleted:
+		return fileUnknown(file.Path, "deleted_file", "deleted file cannot be certified against the current index"), true
+	case len(file.Hunks) == 0:
+		return fileUnknown(file.Path, "diff_no_hunks", "changed file has no parseable hunks"), true
+	case len(fileSymbols) == 0:
+		return fileUnknown(file.Path, "file_not_indexed", "changed file is unsupported, ignored, sensitive, or missing from the Grove index"), true
+	default:
+		return core.CertificationFinding{}, false
+	}
+}
+
+func addChangedSymbolsForFile(file DiffFile, symbols []core.SymbolRecord, changedByID map[string]core.SymbolRecord) bool {
+	matched := false
+	for _, hunk := range file.Hunks {
+		for _, symbol := range symbols {
+			if rangesOverlap(hunk.NewRange, symbol.Span) {
+				changedByID[symbol.ID] = symbol
+				matched = true
+			}
+		}
+	}
+	return matched
+}
+
+func addDerivedGraphFacts(report *core.CertificationReport, symbols []core.SymbolRecord, edges []core.Edge) {
+	impactedByID := impactedSymbols(report.ChangedSymbols, symbols, edges, 3)
+	for _, changed := range report.ChangedSymbols {
+		delete(impactedByID, changed.ID)
+	}
+	report.ImpactedSymbols = sortedSymbols(impactedByID)
+	report.Tests = sortedSymbols(coveringTests(report.ChangedSymbols, symbols, edges))
 }
 
 func symbolsByFile(symbols []core.SymbolRecord) map[string][]core.SymbolRecord {
@@ -108,34 +124,57 @@ func symbolsByFile(symbols []core.SymbolRecord) map[string][]core.SymbolRecord {
 }
 
 func impactedSymbols(changed []core.SymbolRecord, symbols []core.SymbolRecord, edges []core.Edge, maxDepth int) map[string]core.SymbolRecord {
+	byID := symbolMap(symbols)
+	visited := make(map[string]int, len(changed))
+	queue := seedTraversal(changed, visited)
+	traverseInbound(edges, visited, queue, maxDepth)
+	return materializeVisited(visited, byID)
+}
+
+func symbolMap(symbols []core.SymbolRecord) map[string]core.SymbolRecord {
 	byID := make(map[string]core.SymbolRecord, len(symbols))
 	for _, symbol := range symbols {
 		byID[symbol.ID] = symbol
 	}
-	visited := make(map[string]int, len(changed))
+	return byID
+}
+
+func seedTraversal(changed []core.SymbolRecord, visited map[string]int) []string {
 	queue := make([]string, 0, len(changed))
 	for _, symbol := range changed {
 		visited[symbol.ID] = 0
 		queue = append(queue, symbol.ID)
 	}
+	return queue
+}
+
+func traverseInbound(edges []core.Edge, visited map[string]int, queue []string, maxDepth int) {
 	for len(queue) > 0 {
 		node := queue[0]
 		queue = queue[1:]
-		depth := visited[node]
-		if depth >= maxDepth {
+		if visited[node] >= maxDepth {
 			continue
 		}
-		for _, edge := range edges {
-			if edge.To != node || !impactEdge(edge.Type) {
-				continue
-			}
-			if _, ok := visited[edge.From]; ok {
-				continue
-			}
-			visited[edge.From] = depth + 1
-			queue = append(queue, edge.From)
-		}
+		queue = append(queue, inboundNeighbors(node, edges, visited)...)
 	}
+}
+
+func inboundNeighbors(node string, edges []core.Edge, visited map[string]int) []string {
+	var next []string
+	for _, edge := range edges {
+		if edge.To != node || !impactEdge(edge.Type) {
+			continue
+		}
+		if _, ok := visited[edge.From]; ok {
+			continue
+		}
+		visited[edge.From] = visited[node] + 1
+		next = append(next, edge.From)
+	}
+	return next
+}
+
+func materializeVisited(visited map[string]int, byID map[string]core.SymbolRecord) map[string]core.SymbolRecord {
 	out := make(map[string]core.SymbolRecord)
 	for id := range visited {
 		if symbol, ok := byID[id]; ok {
@@ -268,91 +307,128 @@ func ParseUnifiedDiff(diff string) ([]DiffFile, error) {
 		return nil, nil
 	}
 
-	var files []DiffFile
-	var current *DiffFile
-	var hunk *DiffHunk
-	newLine := 0
-	sawDiff := false
-
+	parser := diffParser{}
 	for _, line := range strings.Split(diff, "\n") {
-		switch {
-		case strings.HasPrefix(line, "diff --git "):
-			sawDiff = true
-			files = append(files, DiffFile{})
-			current = &files[len(files)-1]
-			hunk = nil
-			if path := parseGitPath(line); path != "" {
-				current.Path = path
-			}
-		case strings.HasPrefix(line, "+++ "):
-			if current == nil {
-				return nil, errors.New("diff_malformed: +++ header before file header")
-			}
-			path := strings.TrimSpace(strings.TrimPrefix(line, "+++ "))
-			if path == "/dev/null" {
-				current.Deleted = true
-				continue
-			}
-			current.Path = cleanDiffPath(path)
-		case strings.HasPrefix(line, "deleted file mode "):
-			if current != nil {
-				current.Deleted = true
-			}
-		case strings.HasPrefix(line, "Binary files ") || strings.HasPrefix(line, "GIT binary patch"):
-			if current == nil {
-				files = append(files, DiffFile{Path: binaryPath(line), Binary: true})
-				current = &files[len(files)-1]
-				sawDiff = true
-				continue
-			}
-			current.Binary = true
-		case strings.HasPrefix(line, "@@ "):
-			if current == nil {
-				return nil, errors.New("diff_malformed: hunk before file header")
-			}
-			start, count, err := parseNewRange(line)
-			if err != nil {
-				return nil, err
-			}
-			rangeEnd := start + count - 1
-			if count == 0 {
-				rangeEnd = start
-			}
-			current.Hunks = append(current.Hunks, DiffHunk{NewRange: core.LineRange{Start: start, End: rangeEnd}})
-			hunk = &current.Hunks[len(current.Hunks)-1]
-			newLine = start
-		case hunk != nil:
-			if line == `\ No newline at end of file` {
-				continue
-			}
-			if line == "" {
-				newLine++
-				continue
-			}
-			switch line[0] {
-			case '+':
-				extendHunkRange(hunk, newLine)
-				newLine++
-			case '-':
-			case ' ':
-				newLine++
-			default:
-				return nil, fmt.Errorf("diff_malformed: unexpected hunk line %q", line)
-			}
+		if err := parser.handleLine(line); err != nil {
+			return nil, err
 		}
 	}
-	if !sawDiff && len(files) == 0 {
+	return parser.finish()
+}
+
+type diffParser struct {
+	files   []DiffFile
+	current *DiffFile
+	hunk    *DiffHunk
+	newLine int
+	sawDiff bool
+}
+
+func (p *diffParser) handleLine(line string) error {
+	switch {
+	case strings.HasPrefix(line, "diff --git "):
+		p.startFile(line)
+	case strings.HasPrefix(line, "+++ "):
+		return p.handleNewFileHeader(line)
+	case strings.HasPrefix(line, "deleted file mode "):
+		p.markDeleted()
+	case strings.HasPrefix(line, "Binary files ") || strings.HasPrefix(line, "GIT binary patch"):
+		p.markBinary(line)
+	case strings.HasPrefix(line, "@@ "):
+		return p.startHunk(line)
+	case p.hunk != nil:
+		return p.handleHunkLine(line)
+	}
+	return nil
+}
+
+func (p *diffParser) startFile(line string) {
+	p.sawDiff = true
+	p.files = append(p.files, DiffFile{})
+	p.current = &p.files[len(p.files)-1]
+	p.hunk = nil
+	if path := parseGitPath(line); path != "" {
+		p.current.Path = path
+	}
+}
+
+func (p *diffParser) handleNewFileHeader(line string) error {
+	if p.current == nil {
+		return errors.New("diff_malformed: +++ header before file header")
+	}
+	path := strings.TrimSpace(strings.TrimPrefix(line, "+++ "))
+	if path == "/dev/null" {
+		p.current.Deleted = true
+		return nil
+	}
+	p.current.Path = cleanDiffPath(path)
+	return nil
+}
+
+func (p *diffParser) markDeleted() {
+	if p.current != nil {
+		p.current.Deleted = true
+	}
+}
+
+func (p *diffParser) markBinary(line string) {
+	if p.current == nil {
+		p.files = append(p.files, DiffFile{Path: binaryPath(line), Binary: true})
+		p.current = &p.files[len(p.files)-1]
+		p.sawDiff = true
+		return
+	}
+	p.current.Binary = true
+}
+
+func (p *diffParser) startHunk(line string) error {
+	if p.current == nil {
+		return errors.New("diff_malformed: hunk before file header")
+	}
+	start, count, err := parseNewRange(line)
+	if err != nil {
+		return err
+	}
+	p.current.Hunks = append(p.current.Hunks, DiffHunk{NewRange: hunkRange(start, count)})
+	p.hunk = &p.current.Hunks[len(p.current.Hunks)-1]
+	p.newLine = start
+	return nil
+}
+
+func (p *diffParser) handleHunkLine(line string) error {
+	if line == `\ No newline at end of file` {
+		return nil
+	}
+	if line == "" {
+		p.newLine++
+		return nil
+	}
+	switch line[0] {
+	case '+':
+		extendHunkRange(p.hunk, p.newLine)
+		p.newLine++
+	case '-':
+	case ' ':
+		p.newLine++
+	default:
+		return fmt.Errorf("diff_malformed: unexpected hunk line %q", line)
+	}
+	return nil
+}
+
+func (p *diffParser) finish() ([]DiffFile, error) {
+	if !p.sawDiff && len(p.files) == 0 {
 		return nil, errors.New("diff_malformed: no unified diff file headers found")
 	}
-	for i := range files {
-		if files[i].Path == "" {
+	for i := range p.files {
+		if p.files[i].Path == "" {
 			return nil, errors.New("diff_malformed: changed file path is missing")
 		}
-		if len(files[i].Hunks) == 0 && !files[i].Binary && !files[i].Deleted {
-			return nil, fmt.Errorf("diff_malformed: %s has no hunks", files[i].Path)
+		if len(p.files[i].Hunks) == 0 && !p.files[i].Binary && !p.files[i].Deleted {
+			return nil, fmt.Errorf("diff_malformed: %s has no hunks", p.files[i].Path)
 		}
 	}
-	return files, nil
+	return p.files, nil
 }
 
 func parseGitPath(line string) string {
@@ -388,27 +464,47 @@ func parseNewRange(header string) (int, int, error) {
 	}
 	body := strings.TrimSpace(header[2 : second+2])
 	for _, field := range strings.Fields(body) {
-		if strings.HasPrefix(field, "+") {
-			field = strings.TrimPrefix(field, "+")
-			parts := strings.SplitN(field, ",", 2)
-			start, err := atoiNonNegative(parts[0])
-			if err != nil || (start == 0 && len(parts) != 2) {
-				return 0, 0, fmt.Errorf("diff_malformed: invalid hunk range %q", header)
-			}
-			count := 1
-			if len(parts) == 2 {
-				count, err = atoiNonNegative(parts[1])
-				if err != nil {
-					return 0, 0, fmt.Errorf("diff_malformed: invalid hunk range %q", header)
-				}
-			}
-			if start == 0 && count != 0 {
-				return 0, 0, fmt.Errorf("diff_malformed: invalid hunk range %q", header)
-			}
-			return start, count, nil
+		if !strings.HasPrefix(field, "+") {
+			continue
 		}
+		start, count, err := parseRangeField(strings.TrimPrefix(field, "+"))
+		if err != nil {
+			return 0, 0, fmt.Errorf(invalidHunkRangeError, header)
+		}
+		return start, count, nil
 	}
 	return 0, 0, fmt.Errorf("diff_malformed: missing new-file range %q", header)
+}
+
+func parseRangeField(field string) (int, int, error) {
+	parts := strings.SplitN(field, ",", 2)
+	start, err := atoiNonNegative(parts[0])
+	if err != nil || (start == 0 && len(parts) != 2) {
+		return 0, 0, errors.New("invalid range start")
+	}
+	count, err := rangeCount(parts)
+	if err != nil {
+		return 0, 0, err
+	}
+	if start == 0 && count != 0 {
+		return 0, 0, errors.New("zero start with non-zero count")
+	}
+	return start, count, nil
+}
+
+func rangeCount(parts []string) (int, error) {
+	if len(parts) == 1 {
+		return 1, nil
+	}
+	return atoiNonNegative(parts[1])
+}
+
+func hunkRange(start, count int) core.LineRange {
+	rangeEnd := start + count - 1
+	if count == 0 {
+		rangeEnd = start
+	}
+	return core.LineRange{Start: start, End: rangeEnd}
 }
 
 func atoiNonNegative(value string) (int, error) {
