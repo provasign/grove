@@ -5,9 +5,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 
+	"github.com/provasign/grove/internal/cert"
 	"github.com/provasign/grove/internal/config"
 	"github.com/provasign/grove/internal/core"
 	"github.com/provasign/grove/internal/graph"
@@ -48,6 +50,8 @@ func Run(args []string) int {
 		return tests(engine, codeGraph, args[1:])
 	case "icr":
 		return icr(engine, codeGraph, args[1:])
+	case "certify":
+		return certify(engine, codeGraph, args[1:])
 	case "conflicts":
 		return conflicts(args[1:])
 	case "lock":
@@ -295,6 +299,41 @@ func icr(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int {
 	return printJSON(codeGraph.ComputeICR(intent))
 }
 
+func certify(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: grove certify <diff-file-or-> [dir]")
+		return 2
+	}
+	diffData, err := readDiffArg(args[0])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	cfg, err := config.Resolve(argOrDefault(args, 1, "."), 0)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	if err := prepareReadGraph(engine, codeGraph, cfg.Root, false); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	report := cert.CertifyDiff(codeGraph, core.DiffInput{UnifiedDiff: string(diffData)})
+	if code := printJSON(report); code != 0 {
+		return code
+	}
+	switch report.Verdict {
+	case core.VerdictAllow:
+		return 0
+	case core.VerdictManualReview:
+		return 2
+	case core.VerdictBlock:
+		return 3
+	default:
+		return 1
+	}
+}
+
 func conflicts(args []string) int {
 	if len(args) < 2 {
 		fmt.Fprintln(os.Stderr, "usage: grove conflicts <icr-json-or-base64-a> <icr-json-or-base64-b>")
@@ -407,6 +446,13 @@ func loadGraphFromStore(codeGraph *graph.CodeGraph, st *store.Store) error {
 	return nil
 }
 
+func readDiffArg(path string) ([]byte, error) {
+	if path == "-" {
+		return io.ReadAll(os.Stdin)
+	}
+	return os.ReadFile(path)
+}
+
 func stripRefresh(args []string) ([]string, bool) {
 	if len(args) == 0 {
 		return args, false
@@ -462,6 +508,7 @@ Usage:
   grove impact <symbol-or-file-query> [dir] [--refresh]
   grove tests <file> [dir] [--refresh]
   grove icr <intent> [dir] [--refresh]
+  grove certify <diff-file-or-> [dir]
   grove conflicts <icr-a> <icr-b>
   grove mcp [dir]                    stdio MCP server
 

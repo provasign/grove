@@ -120,3 +120,71 @@ type LockRecord struct {
 	AcquiredAt string `json:"acquiredAt"`
 	ExpiresAt  string `json:"expiresAt"`
 }
+
+type Verdict string
+
+const (
+	VerdictAllow        Verdict = "allow"
+	VerdictManualReview Verdict = "manual_review"
+	VerdictBlock        Verdict = "block"
+)
+
+type EvidenceSource string
+
+const (
+	EvidenceSourceASTKit     EvidenceSource = "astkit"
+	EvidenceSourceTreeSitter EvidenceSource = "tree_sitter"
+	EvidenceSourceHeuristic  EvidenceSource = "heuristic"
+	EvidenceSourceRegex      EvidenceSource = "regex"
+	EvidenceSourceUnknown    EvidenceSource = "unknown"
+)
+
+type EvidenceRef struct {
+	FilePath   string         `json:"filePath,omitempty"`
+	BlobSHA    string         `json:"blobSha,omitempty"`
+	Span       LineRange      `json:"span,omitempty"`
+	SymbolID   string         `json:"symbolId,omitempty"`
+	EdgeID     string         `json:"edgeId,omitempty"`
+	Source     EvidenceSource `json:"source"`
+	Confidence float64        `json:"confidence"`
+	Reason     string         `json:"reason,omitempty"`
+}
+
+type FindingSeverity string
+
+const (
+	FindingInfo    FindingSeverity = "info"
+	FindingWarning FindingSeverity = "warning"
+	FindingError   FindingSeverity = "error"
+)
+
+type CertificationFinding struct {
+	Severity FindingSeverity `json:"severity"`
+	Code     string          `json:"code"`
+	Message  string          `json:"message"`
+	Evidence []EvidenceRef   `json:"evidence,omitempty"`
+}
+
+type CertificationPolicy struct {
+	RequireTestsForCode bool `json:"requireTestsForCode"`
+}
+
+type DiffInput struct {
+	UnifiedDiff string              `json:"unifiedDiff"`
+	BaseRef     string              `json:"baseRef,omitempty"`
+	HeadRef     string              `json:"headRef,omitempty"`
+	Policy      CertificationPolicy `json:"policy,omitempty"`
+}
+
+type CertificationReport struct {
+	Version         int                    `json:"version"`
+	BaseRef         string                 `json:"baseRef,omitempty"`
+	HeadRef         string                 `json:"headRef,omitempty"`
+	ChangedFiles    []string               `json:"changedFiles"`
+	ChangedSymbols  []SymbolRecord         `json:"changedSymbols"`
+	ImpactedSymbols []SymbolRecord         `json:"impactedSymbols"`
+	Tests           []SymbolRecord         `json:"tests"`
+	Unknowns        []CertificationFinding `json:"unknowns,omitempty"`
+	Findings        []CertificationFinding `json:"findings,omitempty"`
+	Verdict         Verdict                `json:"verdict"`
+}

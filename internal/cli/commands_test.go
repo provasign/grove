@@ -34,6 +34,19 @@ func Logout(username string) {
 	if err := os.WriteFile(filepath.Join(dir, "auth.go"), src, 0o644); err != nil {
 		t.Fatalf("write fixture: %v", err)
 	}
+	testSrc := []byte(`package auth
+
+import "testing"
+
+func TestLogin(t *testing.T) {
+	if !Login("user", "pass") {
+		t.Fatal("login failed")
+	}
+}
+`)
+	if err := os.WriteFile(filepath.Join(dir, "auth_test.go"), testSrc, 0o644); err != nil {
+		t.Fatalf("write test fixture: %v", err)
+	}
 	return dir
 }
 
@@ -261,6 +274,36 @@ func TestRun_ReadWithoutIndexDoesNotCreateStore(t *testing.T) {
 
 func TestRun_ICRNoArgs(t *testing.T) {
 	if got := Run([]string{"icr"}); got != 2 {
+		t.Fatalf("want 2, got %d", got)
+	}
+}
+
+// --- certify ---
+
+func TestRun_Certify(t *testing.T) {
+	dir := goFixture(t)
+	if got := Run([]string{"index", dir}); got != 0 {
+		t.Fatalf("index: want 0, got %d", got)
+	}
+	diff := filepath.Join(dir, "change.diff")
+	if err := os.WriteFile(diff, []byte(`diff --git a/auth.go b/auth.go
+--- a/auth.go
++++ b/auth.go
+@@ -6,3 +6,3 @@
+  fmt.Println("login", username)
+-	return false
++	return true
+ }
+`), 0o644); err != nil {
+		t.Fatalf("write diff: %v", err)
+	}
+	if got := Run([]string{"certify", diff, dir}); got != 0 {
+		t.Fatalf("want 0, got %d", got)
+	}
+}
+
+func TestRun_CertifyNoArgs(t *testing.T) {
+	if got := Run([]string{"certify"}); got != 2 {
 		t.Fatalf("want 2, got %d", got)
 	}
 }

@@ -17,6 +17,8 @@ The difference is a graph. Grove indexes your source files into a persistent SQL
 
 Grove is the foundation all other Provasign tools are built on. Prism uses it to focus context. Fuse uses it to resolve conflicts. Provasign uses it to certify agent output. Without Grove, all three fall back to line-level operations.
 
+Grove also exposes a conservative certification report for unified diffs. This mode is additive: it does not change Provasign behavior unless Provasign explicitly opts into consuming the report. The report labels heuristic evidence, returns `manual_review` for unsupported or unmapped changes, and only returns `allow` when changed code maps cleanly to indexed symbols with required test evidence.
+
 ---
 
 ## Architecture
@@ -196,10 +198,28 @@ grove impact <symbol> [dir] [--refresh]
 # Which tests cover a symbol?
 grove tests <symbol> [dir] [--refresh]
 
+# Conservative structural certification for a unified diff.
+# Exit codes: 0 allow, 2 manual_review, 3 block, 1 runtime error.
+grove certify <diff-file-or-> [dir]
+
 # Start MCP stdio server (primary AI agent integration)
 grove mcp [dir]
 
 ```
+
+## Certification Mode
+
+`grove certify` and `pkg/grove.Engine.CertifyDiff` map unified diff hunks to indexed symbols and emit a JSON report containing changed files, changed symbols, impacted symbols, related tests, unknowns, findings, and a verdict.
+
+Verdicts are intentionally conservative:
+
+| Verdict | Meaning |
+|---------|---------|
+| `allow` | Grove mapped the diff to indexed symbols and found required evidence. |
+| `manual_review` | Grove could not prove enough structurally, for example unsupported files, ignored/sensitive paths, deleted/binary files, unmapped hunks, or missing test evidence. |
+| `block` | Grove could not process the diff deterministically, for example malformed diff input. |
+
+Certification mode is not a compiler or language-server resolver. Tree-sitter and astkit provide structural facts; language-native binding with `go/packages`, TypeScript language service, and similar resolvers is a later phase.
 
 ---
 

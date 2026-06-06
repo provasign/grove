@@ -11,6 +11,7 @@ import (
 	"errors"
 	"sync"
 
+	"github.com/provasign/grove/internal/cert"
 	"github.com/provasign/grove/internal/core"
 	"github.com/provasign/grove/internal/graph"
 	"github.com/provasign/grove/internal/index"
@@ -27,6 +28,12 @@ type (
 	IndexResult          = core.IndexResult
 	Status               = core.Status
 	IsolatedChangeRegion = core.IsolatedChangeRegion
+	DiffInput            = core.DiffInput
+	CertificationPolicy  = core.CertificationPolicy
+	CertificationReport  = core.CertificationReport
+	CertificationFinding = core.CertificationFinding
+	EvidenceRef          = core.EvidenceRef
+	Verdict              = core.Verdict
 	Scored               = struct {
 		Symbol *core.SymbolRecord
 		Score  float64
@@ -189,4 +196,11 @@ func (e *Engine) Tests(ctx context.Context, query string) ([]Symbol, error) {
 // ICR computes the Isolated Change Region for a given intent.
 func (e *Engine) ICR(ctx context.Context, intent string) IsolatedChangeRegion {
 	return e.currentGraph().ComputeICR(intent)
+}
+
+// CertifyDiff maps a unified diff onto the indexed graph and returns a
+// conservative structural certification report. The report is additive:
+// retrieval, MCP, and Provasign behavior do not change unless callers opt in.
+func (e *Engine) CertifyDiff(ctx context.Context, input DiffInput) (CertificationReport, error) {
+	return cert.CertifyDiff(e.currentGraph(), input), nil
 }
