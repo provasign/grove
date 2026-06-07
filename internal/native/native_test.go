@@ -4,10 +4,48 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/provasign/grove/internal/core"
 )
+
+func TestGoAnalyzerEnvSetsGoCacheAndHome(t *testing.T) {
+	root := t.TempDir()
+	env := goAnalyzerEnv(root)
+	var hasCache, hasHome bool
+	for _, e := range env {
+		if strings.HasPrefix(e, "GOCACHE=") {
+			hasCache = true
+		}
+		if strings.HasPrefix(e, "HOME=") {
+			hasHome = true
+		}
+	}
+	if !hasCache || !hasHome {
+		t.Fatalf("goAnalyzerEnv missing GOCACHE or HOME: %v", env)
+	}
+	if _, err := os.Stat(filepath.Join(root, ".grove", "go-build")); err != nil {
+		t.Fatalf("go-build dir not created: %v", err)
+	}
+}
+
+func TestPackageFilesRelativesGoFiles(t *testing.T) {
+	root := t.TempDir()
+	pkg := goListPackage{
+		Dir:     filepath.Join(root, "auth"),
+		GoFiles: []string{"auth.go", "login.go"},
+	}
+	got := packageFiles(root, pkg)
+	if len(got) != 2 {
+		t.Fatalf("got %d files, want 2: %v", len(got), got)
+	}
+	for _, f := range got {
+		if filepath.IsAbs(f) {
+			t.Fatalf("expected relative path, got %q", f)
+		}
+	}
+}
 
 func TestAnalyzeReportsSkippedPriorityAnalyzers(t *testing.T) {
 	root := t.TempDir()
