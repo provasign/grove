@@ -464,7 +464,7 @@ func mergeSymbolsByShape(astSyms, regexSyms []core.SymbolRecord) []core.SymbolRe
 }
 
 func symbolShapeKey(s core.SymbolRecord) string {
-	return s.Name + "\x00" + string(s.Kind) + "\x00" + s.ParentSymbol
+	return s.Name + "\x00" + string(s.Kind) + "\x00" + s.ParentSymbol + "\x00" + s.Signature
 }
 
 // attachDocstrings fills SymbolRecord.Docstring by looking at the source.

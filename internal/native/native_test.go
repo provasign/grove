@@ -222,7 +222,7 @@ func TestResolveAgainst(t *testing.T) {
 func TestAddPSR4(t *testing.T) {
 	out := map[string][]string{}
 	addPSR4(out, map[string]any{
-		"App\\": "src/",
+		"App\\":  "src/",
 		"Test\\": []any{"tests/", "extra/"},
 	})
 	if len(out["App\\"]) != 1 || out["App\\"][0] != "src/" {
@@ -656,6 +656,28 @@ func TestGoCallSiteEdgesResolveImportedCalls(t *testing.T) {
 	assertNativeEdge(t, edges, caller.ID, callee.ID, core.EdgeCalls)
 	typeEdges := goTypeUseEdges([]core.SymbolRecord{caller, callee, user})
 	assertNativeEdge(t, typeEdges, caller.ID, user.ID, core.EdgeUsesType)
+}
+
+func TestGoCallSiteEdgesPreferExactImportedPackage(t *testing.T) {
+	caller := core.SymbolRecord{
+		ID: "main.go::main@1", FilePath: "main.go",
+		Language: "go", Kind: core.KindFunction, Name: "main",
+		Imports:   []string{"example.com/app/auth", "example.com/app/other"},
+		CallSites: []core.CallSite{{Callee: "auth.Login", Line: 4}},
+	}
+	authLogin := core.SymbolRecord{
+		ID: "auth/auth.go::Login@1", FilePath: "auth/auth.go",
+		Language: "go", Kind: core.KindFunction, Name: "Login",
+	}
+	otherLogin := core.SymbolRecord{
+		ID: "other/auth.go::Login@1", FilePath: "other/auth.go",
+		Language: "go", Kind: core.KindFunction, Name: "Login",
+	}
+	edges := goCallSiteEdges([]core.SymbolRecord{caller, authLogin, otherLogin})
+	if len(edges) != 1 {
+		t.Fatalf("expected one edge, got %#v", edges)
+	}
+	assertNativeEdge(t, edges, caller.ID, authLogin.ID, core.EdgeCalls)
 }
 
 func TestRustModuleNames(t *testing.T) {

@@ -403,38 +403,75 @@ func countEdgesOfType(edges []core.Edge, edgeType core.EdgeType) int {
 }
 
 func goCallSiteEdges(symbols []core.SymbolRecord) []core.Edge {
-	byName := map[string][]core.SymbolRecord{}
-	for _, symbol := range symbols {
-		if symbol.Language == "go" && callableKind(symbol.Kind) {
-			byName[strings.ToLower(symbol.Name)] = append(byName[strings.ToLower(symbol.Name)], symbol)
-		}
-	}
 	var edges []core.Edge
 	seen := map[string]bool{}
 	for _, caller := range symbols {
 		if caller.Language != "go" || !callableKind(caller.Kind) {
 			continue
 		}
-		scope := goImportScope(caller, symbols)
 		for _, callSite := range caller.CallSites {
-			name := callSite.Callee
-			if i := strings.LastIndexByte(name, '.'); i >= 0 {
-				name = name[i+1:]
+			qualifier, name := splitGoCallSite(callSite.Callee)
+			if name == "" {
+				continue
 			}
-			for _, target := range byName[strings.ToLower(name)] {
-				if target.ID == caller.ID || !scope[target.FilePath] {
+			var targets []core.SymbolRecord
+			if qualifier == "" {
+				for _, symbol := range symbols {
+					if symbol.Language == "go" && symbol.Kind == core.KindFunction && symbol.Name == name && packageDir(symbol.FilePath) == packageDir(caller.FilePath) {
+						targets = append(targets, symbol)
+					}
+				}
+			} else {
+				targetPkg, ok := goImportedPackageForQualifier(caller.Imports, qualifier)
+				if !ok {
 					continue
 				}
-				key := caller.ID + "\x00" + target.ID
-				if seen[key] {
-					continue
+				for _, symbol := range symbols {
+					if symbol.Language != "go" || symbol.Kind != core.KindFunction || symbol.Name != name {
+						continue
+					}
+					if packageDir(symbol.FilePath) != targetPkg {
+						continue
+					}
+					targets = append(targets, symbol)
 				}
-				seen[key] = true
-				edges = append(edges, symbolEdge(caller, target, core.EdgeCalls, 0.99))
 			}
+			if len(targets) != 1 {
+				continue
+			}
+			target := targets[0]
+			if target.ID == caller.ID {
+				continue
+			}
+			key := caller.ID + "\x00" + target.ID
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			edges = append(edges, symbolEdge(caller, target, core.EdgeCalls, 0.99))
 		}
 	}
 	return edges
+}
+
+func splitGoCallSite(callee string) (string, string) {
+	if i := strings.LastIndexByte(callee, '.'); i >= 0 {
+		return callee[:i], callee[i+1:]
+	}
+	return "", callee
+}
+
+func goImportedPackageForQualifier(imports []string, qualifier string) (string, bool) {
+	for _, imp := range imports {
+		seg := imp
+		if i := strings.LastIndexByte(seg, '/'); i >= 0 {
+			seg = seg[i+1:]
+		}
+		if seg == qualifier {
+			return seg, true
+		}
+	}
+	return "", false
 }
 
 func goImportScope(caller core.SymbolRecord, symbols []core.SymbolRecord) map[string]bool {
