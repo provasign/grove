@@ -7,6 +7,7 @@ import (
 	"go/types"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -214,7 +215,10 @@ func TestResolveAgainst(t *testing.T) {
 		t.Fatalf("got %q", got)
 	}
 	// absolute path passes through
-	abs := filepath.FromSlash("/abs/foo.h")
+	abs := "/abs/foo.h"
+	if runtime.GOOS == "windows" {
+		abs = `C:\abs\foo.h`
+	}
 	if got := resolveAgainst("/base", abs); got != abs {
 		t.Fatalf("got %q", got)
 	}
