@@ -2,10 +2,14 @@ package native
 
 import (
 	"context"
+	"encoding/json"
+	"go/ast"
+	"go/types"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/provasign/grove/internal/core"
 )
@@ -45,6 +49,495 @@ func TestPackageFilesRelativesGoFiles(t *testing.T) {
 			t.Fatalf("expected relative path, got %q", f)
 		}
 	}
+}
+
+func TestIsFalseValues(t *testing.T) {
+	for _, v := range []string{"0", "false", "no", "off", "disabled", "FALSE", "OFF"} {
+		if !isFalse(v) {
+			t.Errorf("isFalse(%q) = false, want true", v)
+		}
+	}
+	for _, v := range []string{"1", "true", "yes", "on", "enabled", ""} {
+		if isFalse(v) {
+			t.Errorf("isFalse(%q) = true, want false", v)
+		}
+	}
+}
+
+func TestLanguageSetParsesCSV(t *testing.T) {
+	got := languageSet("go, rust, python")
+	if !got["go"] || !got["rust"] || !got["python"] || got["java"] {
+		t.Fatalf("unexpected language set: %v", got)
+	}
+}
+
+func TestFileSetBuildsMap(t *testing.T) {
+	got := fileSet([]string{"src/main.go", "auth/login.go"})
+	if !got["src/main.go"] || !got["auth/login.go"] || got["missing.go"] {
+		t.Fatalf("unexpected file set: %v", got)
+	}
+}
+
+func TestNativeImportEdge(t *testing.T) {
+	edge := nativeImportEdge("src/main.go", "include/auth.h", 0.95)
+	if edge.Type != core.EdgeImports || edge.Confidence != 0.95 || edge.Source != core.EvidenceSourceNative {
+		t.Fatalf("unexpected edge: %#v", edge)
+	}
+}
+
+func TestCountNativeEdges(t *testing.T) {
+	edges := []core.Edge{
+		{Type: core.EdgeCalls, Source: core.EvidenceSourceNative},
+		{Type: core.EdgeCalls, Source: core.EvidenceSourceNative},
+		{Type: core.EdgeUsesType, Source: core.EvidenceSourceNative},
+	}
+	if countNativeEdges(edges, core.EdgeCalls) != 2 {
+		t.Fatal("expected 2 call edges")
+	}
+	if countNativeEdges(edges, core.EdgeUsesType) != 1 {
+		t.Fatal("expected 1 type-use edge")
+	}
+}
+
+func TestFirstExistingExecutable(t *testing.T) {
+	got := firstExistingExecutable("no-such-tool-xyz", "go")
+	if got != "go" {
+		t.Fatalf("expected go, got %q", got)
+	}
+	if firstExistingExecutable("no-such-tool-xyz") != "" {
+		t.Fatal("expected empty when nothing found")
+	}
+}
+
+func TestBytesReader(t *testing.T) {
+	r := bytesReader([]byte("hello"))
+	if r.Len() != 5 {
+		t.Fatal("unexpected reader length")
+	}
+}
+
+func TestStringTrim(t *testing.T) {
+	if got := stringTrim([]byte("  hi  ")); got != "hi" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestJsonMarshalAndUnmarshal(t *testing.T) {
+	v := map[string]int{"a": 1}
+	data, err := jsonMarshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]int
+	if err := unmarshalJSON(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["a"] != 1 {
+		t.Fatalf("unexpected %v", got)
+	}
+}
+
+func TestOsReadFile(t *testing.T) {
+	f := filepath.Join(t.TempDir(), "f.txt")
+	if err := os.WriteFile(f, []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := osReadFile(f)
+	if err != nil || string(got) != "data" {
+		t.Fatalf("got %q, err %v", got, err)
+	}
+}
+
+func TestDecodeJSON(t *testing.T) {
+	data, _ := json.Marshal(map[string]string{"k": "v"})
+	got, err := decodeJSON[map[string]string](data)
+	if err != nil || got["k"] != "v" {
+		t.Fatalf("got %v, err %v", got, err)
+	}
+}
+
+func TestSymbolByFileAndName(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "1", FilePath: "auth/login.go", Name: "Login", Language: "go"},
+		{ID: "2", FilePath: "auth/login.go", Name: "Check", Language: "go", ParentSymbol: "Auth"},
+	}
+	m := symbolByFileAndName(syms, map[string]bool{"go": true})
+	if _, ok := m["auth/login.go\x00Login"]; !ok {
+		t.Fatal("missing Login key")
+	}
+	if _, ok := m["auth/login.go\x00Auth.Check"]; !ok {
+		t.Fatal("missing qualified Auth.Check key")
+	}
+	// non-matching language filtered out
+	m2 := symbolByFileAndName(syms, map[string]bool{"rust": true})
+	if len(m2) != 0 {
+		t.Fatalf("expected empty for rust: %v", m2)
+	}
+}
+
+func TestGlobAndFilesWithExt(t *testing.T) {
+	root := t.TempDir()
+	_ = os.WriteFile(filepath.Join(root, "main.go"), []byte(""), 0o644)
+	_ = os.WriteFile(filepath.Join(root, "auth.go"), []byte(""), 0o644)
+	_ = os.WriteFile(filepath.Join(root, "notes.txt"), []byte(""), 0o644)
+
+	matches := glob(root, "*.go")
+	if len(matches) != 2 {
+		t.Fatalf("glob: expected 2 .go files, got %v", matches)
+	}
+
+	goFiles := filesWithExt(root, ".go")
+	if len(goFiles) != 2 {
+		t.Fatalf("filesWithExt: expected 2 .go files, got %v", goFiles)
+	}
+	txtFiles := filesWithExt(root, ".txt")
+	if len(txtFiles) != 1 {
+		t.Fatalf("filesWithExt: expected 1 .txt file, got %v", txtFiles)
+	}
+}
+
+func TestFilesUnderDir(t *testing.T) {
+	files := []string{"src/auth.cs", "src/login.cs", "test/unit.cs", "README.md"}
+	got := filesUnderDir("src", files, ".cs")
+	if len(got) != 2 {
+		t.Fatalf("expected 2 cs files under src, got %v", got)
+	}
+	// dot dir means no prefix filter
+	all := filesUnderDir(".", files, ".cs")
+	if len(all) != 3 {
+		t.Fatalf("expected 3 cs files total, got %v", all)
+	}
+}
+
+func TestResolveAgainst(t *testing.T) {
+	if got := resolveAgainst("/base", "include/foo.h"); got != "/base/include/foo.h" {
+		t.Fatalf("got %q", got)
+	}
+	// absolute path passes through
+	if got := resolveAgainst("/base", "/abs/foo.h"); got != "/abs/foo.h" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestAddPSR4(t *testing.T) {
+	out := map[string][]string{}
+	addPSR4(out, map[string]any{
+		"App\\": "src/",
+		"Test\\": []any{"tests/", "extra/"},
+	})
+	if len(out["App\\"]) != 1 || out["App\\"][0] != "src/" {
+		t.Fatalf("unexpected App key: %v", out["App\\"])
+	}
+	if len(out["Test\\"]) != 2 {
+		t.Fatalf("unexpected Test key: %v", out["Test\\"])
+	}
+}
+
+func TestRustModuleEdgesResolvesModDecl(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(root, "src/main.rs"), []byte("mod auth;\nmod utils;\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(root, "src/auth.rs"), []byte(""), 0o644)
+	// utils.rs intentionally absent — edge should not be emitted
+
+	edges := rustModuleEdges(root, []string{"src/main.rs", "src/auth.rs"})
+	if len(edges) != 1 {
+		t.Fatalf("expected 1 edge for resolved auth, got %d: %v", len(edges), edges)
+	}
+	if edges[0].Type != core.EdgeImports {
+		t.Fatalf("expected EdgeImports, got %v", edges[0].Type)
+	}
+}
+
+func TestGoExprTypeName(t *testing.T) {
+	cases := []struct {
+		expr ast.Expr
+		want string
+	}{
+		{&ast.Ident{Name: "User"}, "User"},
+		{&ast.StarExpr{X: &ast.Ident{Name: "Repo"}}, "Repo"},
+		{&ast.SelectorExpr{Sel: &ast.Ident{Name: "Client"}}, "Client"},
+		{&ast.IndexExpr{X: &ast.Ident{Name: "Set"}}, "Set"},
+		{&ast.BasicLit{}, ""},
+	}
+	for _, tc := range cases {
+		if got := goExprTypeName(tc.expr); got != tc.want {
+			t.Errorf("goExprTypeName(%T) = %q, want %q", tc.expr, got, tc.want)
+		}
+	}
+}
+
+func TestConfigFromEnvAppliesOverrides(t *testing.T) {
+	t.Setenv("GROVE_NATIVE", "false")
+	t.Setenv("GROVE_NATIVE_LANGUAGES", "go,rust")
+	t.Setenv("GROVE_NATIVE_DISABLED_LANGUAGES", "php")
+	t.Setenv("GROVE_NATIVE_TIMEOUT", "5s")
+	cfg := ConfigFromEnv()
+	if cfg.Enabled {
+		t.Fatal("expected Enabled=false")
+	}
+	if !cfg.Languages["go"] || !cfg.Languages["rust"] {
+		t.Fatalf("unexpected languages: %v", cfg.Languages)
+	}
+	if !cfg.DisabledLanguages["php"] {
+		t.Fatalf("expected php disabled: %v", cfg.DisabledLanguages)
+	}
+	if cfg.Timeout != 5*time.Second {
+		t.Fatalf("unexpected timeout: %v", cfg.Timeout)
+	}
+
+	// test TIMEOUT_MS branch
+	t.Setenv("GROVE_NATIVE_TIMEOUT", "")
+	t.Setenv("GROVE_NATIVE_TIMEOUT_MS", "2000")
+	cfg2 := ConfigFromEnv()
+	if cfg2.Timeout != 2000*time.Millisecond {
+		t.Fatalf("unexpected timeout from ms: %v", cfg2.Timeout)
+	}
+}
+
+func TestGoTypeBaseNameCoversTypes(t *testing.T) {
+	pkg := types.NewPackage("example", "example")
+	named := types.NewNamed(types.NewTypeName(0, pkg, "User", nil), nil, nil)
+	if got := goTypeBaseName(named); got != "User" {
+		t.Fatalf("Named: got %q", got)
+	}
+	if got := goTypeBaseName(types.NewPointer(named)); got != "User" {
+		t.Fatalf("Pointer: got %q", got)
+	}
+	if got := goTypeBaseName(types.Typ[types.Int]); got != "" {
+		t.Fatalf("basic type: got %q, want empty", got)
+	}
+}
+
+func TestGoObjectDirsAllBranches(t *testing.T) {
+	pkg := types.NewPackage("github.com/example/auth", "auth")
+	m := map[string][]string{"github.com/example/auth": {"src/auth"}}
+
+	// pkg == nil
+	if got := goObjectDirs("src", nil, m); len(got) != 1 || got[0] != "src" {
+		t.Fatalf("nil pkg: got %v", got)
+	}
+	// pkg found in map
+	if got := goObjectDirs("src", pkg, m); len(got) != 1 || got[0] != "src/auth" {
+		t.Fatalf("found in map: got %v", got)
+	}
+	// pkg not found — returns currentDir
+	if got := goObjectDirs("src", pkg, map[string][]string{}); len(got) != 1 || got[0] != "src" {
+		t.Fatalf("not found: got %v", got)
+	}
+}
+
+func TestGoContainsTypeQualifiedName(t *testing.T) {
+	// The regex branch fires when the type appears only as pkg.TypeName.
+	if !goContainsType("func f() { var x auth.User }", "User") {
+		t.Fatal("expected qualified auth.User to match")
+	}
+	if goContainsType("func f() { var x int }", "User") {
+		t.Fatal("expected no match for absent type")
+	}
+}
+
+// ---- Available/Analyze methods that require no external tools ----
+
+func TestCFamilyAvailableChecksCompileCommands(t *testing.T) {
+	root := t.TempDir()
+	a := cFamilyAnalyzer{}
+	if a.Available(context.Background(), root).Available {
+		t.Fatal("expected not available without compile_commands.json")
+	}
+	_ = os.WriteFile(filepath.Join(root, "compile_commands.json"), []byte("[]"), 0o644)
+	if !a.Available(context.Background(), root).Available {
+		t.Fatal("expected available with compile_commands.json")
+	}
+}
+
+func TestCFamilyAnalyzeWithLocalFiles(t *testing.T) {
+	root := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(root, "include"), 0o755)
+	_ = os.WriteFile(filepath.Join(root, "include/auth.h"), []byte("struct Auth {};\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(root, "src/main.c"), []byte(`#include "auth.h"
+void login() {}
+`), 0o644)
+	_ = os.MkdirAll(filepath.Join(root, "src"), 0o755)
+	_ = os.WriteFile(filepath.Join(root, "src/main.c"), []byte(`#include "auth.h"
+void login() {}
+`), 0o644)
+	cmds := `[{"directory":"` + root + `","file":"` + root + `/src/main.c","arguments":["cc","-I","` + root + `/include","` + root + `/src/main.c"]}]`
+	_ = os.WriteFile(filepath.Join(root, "compile_commands.json"), []byte(cmds), 0o644)
+
+	a := cFamilyAnalyzer{}
+	result := a.Analyze(context.Background(), Request{
+		Root:  root,
+		Files: []string{"src/main.c", "include/auth.h"},
+	})
+	if len(result.Diagnostics) == 0 {
+		t.Fatal("expected diagnostics from cfamily analyze")
+	}
+}
+
+func TestCIncludeDirsParsesMixedFormats(t *testing.T) {
+	root := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(root, "include"), 0o755)
+	_ = os.MkdirAll(filepath.Join(root, "extra"), 0o755)
+	commands := []compileCommand{
+		{Directory: root, Arguments: []string{"cc", "-I", "include", "-Iextra", "-isystem", "include"}},
+		{Directory: root, Command: "cc -I include src/main.c"},
+	}
+	dirs := cIncludeDirs(root, commands)
+	if len(dirs) == 0 {
+		t.Fatal("expected some include dirs")
+	}
+}
+
+func TestCSharpAvailableChecksCsproj(t *testing.T) {
+	root := t.TempDir()
+	a := csharpAnalyzer{}
+	if a.Available(context.Background(), root).Available {
+		t.Fatal("expected not available without .csproj")
+	}
+	_ = os.WriteFile(filepath.Join(root, "App.csproj"), []byte("<Project/>"), 0o644)
+	if !a.Available(context.Background(), root).Available {
+		t.Fatal("expected available with .csproj")
+	}
+}
+
+func TestCSharpAnalyzeWithCsproj(t *testing.T) {
+	root := t.TempDir()
+	csproj := `<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <Compile Include="Auth.cs" />
+  </ItemGroup>
+</Project>`
+	_ = os.WriteFile(filepath.Join(root, "App.csproj"), []byte(csproj), 0o644)
+	_ = os.WriteFile(filepath.Join(root, "Auth.cs"), []byte("class Auth {}"), 0o644)
+
+	a := csharpAnalyzer{}
+	result := a.Analyze(context.Background(), Request{
+		Root:  root,
+		Files: []string{"Auth.cs"},
+	})
+	if len(result.Diagnostics) == 0 {
+		t.Fatal("expected diagnostics from csharp analyze")
+	}
+}
+
+func TestJavaAvailableNeedsProjectFiles(t *testing.T) {
+	root := t.TempDir()
+	a := javaAnalyzer{}
+	av := a.Available(context.Background(), root)
+	if av.Available {
+		t.Fatalf("expected not available without Maven/Gradle files, got: %q", av.Reason)
+	}
+}
+
+func TestJavaAnalyzeNoExternalTool(t *testing.T) {
+	a := javaAnalyzer{}
+	result := a.Analyze(context.Background(), Request{
+		Root:    t.TempDir(),
+		Symbols: []core.SymbolRecord{{ID: "1", Name: "Login", Language: "java", FilePath: "Auth.java", Kind: core.KindMethod, ParentSymbol: "Auth"}},
+		Files:   []string{"Auth.java"},
+	})
+	if len(result.Diagnostics) == 0 {
+		t.Fatal("expected diagnostics from java analyze")
+	}
+}
+
+func TestRustAvailableNeedsCargoToml(t *testing.T) {
+	root := t.TempDir()
+	a := rustAnalyzer{}
+	av := a.Available(context.Background(), root)
+	if av.Available {
+		t.Fatalf("expected not available without Cargo.toml, got: %q", av.Reason)
+	}
+}
+
+func TestJsTSAvailableNeedsProjectConfig(t *testing.T) {
+	root := t.TempDir()
+	a := jsTSAnalyzer{}
+	av := a.Available(context.Background(), root)
+	if av.Available {
+		t.Fatalf("expected not available without package.json/tsconfig.json, got: %q", av.Reason)
+	}
+}
+
+func TestPHPAvailableChecksComposerJSON(t *testing.T) {
+	root := t.TempDir()
+	a := phpAnalyzer{}
+	if a.Available(context.Background(), root).Available {
+		t.Fatal("expected not available without composer.json")
+	}
+	_ = os.WriteFile(filepath.Join(root, "composer.json"), []byte("{}"), 0o644)
+	if !a.Available(context.Background(), root).Available {
+		t.Fatal("expected available with composer.json")
+	}
+}
+
+func TestPHPAnalyzeReadsComposerJSON(t *testing.T) {
+	root := t.TempDir()
+	composer := `{"autoload":{"psr-4":{"App\\":"src/"}}}`
+	_ = os.WriteFile(filepath.Join(root, "composer.json"), []byte(composer), 0o644)
+	_ = os.MkdirAll(filepath.Join(root, "src"), 0o755)
+	_ = os.WriteFile(filepath.Join(root, "src/Auth.php"), []byte("<?php\nuse App\\User;\nclass Auth {}"), 0o644)
+
+	a := phpAnalyzer{}
+	result := a.Analyze(context.Background(), Request{
+		Root:  root,
+		Files: []string{"src/Auth.php"},
+	})
+	if len(result.Diagnostics) == 0 {
+		t.Fatal("expected diagnostics from php analyze")
+	}
+}
+
+func TestPythonAvailableWithProjectFile(t *testing.T) {
+	root := t.TempDir()
+	a := pythonAnalyzer{}
+	_ = os.WriteFile(filepath.Join(root, "requirements.txt"), []byte(""), 0o644)
+	// Covers anyFile() passing + firstExistingExecutable check
+	a.Available(context.Background(), root) // result depends on environment
+}
+
+func TestPythonAnalyzeWithRealInterpreter(t *testing.T) {
+	if firstExistingExecutable("python3", "python") == "" {
+		t.Skip("python3/python not available")
+	}
+	root := t.TempDir()
+	_ = os.WriteFile(filepath.Join(root, "requirements.txt"), []byte(""), 0o644)
+	_ = os.WriteFile(filepath.Join(root, "auth.py"), []byte(`
+class User:
+    pass
+
+class Auth:
+    def login(self, user: User) -> bool:
+        return True
+`), 0o644)
+
+	a := pythonAnalyzer{}
+	result := a.Analyze(context.Background(), Request{
+		Root:  root,
+		Files: []string{"auth.py"},
+	})
+	if len(result.Diagnostics) != 3 {
+		t.Fatalf("expected 3 diagnostics, got %d: %v", len(result.Diagnostics), result.Diagnostics)
+	}
+}
+
+func TestRustAvailableWithCargoToml(t *testing.T) {
+	root := t.TempDir()
+	a := rustAnalyzer{}
+	_ = os.WriteFile(filepath.Join(root, "Cargo.toml"), []byte("[package]\nname = \"test\"\n"), 0o644)
+	// Covers anyFile() passing + commandExists("cargo") check
+	a.Available(context.Background(), root) // result depends on environment
+}
+
+func TestJavaAvailableWithProjectFiles(t *testing.T) {
+	root := t.TempDir()
+	a := javaAnalyzer{}
+	_ = os.WriteFile(filepath.Join(root, "pom.xml"), []byte("<project/>"), 0o644)
+	// Covers anyFile() passing + firstExistingExecutable check
+	a.Available(context.Background(), root) // result depends on environment
 }
 
 func TestAnalyzeReportsSkippedPriorityAnalyzers(t *testing.T) {
