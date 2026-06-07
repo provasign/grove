@@ -210,7 +210,7 @@ func TestFilesUnderDir(t *testing.T) {
 }
 
 func TestResolveAgainst(t *testing.T) {
-	if got := resolveAgainst("/base", "include/foo.h"); got != "/base/include/foo.h" {
+	if got := resolveAgainst("/base", "include/foo.h"); got != filepath.Join("/base", "include/foo.h") {
 		t.Fatalf("got %q", got)
 	}
 	// absolute path passes through
