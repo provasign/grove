@@ -1159,6 +1159,64 @@ func TestLanguageDetectionNewLanguages(t *testing.T) {
 	}
 }
 
+func TestCPPClassMemberExtraction(t *testing.T) {
+	src := `class Repo {
+public:
+    Repo();
+    static void Save();
+};
+`
+	syms, err := extractSymbolsFromString("cpp", "repo.hpp", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := nameIndex(syms)
+	repo, ok := symbolByKind(syms, "Repo", core.KindClass)
+	if !ok {
+		t.Fatal("Repo class missing")
+	}
+	if repo.Kind != core.KindClass {
+		t.Fatalf("Repo kind = %q, want %q", repo.Kind, core.KindClass)
+	}
+	save, ok := byName["Save"]
+	if !ok {
+		t.Fatal("Save method missing")
+	}
+	if save.Kind != core.KindMethod {
+		t.Fatalf("Save kind = %q, want %q", save.Kind, core.KindMethod)
+	}
+	if save.ParentSymbol != "Repo" {
+		t.Fatalf("Save parentSymbol = %q, want Repo", save.ParentSymbol)
+	}
+	byQualified := qualifiedNameIndex(syms)
+	ctor := byQualified["Repo.Repo"]
+	if ctor.Kind != core.KindConstructor {
+		t.Fatalf("Repo constructor kind = %q, want %q", ctor.Kind, core.KindConstructor)
+	}
+}
+
+func TestCPPOverloadedMemberExtraction(t *testing.T) {
+	src := `class Repo {
+public:
+    void Save();
+    void Save(int retries);
+};
+`
+	syms, err := extractSymbolsFromString("cpp", "repo.hpp", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var saveCount int
+	for _, s := range syms {
+		if s.Name == "Save" && s.Kind == core.KindMethod && s.ParentSymbol == "Repo" {
+			saveCount++
+		}
+	}
+	if saveCount != 2 {
+		t.Fatalf("Save method count = %d, want 2; symbols=%#v", saveCount, syms)
+	}
+}
+
 // nameIndex builds a map[name]SymbolRecord for assertion helpers.
 func nameIndex(syms []core.SymbolRecord) map[string]core.SymbolRecord {
 	m := make(map[string]core.SymbolRecord, len(syms))
@@ -1166,4 +1224,21 @@ func nameIndex(syms []core.SymbolRecord) map[string]core.SymbolRecord {
 		m[s.Name] = s
 	}
 	return m
+}
+
+func qualifiedNameIndex(syms []core.SymbolRecord) map[string]core.SymbolRecord {
+	m := make(map[string]core.SymbolRecord, len(syms))
+	for _, s := range syms {
+		m[s.QualifiedName] = s
+	}
+	return m
+}
+
+func symbolByKind(syms []core.SymbolRecord, name string, kind core.SymbolKind) (core.SymbolRecord, bool) {
+	for _, s := range syms {
+		if s.Name == name && s.Kind == kind {
+			return s, true
+		}
+	}
+	return core.SymbolRecord{}, false
 }

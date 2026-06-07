@@ -72,10 +72,11 @@ const (
 )
 
 type Edge struct {
-	From       string   `json:"from"`
-	To         string   `json:"to"`
-	Type       EdgeType `json:"type"`
-	Confidence float64  `json:"confidence"`
+	From       string         `json:"from"`
+	To         string         `json:"to"`
+	Type       EdgeType       `json:"type"`
+	Confidence float64        `json:"confidence"`
+	Source     EvidenceSource `json:"source,omitempty"`
 }
 
 type Status struct {
@@ -95,6 +96,7 @@ type IndexResult struct {
 	SymbolCount  int      `json:"symbolCount"`
 	EdgeCount    int      `json:"edgeCount"`
 	Errors       []string `json:"errors,omitempty"`
+	Native       []string `json:"native,omitempty"`
 }
 
 type IsolatedChangeRegion struct {
@@ -134,6 +136,7 @@ type EvidenceSource string
 const (
 	EvidenceSourceASTKit     EvidenceSource = "astkit"
 	EvidenceSourceTreeSitter EvidenceSource = "tree_sitter"
+	EvidenceSourceNative     EvidenceSource = "native"
 	EvidenceSourceHeuristic  EvidenceSource = "heuristic"
 	EvidenceSourceRegex      EvidenceSource = "regex"
 	EvidenceSourceUnknown    EvidenceSource = "unknown"

@@ -8,17 +8,27 @@ import (
 
 	"github.com/provasign/grove/internal/core"
 	"github.com/provasign/grove/internal/graph"
+	"github.com/provasign/grove/internal/native"
 	"github.com/provasign/grove/internal/parser"
 	"github.com/provasign/grove/internal/store"
 )
 
 type Indexer struct {
-	parser *parser.Engine
-	store  *store.Store
+	parser       *parser.Engine
+	store        *store.Store
+	nativeConfig native.Config
 }
 
 func New(parser *parser.Engine, store *store.Store) *Indexer {
-	return &Indexer{parser: parser, store: store}
+	return &Indexer{parser: parser, store: store, nativeConfig: native.ConfigFromEnv()}
+}
+
+func NewWithNativeConfig(parser *parser.Engine, store *store.Store, cfg native.Config) *Indexer {
+	return &Indexer{parser: parser, store: store, nativeConfig: cfg}
+}
+
+func (i *Indexer) SetNativeConfig(cfg native.Config) {
+	i.nativeConfig = cfg
 }
 
 func (i *Indexer) Index(ctx context.Context, root string) (*graph.CodeGraph, core.IndexResult, error) {
@@ -26,6 +36,13 @@ func (i *Indexer) Index(ctx context.Context, root string) (*graph.CodeGraph, cor
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
 		return nil, result, err
+	}
+	// Resolve symlinks so that external tools (compile_commands.json, go list,
+	// cargo metadata) which emit real paths stay consistent with our root.
+	// On macOS /tmp is a symlink to /private/tmp; without this relFile() fails
+	// to relativize those absolute paths.
+	if resolved, err2 := filepath.EvalSymlinks(absRoot); err2 == nil {
+		absRoot = resolved
 	}
 	root = absRoot
 	result.Root = root
@@ -98,8 +115,11 @@ func (i *Indexer) Index(ctx context.Context, root string) (*graph.CodeGraph, cor
 	if err != nil {
 		return nil, result, err
 	}
+	nativeResult := native.AnalyzeWithConfig(ctx, root, symbols, i.nativeConfig)
+	result.Native = append(result.Native, nativeResult.Diagnostics...)
+
 	codeGraph := graph.New()
-	codeGraph.Replace(symbols, result.FilesSeen)
+	codeGraph.ReplaceWithEdges(symbols, nativeResult.Edges, result.FilesSeen)
 	_, edges := codeGraph.Snapshot()
 	if err := i.store.ReplaceEdges(ctx, edges); err != nil {
 		return nil, result, err

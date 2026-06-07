@@ -74,6 +74,7 @@ func (s *Store) runAlterMigrations(ctx context.Context) error {
 		`ALTER TABLE symbols ADD COLUMN type_parameters TEXT NOT NULL DEFAULT '[]'`,
 		`ALTER TABLE symbols ADD COLUMN annotations     TEXT NOT NULL DEFAULT '[]'`,
 		`ALTER TABLE symbols ADD COLUMN call_sites      TEXT NOT NULL DEFAULT '[]'`,
+		`ALTER TABLE edges ADD COLUMN source            TEXT NOT NULL DEFAULT 'unknown'`,
 	}
 	for _, stmt := range alters {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
@@ -198,9 +199,9 @@ func (s *Store) ReplaceEdges(ctx context.Context, edges []core.Edge) error {
 	for _, edge := range edges {
 		id := fmt.Sprintf("%s::%s::%s", edge.From, edge.Type, edge.To)
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO edges (id, from_node, to_node, edge_type, confidence) VALUES (?, ?, ?, ?, ?)
-			 ON CONFLICT(id) DO UPDATE SET confidence = excluded.confidence`,
-			id, edge.From, edge.To, string(edge.Type), edge.Confidence,
+			`INSERT INTO edges (id, from_node, to_node, edge_type, confidence, source) VALUES (?, ?, ?, ?, ?, ?)
+			 ON CONFLICT(id) DO UPDATE SET confidence = excluded.confidence, source = excluded.source`,
+			id, edge.From, edge.To, string(edge.Type), edge.Confidence, string(edge.Source),
 		); err != nil {
 			return err
 		}
@@ -299,6 +300,30 @@ func (s *Store) AllSymbols(ctx context.Context) ([]core.SymbolRecord, error) {
 		symbols = append(symbols, symbol)
 	}
 	return symbols, rows.Err()
+}
+
+func (s *Store) AllEdges(ctx context.Context) ([]core.Edge, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT from_node, to_node, edge_type, confidence, COALESCE(source, 'unknown')
+		FROM edges
+		ORDER BY from_node, edge_type, to_node
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var edges []core.Edge
+	for rows.Next() {
+		var edge core.Edge
+		var typ, source string
+		if err := rows.Scan(&edge.From, &edge.To, &typ, &edge.Confidence, &source); err != nil {
+			return nil, err
+		}
+		edge.Type = core.EdgeType(typ)
+		edge.Source = core.EvidenceSource(source)
+		edges = append(edges, edge)
+	}
+	return edges, rows.Err()
 }
 
 // SearchFTS5 runs a full-text search against the symbols_fts virtual table.
@@ -521,7 +546,8 @@ CREATE TABLE IF NOT EXISTS edges (
     from_node  TEXT NOT NULL,
     to_node    TEXT NOT NULL,
     edge_type  TEXT NOT NULL,
-    confidence REAL NOT NULL DEFAULT 1.0
+    confidence REAL NOT NULL DEFAULT 1.0,
+    source     TEXT NOT NULL DEFAULT 'unknown'
 );
 
 CREATE INDEX IF NOT EXISTS idx_edge_from ON edges(from_node);
