@@ -278,6 +278,60 @@ $x = new \App\Model\User();
 	}
 }
 
+func TestPHPSemanticEdgesResolveClassAwareBindings(t *testing.T) {
+	psr4 := map[string][]string{"App\\": {"src"}}
+	scope := map[string]bool{
+		"src/Service/AuthService.php": true,
+		"src/Service/BaseService.php": true,
+		"src/Contract/Loginable.php":  true,
+		"src/Support/Loggable.php":    true,
+		"src/Repo/UserRepo.php":       true,
+	}
+	symbols := []core.SymbolRecord{
+		{
+			ID: "src/Service/BaseService.php::BaseService@1", FilePath: "src/Service/BaseService.php",
+			Language: "php", Kind: core.KindClass, Name: "BaseService",
+		},
+		{
+			ID: "src/Contract/Loginable.php::Loginable@1", FilePath: "src/Contract/Loginable.php",
+			Language: "php", Kind: core.KindInterface, Name: "Loginable",
+		},
+		{
+			ID: "src/Support/Loggable.php::Loggable@1", FilePath: "src/Support/Loggable.php",
+			Language: "php", Kind: core.KindTrait, Name: "Loggable",
+		},
+		{
+			ID: "src/Repo/UserRepo.php::UserRepo@1", FilePath: "src/Repo/UserRepo.php",
+			Language: "php", Kind: core.KindClass, Name: "UserRepo",
+		},
+		{
+			ID: "src/Repo/UserRepo.php::__construct@1", FilePath: "src/Repo/UserRepo.php",
+			Language: "php", Kind: core.KindMethod, Name: "__construct", ParentSymbol: "UserRepo",
+		},
+		{
+			ID: "src/Repo/UserRepo.php::create@1", FilePath: "src/Repo/UserRepo.php",
+			Language: "php", Kind: core.KindMethod, Name: "create", ParentSymbol: "UserRepo",
+		},
+		{
+			ID: "src/Service/AuthService.php::AuthService@1", FilePath: "src/Service/AuthService.php",
+			Language: "php", Kind: core.KindClass, Name: "AuthService",
+			RawText: `class AuthService extends BaseService implements Loginable { use Loggable; }`,
+		},
+		{
+			ID: "src/Service/AuthService.php::login@1", FilePath: "src/Service/AuthService.php",
+			Language: "php", Kind: core.KindMethod, Name: "login", ParentSymbol: "AuthService",
+			RawText: `public function login(): UserRepo { $repo = new UserRepo(); UserRepo::create(); return $repo; }`,
+		},
+	}
+	edges := phpSemanticEdges(symbols, psr4, scope)
+	assertNativeEdge(t, edges, "src/Service/AuthService.php::AuthService@1", "src/Service/BaseService.php::BaseService@1", core.EdgeExtends)
+	assertNativeEdge(t, edges, "src/Service/AuthService.php::AuthService@1", "src/Contract/Loginable.php::Loginable@1", core.EdgeImplements)
+	assertNativeEdge(t, edges, "src/Service/AuthService.php::AuthService@1", "src/Support/Loggable.php::Loggable@1", core.EdgeImplements)
+	assertNativeEdge(t, edges, "src/Service/AuthService.php::login@1", "src/Repo/UserRepo.php::create@1", core.EdgeCalls)
+	assertNativeEdge(t, edges, "src/Service/AuthService.php::login@1", "src/Repo/UserRepo.php::__construct@1", core.EdgeCalls)
+	assertNativeEdge(t, edges, "src/Service/AuthService.php::login@1", "src/Repo/UserRepo.php::UserRepo@1", core.EdgeUsesType)
+}
+
 func TestLexicalSemanticEdgesResolveSameFileCallsAndTypes(t *testing.T) {
 	symbols := []core.SymbolRecord{
 		{
