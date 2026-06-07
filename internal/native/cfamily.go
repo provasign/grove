@@ -43,6 +43,7 @@ func (cFamilyAnalyzer) Analyze(ctx context.Context, req Request) Result {
 	includeDirs := cIncludeDirs(req.Root, commands)
 	fileScope := fileSet(req.Files)
 	var edges []core.Edge
+	includeTargets := map[string][]string{}
 	for _, file := range req.Files {
 		content, err := osReadFile(filepath.Join(req.Root, file))
 		if err != nil {
@@ -51,11 +52,12 @@ func (cFamilyAnalyzer) Analyze(ctx context.Context, req Request) Result {
 		for _, inc := range cIncludes(string(content)) {
 			if target, ok := resolveCInclude(req.Root, file, inc, includeDirs, fileScope); ok {
 				edges = append(edges, nativeImportEdge(file, target, 0.95))
+				includeTargets[file] = append(includeTargets[file], target)
 			}
 		}
 	}
 	includeCount := len(edges)
-	semanticEdges := lexicalSemanticEdges(req.Symbols, map[string]bool{"c": true, "cpp": true}, 0.9, 0.88)
+	semanticEdges := cFamilySemanticEdges(req.Symbols, includeTargets)
 	edges = append(edges, semanticEdges...)
 	return Result{
 		Edges: edges,
@@ -152,4 +154,189 @@ func resolveAgainst(base, path string) string {
 		return path
 	}
 	return filepath.Join(base, path)
+}
+
+type cFamilyIndex struct {
+	byFile       map[string][]core.SymbolRecord
+	typesByName  map[string][]core.SymbolRecord
+	methods      map[string][]core.SymbolRecord
+	functions    map[string][]core.SymbolRecord
+	ctors        map[string][]core.SymbolRecord
+	methodsByCls map[string][]core.SymbolRecord
+}
+
+func newCFamilyIndex(symbols []core.SymbolRecord) cFamilyIndex {
+	idx := cFamilyIndex{
+		byFile:       map[string][]core.SymbolRecord{},
+		typesByName:  map[string][]core.SymbolRecord{},
+		methods:      map[string][]core.SymbolRecord{},
+		functions:    map[string][]core.SymbolRecord{},
+		ctors:        map[string][]core.SymbolRecord{},
+		methodsByCls: map[string][]core.SymbolRecord{},
+	}
+	for _, symbol := range symbols {
+		if symbol.Language != "c" && symbol.Language != "cpp" {
+			continue
+		}
+		idx.byFile[symbol.FilePath] = append(idx.byFile[symbol.FilePath], symbol)
+		if typeKind(symbol.Kind) {
+			idx.typesByName[symbol.Name] = append(idx.typesByName[symbol.Name], symbol)
+		}
+		switch symbol.Kind {
+		case core.KindFunction:
+			idx.functions[symbol.Name] = append(idx.functions[symbol.Name], symbol)
+		case core.KindMethod:
+			key := symbol.ParentSymbol + "::" + symbol.Name
+			idx.methods[key] = append(idx.methods[key], symbol)
+			idx.methodsByCls[symbol.ParentSymbol] = append(idx.methodsByCls[symbol.ParentSymbol], symbol)
+		case core.KindConstructor:
+			idx.ctors[symbol.ParentSymbol] = append(idx.ctors[symbol.ParentSymbol], symbol)
+		}
+	}
+	return idx
+}
+
+func cFamilySemanticEdges(symbols []core.SymbolRecord, includeTargets map[string][]string) []core.Edge {
+	idx := newCFamilyIndex(symbols)
+	var edges []core.Edge
+	seen := map[string]bool{}
+	add := func(edge core.Edge) {
+		key := edge.From + "\x00" + string(edge.Type) + "\x00" + edge.To
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		edges = append(edges, edge)
+	}
+	for _, caller := range symbols {
+		if (caller.Language != "c" && caller.Language != "cpp") || caller.RawText == "" || !callableKind(caller.Kind) {
+			continue
+		}
+		scopeFiles := cFamilyScopeFiles(caller.FilePath, includeTargets)
+		for _, file := range scopeFiles {
+			for _, target := range idx.byFile[file] {
+				if target.ID == caller.ID {
+					continue
+				}
+				if callableKind(target.Kind) && cFamilyContainsCallable(caller.RawText, target, file != caller.FilePath) {
+					add(symbolEdge(caller, target, core.EdgeCalls, 0.93))
+				}
+				if typeKind(target.Kind) && cFamilyContainsType(caller.RawText, target, file != caller.FilePath) {
+					add(symbolEdge(caller, target, core.EdgeUsesType, 0.91))
+				}
+			}
+		}
+		for _, call := range cFamilyQualifiedCalls(caller.RawText) {
+			for _, method := range idx.methods[call.Qualifier+"::"+call.Method] {
+				if method.ID != caller.ID {
+					add(symbolEdge(caller, method, core.EdgeCalls, 0.95))
+				}
+			}
+		}
+		for _, typeName := range cFamilyConstructedTypes(caller.RawText) {
+			if target, ok := cFamilyBestType(idx, typeName, caller.FilePath); ok && target.ID != caller.ID {
+				add(symbolEdge(caller, target, core.EdgeUsesType, 0.93))
+			}
+			for _, ctor := range idx.ctors[typeName] {
+				if ctor.ID != caller.ID {
+					add(symbolEdge(caller, ctor, core.EdgeCalls, 0.95))
+				}
+			}
+		}
+	}
+	return edges
+}
+
+func cFamilyScopeFiles(fromFile string, includeTargets map[string][]string) []string {
+	seen := map[string]bool{fromFile: true}
+	out := []string{fromFile}
+	for _, target := range includeTargets[fromFile] {
+		if !seen[target] {
+			seen[target] = true
+			out = append(out, target)
+		}
+	}
+	return out
+}
+
+func cFamilyContainsCallable(rawText string, target core.SymbolRecord, crossFile bool) bool {
+	if !crossFile {
+		return containsCall(rawText, target.Name)
+	}
+	if target.ParentSymbol != "" {
+		pattern := regexp.MustCompile(`\b` + regexp.QuoteMeta(target.ParentSymbol) + `::` + regexp.QuoteMeta(target.Name) + `\s*\(`)
+		if pattern.MatchString(stripQuotedText(rawText)) {
+			return true
+		}
+	}
+	return containsCall(rawText, target.Name)
+}
+
+func cFamilyContainsType(rawText string, target core.SymbolRecord, crossFile bool) bool {
+	if !crossFile {
+		return containsTypeToken(rawText, target.Name)
+	}
+	if target.ParentSymbol != "" {
+		pattern := regexp.MustCompile(`\b` + regexp.QuoteMeta(target.ParentSymbol) + `::` + regexp.QuoteMeta(target.Name) + `\b`)
+		if pattern.MatchString(stripQuotedText(rawText)) {
+			return true
+		}
+	}
+	return containsTypeToken(rawText, target.Name)
+}
+
+type cFamilyQualifiedCall struct {
+	Qualifier string
+	Method    string
+}
+
+var cFamilyQualifiedCallPattern = regexp.MustCompile(`\b([A-Z_][A-Za-z0-9_]*)::([A-Za-z_][A-Za-z0-9_]*)\s*\(`)
+
+func cFamilyQualifiedCalls(rawText string) []cFamilyQualifiedCall {
+	matches := cFamilyQualifiedCallPattern.FindAllStringSubmatch(stripQuotedText(rawText), -1)
+	out := make([]cFamilyQualifiedCall, 0, len(matches))
+	for _, match := range matches {
+		if len(match) == 3 {
+			out = append(out, cFamilyQualifiedCall{Qualifier: match[1], Method: match[2]})
+		}
+	}
+	return out
+}
+
+var cFamilyConstructorPattern = regexp.MustCompile(`\b(?:new\s+)?([A-Z_][A-Za-z0-9_]*)\s*\(`)
+
+func cFamilyConstructedTypes(rawText string) []string {
+	matches := cFamilyConstructorPattern.FindAllStringSubmatch(stripQuotedText(rawText), -1)
+	seen := map[string]bool{}
+	var out []string
+	for _, match := range matches {
+		if len(match) != 2 {
+			continue
+		}
+		name := match[1]
+		if name != "" && !seen[name] {
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+func cFamilyBestType(idx cFamilyIndex, name, fromFile string) (core.SymbolRecord, bool) {
+	candidates := idx.typesByName[name]
+	if len(candidates) == 0 {
+		return core.SymbolRecord{}, false
+	}
+	for _, candidate := range candidates {
+		if candidate.FilePath == fromFile {
+			return candidate, true
+		}
+	}
+	fromDir := packageDir(fromFile)
+	for _, candidate := range candidates {
+		if packageDir(candidate.FilePath) == fromDir {
+			return candidate, true
+		}
+	}
+	return candidates[0], true
 }

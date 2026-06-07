@@ -176,6 +176,53 @@ func TestCIncludes(t *testing.T) {
 	}
 }
 
+func TestCFamilySemanticEdgesUseIncludedHeaderScope(t *testing.T) {
+	symbols := []core.SymbolRecord{
+		{
+			ID: "src/main.c::run@1", FilePath: "src/main.c",
+			Language: "c", Kind: core.KindFunction, Name: "run",
+			RawText: `void run() { User u; save(&u); }`,
+		},
+		{
+			ID: "include/auth.h::User@1", FilePath: "include/auth.h",
+			Language: "c", Kind: core.KindStruct, Name: "User",
+		},
+		{
+			ID: "include/auth.h::save@1", FilePath: "include/auth.h",
+			Language: "c", Kind: core.KindFunction, Name: "save",
+		},
+	}
+	edges := cFamilySemanticEdges(symbols, map[string][]string{"src/main.c": {"include/auth.h"}})
+	assertNativeEdge(t, edges, "src/main.c::run@1", "include/auth.h::save@1", core.EdgeCalls)
+	assertNativeEdge(t, edges, "src/main.c::run@1", "include/auth.h::User@1", core.EdgeUsesType)
+}
+
+func TestCFamilySemanticEdgesResolveCppQualifiedCallsAndConstructors(t *testing.T) {
+	symbols := []core.SymbolRecord{
+		{
+			ID: "src/main.cpp::run@1", FilePath: "src/main.cpp",
+			Language: "cpp", Kind: core.KindFunction, Name: "run",
+			RawText: `void run() { Repo::Save(); Repo repo = Repo(); }`,
+		},
+		{
+			ID: "include/repo.hpp::Repo@1", FilePath: "include/repo.hpp",
+			Language: "cpp", Kind: core.KindClass, Name: "Repo",
+		},
+		{
+			ID: "include/repo.hpp::Repo_ctor@1", FilePath: "include/repo.hpp",
+			Language: "cpp", Kind: core.KindConstructor, Name: "Repo", ParentSymbol: "Repo",
+		},
+		{
+			ID: "include/repo.hpp::Save@1", FilePath: "include/repo.hpp",
+			Language: "cpp", Kind: core.KindMethod, Name: "Save", ParentSymbol: "Repo",
+		},
+	}
+	edges := cFamilySemanticEdges(symbols, map[string][]string{"src/main.cpp": {"include/repo.hpp"}})
+	assertNativeEdge(t, edges, "src/main.cpp::run@1", "include/repo.hpp::Save@1", core.EdgeCalls)
+	assertNativeEdge(t, edges, "src/main.cpp::run@1", "include/repo.hpp::Repo_ctor@1", core.EdgeCalls)
+	assertNativeEdge(t, edges, "src/main.cpp::run@1", "include/repo.hpp::Repo@1", core.EdgeUsesType)
+}
+
 func TestResolveCIncludeUsesFileDirAndIncludeDirs(t *testing.T) {
 	scope := map[string]bool{
 		"src/local.h":      true,
