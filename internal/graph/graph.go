@@ -50,6 +50,10 @@ func New() *CodeGraph {
 }
 
 func (g *CodeGraph) Replace(symbols []core.SymbolRecord, filesIndexed int) {
+	g.ReplaceWithEdges(symbols, nil, filesIndexed)
+}
+
+func (g *CodeGraph) ReplaceWithEdges(symbols []core.SymbolRecord, extraEdges []core.Edge, filesIndexed int) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
@@ -57,13 +61,51 @@ func (g *CodeGraph) Replace(symbols []core.SymbolRecord, filesIndexed int) {
 	for _, s := range symbols {
 		g.symbols[s.ID] = s
 	}
-	g.edges = BuildEdges(symbols)
+	g.edges = mergeEdges(BuildEdges(symbols), extraEdges)
 	g.filesIndexed = filesIndexed
 
 	g.semMu.Lock()
 	g.semDirty = true
 	g.semEngine = nil
 	g.semMu.Unlock()
+}
+
+// mergeEdges overlays native analyzer edges onto baseline graph edges. For a
+// duplicate (from, type, to), the higher-confidence edge wins.
+func mergeEdges(base, enriched []core.Edge) []core.Edge {
+	type key struct {
+		from string
+		to   string
+		typ  core.EdgeType
+	}
+	ordered := make([]key, 0, len(base)+len(enriched))
+	byKey := make(map[key]core.Edge, len(base)+len(enriched))
+	add := func(edge core.Edge) {
+		if edge.Source == "" {
+			edge.Source = core.EvidenceSourceUnknown
+		}
+		k := key{from: edge.From, to: edge.To, typ: edge.Type}
+		existing, ok := byKey[k]
+		if !ok {
+			ordered = append(ordered, k)
+			byKey[k] = edge
+			return
+		}
+		if edge.Confidence > existing.Confidence {
+			byKey[k] = edge
+		}
+	}
+	for _, edge := range base {
+		add(edge)
+	}
+	for _, edge := range enriched {
+		add(edge)
+	}
+	out := make([]core.Edge, 0, len(ordered))
+	for _, k := range ordered {
+		out = append(out, byKey[k])
+	}
+	return out
 }
 
 // BuildEdges constructs all 8 edge types from the symbol set.

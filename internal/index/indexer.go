@@ -8,6 +8,7 @@ import (
 
 	"github.com/provasign/grove/internal/core"
 	"github.com/provasign/grove/internal/graph"
+	"github.com/provasign/grove/internal/native"
 	"github.com/provasign/grove/internal/parser"
 	"github.com/provasign/grove/internal/store"
 )
@@ -98,8 +99,11 @@ func (i *Indexer) Index(ctx context.Context, root string) (*graph.CodeGraph, cor
 	if err != nil {
 		return nil, result, err
 	}
+	nativeResult := native.Analyze(ctx, root, symbols)
+	result.Native = append(result.Native, nativeResult.Diagnostics...)
+
 	codeGraph := graph.New()
-	codeGraph.Replace(symbols, result.FilesSeen)
+	codeGraph.ReplaceWithEdges(symbols, nativeResult.Edges, result.FilesSeen)
 	_, edges := codeGraph.Snapshot()
 	if err := i.store.ReplaceEdges(ctx, edges); err != nil {
 		return nil, result, err
