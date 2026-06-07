@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -13,6 +14,41 @@ import (
 )
 
 const defaultTimeout = 5 * time.Second
+
+type Config struct {
+	Enabled           bool
+	Languages         map[string]bool
+	DisabledLanguages map[string]bool
+	Timeout           time.Duration
+}
+
+func DefaultConfig() Config {
+	return Config{Enabled: true, Timeout: defaultTimeout}
+}
+
+func ConfigFromEnv() Config {
+	cfg := DefaultConfig()
+	if value := strings.TrimSpace(os.Getenv("GROVE_NATIVE")); value != "" {
+		cfg.Enabled = !isFalse(value)
+	}
+	if value := strings.TrimSpace(os.Getenv("GROVE_NATIVE_LANGUAGES")); value != "" {
+		cfg.Languages = languageSet(value)
+	}
+	if value := strings.TrimSpace(os.Getenv("GROVE_NATIVE_DISABLED_LANGUAGES")); value != "" {
+		cfg.DisabledLanguages = languageSet(value)
+	}
+	if value := strings.TrimSpace(os.Getenv("GROVE_NATIVE_TIMEOUT")); value != "" {
+		if d, err := time.ParseDuration(value); err == nil && d > 0 {
+			cfg.Timeout = d
+		}
+	}
+	if value := strings.TrimSpace(os.Getenv("GROVE_NATIVE_TIMEOUT_MS")); value != "" {
+		if ms, err := strconv.Atoi(value); err == nil && ms > 0 {
+			cfg.Timeout = time.Duration(ms) * time.Millisecond
+		}
+	}
+	return cfg
+}
 
 // Analyzer enriches the tree-sitter/astkit symbol graph with project-native
 // facts from compiler, package-manager, or language-server tooling.
@@ -53,9 +89,23 @@ func PriorityAnalyzers() []Analyzer {
 }
 
 func Analyze(ctx context.Context, root string, symbols []core.SymbolRecord) Result {
+	return AnalyzeWithConfig(ctx, root, symbols, ConfigFromEnv())
+}
+
+func AnalyzeWithConfig(ctx context.Context, root string, symbols []core.SymbolRecord, cfg Config) Result {
+	if !cfg.Enabled {
+		return Result{Diagnostics: []string{"native analyzers disabled"}}
+	}
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = defaultTimeout
+	}
 	files := filesByLanguage(symbols)
 	var combined Result
 	for _, analyzer := range PriorityAnalyzers() {
+		if !analyzerEnabled(analyzer, cfg) {
+			combined.Diagnostics = append(combined.Diagnostics, analyzer.Name()+": skipped: disabled by config")
+			continue
+		}
 		reqFiles := filterFiles(files, analyzer.Languages())
 		if len(reqFiles) == 0 {
 			continue
@@ -65,7 +115,7 @@ func Analyze(ctx context.Context, root string, symbols []core.SymbolRecord) Resu
 			combined.Diagnostics = append(combined.Diagnostics, analyzer.Name()+": skipped: "+avail.Reason)
 			continue
 		}
-		runCtx, cancel := context.WithTimeout(ctx, defaultTimeout)
+		runCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
 		result := analyzer.Analyze(runCtx, Request{Root: root, Symbols: symbols, Files: reqFiles})
 		cancel()
 		for _, diag := range result.Diagnostics {
@@ -74,6 +124,46 @@ func Analyze(ctx context.Context, root string, symbols []core.SymbolRecord) Resu
 		combined.Edges = append(combined.Edges, result.Edges...)
 	}
 	return combined
+}
+
+func analyzerEnabled(analyzer Analyzer, cfg Config) bool {
+	for _, lang := range analyzer.Languages() {
+		if cfg.DisabledLanguages[lang] || cfg.DisabledLanguages[analyzer.Name()] {
+			return false
+		}
+	}
+	if len(cfg.Languages) == 0 {
+		return true
+	}
+	if cfg.Languages[analyzer.Name()] {
+		return true
+	}
+	for _, lang := range analyzer.Languages() {
+		if cfg.Languages[lang] {
+			return true
+		}
+	}
+	return false
+}
+
+func isFalse(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "0", "false", "no", "off", "disabled":
+		return true
+	default:
+		return false
+	}
+}
+
+func languageSet(value string) map[string]bool {
+	out := map[string]bool{}
+	for _, part := range strings.Split(value, ",") {
+		part = strings.ToLower(strings.TrimSpace(part))
+		if part != "" {
+			out[part] = true
+		}
+	}
+	return out
 }
 
 func filesByLanguage(symbols []core.SymbolRecord) map[string][]string {

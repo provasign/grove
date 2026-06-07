@@ -47,6 +47,29 @@ func TestUpsertFileAndAllSymbols(t *testing.T) {
 	}
 }
 
+func TestReplaceEdgesAndAllEdgesPreservesSource(t *testing.T) {
+	ctx := context.Background()
+	st := openStore(t)
+
+	edges := []core.Edge{{
+		From: "a", To: "b", Type: core.EdgeCalls,
+		Confidence: 0.99, Source: core.EvidenceSourceNative,
+	}}
+	if err := st.ReplaceEdges(ctx, edges); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.AllEdges(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d edges, want 1", len(got))
+	}
+	if got[0].Source != core.EvidenceSourceNative || got[0].Type != core.EdgeCalls || got[0].Confidence != 0.99 {
+		t.Fatalf("unexpected edge: %#v", got[0])
+	}
+}
+
 func TestUpsertReplacesExistingSymbolsForFile(t *testing.T) {
 	st := openStore(t)
 	ctx := context.Background()

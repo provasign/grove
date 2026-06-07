@@ -302,6 +302,30 @@ func (s *Store) AllSymbols(ctx context.Context) ([]core.SymbolRecord, error) {
 	return symbols, rows.Err()
 }
 
+func (s *Store) AllEdges(ctx context.Context) ([]core.Edge, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT from_node, to_node, edge_type, confidence, COALESCE(source, 'unknown')
+		FROM edges
+		ORDER BY from_node, edge_type, to_node
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var edges []core.Edge
+	for rows.Next() {
+		var edge core.Edge
+		var typ, source string
+		if err := rows.Scan(&edge.From, &edge.To, &typ, &edge.Confidence, &source); err != nil {
+			return nil, err
+		}
+		edge.Type = core.EdgeType(typ)
+		edge.Source = core.EvidenceSource(source)
+		edges = append(edges, edge)
+	}
+	return edges, rows.Err()
+}
+
 // SearchFTS5 runs a full-text search against the symbols_fts virtual table.
 // Returns up to limit results ranked by FTS5 relevance (bm25).
 func (s *Store) SearchFTS5(ctx context.Context, query string, limit int) ([]core.SymbolRecord, error) {

@@ -9,12 +9,15 @@ package grove
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/provasign/grove/internal/cert"
 	"github.com/provasign/grove/internal/core"
 	"github.com/provasign/grove/internal/graph"
 	"github.com/provasign/grove/internal/index"
+	"github.com/provasign/grove/internal/native"
 	"github.com/provasign/grove/internal/parser"
 	"github.com/provasign/grove/internal/store"
 )
@@ -45,6 +48,14 @@ type Config struct {
 	// RepoRoot is the absolute path to the repository whose .grove/ directory
 	// holds the index. Required.
 	RepoRoot string
+	// NativeAnalyzers overrides native graph enrichment when non-nil.
+	NativeAnalyzers *bool
+	// NativeLanguages limits native analyzers to these languages/analyzer names.
+	NativeLanguages []string
+	// NativeDisabledLanguages disables these languages/analyzer names.
+	NativeDisabledLanguages []string
+	// NativeTimeout bounds each analyzer invocation. Zero uses Grove's default.
+	NativeTimeout time.Duration
 }
 
 // Engine is the embedded Grove API consumed by Prism, Fuse, and Relay.
@@ -78,15 +89,44 @@ func Open(ctx context.Context, cfg Config) (*Engine, error) {
 		root:   cfg.RepoRoot,
 		store:  st,
 		parser: p,
-		idx:    index.New(p, st),
+		idx:    index.NewWithNativeConfig(p, st, nativeConfigFromPublic(cfg)),
 		graph:  graph.New(),
 	}
 	// Rehydrate graph from any previously-indexed symbols so reads work
 	// before the first Index call.
 	if symbols, err := st.AllSymbols(ctx); err == nil && len(symbols) > 0 {
-		e.graph.Replace(symbols, 0)
+		edges, _ := st.AllEdges(ctx)
+		e.graph.ReplaceWithEdges(symbols, edges, 0)
 	}
 	return e, nil
+}
+
+func nativeConfigFromPublic(cfg Config) native.Config {
+	nativeCfg := native.ConfigFromEnv()
+	if cfg.NativeAnalyzers != nil {
+		nativeCfg.Enabled = *cfg.NativeAnalyzers
+	}
+	if len(cfg.NativeLanguages) > 0 {
+		nativeCfg.Languages = publicLanguageSet(cfg.NativeLanguages)
+	}
+	if len(cfg.NativeDisabledLanguages) > 0 {
+		nativeCfg.DisabledLanguages = publicLanguageSet(cfg.NativeDisabledLanguages)
+	}
+	if cfg.NativeTimeout > 0 {
+		nativeCfg.Timeout = cfg.NativeTimeout
+	}
+	return nativeCfg
+}
+
+func publicLanguageSet(values []string) map[string]bool {
+	out := map[string]bool{}
+	for _, value := range values {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value != "" {
+			out[value] = true
+		}
+	}
+	return out
 }
 
 // Close releases the underlying SQLite handle.

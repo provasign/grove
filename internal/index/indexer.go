@@ -14,12 +14,21 @@ import (
 )
 
 type Indexer struct {
-	parser *parser.Engine
-	store  *store.Store
+	parser       *parser.Engine
+	store        *store.Store
+	nativeConfig native.Config
 }
 
 func New(parser *parser.Engine, store *store.Store) *Indexer {
-	return &Indexer{parser: parser, store: store}
+	return &Indexer{parser: parser, store: store, nativeConfig: native.ConfigFromEnv()}
+}
+
+func NewWithNativeConfig(parser *parser.Engine, store *store.Store, cfg native.Config) *Indexer {
+	return &Indexer{parser: parser, store: store, nativeConfig: cfg}
+}
+
+func (i *Indexer) SetNativeConfig(cfg native.Config) {
+	i.nativeConfig = cfg
 }
 
 func (i *Indexer) Index(ctx context.Context, root string) (*graph.CodeGraph, core.IndexResult, error) {
@@ -99,7 +108,7 @@ func (i *Indexer) Index(ctx context.Context, root string) (*graph.CodeGraph, cor
 	if err != nil {
 		return nil, result, err
 	}
-	nativeResult := native.Analyze(ctx, root, symbols)
+	nativeResult := native.AnalyzeWithConfig(ctx, root, symbols, i.nativeConfig)
 	result.Native = append(result.Native, nativeResult.Diagnostics...)
 
 	codeGraph := graph.New()

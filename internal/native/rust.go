@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/provasign/grove/internal/core"
@@ -89,7 +90,7 @@ func (rustAnalyzer) Analyze(ctx context.Context, req Request) Result {
 	}
 	edges = append(edges, rustModuleEdges(req.Root, req.Files)...)
 	importCount := len(edges)
-	semanticEdges := lexicalSemanticEdges(req.Symbols, map[string]bool{"rust": true}, 0.93, 0.9)
+	semanticEdges := rustSemanticEdges(req.Symbols, req.Files)
 	edges = append(edges, semanticEdges...)
 	return Result{
 		Edges: edges,
@@ -145,4 +146,115 @@ func rustModuleCandidates(from, mod string) []string {
 		filepath.ToSlash(filepath.Join(dir, mod+".rs")),
 		filepath.ToSlash(filepath.Join(dir, mod, "mod.rs")),
 	}
+}
+
+func rustSemanticEdges(symbols []core.SymbolRecord, files []string) []core.Edge {
+	byFile := map[string][]core.SymbolRecord{}
+	moduleFiles := rustModuleFileIndex(files)
+	for _, symbol := range symbols {
+		if symbol.Language == "rust" {
+			byFile[symbol.FilePath] = append(byFile[symbol.FilePath], symbol)
+		}
+	}
+	var edges []core.Edge
+	seen := map[string]bool{}
+	add := func(edge core.Edge) {
+		key := edge.From + "\x00" + string(edge.Type) + "\x00" + edge.To
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		edges = append(edges, edge)
+	}
+	for _, caller := range symbols {
+		if caller.Language != "rust" || caller.RawText == "" || !callableKind(caller.Kind) {
+			continue
+		}
+		scopeFiles := append([]string{caller.FilePath}, rustModuleScopeFiles(caller.FilePath, caller.RawText, moduleFiles)...)
+		for _, file := range scopeFiles {
+			for _, target := range byFile[file] {
+				if target.ID == caller.ID {
+					continue
+				}
+				if callableKind(target.Kind) && rustContainsCall(caller.RawText, target, file != caller.FilePath) {
+					add(symbolEdge(caller, target, core.EdgeCalls, 0.95))
+				}
+				if typeKind(target.Kind) && rustContainsType(caller.RawText, target, file != caller.FilePath) {
+					add(symbolEdge(caller, target, core.EdgeUsesType, 0.93))
+				}
+			}
+		}
+	}
+	return edges
+}
+
+func rustModuleFileIndex(files []string) map[string]string {
+	out := map[string]string{}
+	for _, file := range files {
+		if !strings.HasSuffix(file, ".rs") {
+			continue
+		}
+		base := filepath.Base(file)
+		name := strings.TrimSuffix(base, ".rs")
+		if name == "mod" {
+			name = filepath.Base(packageDir(file))
+		}
+		if name != "" {
+			out[name] = file
+		}
+	}
+	return out
+}
+
+func rustModuleScopeFiles(fromFile, rawText string, moduleFiles map[string]string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, mod := range rustPathPrefixes(rawText) {
+		if file := moduleFiles[mod]; file != "" && file != fromFile && !seen[file] {
+			seen[file] = true
+			out = append(out, file)
+		}
+	}
+	return out
+}
+
+var rustPathPrefixPattern = regexp.MustCompile(`\b([A-Za-z_][A-Za-z0-9_]*)::[A-Za-z_][A-Za-z0-9_]*`)
+
+func rustPathPrefixes(rawText string) []string {
+	matches := rustPathPrefixPattern.FindAllStringSubmatch(rawText, -1)
+	seen := map[string]bool{}
+	var out []string
+	for _, match := range matches {
+		if len(match) == 2 && !seen[match[1]] {
+			seen[match[1]] = true
+			out = append(out, match[1])
+		}
+	}
+	return out
+}
+
+func rustContainsCall(rawText string, target core.SymbolRecord, qualified bool) bool {
+	if !qualified {
+		return containsCall(rawText, target.Name)
+	}
+	module := rustModuleName(target.FilePath)
+	pattern := regexp.MustCompile(`\b` + regexp.QuoteMeta(module) + `::` + regexp.QuoteMeta(target.Name) + `\s*\(`)
+	return pattern.MatchString(stripQuotedText(rawText))
+}
+
+func rustContainsType(rawText string, target core.SymbolRecord, qualified bool) bool {
+	if !qualified {
+		return containsTypeToken(rawText, target.Name)
+	}
+	module := rustModuleName(target.FilePath)
+	pattern := regexp.MustCompile(`\b` + regexp.QuoteMeta(module) + `::` + regexp.QuoteMeta(target.Name) + `\b`)
+	return pattern.MatchString(stripQuotedText(rawText))
+}
+
+func rustModuleName(file string) string {
+	name := strings.TrimSuffix(filepath.Base(file), ".rs")
+	if name == "mod" {
+		name = filepath.Base(packageDir(file))
+	}
+	return name
 }

@@ -8,6 +8,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/provasign/grove/internal/cert"
 	"github.com/provasign/grove/internal/config"
@@ -15,6 +17,7 @@ import (
 	"github.com/provasign/grove/internal/graph"
 	"github.com/provasign/grove/internal/index"
 	"github.com/provasign/grove/internal/mcp"
+	"github.com/provasign/grove/internal/native"
 	"github.com/provasign/grove/internal/parser"
 	"github.com/provasign/grove/internal/store"
 	"github.com/provasign/grove/internal/version"
@@ -119,13 +122,18 @@ func initWorkspace(args []string) int {
 }
 
 func indexCommand(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int {
-	cfg, err := config.Resolve(argOrDefault(args, 0, "."), 0)
+	dir, nativeCfg, err := parseNativeIndexArgs(args)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+	cfg, err := config.Resolve(dir, 0)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
 	root := cfg.Root
-	result, err := indexRoot(engine, codeGraph, root)
+	result, err := indexRootWithNativeConfig(engine, codeGraph, root, nativeCfg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -401,18 +409,73 @@ func unlockCommand(args []string) int {
 }
 
 func indexRoot(engine *parser.Engine, codeGraph *graph.CodeGraph, root string) (any, error) {
+	return indexRootWithNativeConfig(engine, codeGraph, root, native.ConfigFromEnv())
+}
+
+func indexRootWithNativeConfig(engine *parser.Engine, codeGraph *graph.CodeGraph, root string, nativeCfg native.Config) (any, error) {
 	store, err := store.Open(root)
 	if err != nil {
 		return nil, err
 	}
 	defer store.Close()
-	indexedGraph, result, err := index.New(engine, store).Index(context.Background(), root)
+	idx := index.NewWithNativeConfig(engine, store, nativeCfg)
+	indexedGraph, result, err := idx.Index(context.Background(), root)
 	if err != nil {
 		return nil, err
 	}
-	symbols, _ := indexedGraph.Snapshot()
-	codeGraph.Replace(symbols, result.FilesSeen)
+	symbols, edges := indexedGraph.Snapshot()
+	codeGraph.ReplaceWithEdges(symbols, edges, result.FilesSeen)
 	return result, nil
+}
+
+func parseNativeIndexArgs(args []string) (string, native.Config, error) {
+	cfg := native.ConfigFromEnv()
+	var positional []string
+	for _, arg := range args {
+		switch {
+		case arg == "--no-native":
+			cfg.Enabled = false
+		case strings.HasPrefix(arg, "--native="):
+			cfg.Enabled = !cliFalse(strings.TrimPrefix(arg, "--native="))
+		case strings.HasPrefix(arg, "--native-languages="):
+			cfg.Languages = cliLanguageSet(strings.TrimPrefix(arg, "--native-languages="))
+		case strings.HasPrefix(arg, "--native-disabled-languages="):
+			cfg.DisabledLanguages = cliLanguageSet(strings.TrimPrefix(arg, "--native-disabled-languages="))
+		case strings.HasPrefix(arg, "--native-timeout="):
+			value := strings.TrimPrefix(arg, "--native-timeout=")
+			d, err := time.ParseDuration(value)
+			if err != nil || d <= 0 {
+				return "", cfg, fmt.Errorf("invalid --native-timeout: %s", value)
+			}
+			cfg.Timeout = d
+		default:
+			if strings.HasPrefix(arg, "--native") {
+				return "", cfg, fmt.Errorf("unknown native flag: %s", arg)
+			}
+			positional = append(positional, arg)
+		}
+	}
+	return argOrDefault(positional, 0, "."), cfg, nil
+}
+
+func cliFalse(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "0", "false", "no", "off", "disabled":
+		return true
+	default:
+		return false
+	}
+}
+
+func cliLanguageSet(value string) map[string]bool {
+	out := map[string]bool{}
+	for _, item := range strings.Split(value, ",") {
+		item = strings.ToLower(strings.TrimSpace(item))
+		if item != "" {
+			out[item] = true
+		}
+	}
+	return out
 }
 
 func prepareReadGraph(engine *parser.Engine, codeGraph *graph.CodeGraph, root string, refresh bool) error {
@@ -442,7 +505,11 @@ func loadGraphFromStore(codeGraph *graph.CodeGraph, st *store.Store) error {
 	if err != nil {
 		return err
 	}
-	codeGraph.Replace(symbols, len(symbols))
+	edges, err := st.AllEdges(context.Background())
+	if err != nil {
+		return err
+	}
+	codeGraph.ReplaceWithEdges(symbols, edges, len(symbols))
 	return nil
 }
 
@@ -500,7 +567,7 @@ func usage() {
 Usage:
   grove version
   grove init [dir]
-  grove index [dir]
+  grove index [dir] [--no-native] [--native=false] [--native-languages=go,rust] [--native-disabled-languages=python] [--native-timeout=5s]
   grove status [dir] [--refresh]
   grove symbols <query> [dir] [--refresh]        lexical substring search over names/paths/signatures
   grove query <intent> [dir] [--refresh]         semantic search (Model2Vec embeddings)
@@ -514,5 +581,11 @@ Usage:
 
 Grove is an embedded library: Prism, Fuse, and Relay link against it
 directly. No HTTP daemon, no ports, no tokens.
+
+Native analyzer environment overrides:
+  GROVE_NATIVE=false
+  GROVE_NATIVE_LANGUAGES=go,rust
+  GROVE_NATIVE_DISABLED_LANGUAGES=python
+  GROVE_NATIVE_TIMEOUT=5s
 `)
 }

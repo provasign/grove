@@ -22,6 +22,32 @@ func TestAnalyzeReportsSkippedPriorityAnalyzers(t *testing.T) {
 	}
 }
 
+func TestAnalyzeWithConfigDisabled(t *testing.T) {
+	root := t.TempDir()
+	result := AnalyzeWithConfig(context.Background(), root, []core.SymbolRecord{{
+		ID: "main.go::main@1", FilePath: "main.go",
+		Language: "go", Kind: core.KindFunction, Name: "main",
+	}}, Config{Enabled: false})
+	if len(result.Edges) != 0 {
+		t.Fatalf("got %d edges, want 0", len(result.Edges))
+	}
+	if len(result.Diagnostics) != 1 || result.Diagnostics[0] != "native analyzers disabled" {
+		t.Fatalf("unexpected diagnostics: %#v", result.Diagnostics)
+	}
+}
+
+func TestAnalyzerEnabledLanguageAllowDeny(t *testing.T) {
+	if !analyzerEnabled(rustAnalyzer{}, Config{Enabled: true, Languages: map[string]bool{"rust": true}}) {
+		t.Fatal("rust analyzer should be enabled by language allow-list")
+	}
+	if analyzerEnabled(rustAnalyzer{}, Config{Enabled: true, Languages: map[string]bool{"java": true}}) {
+		t.Fatal("rust analyzer should be disabled by allow-list")
+	}
+	if analyzerEnabled(rustAnalyzer{}, Config{Enabled: true, DisabledLanguages: map[string]bool{"rust": true}}) {
+		t.Fatal("rust analyzer should be disabled by deny-list")
+	}
+}
+
 func TestGoAnalyzerAvailabilityRequiresGoProject(t *testing.T) {
 	root := t.TempDir()
 	avail := goAnalyzer{}.Available(context.Background(), root)
@@ -100,6 +126,37 @@ func TestRustModuleCandidates(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("got %#v, want %#v", got, want)
 		}
+	}
+}
+
+func TestRustSemanticEdgesResolveModuleQualifiedSymbols(t *testing.T) {
+	symbols := []core.SymbolRecord{
+		{
+			ID: "src/lib.rs::run@1", FilePath: "src/lib.rs",
+			Language: "rust", Kind: core.KindFunction, Name: "run",
+			RawText: `pub fn run() { let u: auth::User = auth::save(); }`,
+		},
+		{
+			ID: "src/auth.rs::save@1", FilePath: "src/auth.rs",
+			Language: "rust", Kind: core.KindFunction, Name: "save",
+		},
+		{
+			ID: "src/auth.rs::User@1", FilePath: "src/auth.rs",
+			Language: "rust", Kind: core.KindStruct, Name: "User",
+		},
+	}
+	edges := rustSemanticEdges(symbols, []string{"src/lib.rs", "src/auth.rs"})
+	var foundCall, foundType bool
+	for _, edge := range edges {
+		if edge.From == "src/lib.rs::run@1" && edge.To == "src/auth.rs::save@1" && edge.Type == core.EdgeCalls {
+			foundCall = true
+		}
+		if edge.From == "src/lib.rs::run@1" && edge.To == "src/auth.rs::User@1" && edge.Type == core.EdgeUsesType {
+			foundType = true
+		}
+	}
+	if !foundCall || !foundType {
+		t.Fatalf("expected module call and type edges, got %#v", edges)
 	}
 }
 

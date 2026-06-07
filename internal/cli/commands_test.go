@@ -118,6 +118,37 @@ func TestRun_IndexDefaultDir(t *testing.T) {
 	}
 }
 
+func TestParseNativeIndexArgs(t *testing.T) {
+	dir, cfg, err := parseNativeIndexArgs([]string{
+		"--native-languages=go,rust",
+		"--native-disabled-languages=python",
+		"--native-timeout=250ms",
+		"/repo",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dir != "/repo" {
+		t.Fatalf("dir = %q", dir)
+	}
+	if !cfg.Enabled || !cfg.Languages["go"] || !cfg.Languages["rust"] || cfg.DisabledLanguages["python"] == false {
+		t.Fatalf("unexpected config: %#v", cfg)
+	}
+	if cfg.Timeout.String() != "250ms" {
+		t.Fatalf("timeout = %s, want 250ms", cfg.Timeout)
+	}
+}
+
+func TestParseNativeIndexArgsNoNative(t *testing.T) {
+	_, cfg, err := parseNativeIndexArgs([]string{"--no-native"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Enabled {
+		t.Fatal("native analyzers should be disabled")
+	}
+}
+
 // --- status ---
 
 func TestRun_Status(t *testing.T) {
