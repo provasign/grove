@@ -261,3 +261,59 @@ func TestLexicalSemanticEdgesResolveSameFileCallsAndTypes(t *testing.T) {
 		t.Fatalf("expected call and type edges, got %#v", edges)
 	}
 }
+
+func TestJavaSemanticEdgesResolveClassAwareBindings(t *testing.T) {
+	symbols := []core.SymbolRecord{
+		{
+			ID: "src/App.java::Runnable@1", FilePath: "src/App.java",
+			Language: "java", Kind: core.KindInterface, Name: "Runnable",
+		},
+		{
+			ID: "src/App.java::BaseController@1", FilePath: "src/App.java",
+			Language: "java", Kind: core.KindClass, Name: "BaseController",
+		},
+		{
+			ID: "src/App.java::Controller@1", FilePath: "src/App.java",
+			Language: "java", Kind: core.KindClass, Name: "Controller",
+			Signature: "public class Controller extends BaseController implements Runnable",
+		},
+		{
+			ID: "src/App.java::Repo@1", FilePath: "src/App.java",
+			Language: "java", Kind: core.KindClass, Name: "Repo",
+		},
+		{
+			ID: "src/App.java::Repo_ctor@1", FilePath: "src/App.java",
+			Language: "java", Kind: core.KindConstructor, Name: "Repo", ParentSymbol: "Repo",
+		},
+		{
+			ID: "src/App.java::save@1", FilePath: "src/App.java",
+			Language: "java", Kind: core.KindMethod, Name: "save", ParentSymbol: "Repo",
+		},
+		{
+			ID: "src/App.java::helper@1", FilePath: "src/App.java",
+			Language: "java", Kind: core.KindMethod, Name: "helper", ParentSymbol: "Controller",
+		},
+		{
+			ID: "src/App.java::handle@1", FilePath: "src/App.java",
+			Language: "java", Kind: core.KindMethod, Name: "handle", ParentSymbol: "Controller",
+			RawText: `void handle() { helper(); Repo.save(); Repo repo = new Repo(); }`,
+		},
+	}
+	edges := javaSemanticEdges(symbols)
+	assertNativeEdge(t, edges, "src/App.java::Controller@1", "src/App.java::BaseController@1", core.EdgeExtends)
+	assertNativeEdge(t, edges, "src/App.java::Controller@1", "src/App.java::Runnable@1", core.EdgeImplements)
+	assertNativeEdge(t, edges, "src/App.java::handle@1", "src/App.java::helper@1", core.EdgeCalls)
+	assertNativeEdge(t, edges, "src/App.java::handle@1", "src/App.java::save@1", core.EdgeCalls)
+	assertNativeEdge(t, edges, "src/App.java::handle@1", "src/App.java::Repo_ctor@1", core.EdgeCalls)
+	assertNativeEdge(t, edges, "src/App.java::handle@1", "src/App.java::Repo@1", core.EdgeUsesType)
+}
+
+func assertNativeEdge(t *testing.T, edges []core.Edge, from, to string, edgeType core.EdgeType) {
+	t.Helper()
+	for _, edge := range edges {
+		if edge.From == from && edge.To == to && edge.Type == edgeType && edge.Source == core.EvidenceSourceNative {
+			return
+		}
+	}
+	t.Fatalf("missing %s edge %s -> %s in %#v", edgeType, from, to, edges)
+}
