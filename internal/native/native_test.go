@@ -308,6 +308,52 @@ func TestJavaSemanticEdgesResolveClassAwareBindings(t *testing.T) {
 	assertNativeEdge(t, edges, "src/App.java::handle@1", "src/App.java::Repo@1", core.EdgeUsesType)
 }
 
+func TestCSharpSemanticEdgesResolveClassAwareBindings(t *testing.T) {
+	symbols := []core.SymbolRecord{
+		{
+			ID: "src/App.cs::IRunnable@1", FilePath: "src/App.cs",
+			Language: "csharp", Kind: core.KindInterface, Name: "IRunnable",
+		},
+		{
+			ID: "src/App.cs::BaseController@1", FilePath: "src/App.cs",
+			Language: "csharp", Kind: core.KindClass, Name: "BaseController",
+		},
+		{
+			ID: "src/App.cs::Controller@1", FilePath: "src/App.cs",
+			Language: "csharp", Kind: core.KindClass, Name: "Controller",
+			Signature: "public class Controller : BaseController, IRunnable",
+		},
+		{
+			ID: "src/App.cs::Repo@1", FilePath: "src/App.cs",
+			Language: "csharp", Kind: core.KindClass, Name: "Repo",
+		},
+		{
+			ID: "src/App.cs::Repo_ctor@1", FilePath: "src/App.cs",
+			Language: "csharp", Kind: core.KindConstructor, Name: "Repo", ParentSymbol: "Repo",
+		},
+		{
+			ID: "src/App.cs::Save@1", FilePath: "src/App.cs",
+			Language: "csharp", Kind: core.KindMethod, Name: "Save", ParentSymbol: "Repo",
+		},
+		{
+			ID: "src/App.cs::Helper@1", FilePath: "src/App.cs",
+			Language: "csharp", Kind: core.KindMethod, Name: "Helper", ParentSymbol: "Controller",
+		},
+		{
+			ID: "src/App.cs::Handle@1", FilePath: "src/App.cs",
+			Language: "csharp", Kind: core.KindMethod, Name: "Handle", ParentSymbol: "Controller",
+			RawText: `void Handle() { Helper(); Repo.Save(); Repo repo = new Repo(); }`,
+		},
+	}
+	edges := csharpSemanticEdges(symbols)
+	assertNativeEdge(t, edges, "src/App.cs::Controller@1", "src/App.cs::BaseController@1", core.EdgeExtends)
+	assertNativeEdge(t, edges, "src/App.cs::Controller@1", "src/App.cs::IRunnable@1", core.EdgeImplements)
+	assertNativeEdge(t, edges, "src/App.cs::Handle@1", "src/App.cs::Helper@1", core.EdgeCalls)
+	assertNativeEdge(t, edges, "src/App.cs::Handle@1", "src/App.cs::Save@1", core.EdgeCalls)
+	assertNativeEdge(t, edges, "src/App.cs::Handle@1", "src/App.cs::Repo_ctor@1", core.EdgeCalls)
+	assertNativeEdge(t, edges, "src/App.cs::Handle@1", "src/App.cs::Repo@1", core.EdgeUsesType)
+}
+
 func assertNativeEdge(t *testing.T, edges []core.Edge, from, to string, edgeType core.EdgeType) {
 	t.Helper()
 	for _, edge := range edges {
