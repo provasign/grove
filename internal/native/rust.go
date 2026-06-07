@@ -99,6 +99,7 @@ func (rustAnalyzer) Analyze(ctx context.Context, req Request) Result {
 			"resolved " + itoa(importCount) + " native import edge(s)",
 			"resolved " + itoa(countNativeEdges(semanticEdges, core.EdgeCalls)) + " native call edge(s)",
 			"resolved " + itoa(countNativeEdges(semanticEdges, core.EdgeUsesType)) + " native type-use edge(s)",
+			"resolved " + itoa(countNativeEdges(semanticEdges, core.EdgeImplements)) + " native implements edge(s)",
 		},
 	}
 }
@@ -150,10 +151,18 @@ func rustModuleCandidates(from, mod string) []string {
 
 func rustSemanticEdges(symbols []core.SymbolRecord, files []string) []core.Edge {
 	byFile := map[string][]core.SymbolRecord{}
+	typesByName := map[string][]core.SymbolRecord{}
+	methodsByType := map[string][]core.SymbolRecord{}
 	moduleFiles := rustModuleFileIndex(files)
 	for _, symbol := range symbols {
 		if symbol.Language == "rust" {
 			byFile[symbol.FilePath] = append(byFile[symbol.FilePath], symbol)
+			if typeKind(symbol.Kind) {
+				typesByName[symbol.Name] = append(typesByName[symbol.Name], symbol)
+			}
+			if callableKind(symbol.Kind) && symbol.ParentSymbol != "" {
+				methodsByType[symbol.ParentSymbol] = append(methodsByType[symbol.ParentSymbol], symbol)
+			}
 		}
 	}
 	var edges []core.Edge
@@ -166,10 +175,22 @@ func rustSemanticEdges(symbols []core.SymbolRecord, files []string) []core.Edge 
 		seen[key] = true
 		edges = append(edges, edge)
 	}
+	for _, symbol := range symbols {
+		if symbol.Language == "rust" && symbol.RawText != "" {
+			for _, ref := range rustImplRefs(symbol.RawText) {
+				concrete, okConcrete := rustBestType(typesByName, ref.TypeName, symbol.FilePath)
+				trait, okTrait := rustBestType(typesByName, ref.TraitName, symbol.FilePath)
+				if okConcrete && okTrait && concrete.ID != trait.ID {
+					add(symbolEdge(concrete, trait, core.EdgeImplements, 0.96))
+				}
+			}
+		}
+	}
 	for _, caller := range symbols {
 		if caller.Language != "rust" || caller.RawText == "" || !callableKind(caller.Kind) {
 			continue
 		}
+		varTypes := rustVariableTypes(caller.RawText)
 		scopeFiles := append([]string{caller.FilePath}, rustModuleScopeFiles(caller.FilePath, caller.RawText, moduleFiles)...)
 		for _, file := range scopeFiles {
 			for _, target := range byFile[file] {
@@ -184,8 +205,118 @@ func rustSemanticEdges(symbols []core.SymbolRecord, files []string) []core.Edge 
 				}
 			}
 		}
+		for _, receiverCall := range rustReceiverCalls(caller.RawText) {
+			typeName := varTypes[receiverCall.Receiver]
+			if typeName == "" {
+				continue
+			}
+			for _, method := range methodsByType[typeName] {
+				if method.Name == receiverCall.Method && method.ID != caller.ID {
+					add(symbolEdge(caller, method, core.EdgeCalls, 0.96))
+				}
+			}
+		}
+		for _, typeName := range rustSignatureTypes(caller.Signature + "\n" + caller.RawText) {
+			if target, ok := rustBestType(typesByName, typeName, caller.FilePath); ok && target.ID != caller.ID {
+				add(symbolEdge(caller, target, core.EdgeUsesType, 0.94))
+			}
+		}
 	}
 	return edges
+}
+
+type rustImplRef struct {
+	TraitName string
+	TypeName  string
+}
+
+var rustImplForPattern = regexp.MustCompile(`\bimpl(?:<[^>]+>)?\s+([A-Za-z_][A-Za-z0-9_:]*)\s+for\s+([A-Za-z_][A-Za-z0-9_:]*)`)
+
+func rustImplRefs(rawText string) []rustImplRef {
+	matches := rustImplForPattern.FindAllStringSubmatch(rawText, -1)
+	out := make([]rustImplRef, 0, len(matches))
+	for _, match := range matches {
+		if len(match) == 3 {
+			out = append(out, rustImplRef{TraitName: rustLastPathSegment(match[1]), TypeName: rustLastPathSegment(match[2])})
+		}
+	}
+	return out
+}
+
+var rustLetTypePattern = regexp.MustCompile(`\blet\s+(?:mut\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*:\s*&?(?:mut\s+)?([A-Za-z_][A-Za-z0-9_:]*)`)
+
+func rustVariableTypes(rawText string) map[string]string {
+	matches := rustLetTypePattern.FindAllStringSubmatch(rawText, -1)
+	out := map[string]string{}
+	for _, match := range matches {
+		if len(match) == 3 {
+			out[match[1]] = rustLastPathSegment(match[2])
+		}
+	}
+	return out
+}
+
+type rustReceiverCall struct {
+	Receiver string
+	Method   string
+}
+
+var rustReceiverCallPattern = regexp.MustCompile(`\b([a-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*\(`)
+
+func rustReceiverCalls(rawText string) []rustReceiverCall {
+	matches := rustReceiverCallPattern.FindAllStringSubmatch(stripQuotedText(rawText), -1)
+	out := make([]rustReceiverCall, 0, len(matches))
+	for _, match := range matches {
+		if len(match) == 3 {
+			out = append(out, rustReceiverCall{Receiver: match[1], Method: match[2]})
+		}
+	}
+	return out
+}
+
+var rustSignatureTypePattern = regexp.MustCompile(`(?:->|:)\s*&?(?:mut\s+)?([A-Z][A-Za-z0-9_:]*)`)
+
+func rustSignatureTypes(text string) []string {
+	matches := rustSignatureTypePattern.FindAllStringSubmatch(text, -1)
+	seen := map[string]bool{}
+	var out []string
+	for _, match := range matches {
+		if len(match) == 2 {
+			name := rustLastPathSegment(match[1])
+			if name != "" && !seen[name] {
+				seen[name] = true
+				out = append(out, name)
+			}
+		}
+	}
+	return out
+}
+
+func rustBestType(typesByName map[string][]core.SymbolRecord, name, fromFile string) (core.SymbolRecord, bool) {
+	candidates := typesByName[rustLastPathSegment(name)]
+	if len(candidates) == 0 {
+		return core.SymbolRecord{}, false
+	}
+	for _, candidate := range candidates {
+		if candidate.FilePath == fromFile {
+			return candidate, true
+		}
+	}
+	fromDir := packageDir(fromFile)
+	for _, candidate := range candidates {
+		if packageDir(candidate.FilePath) == fromDir {
+			return candidate, true
+		}
+	}
+	return candidates[0], true
+}
+
+func rustLastPathSegment(name string) string {
+	name = strings.TrimSpace(name)
+	if i := strings.LastIndex(name, "::"); i >= 0 {
+		name = name[i+2:]
+	}
+	return name
 }
 
 func rustModuleFileIndex(files []string) map[string]string {

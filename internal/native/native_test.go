@@ -160,6 +160,39 @@ func TestRustSemanticEdgesResolveModuleQualifiedSymbols(t *testing.T) {
 	}
 }
 
+func TestRustSemanticEdgesResolveImplReceiverAndSignatureTypes(t *testing.T) {
+	symbols := []core.SymbolRecord{
+		{
+			ID: "src/lib.rs::AuthProvider@1", FilePath: "src/lib.rs",
+			Language: "rust", Kind: core.KindTrait, Name: "AuthProvider",
+		},
+		{
+			ID: "src/lib.rs::User@1", FilePath: "src/lib.rs",
+			Language: "rust", Kind: core.KindStruct, Name: "User",
+		},
+		{
+			ID: "src/lib.rs::Service@1", FilePath: "src/lib.rs",
+			Language: "rust", Kind: core.KindStruct, Name: "Service",
+			RawText: `impl AuthProvider for Service { fn authenticate(&self) -> User { User {} } }`,
+		},
+		{
+			ID: "src/lib.rs::authenticate@1", FilePath: "src/lib.rs",
+			Language: "rust", Kind: core.KindMethod, Name: "authenticate", ParentSymbol: "Service",
+		},
+		{
+			ID: "src/lib.rs::run@1", FilePath: "src/lib.rs",
+			Language: "rust", Kind: core.KindFunction, Name: "run",
+			Signature: "pub fn run(svc: Service) -> User",
+			RawText:   `pub fn run() -> User { let svc: Service = Service {}; svc.authenticate() }`,
+		},
+	}
+	edges := rustSemanticEdges(symbols, []string{"src/lib.rs"})
+	assertNativeEdge(t, edges, "src/lib.rs::Service@1", "src/lib.rs::AuthProvider@1", core.EdgeImplements)
+	assertNativeEdge(t, edges, "src/lib.rs::run@1", "src/lib.rs::authenticate@1", core.EdgeCalls)
+	assertNativeEdge(t, edges, "src/lib.rs::run@1", "src/lib.rs::Service@1", core.EdgeUsesType)
+	assertNativeEdge(t, edges, "src/lib.rs::run@1", "src/lib.rs::User@1", core.EdgeUsesType)
+}
+
 func TestCIncludes(t *testing.T) {
 	got := cIncludes(`#include "local.h"
 # include <lib/system.hpp>
