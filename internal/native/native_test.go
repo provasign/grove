@@ -214,7 +214,8 @@ func TestResolveAgainst(t *testing.T) {
 		t.Fatalf("got %q", got)
 	}
 	// absolute path passes through
-	if got := resolveAgainst("/base", "/abs/foo.h"); got != "/abs/foo.h" {
+	abs := filepath.FromSlash("/abs/foo.h")
+	if got := resolveAgainst("/base", abs); got != abs {
 		t.Fatalf("got %q", got)
 	}
 }
