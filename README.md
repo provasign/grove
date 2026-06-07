@@ -31,6 +31,8 @@ Source files
 │  internal/parser/                                       │
 │  Tree-sitter AST walkers (11 languages)                 │
 │  Regex fallback for syntax-error recovery               │
+│  Native semantic analyzers for Go, Python, Java,       │
+│  Rust, C, C++, C#, PHP, JS, and TS                      │
 │  All CGO is isolated to this package                    │
 └────────────────────────┬────────────────────────────────┘
                          │ []SymbolRecord
@@ -69,7 +71,7 @@ Source files
 
 **Delta indexing by content hash.** Grove hashes each file before parsing. If the stored hash matches, the file is skipped entirely. Indexing a 5000-file repo after a one-line change touches one file, not 5000.
 
-**AST-first with regex fallback.** Tree-sitter produces a complete AST even for files with syntax errors, but marks broken subtrees as `ERROR` nodes. When `root.HasError()` is true, Grove runs both the AST extractor and the regex fallback, then merges the results with AST taking precedence. Files that are actively being edited mid-keystroke are still indexed usefully.
+**AST-first with native enrichment.** Tree-sitter produces a complete AST even for files with syntax errors, but marks broken subtrees as `ERROR` nodes. When `root.HasError()` is true, Grove runs both the AST extractor and the regex fallback, then merges the results with AST taking precedence. On top of that, language-native analyzers add higher-confidence call, type-use, inheritance, import, and constructor edges when the local toolchain is available. Files that are actively being edited mid-keystroke are still indexed usefully, and the graph gets richer when the repository can be resolved with native tooling.
 
 **Scoped edges prevent false positives.** `calls` and `uses-type` edges are only created between symbols in the same file or in files connected by an `imports` edge. Without this constraint, a function named `parse` in one package would appear to call a `parse` function in an unrelated package, producing roughly 5× the false-positive edges.
 
@@ -79,19 +81,19 @@ Source files
 
 ## Language Support
 
-| Language | Extension(s) | Extractor |
+| Language | Extension(s) | Extraction |
 |----------|-------------|-----------|
-| Go | `.go` | AST walker |
-| TypeScript | `.ts` | AST walker |
-| TSX | `.tsx` | AST walker (separate JSX grammar) |
-| JavaScript | `.js .jsx .mjs .cjs` | AST walker |
-| Python | `.py` | AST walker |
-| Java | `.java` | AST walker |
-| Rust | `.rs` | AST walker |
-| C | `.c .h` | AST walker |
-| C++ | `.cc .cpp .cxx .hh .hpp` | AST walker |
-| C# | `.cs` | AST walker |
-| PHP | `.php .phtml` | AST walker |
+| Go | `.go` | AST walker + native semantic enrichment |
+| TypeScript | `.ts` | AST walker + native semantic enrichment |
+| TSX | `.tsx` | AST walker + native semantic enrichment |
+| JavaScript | `.js .jsx .mjs .cjs` | AST walker + native semantic enrichment |
+| Python | `.py` | AST walker + native semantic enrichment |
+| Java | `.java` | AST walker + native semantic enrichment |
+| Rust | `.rs` | AST walker + native semantic enrichment |
+| C | `.c .h` | AST walker + native semantic enrichment |
+| C++ | `.cc .cpp .cxx .hh .hpp` | AST walker + native semantic enrichment |
+| C# | `.cs` | AST walker + native semantic enrichment |
+| PHP | `.php .phtml` | AST walker + native semantic enrichment |
 
 Non-code files (`.md`, `.yaml`, `.json`, `.xml`, `.sh`, `.toml`, `.proto`, `.sql`, `Makefile`, `Dockerfile`, and more) are indexed as `document` symbols with their content in the FTS5 full-text index. Agents can query them semantically alongside code symbols.
 
@@ -159,7 +161,7 @@ curl -fsSL https://raw.githubusercontent.com/provasign/grove/main/install.sh | b
 irm https://raw.githubusercontent.com/provasign/grove/main/install.ps1 | iex
 
 # Pin a specific version
-VERSION=v0.4.0 curl -fsSL https://raw.githubusercontent.com/provasign/grove/main/install.sh | bash
+VERSION=v0.5.0 curl -fsSL https://raw.githubusercontent.com/provasign/grove/main/install.sh | bash
 ```
 
 Installs to `~/bin` by default. Set `INSTALL_DIR=/usr/local/bin` to override.
@@ -219,7 +221,7 @@ Verdicts are intentionally conservative:
 | `manual_review` | Grove could not prove enough structurally, for example unsupported files, ignored/sensitive paths, deleted/binary files, unmapped hunks, or missing test evidence. |
 | `block` | Grove could not process the diff deterministically, for example malformed diff input. |
 
-Certification mode is not a compiler or language-server resolver. Tree-sitter and astkit provide structural facts; language-native binding with `go/packages`, TypeScript language service, and similar resolvers is a later phase.
+Certification mode is not a compiler or language-server resolver. Tree-sitter, astkit, and the native analyzers provide structural facts; the report still stays conservative and falls back to `manual_review` whenever evidence is incomplete.
 
 ---
 
