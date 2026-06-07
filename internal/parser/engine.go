@@ -410,6 +410,9 @@ func extractSymbols(language, filePath, blobSHA, content string, fileImports []s
 		return syms
 	}
 	if !hasErrors {
+		if language == "c" || language == "cpp" {
+			astSyms = mergeSymbolsByShape(astSyms, extractSymbolsRegex(language, filePath, blobSHA, content, fileImports))
+		}
 		attachDocstrings(language, content, astSyms)
 		return astSyms
 	}
@@ -439,6 +442,29 @@ func mergeSymbols(astSyms, regexSyms []core.SymbolRecord) []core.SymbolRecord {
 		}
 	}
 	return merged
+}
+
+func mergeSymbolsByShape(astSyms, regexSyms []core.SymbolRecord) []core.SymbolRecord {
+	if len(regexSyms) == 0 {
+		return astSyms
+	}
+	seen := make(map[string]bool, len(astSyms))
+	for _, s := range astSyms {
+		seen[symbolShapeKey(s)] = true
+	}
+	merged := append([]core.SymbolRecord(nil), astSyms...)
+	for _, s := range regexSyms {
+		key := symbolShapeKey(s)
+		if !seen[key] {
+			seen[key] = true
+			merged = append(merged, s)
+		}
+	}
+	return merged
+}
+
+func symbolShapeKey(s core.SymbolRecord) string {
+	return s.Name + "\x00" + string(s.Kind) + "\x00" + s.ParentSymbol
 }
 
 // attachDocstrings fills SymbolRecord.Docstring by looking at the source.
@@ -568,6 +594,9 @@ func extractSymbolsRegex(language, filePath, blobSHA, content string, fileImport
 	if language == "go" {
 		return extractGoSymbols(filePath, blobSHA, content, fileImports)
 	}
+	if language == "c" || language == "cpp" {
+		return extractCFamilySymbols(language, filePath, blobSHA, content, fileImports)
+	}
 
 	lines := strings.Split(content, "\n")
 	var symbols []core.SymbolRecord
@@ -595,7 +624,6 @@ func extractSymbolsRegex(language, filePath, blobSHA, content string, fileImport
 			}
 
 			endLine, body := extractBody(lines, i, language)
-
 			symbol := core.SymbolRecord{
 				ID:            fmt.Sprintf("%s::%s@%s", filePath, qualifiedName, blobSHA),
 				FilePath:      filePath,
@@ -615,6 +643,106 @@ func extractSymbolsRegex(language, filePath, blobSHA, content string, fileImport
 			symbols = append(symbols, symbol)
 			break
 		}
+	}
+	return symbols
+}
+
+// extractCFamilySymbols handles top-level C/C++ declarations plus simple
+// in-class C++ method and constructor declarations.
+func extractCFamilySymbols(language, filePath, blobSHA, content string, fileImports []string) []core.SymbolRecord {
+	patterns := symbolPatterns(language)
+	lines := strings.Split(content, "\n")
+	var symbols []core.SymbolRecord
+
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+
+		for _, pattern := range patterns {
+			matches := pattern.regex.FindStringSubmatch(line)
+			if len(matches) < 2 {
+				continue
+			}
+
+			name, parentSymbol := extractNameAndParent(matches, pattern)
+			if name == "" {
+				continue
+			}
+			endLine, body := extractBody(lines, i, language)
+			if language == "cpp" && (pattern.kind == core.KindClass || pattern.kind == core.KindStruct) {
+				endLine, body = extractBraceBody(lines, i)
+			}
+			symbols = append(symbols, core.SymbolRecord{
+				ID:            fmt.Sprintf("%s::%s@%s", filePath, name, blobSHA),
+				FilePath:      filePath,
+				BlobSHA:       blobSHA,
+				Language:      language,
+				Kind:          pattern.kind,
+				Name:          name,
+				QualifiedName: name,
+				Signature:     strings.TrimSpace(line),
+				Span:          core.LineRange{Start: i + 1, End: endLine},
+				Exports:       isExported(language, name, line),
+				RawText:       body,
+				ParentSymbol:  parentSymbol,
+				Imports:       fileImports,
+				TokenEstimate: estimateTokens(body),
+			})
+			if language == "cpp" && pattern.kind == core.KindClass {
+				symbols = append(symbols, extractCPPClassMembers(filePath, blobSHA, name, lines, i+1, endLine-1, fileImports)...)
+			}
+			break
+		}
+	}
+	return symbols
+}
+
+var cppMemberPattern = regexp.MustCompile(`^\s*(?:(?:virtual|static|inline|constexpr|explicit|friend)\s+)*(?:(?:[\w:<>,~*&]+\s+)+)?(~?[A-Za-z_][A-Za-z0-9_]*)\s*\([^;{}]*\)\s*(?:const\s*)?(?:=\s*0\s*)?[;{]`)
+
+func extractCPPClassMembers(filePath, blobSHA, className string, lines []string, start, end int, fileImports []string) []core.SymbolRecord {
+	var symbols []core.SymbolRecord
+	for i := start; i < end && i < len(lines); i++ {
+		line := lines[i]
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "//") || strings.HasSuffix(trimmed, ":") {
+			continue
+		}
+		matches := cppMemberPattern.FindStringSubmatch(line)
+		if len(matches) != 2 {
+			continue
+		}
+		name := matches[1]
+		if name == "" || strings.HasPrefix(name, "~") {
+			continue
+		}
+		kind := core.KindMethod
+		if name == className {
+			kind = core.KindConstructor
+		}
+		qualifiedName := className + "." + name
+		bodyEnd, body := extractBody(lines, i, "cpp")
+		if bodyEnd > end || !strings.Contains(line, "{") {
+			bodyEnd = i + 1
+			body = strings.TrimSpace(line)
+		}
+		symbols = append(symbols, core.SymbolRecord{
+			ID:            fmt.Sprintf("%s::%s@%s", filePath, qualifiedName, blobSHA),
+			FilePath:      filePath,
+			BlobSHA:       blobSHA,
+			Language:      "cpp",
+			Kind:          kind,
+			Name:          name,
+			QualifiedName: qualifiedName,
+			Signature:     strings.TrimSpace(line),
+			Span:          core.LineRange{Start: i + 1, End: bodyEnd},
+			Exports:       true,
+			RawText:       body,
+			ParentSymbol:  className,
+			Imports:       fileImports,
+			TokenEstimate: estimateTokens(body),
+		})
 	}
 	return symbols
 }

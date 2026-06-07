@@ -105,6 +105,28 @@ func Caller() {
 	}
 }
 
+func TestGoCallSiteEdgesResolveImportedCalls(t *testing.T) {
+	caller := core.SymbolRecord{
+		ID: "main.go::main@1", FilePath: "main.go",
+		Language: "go", Kind: core.KindFunction, Name: "main",
+		Imports:   []string{"example.com/app/auth"},
+		CallSites: []core.CallSite{{Callee: "auth.Login", Line: 4}},
+		RawText:   "func main() { var u auth.User; auth.Login(u) }",
+	}
+	callee := core.SymbolRecord{
+		ID: "auth/auth.go::Login@1", FilePath: "auth/auth.go",
+		Language: "go", Kind: core.KindFunction, Name: "Login",
+	}
+	user := core.SymbolRecord{
+		ID: "auth/auth.go::User@1", FilePath: "auth/auth.go",
+		Language: "go", Kind: core.KindStruct, Name: "User",
+	}
+	edges := goCallSiteEdges([]core.SymbolRecord{caller, callee, user})
+	assertNativeEdge(t, edges, caller.ID, callee.ID, core.EdgeCalls)
+	typeEdges := goTypeUseEdges([]core.SymbolRecord{caller, callee, user})
+	assertNativeEdge(t, typeEdges, caller.ID, user.ID, core.EdgeUsesType)
+}
+
 func TestRustModuleNames(t *testing.T) {
 	mods := rustModuleNames(`mod private;
 pub mod public;

@@ -9,8 +9,10 @@ import (
 	"go/token"
 	"go/types"
 	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/provasign/grove/internal/core"
@@ -43,6 +45,7 @@ type goListPackage struct {
 func (goAnalyzer) Analyze(ctx context.Context, req Request) Result {
 	cmd := exec.CommandContext(ctx, "go", "list", "-mod=readonly", "-json", "./...")
 	cmd.Dir = req.Root
+	cmd.Env = goAnalyzerEnv(req.Root)
 	out, err := cmd.Output()
 	if err != nil {
 		return Result{Diagnostics: []string{"go list failed: " + err.Error()}}
@@ -90,13 +93,28 @@ func (goAnalyzer) Analyze(ctx context.Context, req Request) Result {
 	}
 	semanticEdges, semanticDiagnostics := goSemanticEdges(req.Root, req.Files, req.Symbols, pkgs)
 	edges = append(edges, semanticEdges...)
+	callSiteEdges := goCallSiteEdges(req.Symbols)
+	edges = append(edges, callSiteEdges...)
+	typeUseEdges := goTypeUseEdges(req.Symbols)
+	edges = append(edges, typeUseEdges...)
 
 	return Result{
 		Edges: edges,
 		Diagnostics: append([]string{
 			"go list resolved " + itoa(len(pkgs)) + " package(s)",
+			"resolved " + itoa(countEdgesOfType(callSiteEdges, core.EdgeCalls)) + " native call-site edge(s)",
+			"resolved " + itoa(countEdgesOfType(typeUseEdges, core.EdgeUsesType)) + " native lexical type-use edge(s)",
 		}, semanticDiagnostics...),
 	}
+}
+
+func goAnalyzerEnv(root string) []string {
+	groveDir := filepath.Join(root, ".grove")
+	goCache := filepath.Join(groveDir, "go-build")
+	home := filepath.Join(groveDir, "home")
+	_ = os.MkdirAll(goCache, 0o755)
+	_ = os.MkdirAll(home, 0o755)
+	return appendEnv("GOCACHE="+goCache, "HOME="+home)
 }
 
 func packageFiles(root string, pkg goListPackage) []string {
@@ -382,4 +400,103 @@ func countEdgesOfType(edges []core.Edge, edgeType core.EdgeType) int {
 		}
 	}
 	return count
+}
+
+func goCallSiteEdges(symbols []core.SymbolRecord) []core.Edge {
+	byName := map[string][]core.SymbolRecord{}
+	for _, symbol := range symbols {
+		if symbol.Language == "go" && callableKind(symbol.Kind) {
+			byName[strings.ToLower(symbol.Name)] = append(byName[strings.ToLower(symbol.Name)], symbol)
+		}
+	}
+	var edges []core.Edge
+	seen := map[string]bool{}
+	for _, caller := range symbols {
+		if caller.Language != "go" || !callableKind(caller.Kind) {
+			continue
+		}
+		scope := goImportScope(caller, symbols)
+		for _, callSite := range caller.CallSites {
+			name := callSite.Callee
+			if i := strings.LastIndexByte(name, '.'); i >= 0 {
+				name = name[i+1:]
+			}
+			for _, target := range byName[strings.ToLower(name)] {
+				if target.ID == caller.ID || !scope[target.FilePath] {
+					continue
+				}
+				key := caller.ID + "\x00" + target.ID
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+				edges = append(edges, symbolEdge(caller, target, core.EdgeCalls, 0.99))
+			}
+		}
+	}
+	return edges
+}
+
+func goImportScope(caller core.SymbolRecord, symbols []core.SymbolRecord) map[string]bool {
+	scope := map[string]bool{caller.FilePath: true}
+	callerDir := packageDir(caller.FilePath)
+	for _, symbol := range symbols {
+		if symbol.Language == "go" && packageDir(symbol.FilePath) == callerDir {
+			scope[symbol.FilePath] = true
+		}
+	}
+	for _, imp := range caller.Imports {
+		seg := imp
+		if i := strings.LastIndexByte(seg, '/'); i >= 0 {
+			seg = seg[i+1:]
+		}
+		for _, symbol := range symbols {
+			if symbol.Language == "go" && (packageDir(symbol.FilePath) == seg || strings.HasSuffix(packageDir(symbol.FilePath), "/"+seg)) {
+				scope[symbol.FilePath] = true
+			}
+		}
+	}
+	return scope
+}
+
+func goTypeUseEdges(symbols []core.SymbolRecord) []core.Edge {
+	typesByName := map[string][]core.SymbolRecord{}
+	for _, symbol := range symbols {
+		if symbol.Language == "go" && typeKind(symbol.Kind) {
+			typesByName[symbol.Name] = append(typesByName[symbol.Name], symbol)
+		}
+	}
+	var edges []core.Edge
+	seen := map[string]bool{}
+	for _, caller := range symbols {
+		if caller.Language != "go" || !callableKind(caller.Kind) || caller.RawText == "" {
+			continue
+		}
+		scope := goImportScope(caller, symbols)
+		for name, candidates := range typesByName {
+			if !goContainsType(caller.RawText, name) {
+				continue
+			}
+			for _, target := range candidates {
+				if target.ID == caller.ID || !scope[target.FilePath] {
+					continue
+				}
+				key := caller.ID + "\x00" + target.ID
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+				edges = append(edges, symbolEdge(caller, target, core.EdgeUsesType, 0.98))
+			}
+		}
+	}
+	return edges
+}
+
+func goContainsType(rawText, name string) bool {
+	if containsTypeToken(rawText, name) {
+		return true
+	}
+	pattern := regexp.MustCompile(`\b[A-Za-z_][A-Za-z0-9_]*\.` + regexp.QuoteMeta(name) + `\b`)
+	return pattern.MatchString(stripQuotedText(rawText))
 }

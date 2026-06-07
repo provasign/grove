@@ -37,6 +37,13 @@ func (i *Indexer) Index(ctx context.Context, root string) (*graph.CodeGraph, cor
 	if err != nil {
 		return nil, result, err
 	}
+	// Resolve symlinks so that external tools (compile_commands.json, go list,
+	// cargo metadata) which emit real paths stay consistent with our root.
+	// On macOS /tmp is a symlink to /private/tmp; without this relFile() fails
+	// to relativize those absolute paths.
+	if resolved, err2 := filepath.EvalSymlinks(absRoot); err2 == nil {
+		absRoot = resolved
+	}
 	root = absRoot
 	result.Root = root
 	currentFiles := map[string]bool{}

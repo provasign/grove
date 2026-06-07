@@ -155,14 +155,14 @@ print(json.dumps({"edges": edges, "calls": calls, "types": types}))
 		from, okFrom := symbols[edge.From+"\x00"+edge.FromName]
 		to, okTo := symbols[edge.To+"\x00"+edge.ToName]
 		if okFrom && okTo && from.ID != to.ID {
-			edges = append(edges, symbolEdge(from, to, core.EdgeCalls, 0.94))
+			edges = append(edges, symbolEdge(from, to, core.EdgeCalls, 0.98))
 		}
 	}
 	for _, edge := range payload.Types {
 		from, okFrom := symbols[edge.From+"\x00"+edge.FromName]
 		to, okTo := symbols[edge.To+"\x00"+edge.ToName]
 		if okFrom && okTo && from.ID != to.ID {
-			edges = append(edges, symbolEdge(from, to, core.EdgeUsesType, 0.92))
+			edges = append(edges, symbolEdge(from, to, core.EdgeUsesType, 0.96))
 		}
 	}
 	return Result{
