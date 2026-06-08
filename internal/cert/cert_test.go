@@ -156,7 +156,9 @@ func TestCertifyDiffManualReviewForMissingTestEvidence(t *testing.T) {
 		},
 	}, 1)
 
-	report := CertifyDiff(cg, core.DiffInput{UnifiedDiff: `diff --git a/auth.go b/auth.go
+	report := CertifyDiff(cg, core.DiffInput{
+		Policy: core.CertificationPolicy{RequireTestsForCode: true},
+		UnifiedDiff: `diff --git a/auth.go b/auth.go
 --- a/auth.go
 +++ b/auth.go
 @@ -3,4 +3,4 @@
@@ -171,6 +173,112 @@ func TestCertifyDiffManualReviewForMissingTestEvidence(t *testing.T) {
 	}
 	if len(report.Unknowns) != 1 || report.Unknowns[0].Code != "tests_unknown" {
 		t.Fatalf("unknowns = %+v", report.Unknowns)
+	}
+}
+
+func TestCertifyDiffAllowWhenRequireTestsForCodeFalse(t *testing.T) {
+	cg := graph.New()
+	cg.Replace([]core.SymbolRecord{
+		{
+			ID:            "auth.go::Login@sha",
+			FilePath:      "auth.go",
+			BlobSHA:       "sha",
+			Language:      "go",
+			Kind:          core.KindFunction,
+			Name:          "Login",
+			QualifiedName: "Login",
+			Span:          core.LineRange{Start: 3, End: 6},
+		},
+	}, 1)
+
+	report := CertifyDiff(cg, core.DiffInput{
+		Policy: core.CertificationPolicy{RequireTestsForCode: false},
+		UnifiedDiff: `diff --git a/auth.go b/auth.go
+--- a/auth.go
++++ b/auth.go
+@@ -3,4 +3,4 @@
+ func Login() bool {
+-	return false
++	return true
+ }
+`})
+
+	if report.Verdict != core.VerdictAllow {
+		t.Fatalf("verdict = %q, want allow when RequireTestsForCode=false; unknowns=%+v", report.Verdict, report.Unknowns)
+	}
+}
+
+func TestCertifyDiffManualReviewPartialTestCoverage(t *testing.T) {
+	cg := graph.New()
+	cg.Replace([]core.SymbolRecord{
+		{
+			ID:            "auth.go::Login@sha",
+			FilePath:      "auth.go",
+			BlobSHA:       "sha",
+			Language:      "go",
+			Kind:          core.KindFunction,
+			Name:          "Login",
+			QualifiedName: "Login",
+			Span:          core.LineRange{Start: 3, End: 6},
+		},
+		{
+			ID:            "auth.go::Logout@sha",
+			FilePath:      "auth.go",
+			BlobSHA:       "sha",
+			Language:      "go",
+			Kind:          core.KindFunction,
+			Name:          "Logout",
+			QualifiedName: "Logout",
+			Span:          core.LineRange{Start: 8, End: 11},
+		},
+		{
+			ID:            "auth_test.go::TestLogin@sha",
+			FilePath:      "auth_test.go",
+			BlobSHA:       "sha",
+			Language:      "go",
+			Kind:          core.KindFunction,
+			Name:          "TestLogin",
+			QualifiedName: "TestLogin",
+			Span:          core.LineRange{Start: 3, End: 5},
+		},
+	}, 3)
+
+	report := CertifyDiff(cg, core.DiffInput{
+		Policy: core.CertificationPolicy{RequireTestsForCode: true},
+		UnifiedDiff: `diff --git a/auth.go b/auth.go
+--- a/auth.go
++++ b/auth.go
+@@ -3,4 +3,4 @@
+ func Login() bool {
+-	return false
++	return true
+ }
+@@ -8,4 +8,4 @@
+ func Logout() {
+-	sessions.Clear()
++	sessions.ClearAll()
+ }
+`})
+
+	if report.Verdict != core.VerdictManualReview {
+		t.Fatalf("verdict = %q, want manual_review", report.Verdict)
+	}
+	// Logout has no covering test; Login is covered by TestLogin via graph edge.
+	if len(report.Unknowns) != 1 || report.Unknowns[0].Code != "tests_unknown" {
+		t.Fatalf("unknowns = %+v, want exactly one tests_unknown for uncovered symbol", report.Unknowns)
+	}
+}
+
+func TestParseUnifiedDiffChmodOnly(t *testing.T) {
+	files, err := ParseUnifiedDiff(`diff --git a/auth.go b/auth.go
+old mode 100644
+new mode 100755
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 0 {
+		t.Fatalf("files = %+v, want empty for mode-only change", files)
 	}
 }
 

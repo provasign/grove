@@ -22,9 +22,6 @@ const (
 // unresolved or heuristic-only coverage is surfaced as manual review.
 func CertifyDiff(codeGraph *graph.CodeGraph, input core.DiffInput) core.CertificationReport {
 	policy := input.Policy
-	if !policy.RequireTestsForCode {
-		policy.RequireTestsForCode = true
-	}
 	report := core.CertificationReport{
 		Version: reportVersion,
 		BaseRef: input.BaseRef,
@@ -48,7 +45,7 @@ func CertifyDiff(codeGraph *graph.CodeGraph, input core.DiffInput) core.Certific
 	addDerivedGraphFacts(&report, symbols, edges)
 
 	if policy.RequireTestsForCode {
-		report.Unknowns = append(report.Unknowns, missingTestFindings(report.ChangedSymbols, report.Tests)...)
+		report.Unknowns = append(report.Unknowns, missingTestFindings(report.ChangedSymbols, report.Tests, edges)...)
 	}
 
 	if len(report.Unknowns) > 0 {
@@ -195,22 +192,37 @@ func coveringTests(changed []core.SymbolRecord, symbols []core.SymbolRecord, edg
 	return out
 }
 
-func missingTestFindings(changed []core.SymbolRecord, tests []core.SymbolRecord) []core.CertificationFinding {
-	if len(tests) > 0 {
-		return nil
+func missingTestFindings(changed []core.SymbolRecord, tests []core.SymbolRecord, edges []core.Edge) []core.CertificationFinding {
+	testIDs := make(map[string]struct{}, len(tests))
+	for _, t := range tests {
+		testIDs[t.ID] = struct{}{}
 	}
+	var findings []core.CertificationFinding
 	for _, symbol := range changed {
 		if !requiresTestEvidence(symbol) {
 			continue
 		}
-		return []core.CertificationFinding{{
-			Severity: core.FindingWarning,
-			Code:     "tests_unknown",
-			Message:  "code changes require test evidence, but Grove found no covering test symbols",
-			Evidence: []core.EvidenceRef{symbolEvidence(symbol, core.EvidenceSourceHeuristic, 0.8, "test coverage is inferred from graph edges and test naming")},
-		}}
+		if !symbolHasCoveringTest(symbol.ID, testIDs, edges) {
+			findings = append(findings, core.CertificationFinding{
+				Severity: core.FindingWarning,
+				Code:     "tests_unknown",
+				Message:  "code changes require test evidence, but Grove found no covering test symbols",
+				Evidence: []core.EvidenceRef{symbolEvidence(symbol, core.EvidenceSourceHeuristic, 0.8, "test coverage is inferred from graph edges and test naming")},
+			})
+		}
 	}
-	return nil
+	return findings
+}
+
+func symbolHasCoveringTest(symbolID string, testIDs map[string]struct{}, edges []core.Edge) bool {
+	for _, edge := range edges {
+		if edge.To == symbolID {
+			if _, ok := testIDs[edge.From]; ok {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func requiresTestEvidence(symbol core.SymbolRecord) bool {
@@ -420,15 +432,17 @@ func (p *diffParser) finish() ([]DiffFile, error) {
 	if !p.sawDiff && len(p.files) == 0 {
 		return nil, errors.New("diff_malformed: no unified diff file headers found")
 	}
+	out := p.files[:0]
 	for i := range p.files {
 		if p.files[i].Path == "" {
 			return nil, errors.New("diff_malformed: changed file path is missing")
 		}
 		if len(p.files[i].Hunks) == 0 && !p.files[i].Binary && !p.files[i].Deleted {
-			return nil, fmt.Errorf("diff_malformed: %s has no hunks", p.files[i].Path)
+			continue
 		}
+		out = append(out, p.files[i])
 	}
-	return p.files, nil
+	return out, nil
 }
 
 func parseGitPath(line string) string {
