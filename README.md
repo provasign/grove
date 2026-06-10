@@ -2,7 +2,7 @@
 
 > **Your codebase's persistent long-term memory — queryable by any AI agent.**
 
-> **Embedded mode (current):** Grove is a Go library at `github.com/provasign/grove/pkg/grove`. Prism, Fuse, and Provasign link it directly and open the on-disk index in-process. There is no `grove serve` daemon, no port (7777/7778), and no `.grove/.token`. The CLI is available for explicit indexing plus read queries (`grove index .`, `grove symbols main`) and stdio MCP (`grove mcp`).
+> **Embedded mode (current):** Grove is a Go library at `github.com/provasign/grove/pkg/grove`. Prism and Fuse link it directly and open the on-disk index in-process. There is no `grove serve` daemon, no port (7777/7778), and no `.grove/.token`. The CLI is available for explicit indexing plus read queries (`grove index .`, `grove symbols main`) and stdio MCP (`grove mcp`).
 
 ---
 
@@ -15,9 +15,9 @@ Grep answers "does this string appear somewhere?" A language server answers "whe
 
 The difference is a graph. Grove indexes your source files into a persistent SQLite graph — 11 languages, 8 edge types, BFS traversal — and keeps it live with delta indexing (files whose content hash hasn't changed are never re-parsed). The graph is queryable through the embedded Go API, CLI, and MCP stdio.
 
-Grove is the foundation all other Provasign tools are built on. Prism uses it to focus context. Fuse uses it to resolve conflicts. Provasign uses it to certify agent output. Without Grove, all three fall back to line-level operations.
+Grove is the foundation the rest of the toolchain is built on. Prism uses it to focus context. Fuse uses it to resolve conflicts. Shale will use it for intent-to-diff conformance. Without Grove, they fall back to line-level operations.
 
-Grove also exposes a conservative certification report for unified diffs. This mode is additive: it does not change Provasign behavior unless Provasign explicitly opts into consuming the report. The report labels heuristic evidence, returns `manual_review` for unsupported or unmapped changes, and only returns `allow` when changed code maps cleanly to indexed symbols with required test evidence.
+Grove also exposes a conservative certification report for unified diffs. This mode is additive: consumers see no change unless they explicitly opt into the report. The report labels heuristic evidence, returns `manual_review` for unsupported or unmapped changes, and only returns `allow` when changed code maps cleanly to indexed symbols with required test evidence.
 
 ---
 
@@ -133,7 +133,7 @@ Query latency is FTS5 full-text search + BFS graph traversal returning ranked re
 
 ## Tool and IDE Integration
 
-Grove is the backend for the Provasign suite. Prism, Fuse, and Provasign consume the embedded Go API directly. Direct AI agent integration is available through MCP stdio.
+Grove is the graph backend for the toolchain. Prism and Fuse consume the embedded Go API directly. Direct AI agent integration is available through MCP stdio.
 
 | Integration | How | Use case |
 |-------------|-----|---------|
@@ -142,7 +142,7 @@ Grove is the backend for the Provasign suite. Prism, Fuse, and Provasign consume
 | VS Code (Copilot Agent) | Prism extension → embedded Grove | Grove-backed context through Prism |
 | Prism (all IDEs) | Embedded Go API | Token-optimized context delivery |
 | Fuse (git merge) | Embedded Go API | Blast radius + conflict hints |
-| Provasign | Embedded Go API | Intent and certification inputs |
+| Shale (planned) | Embedded Go API | Intent-to-diff conformance |
 | Custom automation | `pkg/grove` | In-process Go integration |
 
 For most AI agent use cases, running Grove directly is only necessary for custom integrations. The normal path is `prism init` in your project, which starts Grove automatically.
