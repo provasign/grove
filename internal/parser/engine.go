@@ -54,7 +54,30 @@ func (e *Engine) ExtractFile(path string, root string) ([]core.SymbolRecord, err
 	src := string(content)
 	imports := extractImports(language, src)
 	symbols := extractSymbols(language, relPath, blobSHA, src, imports)
+	ensureUniqueIDs(symbols)
 	return symbols, nil
+}
+
+// ensureUniqueIDs disambiguates duplicate symbol IDs within one file. Parent
+// qualification handles the common cases (methods on different receivers or
+// classes), but extraction paths without parent context — and pathological
+// inputs like two same-named nested classes — can still collide. Without this,
+// the store's PRIMARY KEY dedup silently drops every colliding symbol after
+// the first. The suffix is deterministic because extraction order is document
+// order.
+func ensureUniqueIDs(symbols []core.SymbolRecord) {
+	if len(symbols) < 2 {
+		return
+	}
+	seen := make(map[string]int, len(symbols))
+	for i := range symbols {
+		id := symbols[i].ID
+		n := seen[id]
+		seen[id] = n + 1
+		if n > 0 {
+			symbols[i].ID = fmt.Sprintf("%s#%d", id, n+1)
+		}
+	}
 }
 
 func (e *Engine) Walk(root string) ([]core.SymbolRecord, int, error) {
@@ -622,6 +645,9 @@ func extractSymbolsRegex(language, filePath, blobSHA, content string, fileImport
 			if pattern.qualifier != "" {
 				qualifiedName = pattern.qualifier + "." + name
 			}
+			if parentSymbol != "" {
+				qualifiedName = parentSymbol + "." + name
+			}
 
 			endLine, body := extractBody(lines, i, language)
 			symbol := core.SymbolRecord{
@@ -851,16 +877,23 @@ func extractGoSymbols(filePath, blobSHA, content string, fileImports []string) [
 				continue
 			}
 
+			// Methods are qualified by their receiver type so that same-named
+			// methods on different receivers get distinct IDs.
+			qualifiedName := name
+			if parentSymbol != "" {
+				qualifiedName = parentSymbol + "." + name
+			}
+
 			endLine, body := extractBody(lines, i, "go")
 
 			symbols = append(symbols, core.SymbolRecord{
-				ID:            fmt.Sprintf("%s::%s@%s", filePath, name, blobSHA),
+				ID:            fmt.Sprintf("%s::%s@%s", filePath, qualifiedName, blobSHA),
 				FilePath:      filePath,
 				BlobSHA:       blobSHA,
 				Language:      "go",
 				Kind:          pattern.kind,
 				Name:          name,
-				QualifiedName: name,
+				QualifiedName: qualifiedName,
 				Signature:     strings.TrimSpace(line),
 				Span:          core.LineRange{Start: i + 1, End: endLine},
 				Exports:       isExported("go", name, line),

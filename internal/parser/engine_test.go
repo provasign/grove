@@ -898,7 +898,96 @@ func mapNames2(syms []core.SymbolRecord) []string {
 func extractSymbolsFromString(language, filePath, src string) ([]core.SymbolRecord, error) {
 	blobSHA := "testsha"
 	imports := extractImports(language, src)
-	return extractSymbols(language, filePath, blobSHA, src, imports), nil
+	symbols := extractSymbols(language, filePath, blobSHA, src, imports)
+	ensureUniqueIDs(symbols)
+	return symbols, nil
+}
+
+// TestSameNameSymbolsGetDistinctIDs guards against the ID-collision bug where
+// same-named members in one file produced identical IDs and all but one were
+// silently dropped by the store's PRIMARY KEY dedup.
+func TestSameNameSymbolsGetDistinctIDs(t *testing.T) {
+	cases := []struct {
+		language string
+		filePath string
+		src      string
+		name     string
+		want     int
+	}{
+		{"go", "conn.go", `package p
+
+type A struct{}
+type B struct{}
+
+func (a *A) Close() error { return nil }
+func (b *B) Close() error { return nil }
+`, "Close", 2},
+		{"python", "models.py", `class User:
+    def __init__(self):
+        pass
+    def save(self):
+        pass
+
+class Account:
+    def __init__(self):
+        pass
+    def save(self):
+        pass
+`, "save", 2},
+		{"cpp", "repo.hpp", "class Repo {\npublic:\n    void Save();\n    void Save(int retries);\n};\n", "Save", 2},
+	}
+	for _, tc := range cases {
+		syms, err := extractSymbolsFromString(tc.language, tc.filePath, tc.src)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.language, err)
+		}
+		ids := map[string]bool{}
+		count := 0
+		for _, s := range syms {
+			if s.Name != tc.name {
+				continue
+			}
+			count++
+			if ids[s.ID] {
+				t.Errorf("%s: duplicate symbol ID %q for %s", tc.language, s.ID, tc.name)
+			}
+			ids[s.ID] = true
+		}
+		if count != tc.want {
+			t.Errorf("%s: %s symbol count = %d, want %d; symbols=%#v", tc.language, tc.name, count, tc.want, syms)
+		}
+	}
+}
+
+// TestGoMethodQualifiedNameIncludesReceiver pins the receiver-qualified
+// naming that keeps method IDs distinct across receiver types.
+func TestGoMethodQualifiedNameIncludesReceiver(t *testing.T) {
+	src := `package p
+
+type Service struct{}
+
+func (s *Service) Login() {}
+`
+	syms, err := extractSymbolsFromString("go", "svc.go", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byQualified := qualifiedNameIndex(syms)
+	login, ok := byQualified["Service.Login"]
+	if !ok {
+		t.Fatalf("Service.Login not found; got %v", symbolQualifiedNames(syms))
+	}
+	if login.Kind != core.KindMethod || login.ParentSymbol != "Service" {
+		t.Fatalf("Service.Login = kind %q parent %q, want method/Service", login.Kind, login.ParentSymbol)
+	}
+}
+
+func symbolQualifiedNames(syms []core.SymbolRecord) []string {
+	out := make([]string, 0, len(syms))
+	for _, s := range syms {
+		out = append(out, s.QualifiedName)
+	}
+	return out
 }
 
 // TestExtractSymbolsWithSyntaxError verifies that a file with an AST syntax

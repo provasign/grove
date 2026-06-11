@@ -154,15 +154,24 @@ func extractImportsFromAST(language string, src []byte) ([]string, bool) {
 
 // projectSymbol converts an astkit.Symbol into a Grove SymbolRecord by adding
 // storage-aware identifiers and per-file import context.
+//
+// astkit reports QualifiedName as the bare member name; Grove qualifies it
+// with the parent (receiver/class) so that two same-named members in one file
+// (e.g. `(*A).Close` and `(*B).Close`, or `__init__` on two classes) produce
+// distinct symbol IDs instead of silently collapsing into one record.
 func projectSymbol(s astkit.Symbol, filePath, blobSHA, language string, fileImports []string) core.SymbolRecord {
+	qualifiedName := s.QualifiedName
+	if s.ParentName != "" && qualifiedName == s.Name {
+		qualifiedName = s.ParentName + "." + s.Name
+	}
 	return core.SymbolRecord{
-		ID:             symID(filePath, s.QualifiedName, blobSHA),
+		ID:             symID(filePath, qualifiedName, blobSHA),
 		FilePath:       filePath,
 		BlobSHA:        blobSHA,
 		Language:       language,
 		Kind:           core.SymbolKind(s.Kind),
 		Name:           s.Name,
-		QualifiedName:  s.QualifiedName,
+		QualifiedName:  qualifiedName,
 		ParentSymbol:   s.ParentName,
 		Signature:      s.Signature,
 		Docstring:      s.Docstring,
