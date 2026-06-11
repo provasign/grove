@@ -2,7 +2,7 @@
 // Product Roadmap:
 //
 //   - Index 5000 files (≈50K symbols) in < 5 s
-//   - FTS5-style Search query           < 10 ms
+//   - Search query                      < 15 ms
 //   - BFS depth-3 over 50K-node graph   < 30 ms
 //
 // These benchmarks are pure-in-memory — they exercise BuildEdges, Search,
@@ -87,9 +87,8 @@ func Benchmark50K_BuildEdges(b *testing.B) {
 	}
 }
 
-// Benchmark50K_Search measures a single Search query. Target: < 10 ms.
-// (Grove's in-memory Search is a substring scan; FTS5 is exercised by the
-// store-level benchmarks.)
+// Benchmark50K_Search measures a single Search query. Target: < 15 ms.
+// (Grove's in-memory Search is a ranked substring scan over the graph.)
 func Benchmark50K_Search(b *testing.B) {
 	g := New()
 	g.Replace(generate50KSymbols(), 5000)

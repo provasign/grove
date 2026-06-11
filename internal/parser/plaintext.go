@@ -9,8 +9,8 @@ import (
 
 const (
 	// PlaintextFTSLimit is the maximum bytes stored in the docstring column,
-	// which is FTS5-indexed. 64 KB covers nearly all real-world docs and
-	// configs while preventing unbounded FTS5 table growth.
+	// which feeds the search indexes. 64 KB covers nearly all real-world
+	// docs and configs while bounding per-document index cost.
 	PlaintextFTSLimit = 64 * 1024
 
 	// PlaintextRawLimit is the maximum bytes stored in raw_text.
@@ -23,7 +23,7 @@ const (
 // documents. The record kind is KindDocument and the language is "plaintext".
 //
 // Content layout:
-//   - docstring  — full text, capped at PlaintextFTSLimit (FTS5 searchable)
+//   - docstring  — full text, capped at PlaintextFTSLimit (searchable)
 //   - raw_text   — full text, capped at PlaintextRawLimit (Prism disclosure)
 //   - signature  — first meaningful line (title / heading / top-level key)
 //   - name       — base filename

@@ -89,58 +89,6 @@ func TestUpsertReplacesExistingSymbolsForFile(t *testing.T) {
 	}
 }
 
-func TestSearchFTS5MatchesNameAndDocstring(t *testing.T) {
-	st := openStore(t)
-	ctx := context.Background()
-	must(t, st.UpsertFile(ctx, "auth.go", "s", "go", []core.SymbolRecord{
-		{ID: "auth.go::Login@s", FilePath: "auth.go", BlobSHA: "s", Language: "go", Kind: core.KindFunction,
-			Name: "Login", QualifiedName: "Login", Docstring: "authenticate the calling user"},
-		{ID: "auth.go::Logout@s", FilePath: "auth.go", BlobSHA: "s", Language: "go", Kind: core.KindFunction,
-			Name: "Logout", QualifiedName: "Logout", Docstring: "terminate the session"},
-	}))
-
-	byName, err := st.SearchFTS5(ctx, "Login", 10)
-	if err != nil {
-		t.Fatalf("fts5 by name: %v", err)
-	}
-	if len(byName) != 1 || byName[0].Name != "Login" {
-		t.Fatalf("expected Login, got %+v", byName)
-	}
-
-	byDoc, err := st.SearchFTS5(ctx, "session", 10)
-	if err != nil {
-		t.Fatalf("fts5 by docstring: %v", err)
-	}
-	if len(byDoc) != 1 || byDoc[0].Name != "Logout" {
-		t.Fatalf("expected Logout via docstring, got %+v", byDoc)
-	}
-}
-
-func TestSearchFTS5SyncsOnUpdate(t *testing.T) {
-	st := openStore(t)
-	ctx := context.Background()
-	must(t, st.UpsertFile(ctx, "f.go", "s1", "go", []core.SymbolRecord{
-		{ID: "f.go::OriginalName@s1", FilePath: "f.go", BlobSHA: "s1", Language: "go", Kind: core.KindFunction,
-			Name: "OriginalName", QualifiedName: "OriginalName"},
-	}))
-	must(t, st.UpsertFile(ctx, "f.go", "s2", "go", []core.SymbolRecord{
-		{ID: "f.go::RenamedName@s2", FilePath: "f.go", BlobSHA: "s2", Language: "go", Kind: core.KindFunction,
-			Name: "RenamedName", QualifiedName: "RenamedName"},
-	}))
-
-	old, _ := st.SearchFTS5(ctx, "OriginalName", 10)
-	if len(old) != 0 {
-		t.Fatalf("expected stale FTS5 row to be deleted, got %+v", old)
-	}
-	got, err := st.SearchFTS5(ctx, "RenamedName", 10)
-	if err != nil {
-		t.Fatalf("fts5: %v", err)
-	}
-	if len(got) != 1 || got[0].Name != "RenamedName" {
-		t.Fatalf("expected RenamedName, got %+v", got)
-	}
-}
-
 func TestReplaceEdgesAndStatus(t *testing.T) {
 	st := openStore(t)
 	ctx := context.Background()

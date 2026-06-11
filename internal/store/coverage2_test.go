@@ -65,13 +65,6 @@ func TestUpsert_ReplaceEdges_Delete_AllSymbols_FTS(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// SearchFTS5 with hits
-	hits, err := st.SearchFTS5(ctx, "Foo", 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = hits
-
 	// Status non-zero
 	status, err := st.Status(ctx)
 	if err != nil {

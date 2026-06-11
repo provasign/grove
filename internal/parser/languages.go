@@ -7,12 +7,12 @@ import (
 
 // PlaintextLanguage is the language tag assigned to non-code documents
 // (markdown, YAML, JSON, XML, shell scripts, etc.) that Grove indexes as
-// whole-file FTS5 records rather than extracted symbol trees.
+// whole-file document records rather than extracted symbol trees.
 const PlaintextLanguage = "plaintext"
 
 // securityExtensions are file types that may contain credentials or key
 // material. Grove never indexes these, even if they appear inside a tracked
-// repository, to prevent credential content leaking into the FTS5 index.
+// repository, to prevent credential content leaking into the search index.
 var securityExtensions = map[string]bool{
 	".key":      true,
 	".pem":      true,
@@ -75,7 +75,7 @@ func DetectLanguage(path string) string {
 	case ".php", ".php3", ".php4", ".php5", ".phtml":
 		return "php"
 
-	// ── Plaintext documents (FTS5-indexed as whole-file records) ──
+	// ── Plaintext documents (indexed as whole-file records) ──
 	case ".md", ".mdx", ".markdown":
 		return PlaintextLanguage
 	case ".yaml", ".yml":

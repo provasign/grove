@@ -75,6 +75,14 @@ func (s *Store) runAlterMigrations(ctx context.Context) error {
 		`ALTER TABLE symbols ADD COLUMN annotations     TEXT NOT NULL DEFAULT '[]'`,
 		`ALTER TABLE symbols ADD COLUMN call_sites      TEXT NOT NULL DEFAULT '[]'`,
 		`ALTER TABLE edges ADD COLUMN source            TEXT NOT NULL DEFAULT 'unknown'`,
+		// The FTS5 mirror was never queried by any retrieval path (search
+		// runs in-memory over the graph), yet its sync triggers doubled the
+		// cost of every symbol write and the table duplicated symbol text
+		// on disk. Drop it from existing databases.
+		`DROP TRIGGER IF EXISTS symbols_fts_insert`,
+		`DROP TRIGGER IF EXISTS symbols_fts_delete`,
+		`DROP TRIGGER IF EXISTS symbols_fts_update`,
+		`DROP TABLE IF EXISTS symbols_fts`,
 	}
 	for _, stmt := range alters {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
@@ -340,55 +348,6 @@ func (s *Store) AllEdges(ctx context.Context) ([]core.Edge, error) {
 	return edges, rows.Err()
 }
 
-// SearchFTS5 runs a full-text search against the symbols_fts virtual table.
-// Returns up to limit results ranked by FTS5 relevance (bm25).
-func (s *Store) SearchFTS5(ctx context.Context, query string, limit int) ([]core.SymbolRecord, error) {
-	if limit <= 0 {
-		limit = 50
-	}
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT s.id, s.file_path, s.blob_sha, s.language, s.kind, s.name,
-		       s.qualified_name, s.signature, s.docstring, s.span_start, s.span_end,
-		       s.imports, s.exports, s.raw_text, COALESCE(s.parent_symbol, ''), s.token_estimate,
-		       s.modifiers, s.type_parameters, s.annotations, s.call_sites
-		FROM symbols s
-		JOIN symbols_fts f ON s.rowid = f.rowid
-		WHERE symbols_fts MATCH ?
-		ORDER BY rank
-		LIMIT ?
-	`, query, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var symbols []core.SymbolRecord
-	for rows.Next() {
-		var symbol core.SymbolRecord
-		var kind, importsJSON, modifiersJSON, typeParamsJSON, annotationsJSON, callSitesJSON string
-		var exports int
-		if err := rows.Scan(
-			&symbol.ID, &symbol.FilePath, &symbol.BlobSHA, &symbol.Language,
-			&kind, &symbol.Name, &symbol.QualifiedName, &symbol.Signature,
-			&symbol.Docstring, &symbol.Span.Start, &symbol.Span.End,
-			&importsJSON, &exports, &symbol.RawText, &symbol.ParentSymbol,
-			&symbol.TokenEstimate,
-			&modifiersJSON, &typeParamsJSON, &annotationsJSON, &callSitesJSON,
-		); err != nil {
-			return nil, err
-		}
-		_ = json.Unmarshal([]byte(importsJSON), &symbol.Imports)
-		_ = json.Unmarshal([]byte(modifiersJSON), &symbol.Modifiers)
-		_ = json.Unmarshal([]byte(typeParamsJSON), &symbol.TypeParameters)
-		_ = json.Unmarshal([]byte(annotationsJSON), &symbol.Annotations)
-		_ = json.Unmarshal([]byte(callSitesJSON), &symbol.CallSites)
-		symbol.Kind = core.SymbolKind(kind)
-		symbol.Exports = exports == 1
-		symbols = append(symbols, symbol)
-	}
-	return symbols, rows.Err()
-}
-
 func (s *Store) Status(ctx context.Context) (core.Status, error) {
 	var status core.Status
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM file_index`).Scan(&status.FilesIndexed); err != nil {
@@ -538,32 +497,6 @@ CREATE INDEX IF NOT EXISTS idx_sym_kind      ON symbols(kind);
 CREATE INDEX IF NOT EXISTS idx_sym_lang      ON symbols(language);
 CREATE INDEX IF NOT EXISTS idx_sym_qualified ON symbols(qualified_name);
 CREATE INDEX IF NOT EXISTS idx_sym_parent    ON symbols(parent_symbol);
-
-CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
-    name, qualified_name, signature, docstring,
-    content=symbols, content_rowid=rowid
-);
-
--- FTS5 sync triggers (keep symbols_fts in sync with symbols table)
-CREATE TRIGGER IF NOT EXISTS symbols_fts_insert
-AFTER INSERT ON symbols BEGIN
-    INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring)
-    VALUES (new.rowid, new.name, new.qualified_name, new.signature, new.docstring);
-END;
-
-CREATE TRIGGER IF NOT EXISTS symbols_fts_delete
-AFTER DELETE ON symbols BEGIN
-    INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring)
-    VALUES ('delete', old.rowid, old.name, old.qualified_name, old.signature, old.docstring);
-END;
-
-CREATE TRIGGER IF NOT EXISTS symbols_fts_update
-AFTER UPDATE ON symbols BEGIN
-    INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, docstring)
-    VALUES ('delete', old.rowid, old.name, old.qualified_name, old.signature, old.docstring);
-    INSERT INTO symbols_fts(rowid, name, qualified_name, signature, docstring)
-    VALUES (new.rowid, new.name, new.qualified_name, new.signature, new.docstring);
-END;
 
 CREATE TABLE IF NOT EXISTS edges (
     id         TEXT PRIMARY KEY,

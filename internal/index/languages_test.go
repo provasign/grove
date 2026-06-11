@@ -191,15 +191,6 @@ func TestAllLanguagesProduceSymbolsAndEdges(t *testing.T) {
 		t.Errorf("expected at least one symbol to carry the 'Authenticate the caller' docstring")
 	}
 
-	// FTS5 search hits.
-	hits, err := st.SearchFTS5(context.Background(), "Login", 10)
-	if err != nil {
-		t.Fatalf("fts5: %v", err)
-	}
-	if len(hits) == 0 {
-		t.Errorf("FTS5 returned no hits for Login")
-	}
-
 	// Re-index: every file skipped (delta).
 	_, second, err := New(parser.NewEngine(), st).Index(context.Background(), root)
 	if err != nil {
