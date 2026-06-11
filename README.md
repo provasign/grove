@@ -39,8 +39,8 @@ Source files
                          ▼
 ┌─────────────────────────────────────────────────────────┐
 │  internal/store/                                        │
-│  SQLite WAL + FTS5                                      │
-│  Delta indexing by git blob SHA                         │
+│  SQLite WAL                                             │
+│  Delta indexing by content SHA                          │
 │  Stale-file pruning                                     │
 └────────────────────────┬────────────────────────────────┘
                          │
@@ -57,10 +57,10 @@ Source files
 ┌────────────┐        ┌────────────────────┐
 │ internal/  │        │ pkg/grove          │
 │ mcp/       │        │ Embedded Go API    │
-│ 8 tools    │        │ Query / impact /   │
+│ 9 tools    │        │ Query / impact /   │
 │ JSON-RPC   │        │ deps / tests / ICR │
-│ stdio      │        └────────────────────┘
-└────────────┘
+│ stdio      │        │ / certify / diff   │
+└────────────┘        └────────────────────┘
 ```
 
 ---
@@ -95,7 +95,7 @@ Source files
 | C# | `.cs` | AST walker + native semantic enrichment |
 | PHP | `.php .phtml` | AST walker + native semantic enrichment |
 
-Non-code files (`.md`, `.yaml`, `.json`, `.xml`, `.sh`, `.toml`, `.proto`, `.sql`, `Makefile`, `Dockerfile`, and more) are indexed as `document` symbols with their content in the FTS5 full-text index. Agents can query them semantically alongside code symbols.
+Non-code files (`.md`, `.yaml`, `.json`, `.xml`, `.sh`, `.toml`, `.proto`, `.sql`, `Makefile`, `Dockerfile`, and more) are indexed as `document` symbols whose content feeds the semantic and lexical search indexes. Agents can query them alongside code symbols.
 
 ---
 
@@ -127,7 +127,7 @@ Benchmarks run on macOS against synthetic Go projects (2026-05-27). Numbers refl
 
 Query latency covers in-memory ranked symbol search plus BFS graph traversal over a per-node inbound-edge index. A no-change reindex short-circuits: unchanged files are skipped by content hash and the persisted edge set is reused without re-running native analyzers (measured ~35 ms on an 80-file repo; `grove index --force` opts back into the full pass). RSS scales with project size because the in-memory graph is loaded at serve time.
 
-**Targets:** index 5,000 files < 5 s · BFS depth-3 on 50K nodes < 30 ms · FTS5 query < 10 ms
+**Targets:** index 5,000 files < 5 s · BFS depth-3 on 50K nodes < 30 ms · symbol query < 15 ms
 
 ---
 
@@ -210,6 +210,25 @@ grove mcp [dir]
 
 ```
 
+## Graph Diff
+
+`pkg/grove` exposes the primitive behind cross-agent drift detection:
+
+```go
+before := eng.SnapshotSymbols(ctx)   // capture
+// ... merge lands / files change ...
+eng.Index(ctx, "")                   // reindex
+diff := eng.DiffSince(ctx, before)   // structural delta
+```
+
+`GraphDiff` reports added, removed, and changed symbols plus
+`BreakingChanges` (exported symbols removed or with a changed signature).
+Symbols are matched by stable identity — file path + qualified name + kind —
+so line shifts and content-SHA churn don't register; only symbols whose
+signature or body actually changed appear. Fuse can diff the graph across a
+merge and intersect the result with another agent's working set to deliver
+"the ground shifted under you" notifications with a minimal context patch.
+
 ## Certification Mode
 
 `grove certify` and `pkg/grove.Engine.CertifyDiff` map unified diff hunks to indexed symbols and emit a JSON report containing changed files, changed symbols, impacted symbols, related tests, unknowns, findings, and a verdict.
@@ -260,7 +279,6 @@ Grove stores everything in `.grove/grove.db` (SQLite, WAL mode). The database is
 
 Key SQLite settings:
 - WAL mode for concurrent reads during indexing
-- FTS5 virtual table for full-text symbol search
 - `busy_timeout = 30s` to handle contention without immediate errors
 
 ---

@@ -31,6 +31,8 @@ type (
 	IndexResult          = core.IndexResult
 	Status               = core.Status
 	IsolatedChangeRegion = core.IsolatedChangeRegion
+	GraphDiff            = core.GraphDiff
+	SymbolChange         = core.SymbolChange
 	DiffInput            = core.DiffInput
 	CertificationPolicy  = core.CertificationPolicy
 	CertificationReport  = core.CertificationReport
@@ -249,6 +251,30 @@ func (e *Engine) Tests(ctx context.Context, query string) ([]Symbol, error) {
 // ICR computes the Isolated Change Region for a given intent.
 func (e *Engine) ICR(ctx context.Context, intent string) IsolatedChangeRegion {
 	return e.currentGraph().ComputeICR(intent)
+}
+
+// SnapshotSymbols returns a deep copy of every symbol in the current graph.
+// Capture one before a merge/reindex and pass it to Diff afterwards to get
+// the structural delta.
+func (e *Engine) SnapshotSymbols(ctx context.Context) []Symbol {
+	symbols, _ := e.currentGraph().Snapshot()
+	return symbols
+}
+
+// Diff computes the structural delta between two symbol snapshots, matched
+// by stable identity (file path + qualified name + kind) so line shifts and
+// content-SHA churn don't register as changes. This is the primitive behind
+// the stale-context loop: diff the graph across a merge, intersect the
+// changed/breaking symbols with another agent's working set, and you know
+// exactly whose ground shifted.
+func Diff(before, after []Symbol) GraphDiff {
+	return graph.DiffSymbols(before, after)
+}
+
+// DiffSince diffs a previously captured snapshot against the engine's
+// current graph.
+func (e *Engine) DiffSince(ctx context.Context, before []Symbol) GraphDiff {
+	return Diff(before, e.SnapshotSymbols(ctx))
 }
 
 // CertifyDiff maps a unified diff onto the indexed graph and returns a

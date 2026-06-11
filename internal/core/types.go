@@ -123,6 +123,34 @@ type LockRecord struct {
 	ExpiresAt  string `json:"expiresAt"`
 }
 
+// SymbolChange pairs the before/after versions of one logical symbol in a
+// graph diff. After is nil for removals; Before is nil for additions when a
+// change surfaces in BreakingChanges context.
+type SymbolChange struct {
+	Before           *SymbolRecord `json:"before,omitempty"`
+	After            *SymbolRecord `json:"after,omitempty"`
+	SignatureChanged bool          `json:"signatureChanged"`
+	BodyChanged      bool          `json:"bodyChanged"`
+}
+
+// GraphDiff is the structural delta between two symbol snapshots, keyed by
+// stable identity (file path + qualified name + kind) rather than symbol ID,
+// so a one-line edit — which changes every ID in the file via the content
+// SHA — reports only the symbols whose signature or body actually changed.
+type GraphDiff struct {
+	Added   []SymbolRecord `json:"added"`
+	Removed []SymbolRecord `json:"removed"`
+	Changed []SymbolChange `json:"changed"`
+	// BreakingChanges are exported symbols that were removed or whose
+	// signature changed — the contract surface consumers depend on.
+	BreakingChanges []SymbolChange `json:"breakingChanges"`
+}
+
+// Empty reports whether the diff carries no structural change.
+func (d GraphDiff) Empty() bool {
+	return len(d.Added) == 0 && len(d.Removed) == 0 && len(d.Changed) == 0
+}
+
 type Verdict string
 
 const (
