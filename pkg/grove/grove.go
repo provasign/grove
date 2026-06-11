@@ -66,6 +66,10 @@ type Engine struct {
 	parser *parser.Engine
 	idx    *index.Indexer
 
+	// indexMu serializes Index calls: two concurrent walks would interleave
+	// per-file store writes and race on the final edge rewrite.
+	indexMu sync.Mutex
+
 	mu    sync.RWMutex
 	graph *graph.CodeGraph
 }
@@ -76,12 +80,9 @@ func Open(ctx context.Context, cfg Config) (*Engine, error) {
 	if cfg.RepoRoot == "" {
 		return nil, errors.New("grove: RepoRoot is required")
 	}
+	// store.Open runs schema migrations itself; no second Migrate needed.
 	st, err := store.Open(cfg.RepoRoot)
 	if err != nil {
-		return nil, err
-	}
-	if err := st.Migrate(ctx); err != nil {
-		_ = st.Close()
 		return nil, err
 	}
 	p := parser.NewEngine()
@@ -93,10 +94,20 @@ func Open(ctx context.Context, cfg Config) (*Engine, error) {
 		graph:  graph.New(),
 	}
 	// Rehydrate graph from any previously-indexed symbols so reads work
-	// before the first Index call.
-	if symbols, err := st.AllSymbols(ctx); err == nil && len(symbols) > 0 {
-		edges, _ := st.AllEdges(ctx)
-		e.graph.ReplaceWithEdges(symbols, edges, 0)
+	// before the first Index call. Stored edges are the merged set the last
+	// index persisted, so they are installed verbatim — no rebuild.
+	symbols, err := st.AllSymbols(ctx)
+	if err != nil {
+		_ = st.Close()
+		return nil, err
+	}
+	if len(symbols) > 0 {
+		edges, err := st.AllEdges(ctx)
+		if err != nil {
+			_ = st.Close()
+			return nil, err
+		}
+		e.graph.ReplaceWithStoredEdges(symbols, edges, 0)
 	}
 	return e, nil
 }
@@ -153,6 +164,8 @@ func (e *Engine) Index(ctx context.Context, dir string) (IndexResult, error) {
 	if dir == "" {
 		dir = e.root
 	}
+	e.indexMu.Lock()
+	defer e.indexMu.Unlock()
 	cg, result, err := e.idx.Index(ctx, dir)
 	if err != nil {
 		return result, err
@@ -241,6 +254,8 @@ func (e *Engine) ICR(ctx context.Context, intent string) IsolatedChangeRegion {
 // CertifyDiff maps a unified diff onto the indexed graph and returns a
 // conservative structural certification report. The report is additive:
 // retrieval, MCP, and Provasign behavior do not change unless callers opt in.
+// Changed files whose indexed content no longer matches the working tree are
+// reported as index_stale and escalate the verdict to manual_review.
 func (e *Engine) CertifyDiff(ctx context.Context, input DiffInput) (CertificationReport, error) {
-	return cert.CertifyDiff(e.currentGraph(), input), nil
+	return cert.CertifyDiffWithStaleness(e.currentGraph(), input, cert.RepoFileSHA(e.root)), nil
 }
