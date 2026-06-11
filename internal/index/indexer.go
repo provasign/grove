@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sync"
 
 	"github.com/provasign/grove/internal/core"
 	"github.com/provasign/grove/internal/graph"
@@ -62,8 +64,16 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 	// before walking, so they are neither indexed nor left to grow.
 	native.CleanupLegacyCaches(root)
 	currentFiles := map[string]bool{}
-	ignoreRules := loadIgnoreRules(root)
+	ignore := newIgnoreMatcher(root)
 
+	// Phase 1 (serial): walk the tree, apply ignore/sensitivity rules, and
+	// collect the files whose content hash changed since the last index.
+	type parseTask struct {
+		absPath string
+		relPath string
+		blobSHA string
+	}
+	var tasks []parseTask
 	err = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			result.Errors = append(result.Errors, walkErr.Error())
@@ -77,12 +87,18 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 
 		if entry.IsDir() {
 			if path != root && (shouldSkipDirName(entry.Name()) ||
-				ignoredByRules(relPath, true, ignoreRules)) {
+				ignore.Ignored(relPath, true)) {
 				return filepath.SkipDir
+			}
+			// Nested ignore files apply from this directory downward;
+			// WalkDir visits parents first, so deeper rules land later and
+			// override (gitignore last-match-wins).
+			if path != root {
+				ignore.LoadDir(path, relPath)
 			}
 			return nil
 		}
-		if isSensitivePath(relPath) || ignoredByRules(relPath, false, ignoreRules) {
+		if isSensitivePath(relPath) || ignore.Ignored(relPath, false) {
 			return nil
 		}
 		if !parser.Supported(path) {
@@ -105,20 +121,64 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 			result.FilesSkipped++
 			return nil
 		}
-
-		symbols, err := i.parser.ExtractFile(path, root)
-		if err != nil {
-			result.Errors = append(result.Errors, err.Error())
-			return nil
-		}
-		if err := i.store.UpsertFile(ctx, relPath, blobSHA, parser.DetectLanguage(path), symbols); err != nil {
-			return err
-		}
-		result.FilesUpdated++
+		tasks = append(tasks, parseTask{absPath: path, relPath: relPath, blobSHA: blobSHA})
 		return nil
 	})
 	if err != nil {
 		return nil, result, err
+	}
+
+	// Phase 2 (parallel): parse changed files. Tree-sitter parsing is the
+	// dominant cold-index cost and astkit engines are safe for concurrent
+	// use (a fresh parser per Parse call). Outcomes land by index so the
+	// serial write phase below stays in walk order — deterministic errors
+	// and store contents regardless of worker scheduling.
+	type parseOutcome struct {
+		symbols []core.SymbolRecord
+		err     error
+	}
+	outcomes := make([]parseOutcome, len(tasks))
+	if len(tasks) > 0 {
+		workers := runtime.GOMAXPROCS(0)
+		if workers > 8 {
+			workers = 8
+		}
+		if workers > len(tasks) {
+			workers = len(tasks)
+		}
+		taskCh := make(chan int)
+		var wg sync.WaitGroup
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for idx := range taskCh {
+					symbols, parseErr := i.parser.ExtractFile(tasks[idx].absPath, root)
+					outcomes[idx] = parseOutcome{symbols: symbols, err: parseErr}
+				}
+			}()
+		}
+		for idx := range tasks {
+			taskCh <- idx
+		}
+		close(taskCh)
+		wg.Wait()
+	}
+
+	// Phase 3 (serial): persist. SQLite has one writer; ordered writes keep
+	// the run reproducible.
+	for idx, task := range tasks {
+		if err := ctx.Err(); err != nil {
+			return nil, result, err
+		}
+		if outcomes[idx].err != nil {
+			result.Errors = append(result.Errors, outcomes[idx].err.Error())
+			continue
+		}
+		if err := i.store.UpsertFile(ctx, task.relPath, task.blobSHA, parser.DetectLanguage(task.absPath), outcomes[idx].symbols); err != nil {
+			return nil, result, err
+		}
+		result.FilesUpdated++
 	}
 	filesPruned, err := i.store.DeleteFilesNotIn(ctx, currentFiles)
 	if err != nil {

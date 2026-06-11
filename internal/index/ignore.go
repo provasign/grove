@@ -8,32 +8,61 @@ import (
 )
 
 type ignoreRule struct {
-	pattern string
-	negate  bool
-	dirOnly bool
-	rooted  bool
+	// base is the repo-relative directory of the ignore file the rule came
+	// from ("" for root). The rule only applies below base, and its pattern
+	// is matched against the base-relative remainder of the path —
+	// gitignore semantics for nested ignore files.
+	base     string
+	pattern  string
+	negate   bool
+	dirOnly  bool
+	anchored bool // pattern contains a non-trailing slash or led with "/"
 }
 
-func loadIgnoreRules(root string) []ignoreRule {
-	var rules []ignoreRule
+// ignoreMatcher accumulates ignore rules as the walk descends. Nested
+// .gitignore/.groveignore files are loaded when their directory is visited;
+// because parents are visited before children, deeper rules come later in
+// the slice and override shallower ones (last match wins, as in git).
+type ignoreMatcher struct {
+	rules []ignoreRule
+}
+
+func newIgnoreMatcher(root string) *ignoreMatcher {
+	m := &ignoreMatcher{}
+	m.LoadDir(root, "")
+	return m
+}
+
+// LoadDir parses ignore files in absDir (repo-relative relDir; "" = root).
+func (m *ignoreMatcher) LoadDir(absDir, relDir string) {
+	if relDir == "." {
+		relDir = ""
+	}
 	for _, name := range []string{".groveignore", ".gitignore"} {
-		data, err := os.ReadFile(filepath.Join(root, name))
+		data, err := os.ReadFile(filepath.Join(absDir, name))
 		if err != nil {
 			continue
 		}
-		rules = append(rules, parseIgnoreRules(string(data))...)
+		m.rules = append(m.rules, parseIgnoreRulesAt(string(data), relDir)...)
 	}
-	return rules
+}
+
+func (m *ignoreMatcher) Ignored(rel string, isDir bool) bool {
+	return ignoredByRules(rel, isDir, m.rules)
 }
 
 func parseIgnoreRules(body string) []ignoreRule {
+	return parseIgnoreRulesAt(body, "")
+}
+
+func parseIgnoreRulesAt(body, base string) []ignoreRule {
 	var rules []ignoreRule
 	for _, line := range strings.Split(body, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		rule := ignoreRule{}
+		rule := ignoreRule{base: base}
 		if strings.HasPrefix(line, "!") {
 			rule.negate = true
 			line = strings.TrimSpace(strings.TrimPrefix(line, "!"))
@@ -42,7 +71,7 @@ func parseIgnoreRules(body string) []ignoreRule {
 			continue
 		}
 		if strings.HasPrefix(line, "/") {
-			rule.rooted = true
+			rule.anchored = true
 			line = strings.TrimPrefix(line, "/")
 		}
 		if strings.HasSuffix(line, "/") {
@@ -50,10 +79,16 @@ func parseIgnoreRules(body string) []ignoreRule {
 			line = strings.TrimSuffix(line, "/")
 		}
 		line = filepath.ToSlash(line)
-		if line != "" {
-			rule.pattern = line
-			rules = append(rules, rule)
+		if line == "" {
+			continue
 		}
+		// A slash anywhere (after trimming the trailing one) anchors the
+		// pattern to the ignore file's directory, per gitignore.
+		if strings.Contains(line, "/") {
+			rule.anchored = true
+		}
+		rule.pattern = line
+		rules = append(rules, rule)
 	}
 	return rules
 }
@@ -73,22 +108,69 @@ func ignoredByRules(rel string, isDir bool, rules []ignoreRule) bool {
 }
 
 func ignoreRuleMatches(rule ignoreRule, rel string) bool {
-	pattern := rule.pattern
-	if pattern == "" {
+	if rule.pattern == "" {
 		return false
 	}
-	if !strings.Contains(pattern, "/") && !rule.rooted {
+	// Scope to the rule's own directory and match against the remainder.
+	if rule.base != "" {
+		prefix := rule.base + "/"
+		if !strings.HasPrefix(rel, prefix) {
+			return false
+		}
+		rel = rel[len(prefix):]
+	}
+
+	if !rule.anchored {
+		// Bare name: matches any path component at any depth.
 		for _, segment := range strings.Split(rel, "/") {
-			if globMatch(pattern, segment) {
+			if globMatch(rule.pattern, segment) {
 				return true
 			}
 		}
 		return false
 	}
-	if globMatch(pattern, rel) {
+
+	patSegs := strings.Split(rule.pattern, "/")
+	relSegs := strings.Split(rel, "/")
+	if matchSegments(patSegs, relSegs) {
 		return true
 	}
-	return strings.HasPrefix(rel, strings.TrimSuffix(pattern, "/")+"/")
+	// An anchored pattern naming a directory also ignores everything under
+	// it ("build/sub" matches "build/sub/x/y.go").
+	for i := 1; i < len(relSegs); i++ {
+		if matchSegments(patSegs, relSegs[:i]) {
+			return true
+		}
+	}
+	return false
+}
+
+// matchSegments matches gitignore pattern segments against path segments.
+// "**" crosses any number of segments (including zero); other segments use
+// shell glob matching within the segment only.
+func matchSegments(pat, segs []string) bool {
+	for len(pat) > 0 {
+		if pat[0] == "**" {
+			if len(pat) == 1 {
+				return true
+			}
+			for i := 0; i <= len(segs); i++ {
+				if matchSegments(pat[1:], segs[i:]) {
+					return true
+				}
+			}
+			return false
+		}
+		if len(segs) == 0 {
+			return false
+		}
+		if !globMatch(pat[0], segs[0]) {
+			return false
+		}
+		pat = pat[1:]
+		segs = segs[1:]
+	}
+	return len(segs) == 0
 }
 
 func globMatch(pattern, value string) bool {
