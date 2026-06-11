@@ -119,10 +119,11 @@ func TestRun_IndexDefaultDir(t *testing.T) {
 }
 
 func TestParseNativeIndexArgs(t *testing.T) {
-	dir, cfg, err := parseNativeIndexArgs([]string{
+	dir, cfg, opts, err := parseNativeIndexArgs([]string{
 		"--native-languages=go,rust",
 		"--native-disabled-languages=python",
 		"--native-timeout=250ms",
+		"--force",
 		"/repo",
 	})
 	if err != nil {
@@ -137,15 +138,21 @@ func TestParseNativeIndexArgs(t *testing.T) {
 	if cfg.Timeout.String() != "250ms" {
 		t.Fatalf("timeout = %s, want 250ms", cfg.Timeout)
 	}
+	if !opts.Force {
+		t.Fatal("--force not parsed")
+	}
 }
 
 func TestParseNativeIndexArgsNoNative(t *testing.T) {
-	_, cfg, err := parseNativeIndexArgs([]string{"--no-native"})
+	_, cfg, opts, err := parseNativeIndexArgs([]string{"--no-native"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.Enabled {
 		t.Fatal("native analyzers should be disabled")
+	}
+	if opts.Force {
+		t.Fatal("force should default to false")
 	}
 }
 

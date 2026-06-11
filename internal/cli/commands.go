@@ -74,7 +74,7 @@ func Run(args []string) int {
 }
 
 func mcpCommand(engine *parser.Engine, _ *graph.CodeGraph, args []string) int {
-	cfg, err := config.Resolve(argOrDefault(args, 0, "."), 0)
+	cfg, err := config.Resolve(argOrDefault(args, 0, "."))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -98,7 +98,7 @@ func mcpCommand(engine *parser.Engine, _ *graph.CodeGraph, args []string) int {
 }
 
 func initWorkspace(args []string) int {
-	cfg, err := config.Resolve(argOrDefault(args, 0, "."), 0)
+	cfg, err := config.Resolve(argOrDefault(args, 0, "."))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -112,7 +112,7 @@ func initWorkspace(args []string) int {
 	defer st.Close()
 	configPath := filepath.Join(root, ".grove", "config.yaml")
 	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		content := []byte("version: 1\nstore: .grove/grove.db\nserver:\n  port: 7777\n")
+		content := []byte("version: 1\nstore: .grove/grove.db\n")
 		if err := os.WriteFile(configPath, content, 0o644); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return 1
@@ -122,18 +122,18 @@ func initWorkspace(args []string) int {
 }
 
 func indexCommand(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int {
-	dir, nativeCfg, err := parseNativeIndexArgs(args)
+	dir, nativeCfg, opts, err := parseNativeIndexArgs(args)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 2
 	}
-	cfg, err := config.Resolve(dir, 0)
+	cfg, err := config.Resolve(dir)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
 	root := cfg.Root
-	result, err := indexRootWithNativeConfig(engine, codeGraph, root, nativeCfg)
+	result, err := indexRootFull(engine, codeGraph, root, nativeCfg, opts)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -143,7 +143,7 @@ func indexCommand(engine *parser.Engine, codeGraph *graph.CodeGraph, args []stri
 
 func status(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int {
 	args, refresh := stripRefresh(args)
-	cfg, err := config.Resolve(argOrDefault(args, 0, "."), 0)
+	cfg, err := config.Resolve(argOrDefault(args, 0, "."))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -179,7 +179,7 @@ func symbols(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) i
 		return 2
 	}
 	query := args[0]
-	cfg, err := config.Resolve(argOrDefault(args, 1, "."), 0)
+	cfg, err := config.Resolve(argOrDefault(args, 1, "."))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -203,7 +203,7 @@ func query(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int
 		return 2
 	}
 	intent := args[0]
-	cfg, err := config.Resolve(argOrDefault(args, 1, "."), 0)
+	cfg, err := config.Resolve(argOrDefault(args, 1, "."))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -231,7 +231,7 @@ func deps(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int 
 		return 2
 	}
 	filePath := args[0]
-	cfg, err := config.Resolve(argOrDefault(args, 1, "."), 0)
+	cfg, err := config.Resolve(argOrDefault(args, 1, "."))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -251,7 +251,7 @@ func impact(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) in
 		return 2
 	}
 	query := args[0]
-	cfg, err := config.Resolve(argOrDefault(args, 1, "."), 0)
+	cfg, err := config.Resolve(argOrDefault(args, 1, "."))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -274,7 +274,7 @@ func tests(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int
 	if len(args) > 1 {
 		root = args[1]
 	}
-	cfg, err := config.Resolve(root, 0)
+	cfg, err := config.Resolve(root)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -295,7 +295,7 @@ func icr(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int {
 	}
 	intent := args[0]
 	root := argOrDefault(args, 1, ".")
-	cfg, err := config.Resolve(root, 0)
+	cfg, err := config.Resolve(root)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -317,7 +317,7 @@ func certify(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) i
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	cfg, err := config.Resolve(argOrDefault(args, 1, "."), 0)
+	cfg, err := config.Resolve(argOrDefault(args, 1, "."))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -326,7 +326,7 @@ func certify(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) i
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	report := cert.CertifyDiff(codeGraph, core.DiffInput{UnifiedDiff: string(diffData)})
+	report := cert.CertifyDiffWithStaleness(codeGraph, core.DiffInput{UnifiedDiff: string(diffData)}, cert.RepoFileSHA(cfg.Root))
 	if code := printJSON(report); code != 0 {
 		return code
 	}
@@ -365,7 +365,7 @@ func lockCommand(args []string) int {
 		return 2
 	}
 	intentID := args[0]
-	cfg, err := config.Resolve(args[1], 0)
+	cfg, err := config.Resolve(args[1])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -389,7 +389,7 @@ func unlockCommand(args []string) int {
 		fmt.Fprintln(os.Stderr, "usage: grove unlock <intent-id> <dir>")
 		return 2
 	}
-	cfg, err := config.Resolve(args[1], 0)
+	cfg, err := config.Resolve(args[1])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -409,30 +409,33 @@ func unlockCommand(args []string) int {
 }
 
 func indexRoot(engine *parser.Engine, codeGraph *graph.CodeGraph, root string) (any, error) {
-	return indexRootWithNativeConfig(engine, codeGraph, root, native.ConfigFromEnv())
+	return indexRootFull(engine, codeGraph, root, native.ConfigFromEnv(), index.Options{})
 }
 
-func indexRootWithNativeConfig(engine *parser.Engine, codeGraph *graph.CodeGraph, root string, nativeCfg native.Config) (any, error) {
+func indexRootFull(engine *parser.Engine, codeGraph *graph.CodeGraph, root string, nativeCfg native.Config, opts index.Options) (any, error) {
 	store, err := store.Open(root)
 	if err != nil {
 		return nil, err
 	}
 	defer store.Close()
 	idx := index.NewWithNativeConfig(engine, store, nativeCfg)
-	indexedGraph, result, err := idx.Index(context.Background(), root)
+	indexedGraph, result, err := idx.IndexWithOptions(context.Background(), root, opts)
 	if err != nil {
 		return nil, err
 	}
 	symbols, edges := indexedGraph.Snapshot()
-	codeGraph.ReplaceWithEdges(symbols, edges, result.FilesSeen)
+	codeGraph.ReplaceWithStoredEdges(symbols, edges, result.FilesSeen)
 	return result, nil
 }
 
-func parseNativeIndexArgs(args []string) (string, native.Config, error) {
+func parseNativeIndexArgs(args []string) (string, native.Config, index.Options, error) {
 	cfg := native.ConfigFromEnv()
+	var opts index.Options
 	var positional []string
 	for _, arg := range args {
 		switch {
+		case arg == "--force":
+			opts.Force = true
 		case arg == "--no-native":
 			cfg.Enabled = false
 		case strings.HasPrefix(arg, "--native="):
@@ -445,17 +448,17 @@ func parseNativeIndexArgs(args []string) (string, native.Config, error) {
 			value := strings.TrimPrefix(arg, "--native-timeout=")
 			d, err := time.ParseDuration(value)
 			if err != nil || d <= 0 {
-				return "", cfg, fmt.Errorf("invalid --native-timeout: %s", value)
+				return "", cfg, opts, fmt.Errorf("invalid --native-timeout: %s", value)
 			}
 			cfg.Timeout = d
 		default:
 			if strings.HasPrefix(arg, "--native") {
-				return "", cfg, fmt.Errorf("unknown native flag: %s", arg)
+				return "", cfg, opts, fmt.Errorf("unknown native flag: %s", arg)
 			}
 			positional = append(positional, arg)
 		}
 	}
-	return argOrDefault(positional, 0, "."), cfg, nil
+	return argOrDefault(positional, 0, "."), cfg, opts, nil
 }
 
 func cliFalse(value string) bool {
@@ -509,7 +512,7 @@ func loadGraphFromStore(codeGraph *graph.CodeGraph, st *store.Store) error {
 	if err != nil {
 		return err
 	}
-	codeGraph.ReplaceWithEdges(symbols, edges, len(symbols))
+	codeGraph.ReplaceWithStoredEdges(symbols, edges, len(symbols))
 	return nil
 }
 
@@ -537,11 +540,16 @@ func stripRefresh(args []string) ([]string, bool) {
 }
 
 func decodeICR(input string, value *core.IsolatedChangeRegion) error {
-	data := []byte(input)
-	if decoded, err := base64.StdEncoding.DecodeString(input); err == nil {
-		data = decoded
+	// Try plain JSON first: short JSON strings can also be valid base64,
+	// and decoding those first corrupts the input.
+	if json.Unmarshal([]byte(input), value) == nil {
+		return nil
 	}
-	return json.Unmarshal(data, value)
+	decoded, err := base64.StdEncoding.DecodeString(input)
+	if err != nil {
+		return fmt.Errorf("ICR argument is neither JSON nor base64-encoded JSON")
+	}
+	return json.Unmarshal(decoded, value)
 }
 
 func argOrDefault(args []string, index int, fallback string) string {
@@ -567,7 +575,7 @@ func usage() {
 Usage:
   grove version
   grove init [dir]
-  grove index [dir] [--no-native] [--native=false] [--native-languages=go,rust] [--native-disabled-languages=python] [--native-timeout=5s]
+  grove index [dir] [--force] [--no-native] [--native=false] [--native-languages=go,rust] [--native-disabled-languages=python] [--native-timeout=5s]
   grove status [dir] [--refresh]
   grove symbols <query> [dir] [--refresh]        lexical substring search over names/paths/signatures
   grove query <intent> [dir] [--refresh]         semantic search (Model2Vec embeddings)
