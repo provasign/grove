@@ -95,7 +95,7 @@ func (goAnalyzer) Analyze(ctx context.Context, req Request) Result {
 	edges = append(edges, semanticEdges...)
 	callSiteEdges := goCallSiteEdges(req.Symbols)
 	edges = append(edges, callSiteEdges...)
-	typeUseEdges := goTypeUseEdges(req.Symbols)
+	typeUseEdges := goTypeUseEdges(ctx, req.Symbols)
 	edges = append(edges, typeUseEdges...)
 
 	return Result{
@@ -108,13 +108,36 @@ func (goAnalyzer) Analyze(ctx context.Context, req Request) Result {
 	}
 }
 
-func goAnalyzerEnv(root string) []string {
-	groveDir := filepath.Join(root, ".grove")
-	goCache := filepath.Join(groveDir, "go-build")
-	home := filepath.Join(groveDir, "home")
-	_ = os.MkdirAll(goCache, 0o755)
-	_ = os.MkdirAll(home, 0o755)
-	return appendEnv("GOCACHE="+goCache, "HOME="+home)
+// goAnalyzerEnv preserves the user environment. Earlier versions redirected
+// HOME (and therefore GOMODCACHE) plus GOCACHE into <repo>/.grove/, which
+// re-downloaded the entire module graph into every indexed repository
+// (hundreds of MB of read-only files) and broke GOPRIVATE/.netrc auth.
+// `go list -mod=readonly` is already side-effect free with respect to go.mod;
+// module downloads belong in the user's shared cache.
+func goAnalyzerEnv(_ string) []string {
+	return os.Environ()
+}
+
+// CleanupLegacyCaches removes the per-repo Go caches that earlier Grove
+// versions created under .grove/ by redirecting HOME and GOCACHE. The module
+// cache is written with read-only directory permissions, so directories are
+// made writable before removal.
+func CleanupLegacyCaches(root string) {
+	for _, dir := range []string{
+		filepath.Join(root, ".grove", "home"),
+		filepath.Join(root, ".grove", "go-build"),
+	} {
+		if _, err := os.Stat(dir); err != nil {
+			continue
+		}
+		_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+			if err == nil && d.IsDir() {
+				_ = os.Chmod(path, 0o755)
+			}
+			return nil
+		})
+		_ = os.RemoveAll(dir)
+	}
 }
 
 func packageFiles(root string, pkg goListPackage) []string {
@@ -402,7 +425,53 @@ func countEdgesOfType(edges []core.Edge, edgeType core.EdgeType) int {
 	return count
 }
 
+// goNativeIndex precomputes the lookups goCallSiteEdges and goTypeUseEdges
+// need. The previous implementations scanned the full symbol slice per call
+// site / per caller (O(callers × symbols)).
+type goNativeIndex struct {
+	funcsByName map[string][]core.SymbolRecord
+	typesByName map[string][]core.SymbolRecord
+	filesByDir  map[string][]string // package dir → files
+	filesByBase map[string][]string // last dir segment → files
+}
+
+func newGoNativeIndex(symbols []core.SymbolRecord) *goNativeIndex {
+	idx := &goNativeIndex{
+		funcsByName: map[string][]core.SymbolRecord{},
+		typesByName: map[string][]core.SymbolRecord{},
+		filesByDir:  map[string][]string{},
+		filesByBase: map[string][]string{},
+	}
+	seenFile := map[string]bool{}
+	for _, symbol := range symbols {
+		if symbol.Language != "go" {
+			continue
+		}
+		if symbol.Kind == core.KindFunction {
+			idx.funcsByName[symbol.Name] = append(idx.funcsByName[symbol.Name], symbol)
+		}
+		if typeKind(symbol.Kind) {
+			idx.typesByName[symbol.Name] = append(idx.typesByName[symbol.Name], symbol)
+		}
+		if !seenFile[symbol.FilePath] {
+			seenFile[symbol.FilePath] = true
+			dir := packageDir(symbol.FilePath)
+			idx.filesByDir[dir] = append(idx.filesByDir[dir], symbol.FilePath)
+			idx.filesByBase[lastPathSegment(dir)] = append(idx.filesByBase[lastPathSegment(dir)], symbol.FilePath)
+		}
+	}
+	return idx
+}
+
+func lastPathSegment(path string) string {
+	if i := strings.LastIndexByte(path, '/'); i >= 0 {
+		return path[i+1:]
+	}
+	return path
+}
+
 func goCallSiteEdges(symbols []core.SymbolRecord) []core.Edge {
+	idx := newGoNativeIndex(symbols)
 	var edges []core.Edge
 	seen := map[string]bool{}
 	for _, caller := range symbols {
@@ -416,24 +485,30 @@ func goCallSiteEdges(symbols []core.SymbolRecord) []core.Edge {
 			}
 			var targets []core.SymbolRecord
 			if qualifier == "" {
-				for _, symbol := range symbols {
-					if symbol.Language == "go" && symbol.Kind == core.KindFunction && symbol.Name == name && packageDir(symbol.FilePath) == packageDir(caller.FilePath) {
+				callerDir := packageDir(caller.FilePath)
+				for _, symbol := range idx.funcsByName[name] {
+					if packageDir(symbol.FilePath) == callerDir {
 						targets = append(targets, symbol)
 					}
 				}
 			} else {
-				targetPkg, ok := goImportedPackageForQualifier(caller.Imports, qualifier)
+				imp, ok := goImportedPackageForQualifier(caller.Imports, qualifier)
 				if !ok {
 					continue
 				}
-				for _, symbol := range symbols {
-					if symbol.Language != "go" || symbol.Kind != core.KindFunction || symbol.Name != name {
-						continue
+				for _, symbol := range idx.funcsByName[name] {
+					if goDirMatchesImport(packageDir(symbol.FilePath), imp) {
+						targets = append(targets, symbol)
 					}
-					if packageDir(symbol.FilePath) != targetPkg {
-						continue
+				}
+				if len(targets) == 0 {
+					// Layouts where file paths don't share the import's
+					// module prefix: fall back to last-segment matching.
+					for _, symbol := range idx.funcsByName[name] {
+						if lastPathSegment(packageDir(symbol.FilePath)) == qualifier {
+							targets = append(targets, symbol)
+						}
 					}
-					targets = append(targets, symbol)
 				}
 			}
 			if len(targets) != 1 {
@@ -461,60 +536,74 @@ func splitGoCallSite(callee string) (string, string) {
 	return "", callee
 }
 
+// goImportedPackageForQualifier returns the full import path whose last
+// segment matches the qualifier. Returning only the segment (the previous
+// behaviour) made the caller compare "store" against package dirs like
+// "internal/store", silently dropping qualified cross-package call edges
+// for every nested package.
 func goImportedPackageForQualifier(imports []string, qualifier string) (string, bool) {
 	for _, imp := range imports {
-		seg := imp
-		if i := strings.LastIndexByte(seg, '/'); i >= 0 {
-			seg = seg[i+1:]
-		}
-		if seg == qualifier {
-			return seg, true
+		if lastPathSegment(imp) == qualifier {
+			return imp, true
 		}
 	}
 	return "", false
 }
 
-func goImportScope(caller core.SymbolRecord, symbols []core.SymbolRecord) map[string]bool {
+// goDirMatchesImport reports whether a repo-relative package dir is the
+// package an import path names (the import carries the module prefix that
+// repo-relative dirs lack).
+func goDirMatchesImport(dir, imp string) bool {
+	if dir == "" || dir == "." {
+		return false
+	}
+	return imp == dir || strings.HasSuffix(imp, "/"+dir)
+}
+
+func goImportScope(caller core.SymbolRecord, idx *goNativeIndex) map[string]bool {
 	scope := map[string]bool{caller.FilePath: true}
-	callerDir := packageDir(caller.FilePath)
-	for _, symbol := range symbols {
-		if symbol.Language == "go" && packageDir(symbol.FilePath) == callerDir {
-			scope[symbol.FilePath] = true
-		}
+	for _, file := range idx.filesByDir[packageDir(caller.FilePath)] {
+		scope[file] = true
 	}
 	for _, imp := range caller.Imports {
-		seg := imp
-		if i := strings.LastIndexByte(seg, '/'); i >= 0 {
-			seg = seg[i+1:]
-		}
-		for _, symbol := range symbols {
-			if symbol.Language == "go" && (packageDir(symbol.FilePath) == seg || strings.HasSuffix(packageDir(symbol.FilePath), "/"+seg)) {
-				scope[symbol.FilePath] = true
-			}
+		for _, file := range idx.filesByBase[lastPathSegment(imp)] {
+			scope[file] = true
 		}
 	}
 	return scope
 }
 
-func goTypeUseEdges(symbols []core.SymbolRecord) []core.Edge {
-	typesByName := map[string][]core.SymbolRecord{}
-	for _, symbol := range symbols {
-		if symbol.Language == "go" && typeKind(symbol.Kind) {
-			typesByName[symbol.Name] = append(typesByName[symbol.Name], symbol)
-		}
+// goIdentRe extracts identifier tokens from a stripped body in one pass.
+var goIdentRe = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]*`)
+
+// goTypeUseEdges emits lexical type-use edges. Each caller body is stripped
+// and tokenized exactly once and tokens are resolved through the type index;
+// the previous implementation compiled a fresh regex and re-stripped the
+// body for every (caller, type-name) pair, unbounded by the analyzer
+// timeout. ctx is checked so a timeout still ends the pass promptly.
+func goTypeUseEdges(ctx context.Context, symbols []core.SymbolRecord) []core.Edge {
+	idx := newGoNativeIndex(symbols)
+	if len(idx.typesByName) == 0 {
+		return nil
 	}
 	var edges []core.Edge
 	seen := map[string]bool{}
-	for _, caller := range symbols {
+	for i, caller := range symbols {
+		if i%256 == 0 && ctx.Err() != nil {
+			break
+		}
 		if caller.Language != "go" || !callableKind(caller.Kind) || caller.RawText == "" {
 			continue
 		}
-		scope := goImportScope(caller, symbols)
-		for name, candidates := range typesByName {
-			if !goContainsType(caller.RawText, name) {
+		scope := goImportScope(caller, idx)
+		stripped := stripQuotedText(caller.RawText)
+		seenToken := map[string]bool{}
+		for _, token := range goIdentRe.FindAllString(stripped, -1) {
+			if seenToken[token] {
 				continue
 			}
-			for _, target := range candidates {
+			seenToken[token] = true
+			for _, target := range idx.typesByName[token] {
 				if target.ID == caller.ID || !scope[target.FilePath] {
 					continue
 				}
@@ -530,6 +619,9 @@ func goTypeUseEdges(symbols []core.SymbolRecord) []core.Edge {
 	return edges
 }
 
+// goContainsType reports whether name appears as a bare or package-qualified
+// type token in rawText. Retained for direct callers and tests; the hot path
+// in goTypeUseEdges tokenizes instead.
 func goContainsType(rawText, name string) bool {
 	if containsTypeToken(rawText, name) {
 		return true

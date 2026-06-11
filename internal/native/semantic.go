@@ -3,8 +3,14 @@ package native
 import (
 	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/provasign/grove/internal/core"
+)
+
+var (
+	lexCallRe  = regexp.MustCompile(`([A-Za-z_$][A-Za-z0-9_$]*)\s*\(`)
+	lexIdentRe = regexp.MustCompile(`[A-Za-z_$][A-Za-z0-9_$]*`)
 )
 
 func lexicalSemanticEdges(symbols []core.SymbolRecord, languages map[string]bool, callConfidence, typeConfidence float64) []core.Edge {
@@ -28,15 +34,25 @@ func lexicalSemanticEdges(symbols []core.SymbolRecord, languages map[string]bool
 		if !languages[caller.Language] || caller.RawText == "" || !callableKind(caller.Kind) {
 			continue
 		}
-		text := caller.RawText
+		// Strip and tokenize once per caller instead of compiling a regex
+		// and re-stripping the body for every (caller, target) pair.
+		stripped := stripQuotedText(caller.RawText)
+		callNames := map[string]bool{}
+		for _, m := range lexCallRe.FindAllStringSubmatch(stripped, -1) {
+			callNames[m[1]] = true
+		}
+		identNames := map[string]bool{}
+		for _, token := range lexIdentRe.FindAllString(stripped, -1) {
+			identNames[token] = true
+		}
 		for _, target := range byFile[caller.FilePath] {
 			if target.ID == caller.ID {
 				continue
 			}
-			if callableKind(target.Kind) && containsCall(text, target.Name) {
+			if callableKind(target.Kind) && callNames[target.Name] {
 				add(symbolEdge(caller, target, core.EdgeCalls, callConfidence))
 			}
-			if typeKind(target.Kind) && containsTypeToken(text, target.Name) {
+			if typeKind(target.Kind) && identNames[target.Name] {
 				add(symbolEdge(caller, target, core.EdgeUsesType, typeConfidence))
 			}
 		}
@@ -57,11 +73,31 @@ func typeKind(kind core.SymbolKind) bool {
 	}
 }
 
+// Pattern caches: the per-language analyzers call containsCall /
+// containsTypeToken inside (symbol × candidate) loops; compiling a fresh
+// regex per probe dominated their cost.
+var (
+	patternCacheMu    sync.Mutex
+	callPatternCache  = map[string]*regexp.Regexp{}
+	tokenPatternCache = map[string]*regexp.Regexp{}
+)
+
+func cachedPattern(cache map[string]*regexp.Regexp, name, prefix, suffix string) *regexp.Regexp {
+	patternCacheMu.Lock()
+	defer patternCacheMu.Unlock()
+	if p, ok := cache[name]; ok {
+		return p
+	}
+	p := regexp.MustCompile(prefix + regexp.QuoteMeta(name) + suffix)
+	cache[name] = p
+	return p
+}
+
 func containsCall(text, name string) bool {
 	if name == "" {
 		return false
 	}
-	pattern := regexp.MustCompile(`\b` + regexp.QuoteMeta(name) + `\s*\(`)
+	pattern := cachedPattern(callPatternCache, name, `\b`, `\s*\(`)
 	return pattern.MatchString(stripQuotedText(text))
 }
 
@@ -69,7 +105,7 @@ func containsTypeToken(text, name string) bool {
 	if name == "" {
 		return false
 	}
-	pattern := regexp.MustCompile(`\b` + regexp.QuoteMeta(name) + `\b`)
+	pattern := cachedPattern(tokenPatternCache, name, `\b`, `\b`)
 	return pattern.MatchString(stripQuotedText(text))
 }
 

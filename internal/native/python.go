@@ -31,7 +31,8 @@ func (pythonAnalyzer) Analyze(ctx context.Context, req Request) Result {
 	}
 	name := firstExistingExecutable("python3", "python")
 	cmd := exec.CommandContext(ctx, name, "-c", `
-import ast, importlib.util, json, os, sys
+import ast, json, os, sys
+from importlib.machinery import PathFinder
 root = os.getcwd()
 files = json.loads(os.environ.get("GROVE_FILES", "[]"))
 sys.path.insert(0, root)
@@ -46,6 +47,22 @@ def type_name(node):
     if isinstance(node, ast.Subscript):
         return type_name(node.value)
     return None
+def find_spec_no_import(mod):
+    # importlib.util.find_spec imports parent packages for dotted names,
+    # which executes the repository's __init__.py at index time. Walk the
+    # dotted path with PathFinder instead: pure filesystem resolution, no
+    # code from the indexed repo ever runs.
+    path = None
+    spec = None
+    for part in mod.split("."):
+        try:
+            spec = PathFinder.find_spec(part, path)
+        except Exception:
+            return None
+        if spec is None:
+            return None
+        path = spec.submodule_search_locations
+    return spec
 for rel in files:
     path = os.path.join(root, rel)
     try:
@@ -60,10 +77,7 @@ for rel in files:
         elif isinstance(node, ast.ImportFrom) and node.module:
             mods.append(node.module)
     for mod in mods:
-        try:
-            spec = importlib.util.find_spec(mod)
-        except Exception:
-            spec = None
+        spec = find_spec_no_import(mod)
         origin = getattr(spec, "origin", None) if spec else None
         if not origin or origin in ("built-in", "frozen"):
             continue

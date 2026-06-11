@@ -15,23 +15,48 @@ import (
 	"github.com/provasign/grove/internal/core"
 )
 
-func TestGoAnalyzerEnvSetsGoCacheAndHome(t *testing.T) {
+// TestGoAnalyzerEnvDoesNotRedirectIntoRepo guards against the regression
+// where HOME/GOCACHE were pointed at <repo>/.grove, causing a full per-repo
+// module-cache download and breaking GOPRIVATE auth.
+func TestGoAnalyzerEnvDoesNotRedirectIntoRepo(t *testing.T) {
 	root := t.TempDir()
 	env := goAnalyzerEnv(root)
-	var hasCache, hasHome bool
 	for _, e := range env {
-		if strings.HasPrefix(e, "GOCACHE=") {
-			hasCache = true
-		}
-		if strings.HasPrefix(e, "HOME=") {
-			hasHome = true
+		if strings.HasPrefix(e, "HOME="+root) || strings.HasPrefix(e, "GOCACHE="+root) {
+			t.Fatalf("goAnalyzerEnv redirects into the repo: %v", e)
 		}
 	}
-	if !hasCache || !hasHome {
-		t.Fatalf("goAnalyzerEnv missing GOCACHE or HOME: %v", env)
+	if _, err := os.Stat(filepath.Join(root, ".grove", "go-build")); !os.IsNotExist(err) {
+		t.Fatalf("goAnalyzerEnv must not create .grove/go-build (err=%v)", err)
 	}
-	if _, err := os.Stat(filepath.Join(root, ".grove", "go-build")); err != nil {
-		t.Fatalf("go-build dir not created: %v", err)
+}
+
+func TestCleanupLegacyGoCaches(t *testing.T) {
+	root := t.TempDir()
+	modDir := filepath.Join(root, ".grove", "home", "go", "pkg", "mod", "example.com", "m@v1")
+	if err := os.MkdirAll(modDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(modDir, "f.go"), []byte("package m"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	// Module caches are written with read-only directories.
+	if err := os.Chmod(modDir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, ".grove", "go-build"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	CleanupLegacyCaches(root)
+
+	for _, dir := range []string{
+		filepath.Join(root, ".grove", "home"),
+		filepath.Join(root, ".grove", "go-build"),
+	} {
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Fatalf("%s still exists after cleanup (err=%v)", dir, err)
+		}
 	}
 }
 
@@ -659,7 +684,7 @@ func TestGoCallSiteEdgesResolveImportedCalls(t *testing.T) {
 	}
 	edges := goCallSiteEdges([]core.SymbolRecord{caller, callee, user})
 	assertNativeEdge(t, edges, caller.ID, callee.ID, core.EdgeCalls)
-	typeEdges := goTypeUseEdges([]core.SymbolRecord{caller, callee, user})
+	typeEdges := goTypeUseEdges(context.Background(), []core.SymbolRecord{caller, callee, user})
 	assertNativeEdge(t, typeEdges, caller.ID, user.ID, core.EdgeUsesType)
 }
 
