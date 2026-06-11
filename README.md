@@ -75,7 +75,7 @@ Source files
 
 **Scoped edges prevent false positives.** `calls` and `uses-type` edges are only created between symbols in the same file or in files connected by an `imports` edge. Without this constraint, a function named `parse` in one package would appear to call a `parse` function in an unrelated package, producing roughly 5× the false-positive edges.
 
-**Symbol ID format.** Every symbol has a canonical ID: `{filePath}::{qualifiedName}@{blobSHA}`. The blob SHA component means that if you rename a function, the old symbol ID disappears and a new one is created — stale references in the graph don't survive a reindex.
+**Symbol ID format.** Every symbol has a canonical ID: `{filePath}::{qualifiedName}@{contentSHA}` (SHA-1 of the file content). Qualified names include the parent — `Service.Login`, `User.__init__` — so same-named members on different receivers or classes in one file stay distinct; any residual collision is disambiguated deterministically. The content-SHA component means that if you rename a function, the old symbol ID disappears and a new one is created — stale references in the graph don't survive a reindex.
 
 ---
 
@@ -125,7 +125,7 @@ Benchmarks run on macOS against synthetic Go projects (2026-05-27). Numbers refl
 | Large | 4,501 | 11.6 s | 117 MB | 9 ms |
 | Monorepo | 9,901 | 34.0 s | 196 MB | 61 ms |
 
-Query latency is FTS5 full-text search + BFS graph traversal returning ranked results. RSS scales with project size because the in-memory graph is loaded at serve time.
+Query latency covers in-memory ranked symbol search plus BFS graph traversal over a per-node inbound-edge index. A no-change reindex short-circuits: unchanged files are skipped by content hash and the persisted edge set is reused without re-running native analyzers (measured ~35 ms on an 80-file repo; `grove index --force` opts back into the full pass). RSS scales with project size because the in-memory graph is loaded at serve time.
 
 **Targets:** index 5,000 files < 5 s · BFS depth-3 on 50K nodes < 30 ms · FTS5 query < 10 ms
 
@@ -182,8 +182,9 @@ make test     # run all tests
 # Set up a project (creates .grove/ directory and config)
 grove init [dir]
 
-# Index or reindex (skips unchanged files via delta SHA)
-grove index [dir]
+# Index or reindex (skips unchanged files via delta SHA; reuses the stored
+# graph outright when nothing changed — --force re-runs analyzers anyway)
+grove index [dir] [--force]
 
 # Show persisted index status without refreshing
 grove status [dir] [--refresh]
@@ -218,7 +219,7 @@ Verdicts are intentionally conservative:
 | Verdict | Meaning |
 |---------|---------|
 | `allow` | Grove mapped the diff to indexed symbols and found required evidence. |
-| `manual_review` | Grove could not prove enough structurally, for example unsupported files, ignored/sensitive paths, deleted/binary files, unmapped hunks, or missing test evidence. |
+| `manual_review` | Grove could not prove enough structurally, for example unsupported files, ignored/sensitive paths, deleted/binary files, unmapped hunks, a stale index (file on disk no longer matches the indexed content), or missing test evidence. |
 | `block` | Grove could not process the diff deterministically, for example malformed diff input. |
 
 Certification mode is not a compiler or language-server resolver. Tree-sitter, astkit, and the native analyzers provide structural facts; the report still stays conservative and falls back to `manual_review` whenever evidence is incomplete.
@@ -233,18 +234,19 @@ There is no HTTP or gRPC daemon in the current embedded mode. Use `pkg/grove` fo
 
 ## MCP Tools
 
-Grove exposes eight tools over JSON-RPC 2.0 stdio, accessible to any MCP-capable AI agent:
+Grove exposes nine tools over JSON-RPC 2.0 stdio, accessible to any MCP-capable AI agent. Every tool publishes a full JSON schema with per-parameter descriptions, so agents can discover arguments without guessing:
 
 | Tool | Purpose |
 |------|---------|
-| `grove_index` | Index or reindex a directory |
-| `grove_symbols` | Search for symbols by name |
-| `grove_query` | Retrieve ranked context for an intent |
+| `grove_index` | Index or reindex a directory (`force` re-runs analyzers) |
+| `grove_symbols` | Lexical symbol search, ranked by match quality |
+| `grove_query` | Semantic search: ranked context for a free-text intent |
 | `grove_impact` | Blast radius for a symbol or file |
-| `grove_deps` | Dependency tree for a file |
+| `grove_deps` | Dependency edges for a file |
 | `grove_tests` | Tests that cover a symbol |
-| `grove_icr` | Intent complexity rating |
-| `grove_conflicts` | Potential conflict hotspots |
+| `grove_icr` | Isolated Change Region for an intent |
+| `grove_conflicts` | Overlap check between two ICRs |
+| `grove_certify` | Conservative certification report for a unified diff |
 
 Start the MCP server:
 
