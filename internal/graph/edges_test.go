@@ -181,6 +181,42 @@ func TestTestsForTransitiveCaller(t *testing.T) {
 	}
 }
 
+// TestTestsEdgeScopedToImports guards against H3: TestOpen in one package
+// must not produce a tests edge to a same-named symbol in an unrelated,
+// non-imported package.
+func TestTestsEdgeScopedToImports(t *testing.T) {
+	g := New()
+	g.Replace([]core.SymbolRecord{
+		{ID: "internal/store/store.go::Open@sha", FilePath: "internal/store/store.go", Language: "go", Kind: core.KindFunction, Name: "Open", QualifiedName: "Open"},
+		{ID: "pkg/grove/grove.go::Open@sha", FilePath: "pkg/grove/grove.go", Language: "go", Kind: core.KindFunction, Name: "Open", QualifiedName: "Open"},
+		{ID: "internal/store/store_test.go::TestOpen@sha", FilePath: "internal/store/store_test.go", Language: "go", Kind: core.KindFunction, Name: "TestOpen", QualifiedName: "TestOpen"},
+	}, 3)
+
+	if !hasEdge(g, core.EdgeTests, "internal/store/store_test.go::TestOpen@sha", "internal/store/store.go::Open@sha") {
+		t.Fatal("missing tests edge to same-package Open")
+	}
+	if hasEdge(g, core.EdgeTests, "internal/store/store_test.go::TestOpen@sha", "pkg/grove/grove.go::Open@sha") {
+		t.Fatal("tests edge leaked to non-imported package's Open")
+	}
+}
+
+// TestRustAnnotatedTestGetsSameFileTestsEdge: Rust tests live in the same
+// file as production code (mod tests) and are identified by #[test], not by
+// file naming. Call-site evidence links them to what they exercise.
+func TestRustAnnotatedTestGetsSameFileTestsEdge(t *testing.T) {
+	g := New()
+	g.Replace([]core.SymbolRecord{
+		{ID: "src/lib.rs::parse_input@sha", FilePath: "src/lib.rs", Language: "rust", Kind: core.KindFunction, Name: "parse_input", QualifiedName: "parse_input"},
+		{ID: "src/lib.rs::handles_empty@sha", FilePath: "src/lib.rs", Language: "rust", Kind: core.KindFunction, Name: "handles_empty", QualifiedName: "handles_empty",
+			Annotations: []string{"#[test]"},
+			CallSites:   []core.CallSite{{Callee: "parse_input", Line: 42}}},
+	}, 1)
+
+	if !hasEdge(g, core.EdgeTests, "src/lib.rs::handles_empty@sha", "src/lib.rs::parse_input@sha") {
+		t.Fatal("missing tests edge from #[test] fn to called function")
+	}
+}
+
 // ─── ICR / conflict ─────────────────────────────────────────────────────────
 
 func TestComputeICRNoSeedsHasZeroConfidence(t *testing.T) {

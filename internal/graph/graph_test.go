@@ -168,8 +168,8 @@ func TestDepsExactPrefixNotSubstring(t *testing.T) {
 func TestTestsFor(t *testing.T) {
 	codeGraph := New()
 	codeGraph.Replace([]core.SymbolRecord{
-		{ID: "main.go::Login@sha", FilePath: "main.go", Kind: core.KindFunction, Name: "Login", QualifiedName: "Login"},
-		{ID: "main_test.go::TestLogin@sha", FilePath: "main_test.go", Kind: core.KindFunction, Name: "TestLogin", QualifiedName: "TestLogin"},
+		{ID: "main.go::Login@sha", FilePath: "main.go", Language: "go", Kind: core.KindFunction, Name: "Login", QualifiedName: "Login"},
+		{ID: "main_test.go::TestLogin@sha", FilePath: "main_test.go", Language: "go", Kind: core.KindFunction, Name: "TestLogin", QualifiedName: "TestLogin"},
 	}, 2)
 
 	tests := codeGraph.TestsFor("login")
@@ -206,5 +206,31 @@ func TestComputeICRAndDetectConflicts(t *testing.T) {
 	noConflict := DetectConflicts(loginICR, chargeICR)
 	if noConflict.Conflicts {
 		t.Fatalf("expected no conflict between Login and Charge ICRs, got: %+v", noConflict)
+	}
+}
+
+// TestComputeICRNoMatchReturnsEmptyLowConfidenceRegion guards against the
+// fallback bug where a no-match intent seeded the region from the first 20
+// symbols alphabetically and reported confidence 0.9 with real lock keys.
+func TestComputeICRNoMatchReturnsEmptyLowConfidenceRegion(t *testing.T) {
+	codeGraph := New()
+	codeGraph.Replace([]core.SymbolRecord{
+		{ID: "auth.go::Login@sha", FilePath: "auth.go", Kind: core.KindFunction, Name: "Login", QualifiedName: "Login"},
+		{ID: "billing.go::Charge@sha", FilePath: "billing.go", Kind: core.KindFunction, Name: "Charge", QualifiedName: "Charge"},
+	}, 2)
+
+	icr := codeGraph.ComputeICR("implement quantum flux capacitor")
+	if len(icr.Exclusive) != 0 || len(icr.ExclusiveFiles) != 0 || len(icr.LockKeys) != 0 {
+		t.Fatalf("no-match ICR should be empty, got %+v", icr)
+	}
+	if icr.Confidence > 0.2 {
+		t.Fatalf("no-match ICR confidence = %v, want <= 0.2", icr.Confidence)
+	}
+
+	// Two unrelated no-match intents must not conflict with each other.
+	other := codeGraph.ComputeICR("rewrite the warp drive scheduler")
+	conflict := DetectConflicts(icr, other)
+	if conflict.Conflicts {
+		t.Fatalf("two no-match ICRs must not conflict, got %+v", conflict)
 	}
 }

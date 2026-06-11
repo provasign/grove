@@ -4,7 +4,6 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -39,6 +38,11 @@ type CodeGraph struct {
 	edges        []core.Edge
 	filesIndexed int
 
+	// inbound maps node ID → indices into edges whose To is that node, so
+	// BFS traversals (Impact, TestsFor) are O(V+E) instead of scanning the
+	// whole edge list once per visited node.
+	inbound map[string][]int
+
 	// Lazily-built semantic-search engine. Invalidated on every Replace().
 	semMu     sync.Mutex
 	semEngine embeddings.Engine
@@ -54,6 +58,23 @@ func (g *CodeGraph) Replace(symbols []core.SymbolRecord, filesIndexed int) {
 }
 
 func (g *CodeGraph) ReplaceWithEdges(symbols []core.SymbolRecord, extraEdges []core.Edge, filesIndexed int) {
+	g.install(symbols, mergeEdges(BuildEdges(symbols), extraEdges), filesIndexed)
+}
+
+// ReplaceWithStoredEdges installs a previously-computed edge set verbatim —
+// the edges persisted by the last index are already the merged
+// (baseline + native) set, so rehydration must not pay the BuildEdges cost
+// again. Databases written before edges were persisted (symbols but no
+// edges) fall back to a full rebuild.
+func (g *CodeGraph) ReplaceWithStoredEdges(symbols []core.SymbolRecord, edges []core.Edge, filesIndexed int) {
+	if len(edges) == 0 && len(symbols) > 0 {
+		g.ReplaceWithEdges(symbols, nil, filesIndexed)
+		return
+	}
+	g.install(symbols, append([]core.Edge(nil), edges...), filesIndexed)
+}
+
+func (g *CodeGraph) install(symbols []core.SymbolRecord, edges []core.Edge, filesIndexed int) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
@@ -61,8 +82,12 @@ func (g *CodeGraph) ReplaceWithEdges(symbols []core.SymbolRecord, extraEdges []c
 	for _, s := range symbols {
 		g.symbols[s.ID] = s
 	}
-	g.edges = mergeEdges(BuildEdges(symbols), extraEdges)
+	g.edges = edges
 	g.filesIndexed = filesIndexed
+	g.inbound = make(map[string][]int, len(g.edges))
+	for i, e := range g.edges {
+		g.inbound[e.To] = append(g.inbound[e.To], i)
+	}
 
 	g.semMu.Lock()
 	g.semDirty = true
@@ -187,8 +212,12 @@ func (g *CodeGraph) Status() core.Status {
 	}
 }
 
-// Search returns symbols whose name, qualified name, file path, or signature
-// contains the query string (case-insensitive).
+// Search returns symbols matching the query (case-insensitive), ranked by
+// match quality: exact name > exact qualified name > name prefix > name
+// substring > qualified-name substring > path/signature substring. Ranking
+// matters because results are truncated at limit — with the previous
+// alphabetical-by-path ordering, the exact-name match for a common query
+// could be cut off by substring hits in files that happened to sort earlier.
 func (g *CodeGraph) Search(query string, limit int) []core.SymbolRecord {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
@@ -198,23 +227,62 @@ func (g *CodeGraph) Search(query string, limit int) []core.SymbolRecord {
 		limit = 50
 	}
 
-	var results []core.SymbolRecord
+	type rankedSymbol struct {
+		symbol core.SymbolRecord
+		rank   int
+	}
+	var results []rankedSymbol
 	for _, symbol := range g.symbols {
-		text := strings.ToLower(symbol.Name + " " + symbol.QualifiedName + " " + symbol.FilePath + " " + symbol.Signature)
-		if query == "" || strings.Contains(text, query) {
-			results = append(results, symbol)
+		rank := searchRank(symbol, query)
+		if rank < 0 {
+			continue
 		}
+		results = append(results, rankedSymbol{symbol, rank})
 	}
 	sort.Slice(results, func(i, j int) bool {
-		if results[i].FilePath == results[j].FilePath {
-			return results[i].Span.Start < results[j].Span.Start
+		if results[i].rank != results[j].rank {
+			return results[i].rank > results[j].rank
 		}
-		return results[i].FilePath < results[j].FilePath
+		if results[i].symbol.FilePath == results[j].symbol.FilePath {
+			return results[i].symbol.Span.Start < results[j].symbol.Span.Start
+		}
+		return results[i].symbol.FilePath < results[j].symbol.FilePath
 	})
 	if len(results) > limit {
-		return results[:limit]
+		results = results[:limit]
 	}
-	return results
+	out := make([]core.SymbolRecord, 0, len(results))
+	for _, r := range results {
+		out = append(out, r.symbol)
+	}
+	return out
+}
+
+// searchRank scores how well a symbol matches a lowercase query; negative
+// means no match. An empty query matches everything at equal rank.
+func searchRank(symbol core.SymbolRecord, query string) int {
+	if query == "" {
+		return 0
+	}
+	name := strings.ToLower(symbol.Name)
+	qualified := strings.ToLower(symbol.QualifiedName)
+	switch {
+	case name == query:
+		return 100
+	case qualified == query:
+		return 90
+	case strings.HasPrefix(name, query):
+		return 80
+	case strings.Contains(name, query):
+		return 70
+	case strings.Contains(qualified, query):
+		return 60
+	}
+	if strings.Contains(strings.ToLower(symbol.FilePath), query) ||
+		strings.Contains(strings.ToLower(symbol.Signature), query) {
+		return 40
+	}
+	return -1
 }
 
 // Deps returns all edges that touch the given file path.
@@ -250,20 +318,25 @@ func (g *CodeGraph) Impact(query string, maxDepth int) []core.SymbolRecord {
 	}
 	needle := strings.ToLower(strings.TrimSpace(query))
 
-	// Find seed symbol IDs
+	// Find seed symbol IDs: exact name / qualified name / ID / file path.
 	seeds := make(map[string]bool)
 	for id, symbol := range g.symbols {
 		if needle != "" && (strings.EqualFold(symbol.Name, query) ||
 			strings.EqualFold(symbol.QualifiedName, query) ||
-			strings.EqualFold(symbol.ID, query)) {
+			strings.EqualFold(symbol.ID, query) ||
+			strings.EqualFold(symbol.FilePath, query)) {
 			seeds[id] = true
 		}
 	}
-	// Fallback: substring search
-	if len(seeds) == 0 {
+	// Fallback: substring over symbol names and path suffix only. Matching
+	// the whole ID/path by substring (the previous behaviour) silently
+	// over-seeded — a fuzzy query whose text appeared anywhere in a path
+	// pulled entire unrelated files into the blast radius.
+	if len(seeds) == 0 && needle != "" {
 		for id, symbol := range g.symbols {
-			text := strings.ToLower(symbol.ID + " " + symbol.Name + " " + symbol.QualifiedName + " " + symbol.FilePath)
-			if needle == "" || strings.Contains(text, needle) {
+			if strings.Contains(strings.ToLower(symbol.Name), needle) ||
+				strings.Contains(strings.ToLower(symbol.QualifiedName), needle) ||
+				strings.HasSuffix(strings.ToLower(symbol.FilePath), needle) {
 				seeds[id] = true
 			}
 		}
@@ -284,11 +357,9 @@ func (g *CodeGraph) Impact(query string, maxDepth int) []core.SymbolRecord {
 		if depth >= maxDepth {
 			continue
 		}
-		for _, edge := range g.edges {
+		for _, ei := range g.inbound[node] {
+			edge := g.edges[ei]
 			// Only traverse meaningful inbound edge types for blast radius
-			if edge.To != node {
-				continue
-			}
 			if edge.Type != core.EdgeCalls && edge.Type != core.EdgeTests &&
 				edge.Type != core.EdgeContains && edge.Type != core.EdgeImplements &&
 				edge.Type != core.EdgeExtends && edge.Type != core.EdgeUsesType {
@@ -355,10 +426,8 @@ func (g *CodeGraph) TestsFor(query string) []core.SymbolRecord {
 		for len(queue) > 0 {
 			node := queue[0]
 			queue = queue[1:]
-			for _, edge := range g.edges {
-				if edge.To != node {
-					continue
-				}
+			for _, ei := range g.inbound[node] {
+				edge := g.edges[ei]
 				switch edge.Type {
 				case core.EdgeTests:
 					if t, ok := g.symbols[edge.From]; ok {
@@ -401,11 +470,12 @@ func (g *CodeGraph) TestsFor(query string) []core.SymbolRecord {
 }
 
 // ComputeICR computes an Isolated Change Region for the given intent string.
+// When no symbol matches the intent, the region is empty with floor
+// confidence and no lock keys: an arbitrary fallback region (the previous
+// behaviour seeded from the first 20 symbols alphabetically) would make two
+// unrelated no-match intents lock and conflict on the same random files.
 func (g *CodeGraph) ComputeICR(intent string) core.IsolatedChangeRegion {
 	seeds := g.Search(intent, 20)
-	if len(seeds) == 0 {
-		seeds = g.Search("", 20)
-	}
 
 	exclusive := make(map[string]bool)
 	shared := make(map[string]bool)
@@ -470,17 +540,7 @@ func DetectConflicts(a, b core.IsolatedChangeRegion) core.ConflictResult {
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
 func isTestFile(path string) bool {
-	base := filepath.Base(path)
-	lower := strings.ToLower(base)
-	return strings.HasSuffix(lower, "_test.go") ||
-		(strings.HasPrefix(lower, "test_") && strings.HasSuffix(lower, ".py")) ||
-		strings.HasSuffix(lower, "_test.py") ||
-		strings.HasSuffix(lower, ".test.ts") ||
-		strings.HasSuffix(lower, ".spec.ts") ||
-		strings.HasSuffix(lower, ".test.js") ||
-		strings.HasSuffix(lower, ".spec.js") ||
-		strings.HasSuffix(base, "Test.java") ||
-		strings.HasSuffix(base, "Spec.java")
+	return core.IsTestPath(path)
 }
 
 func mapKeys(m map[string]bool) []string {

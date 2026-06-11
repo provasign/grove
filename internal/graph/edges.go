@@ -478,24 +478,74 @@ func buildUsesType(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
 	return edges
 }
 
-// buildTests emits TestX → X edges across files in the project.
-// Matches Go (TestFoo), Python (test_foo), Java (FooTest) test conventions.
+// buildTests emits test → target edges. Two evidence sources:
+//
+//  1. Naming conventions (TestFoo → Foo, test_foo → foo, FooTest → Foo),
+//     scoped to the test file's import graph — an unscoped name match would
+//     link TestOpen to every Open in the repository, inflating the test
+//     evidence that certification relies on.
+//  2. AST call sites: an unqualified call from a test body to a callable in
+//     scope is direct evidence the test exercises it. This also covers tests
+//     that don't follow naming conventions (Rust #[test] fns, table tests).
+//
+// Symbols count as tests if they live in a test file or carry a test
+// annotation (Rust #[test], JUnit @Test, xUnit [Fact], …) — the latter allows
+// same-file targets because such tests live alongside production code.
 func buildTests(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
 	var edges []core.Edge
-	for _, symbol := range symbols {
-		if !isTestFile(symbol.FilePath) {
+	seen := make(map[string]bool)
+	for i := range symbols {
+		symbol := &symbols[i]
+		inTestFile := isTestFile(symbol.FilePath)
+		annotated := core.HasTestAnnotation(symbol)
+		if !inTestFile && !annotated {
 			continue
 		}
-		for _, target := range testTargets(symbol, idx) {
-			if target.FilePath == symbol.FilePath {
-				continue
+		scope := idx.importedFiles(symbol.FilePath)
+		add := func(target *core.SymbolRecord, allowSameFile bool, confidence float64) {
+			if target.ID == symbol.ID {
+				return
 			}
+			if !allowSameFile && target.FilePath == symbol.FilePath {
+				return
+			}
+			if isTestFile(target.FilePath) {
+				return
+			}
+			if _, ok := scope[target.FilePath]; !ok {
+				return
+			}
+			key := symbol.ID + "::tests::" + target.ID
+			if seen[key] {
+				return
+			}
+			seen[key] = true
 			edges = append(edges, core.Edge{
 				From:       symbol.ID,
 				To:         target.ID,
 				Type:       core.EdgeTests,
-				Confidence: 0.8,
+				Confidence: confidence,
 			})
+		}
+
+		for _, target := range testTargets(*symbol, idx) {
+			add(target, annotated, 0.8)
+		}
+
+		// Call-site evidence. Only unqualified callees: a receiver-qualified
+		// call ("t.Run", "user.save") names a variable, not a type, so a
+		// bare-name match would produce exactly the false positives this
+		// scoping exists to prevent.
+		for _, cs := range symbol.CallSites {
+			if strings.ContainsRune(cs.Callee, '.') {
+				continue
+			}
+			for _, target := range idx.byName[strings.ToLower(cs.Callee)] {
+				if target.Kind != core.KindFunction && target.Kind != core.KindMethod && target.Kind != core.KindConstructor {
+					continue
+				}
+				add(target, true, 0.85)
+			}
 		}
 	}
 	return edges
@@ -524,27 +574,60 @@ func testTargets(symbol core.SymbolRecord, idx *edgeIndex) []*core.SymbolRecord 
 	return out
 }
 
+// callIdentRe extracts call-shaped identifiers ("name(") from a stripped
+// body in a single pass.
+var callIdentRe = regexp.MustCompile(`([A-Za-z_$][A-Za-z0-9_$]*)\s*\(`)
+
+// maxCalleeFanout bounds how many cross-file targets a single callee name
+// may resolve to. When a bare name matches more candidates than this, the
+// reference is ambiguous (typically generated or templated code repeating
+// one name across many files); emitting an edge to every candidate carries
+// no signal and inflates Impact blast radii quadratically.
+const maxCalleeFanout = 16
+
+// resolveCallees resolves a bare callee name within symbol's import scope.
+// A same-file match wins outright: in every supported language a local
+// definition shadows imported ones. Cross-file matches are returned only
+// when unambiguous enough to be meaningful.
+func resolveCallees(idx *edgeIndex, symbol *core.SymbolRecord, calleeName string, scope map[string]struct{}, exactCase bool) []*core.SymbolRecord {
+	var sameFile, crossFile []*core.SymbolRecord
+	for _, cand := range idx.byName[strings.ToLower(calleeName)] {
+		if cand.ID == symbol.ID {
+			continue
+		}
+		if exactCase && cand.Name != calleeName {
+			continue
+		}
+		if cand.Kind != core.KindFunction && cand.Kind != core.KindMethod && cand.Kind != core.KindConstructor {
+			continue
+		}
+		if _, ok := scope[cand.FilePath]; !ok {
+			continue
+		}
+		if cand.FilePath == symbol.FilePath {
+			sameFile = append(sameFile, cand)
+		} else {
+			crossFile = append(crossFile, cand)
+		}
+	}
+	if len(sameFile) > 0 {
+		return sameFile
+	}
+	if len(crossFile) > maxCalleeFanout {
+		return nil
+	}
+	return crossFile
+}
+
 // buildCalls emits same-file + imported-file call edges with strings/comments
 // stripped from the body before matching.
+//
+// The fallback path extracts every call-shaped identifier from the body in
+// one pass and resolves it through the name index. The previous
+// implementation matched a per-callable compiled regex against every other
+// callable's body — O(callables²) regex scans, which on a 10K-symbol
+// single-package corpus took ~40s.
 func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
-	type matcher struct {
-		symbol  *core.SymbolRecord
-		pattern *regexp.Regexp
-	}
-	// Pre-compile per-symbol regex patterns for the fallback path.
-	all := make([]matcher, 0, len(symbols))
-	for i := range symbols {
-		s := &symbols[i]
-		if s.Kind != core.KindFunction && s.Kind != core.KindMethod && s.Kind != core.KindConstructor {
-			continue
-		}
-		pattern, err := regexp.Compile(`\b` + regexp.QuoteMeta(s.Name) + `\s*\(`)
-		if err != nil {
-			continue
-		}
-		all = append(all, matcher{s, pattern})
-	}
-
 	var edges []core.Edge
 	seen := make(map[string]bool)
 
@@ -577,43 +660,32 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
 				if calleeName == "" {
 					continue
 				}
-				candidates := idx.byName[strings.ToLower(calleeName)]
-				for _, cand := range candidates {
-					if cand.ID == symbol.ID {
-						continue
-					}
-					if cand.Kind != core.KindFunction && cand.Kind != core.KindMethod && cand.Kind != core.KindConstructor {
-						continue
-					}
-					if _, ok := scope[cand.FilePath]; !ok {
-						continue
-					}
+				for _, cand := range resolveCallees(idx, &symbol, calleeName, scope, false) {
 					addEdge(symbol.ID, cand.ID, 0.95)
 				}
 			}
 			continue // CallSites authoritative; skip regex fallback for this symbol
 		}
 
-		// ── Fallback: regex over comment/string-stripped body ───────────────
+		// ── Fallback: one identifier-extraction pass over the stripped body ──
 		if symbol.RawText == "" {
 			continue
 		}
 		stripped := stripCommentsAndStrings(symbol.RawText)
-		for _, m := range all {
-			if m.symbol.ID == symbol.ID {
+		seenCallee := make(map[string]bool)
+		for _, m := range callIdentRe.FindAllStringSubmatch(stripped, -1) {
+			calleeName := m[1]
+			if seenCallee[calleeName] {
 				continue
 			}
-			if _, ok := scope[m.symbol.FilePath]; !ok {
-				continue
+			seenCallee[calleeName] = true
+			for _, cand := range resolveCallees(idx, &symbol, calleeName, scope, true) {
+				confidence := 0.6
+				if cand.FilePath == symbol.FilePath {
+					confidence = 0.85
+				}
+				addEdge(symbol.ID, cand.ID, confidence)
 			}
-			if !m.pattern.MatchString(stripped) {
-				continue
-			}
-			confidence := 0.6
-			if m.symbol.FilePath == symbol.FilePath {
-				confidence = 0.85
-			}
-			addEdge(symbol.ID, m.symbol.ID, confidence)
 		}
 	}
 	return edges
