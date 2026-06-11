@@ -27,6 +27,18 @@ type Engine interface {
 	Query(query string, limit int) []Scored
 }
 
+// VectorCacher is implemented by engines whose per-document vectors are a
+// pure function of the document text and can therefore be reused across
+// index rebuilds. Symbol IDs embed the file content SHA, so an unchanged ID
+// guarantees unchanged text. TF-IDF cannot implement this: its weights
+// depend on corpus-wide document frequencies.
+type VectorCacher interface {
+	// IndexWithCache behaves like Index but reads previously computed
+	// vectors from cache, writes newly computed ones back, and prunes
+	// entries whose IDs are no longer present.
+	IndexWithCache(symbols []core.SymbolRecord, cache map[string][]float32)
+}
+
 // Scored is one ranked result.
 type Scored struct {
 	Symbol *core.SymbolRecord

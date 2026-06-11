@@ -141,13 +141,37 @@ func (e *Engine) Embed(text string) []float32 {
 // Index pre-computes a normalized vector for every symbol's document text.
 // Safe to call multiple times — each call replaces the previous index.
 func (e *Engine) Index(symbols []core.SymbolRecord) {
+	e.IndexWithCache(symbols, nil)
+}
+
+// IndexWithCache is Index with vector reuse across rebuilds. A symbol's
+// vector is a pure function of its document text, and symbol IDs embed the
+// file content SHA — so a cache hit by ID is always valid. After a delta
+// reindex of a large repo this turns the first query's full-corpus
+// re-embed into embedding only the symbols of changed files. Entries whose
+// IDs are gone are pruned so the cache tracks the live symbol set.
+func (e *Engine) IndexWithCache(symbols []core.SymbolRecord, cache map[string][]float32) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.symbols = symbols
 	e.docVecs = make([]normalizedVec, len(symbols))
+	used := make(map[string]bool, len(symbols))
 	for i := range symbols {
+		id := symbols[i].ID
+		if cache != nil {
+			used[id] = true
+			if vec, ok := cache[id]; ok {
+				if vec != nil {
+					e.docVecs[i] = normalizedVec{v: vec, norm: 1}
+				}
+				continue
+			}
+		}
 		text := documentText(&symbols[i])
 		vec := e.Embed(text)
+		if cache != nil {
+			cache[id] = vec // nil is cached too: "no signal" is a valid result
+		}
 		if vec == nil {
 			e.docVecs[i] = normalizedVec{}
 			continue
@@ -155,6 +179,13 @@ func (e *Engine) Index(symbols []core.SymbolRecord) {
 		// Embed() already normalizes, so norm=1. Track "has signal" via
 		// the v != nil check rather than a separate flag.
 		e.docVecs[i] = normalizedVec{v: vec, norm: 1}
+	}
+	if cache != nil {
+		for id := range cache {
+			if !used[id] {
+				delete(cache, id)
+			}
+		}
 	}
 }
 

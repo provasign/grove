@@ -44,9 +44,13 @@ type CodeGraph struct {
 	inbound map[string][]int
 
 	// Lazily-built semantic-search engine. Invalidated on every Replace().
-	semMu     sync.Mutex
-	semEngine embeddings.Engine
-	semDirty  bool
+	// semVecCache survives invalidation: vectors are keyed by symbol ID
+	// (content-hashed), so unchanged symbols skip re-embedding when the
+	// engine rebuilds after a delta reindex.
+	semMu       sync.Mutex
+	semEngine   embeddings.Engine
+	semDirty    bool
+	semVecCache map[string][]float32
 }
 
 func New() *CodeGraph {
@@ -598,7 +602,14 @@ func (g *CodeGraph) SemanticSearch(query string, limit int) []embeddings.Scored 
 			syms = append(syms, s)
 		}
 		eng := newSemanticEngine()
-		eng.Index(syms)
+		if cacher, ok := eng.(embeddings.VectorCacher); ok {
+			if g.semVecCache == nil {
+				g.semVecCache = map[string][]float32{}
+			}
+			cacher.IndexWithCache(syms, g.semVecCache)
+		} else {
+			eng.Index(syms)
+		}
 		g.semEngine = eng
 		g.semDirty = false
 	}

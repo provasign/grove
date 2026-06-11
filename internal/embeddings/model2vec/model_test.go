@@ -285,6 +285,47 @@ func TestNormalize_ScalesToUnit(t *testing.T) {
 	}
 }
 
+// ─── IndexWithCache ──────────────────────────────────────────────────────────
+
+func TestIndexWithCacheReusesAndPrunes(t *testing.T) {
+	eng, err := Default()
+	if err != nil {
+		t.Fatalf("Default(): %v", err)
+	}
+	login := core.SymbolRecord{ID: "auth.go::Login@s1", Name: "Login", Signature: "func Login(user string) error"}
+	logout := core.SymbolRecord{ID: "auth.go::Logout@s1", Name: "Logout", Signature: "func Logout()"}
+
+	cache := map[string][]float32{}
+	eng.IndexWithCache([]core.SymbolRecord{login, logout}, cache)
+	if len(cache) != 2 {
+		t.Fatalf("cache size = %d, want 2", len(cache))
+	}
+	loginVec := cache[login.ID]
+	if loginVec == nil {
+		t.Fatal("expected a vector for Login")
+	}
+
+	// Reindex: Login unchanged, Logout replaced by Refresh. The Login
+	// vector must be reused (same backing array), Logout pruned.
+	refresh := core.SymbolRecord{ID: "auth.go::Refresh@s2", Name: "Refresh", Signature: "func Refresh()"}
+	eng.IndexWithCache([]core.SymbolRecord{login, refresh}, cache)
+	if len(cache) != 2 {
+		t.Fatalf("cache size after reindex = %d, want 2", len(cache))
+	}
+	if _, stale := cache[logout.ID]; stale {
+		t.Fatal("removed symbol's vector not pruned")
+	}
+	if got := cache[login.ID]; len(got) == 0 || &got[0] != &loginVec[0] {
+		t.Fatal("unchanged symbol's vector was recomputed instead of reused")
+	}
+
+	// Queries still rank sensibly against the cached index.
+	results := eng.Query("log in a user", 2)
+	if len(results) == 0 || results[0].Symbol.Name != "Login" {
+		t.Fatalf("query results = %+v, want Login first", results)
+	}
+}
+
 // ─── Default()/embedded model tests ─────────────────────────────────────────
 
 func TestDefault_ReturnsCachedEngine(t *testing.T) {

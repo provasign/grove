@@ -54,13 +54,34 @@ Accuracy, performance, and trust fixes from the 2026-06-11 assessment
 - Edge and symbol writes use prepared statements.
 
 ### Added
+- **GraphDiff API** (`pkg/grove`: `SnapshotSymbols`, `Diff`, `DiffSince`):
+  structural delta between two snapshots matched by stable identity
+  (file path + qualified name + kind), with `BreakingChanges` for exported
+  symbols removed or re-signatured. Line shifts and content-SHA churn do
+  not register — only symbols whose signature or body changed appear. This
+  is the primitive for cross-agent drift notification (the Fuse
+  stale-context loop).
+- Nested `.gitignore`/`.groveignore` files now apply relative to their own
+  directory with last-match-wins override, and `**` globs are supported.
 - `grove_certify` MCP tool; all MCP tools now publish full JSON schemas
   with per-parameter descriptions.
 - Ranked symbol search (exact name > prefix > substring) replacing
   alphabetical-by-path ordering; tighter Impact seed fallback.
 - `grove index --force` and `force` argument on `grove_index`.
 
+### Changed — performance (second batch)
+- Changed files are parsed on a worker pool (tree-sitter parsing dominates
+  cold indexing; astkit engines are concurrency-safe); store writes remain
+  serial and ordered, so results are deterministic.
+- Embedding vectors are cached by symbol ID across index rebuilds: the
+  first query after a delta reindex re-embeds only changed files' symbols
+  instead of the whole corpus.
+
 ### Removed
+- The unused FTS5 mirror (`symbols_fts` + sync triggers): no retrieval
+  path ever queried it, while its triggers doubled the cost of every
+  symbol write. Existing databases are migrated (table and triggers
+  dropped) on next open.
 - Vestigial daemon-mode config (`server.port: 7777`) from `grove init`.
 
 ## v0.5.0 - 2026-06-07
