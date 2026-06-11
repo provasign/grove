@@ -111,9 +111,9 @@ func (s *Store) UpsertFile(ctx context.Context, filePath, blobSHA, language stri
 	// Symbol IDs for a file have the form  "filePath::symbolName@sha".
 	// The file-level defines-edge source node is "file:filePath".
 	fileNode := "file:" + filePath
-	idPrefix := filePath + "::"
+	idPrefix := escapeLike(filePath) + "::"
 	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM edges WHERE from_node = ? OR from_node LIKE ? OR to_node LIKE ?`,
+		`DELETE FROM edges WHERE from_node = ? OR from_node LIKE ? ESCAPE '\' OR to_node LIKE ? ESCAPE '\'`,
 		fileNode, idPrefix+"%", idPrefix+"%",
 	); err != nil {
 		return err
@@ -121,6 +121,18 @@ func (s *Store) UpsertFile(ctx context.Context, filePath, blobSHA, language stri
 	if _, err := tx.ExecContext(ctx, `DELETE FROM symbols WHERE file_path = ?`, filePath); err != nil {
 		return err
 	}
+
+	insertStmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO symbols
+			(id, file_path, blob_sha, language, kind, name, qualified_name, signature,
+			 docstring, span_start, span_end, imports, exports, raw_text, parent_symbol, token_estimate,
+			 modifiers, type_parameters, annotations, call_sites)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		return err
+	}
+	defer insertStmt.Close()
 
 	// Defensive: collapse duplicate IDs within a single file. Some Tree-sitter
 	// walkers can revisit a node (e.g. a class declared on the same line as a
@@ -155,13 +167,8 @@ func (s *Store) UpsertFile(ctx context.Context, filePath, blobSHA, language stri
 		if symbol.Exports {
 			exports = 1
 		}
-		_, err = tx.ExecContext(ctx, `
-			INSERT INTO symbols
-				(id, file_path, blob_sha, language, kind, name, qualified_name, signature,
-				 docstring, span_start, span_end, imports, exports, raw_text, parent_symbol, token_estimate,
-				 modifiers, type_parameters, annotations, call_sites)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`, symbol.ID, symbol.FilePath, symbol.BlobSHA, symbol.Language, string(symbol.Kind),
+		_, err = insertStmt.ExecContext(ctx,
+			symbol.ID, symbol.FilePath, symbol.BlobSHA, symbol.Language, string(symbol.Kind),
 			symbol.Name, symbol.QualifiedName, symbol.Signature, symbol.Docstring,
 			symbol.Span.Start, symbol.Span.End, string(imports), exports,
 			symbol.RawText, symbol.ParentSymbol, symbol.TokenEstimate,
@@ -196,11 +203,18 @@ func (s *Store) ReplaceEdges(ctx context.Context, edges []core.Edge) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM edges`); err != nil {
 		return err
 	}
+	// Prepared once per rewrite: edge counts reach the hundreds of thousands
+	// on large repos, and re-parsing the INSERT per row dominated write time.
+	stmt, err := tx.PrepareContext(ctx,
+		`INSERT INTO edges (id, from_node, to_node, edge_type, confidence, source) VALUES (?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(id) DO UPDATE SET confidence = excluded.confidence, source = excluded.source`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
 	for _, edge := range edges {
 		id := fmt.Sprintf("%s::%s::%s", edge.From, edge.Type, edge.To)
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO edges (id, from_node, to_node, edge_type, confidence, source) VALUES (?, ?, ?, ?, ?, ?)
-			 ON CONFLICT(id) DO UPDATE SET confidence = excluded.confidence, source = excluded.source`,
+		if _, err := stmt.ExecContext(ctx,
 			id, edge.From, edge.To, string(edge.Type), edge.Confidence, string(edge.Source),
 		); err != nil {
 			return err
@@ -241,9 +255,9 @@ func (s *Store) DeleteFilesNotIn(ctx context.Context, current map[string]bool) (
 	for _, filePath := range stale {
 		// Same exact-prefix edge deletion as in UpsertFile
 		fileNode := "file:" + filePath
-		idPrefix := filePath + "::"
+		idPrefix := escapeLike(filePath) + "::"
 		if _, err := tx.ExecContext(ctx,
-			`DELETE FROM edges WHERE from_node = ? OR from_node LIKE ? OR to_node LIKE ?`,
+			`DELETE FROM edges WHERE from_node = ? OR from_node LIKE ? ESCAPE '\' OR to_node LIKE ? ESCAPE '\'`,
 			fileNode, idPrefix+"%", idPrefix+"%",
 		); err != nil {
 			return 0, err
@@ -446,6 +460,16 @@ func (s *Store) ReleaseLocks(ctx context.Context, intentID string) (int64, error
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
+
+// escapeLike escapes SQLite LIKE wildcards in a literal prefix. Without
+// this, a path like "a_b.go" used as "a_b.go::%" also matches "axb.go::…"
+// because "_" is a single-character wildcard.
+func escapeLike(value string) string {
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	value = strings.ReplaceAll(value, `%`, `\%`)
+	value = strings.ReplaceAll(value, `_`, `\_`)
+	return value
+}
 
 // marshalSlice marshals a string slice to JSON, emitting "[]" for nil slices
 // (instead of the "null" that json.Marshal would produce for nil).

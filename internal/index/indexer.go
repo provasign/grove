@@ -31,7 +31,19 @@ func (i *Indexer) SetNativeConfig(cfg native.Config) {
 	i.nativeConfig = cfg
 }
 
+// Options controls a single Index run.
+type Options struct {
+	// Force re-runs native analyzers and rebuilds edges even when no files
+	// changed — needed after toolchain availability changes (e.g. installing
+	// go/node makes richer native edges possible without any file edits).
+	Force bool
+}
+
 func (i *Indexer) Index(ctx context.Context, root string) (*graph.CodeGraph, core.IndexResult, error) {
+	return i.IndexWithOptions(ctx, root, Options{})
+}
+
+func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Options) (*graph.CodeGraph, core.IndexResult, error) {
 	var result core.IndexResult
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
@@ -46,6 +58,9 @@ func (i *Indexer) Index(ctx context.Context, root string) (*graph.CodeGraph, cor
 	}
 	root = absRoot
 	result.Root = root
+	// Remove per-repo Go caches left behind by earlier Grove versions
+	// before walking, so they are neither indexed nor left to grow.
+	native.CleanupLegacyCaches(root)
 	currentFiles := map[string]bool{}
 	ignoreRules := loadIgnoreRules(root)
 
@@ -115,6 +130,26 @@ func (i *Indexer) Index(ctx context.Context, root string) (*graph.CodeGraph, cor
 	if err != nil {
 		return nil, result, err
 	}
+
+	// No file changed: the persisted edges are still exactly what a rebuild
+	// would produce, so reuse them instead of re-running native analyzers
+	// and edge construction (which previously made a no-change reindex take
+	// seconds instead of milliseconds). Force opts back into the full path.
+	if !opts.Force && result.FilesUpdated == 0 && result.FilesPruned == 0 {
+		edges, err := i.store.AllEdges(ctx)
+		if err != nil {
+			return nil, result, err
+		}
+		if len(edges) > 0 || len(symbols) == 0 {
+			codeGraph := graph.New()
+			codeGraph.ReplaceWithStoredEdges(symbols, edges, result.FilesSeen)
+			result.SymbolCount = len(symbols)
+			result.EdgeCount = len(edges)
+			result.Native = append(result.Native, "skipped: no file changes since last index (use --force to re-run analyzers)")
+			return codeGraph, result, nil
+		}
+	}
+
 	nativeResult := native.AnalyzeWithConfig(ctx, root, symbols, i.nativeConfig)
 	result.Native = append(result.Native, nativeResult.Diagnostics...)
 
