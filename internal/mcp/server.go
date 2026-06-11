@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/provasign/grove/internal/cert"
 	"github.com/provasign/grove/internal/core"
 	"github.com/provasign/grove/internal/graph"
 	"github.com/provasign/grove/internal/index"
@@ -114,7 +115,8 @@ func (s *Server) callTool(name string, args map[string]any) (any, error) {
 	switch name {
 	case "grove_index":
 		root := stringArg(args, "dir", s.root)
-		codeGraph, result, err := index.New(s.parser, s.store).Index(context.Background(), root)
+		opts := index.Options{Force: boolArg(args, "force")}
+		codeGraph, result, err := index.New(s.parser, s.store).IndexWithOptions(context.Background(), root, opts)
 		if err != nil {
 			return nil, err
 		}
@@ -144,6 +146,16 @@ func (s *Server) callTool(name string, args map[string]any) (any, error) {
 			return nil, err
 		}
 		return graph.DetectConflicts(first, second), nil
+	case "grove_certify":
+		diff := stringArg(args, "diff", "")
+		if diff == "" {
+			return nil, fmt.Errorf("grove_certify: diff is required")
+		}
+		input := core.DiffInput{
+			UnifiedDiff: diff,
+			Policy:      core.CertificationPolicy{RequireTestsForCode: boolArg(args, "requireTests")},
+		}
+		return cert.CertifyDiffWithStaleness(s.currentGraph(), input, cert.RepoFileSHA(s.root)), nil
 	default:
 		return nil, fmt.Errorf("unknown tool: %s", name)
 	}
@@ -170,13 +182,97 @@ func (s *Server) currentGraph() *graph.CodeGraph {
 	return s.graph
 }
 
-func tools() []map[string]any {
-	names := []string{"grove_index", "grove_query", "grove_impact", "grove_deps", "grove_tests", "grove_icr", "grove_conflicts", "grove_symbols"}
-	tools := make([]map[string]any, 0, len(names))
-	for _, name := range names {
-		tools = append(tools, map[string]any{"name": name, "description": "Grove code graph tool: " + name, "inputSchema": map[string]any{"type": "object", "additionalProperties": true}})
+// schema builders keep the tool definitions below readable.
+func prop(typ, description string) map[string]any {
+	return map[string]any{"type": typ, "description": description}
+}
+
+func objectSchema(required []string, props map[string]any) map[string]any {
+	schema := map[string]any{
+		"type":                 "object",
+		"properties":           props,
+		"additionalProperties": false,
 	}
-	return tools
+	if len(required) > 0 {
+		schema["required"] = required
+	}
+	return schema
+}
+
+func tools() []map[string]any {
+	dirProp := prop("string", "Directory to operate on. Defaults to the workspace root the server was started with.")
+	limitProp := prop("integer", "Maximum number of results to return (default 50).")
+	return []map[string]any{
+		{
+			"name":        "grove_index",
+			"description": "Index or reindex the workspace into the Grove code graph. Unchanged files are skipped via content-hash delta; when nothing changed the persisted graph is reused as-is. Run this after making file changes so queries see them.",
+			"inputSchema": objectSchema(nil, map[string]any{
+				"dir":   dirProp,
+				"force": prop("boolean", "Re-run native analyzers and rebuild all edges even if no files changed (use after installing a language toolchain)."),
+			}),
+		},
+		{
+			"name":        "grove_query",
+			"description": "Semantic search: rank indexed symbols against a free-text intent using embeddings. Use for 'where is the code that does X' questions. Returns symbols with similarity scores.",
+			"inputSchema": objectSchema([]string{"intent"}, map[string]any{
+				"intent": prop("string", "Free-text description of what you are looking for, e.g. 'parse unified diff hunk headers'."),
+				"limit":  limitProp,
+			}),
+		},
+		{
+			"name":        "grove_symbols",
+			"description": "Lexical symbol search: case-insensitive substring match over symbol names, qualified names, file paths, and signatures. Use when you know (part of) the identifier.",
+			"inputSchema": objectSchema([]string{"query"}, map[string]any{
+				"query": prop("string", "Substring to match, e.g. 'CertifyDiff' or 'store.Open'."),
+				"limit": limitProp,
+			}),
+		},
+		{
+			"name":        "grove_impact",
+			"description": "Blast radius: every symbol that transitively depends on the given symbol (callers, subtypes, tests) up to maxDepth. Answers 'what breaks if I change this?'.",
+			"inputSchema": objectSchema([]string{"query"}, map[string]any{
+				"query":    prop("string", "Symbol name, qualified name, or symbol ID to compute the blast radius for."),
+				"maxDepth": prop("integer", "Maximum BFS depth over inbound edges (default 3)."),
+			}),
+		},
+		{
+			"name":        "grove_deps",
+			"description": "Dependency edges touching a file: its defines/imports edges plus edges in and out of the symbols it defines.",
+			"inputSchema": objectSchema([]string{"file"}, map[string]any{
+				"file": prop("string", "Repo-relative file path, e.g. 'internal/store/store.go'."),
+			}),
+		},
+		{
+			"name":        "grove_tests",
+			"description": "Tests covering a symbol or file, directly or transitively through the call graph.",
+			"inputSchema": objectSchema([]string{"query"}, map[string]any{
+				"query": prop("string", "Symbol name, qualified name, or file path whose covering tests you want."),
+			}),
+		},
+		{
+			"name":        "grove_icr",
+			"description": "Isolated Change Region for an intent: the symbols/files a change would own exclusively, shared reads, boundary edges, and lock keys for multi-agent coordination. Empty with low confidence when the intent matches no indexed symbol.",
+			"inputSchema": objectSchema([]string{"intent"}, map[string]any{
+				"intent": prop("string", "Free-text task intent used to seed the region."),
+			}),
+		},
+		{
+			"name":        "grove_conflicts",
+			"description": "Check whether two Isolated Change Regions overlap on exclusive symbols or files (would two concurrent tasks collide?).",
+			"inputSchema": objectSchema([]string{"a", "b"}, map[string]any{
+				"a": prop("object", "First ICR, as returned by grove_icr."),
+				"b": prop("object", "Second ICR, as returned by grove_icr."),
+			}),
+		},
+		{
+			"name":        "grove_certify",
+			"description": "Conservative structural certification of a unified diff against the indexed graph: changed/impacted symbols, covering tests, unknowns, and a verdict (allow / manual_review / block). Stale-index and unmappable changes escalate to manual_review, never allow.",
+			"inputSchema": objectSchema([]string{"diff"}, map[string]any{
+				"diff":         prop("string", "Unified diff text (git diff format)."),
+				"requireTests": prop("boolean", "Require test evidence for changed code symbols; uncovered symbols become unknowns (default false)."),
+			}),
+		},
+	}
 }
 
 type rpcError struct {
@@ -239,6 +335,11 @@ func stringArg(args map[string]any, key string, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func boolArg(args map[string]any, key string) bool {
+	value, _ := args[key].(bool)
+	return value
 }
 
 func intArg(args map[string]any, key string, fallback int) int {

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/provasign/grove/internal/core"
 	"github.com/provasign/grove/internal/index"
 	"github.com/provasign/grove/internal/parser"
 	"github.com/provasign/grove/internal/store"
@@ -86,23 +87,55 @@ func TestMCPInitialize(t *testing.T) {
 	}
 }
 
-func TestMCPToolsListReturnsEightTools(t *testing.T) {
+func TestMCPCertifyTool(t *testing.T) {
+	s, _ := newMCPTestServer(t)
+	if _, err := s.callTool("grove_index", map[string]any{}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.callTool("grove_certify", map[string]any{"diff": "not a unified diff"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, ok := result.(core.CertificationReport)
+	if !ok {
+		t.Fatalf("unexpected result type %T", result)
+	}
+	if report.Verdict != core.VerdictBlock {
+		t.Fatalf("verdict = %q, want block for malformed diff", report.Verdict)
+	}
+	if _, err := s.callTool("grove_certify", map[string]any{}); err == nil {
+		t.Fatal("expected error when diff argument is missing")
+	}
+}
+
+func TestMCPToolsListReturnsNineTools(t *testing.T) {
 	s, _ := newMCPTestServer(t)
 	resp := rpcCall(t, s, "tools/list", nil)
 	result, _ := resp["result"].(map[string]any)
 	list, _ := result["tools"].([]any)
-	if len(list) != 8 {
-		t.Fatalf("expected 8 tools, got %d: %v", len(list), list)
+	if len(list) != 9 {
+		t.Fatalf("expected 9 tools, got %d: %v", len(list), list)
 	}
 	want := map[string]bool{
 		"grove_index": false, "grove_query": false, "grove_impact": false,
 		"grove_deps": false, "grove_tests": false, "grove_icr": false,
-		"grove_conflicts": false, "grove_symbols": false,
+		"grove_conflicts": false, "grove_symbols": false, "grove_certify": false,
 	}
 	for _, tool := range list {
 		obj, _ := tool.(map[string]any)
-		if n, _ := obj["name"].(string); n != "" {
+		n, _ := obj["name"].(string)
+		if n != "" {
 			want[n] = true
+		}
+		// Every tool must publish a real parameter schema: agents discover
+		// arguments from inputSchema.properties, which used to be empty.
+		schema, _ := obj["inputSchema"].(map[string]any)
+		props, _ := schema["properties"].(map[string]any)
+		if len(props) == 0 {
+			t.Errorf("tool %s has no parameter properties in inputSchema", n)
+		}
+		if desc, _ := obj["description"].(string); len(desc) < 40 {
+			t.Errorf("tool %s has a stub description: %q", n, desc)
 		}
 	}
 	for name, ok := range want {
