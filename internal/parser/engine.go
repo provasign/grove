@@ -44,7 +44,22 @@ func (e *Engine) ExtractFile(path string, root string) ([]core.SymbolRecord, err
 		relPath = path
 	}
 	relPath = filepath.ToSlash(relPath)
+	return e.ExtractContent(relPath, content)
+}
 
+// ExtractContent extracts symbols from in-memory content as if it lived at
+// relPath (repo-relative, slash-separated). This is how callers preview the
+// symbols a not-yet-written file would index — e.g. a merge driver whose
+// result git only writes to the worktree after the driver exits.
+func (e *Engine) ExtractContent(relPath string, content []byte) ([]core.SymbolRecord, error) {
+	language := DetectLanguage(relPath)
+	if language == "" {
+		return nil, nil
+	}
+	if int64(len(content)) > MaxFileSizeBytes {
+		return nil, fmt.Errorf("skip %s: content exceeds %d bytes", relPath, MaxFileSizeBytes)
+	}
+	relPath = filepath.ToSlash(relPath)
 	blobSHA := sha1Hex(content)
 
 	if language == PlaintextLanguage {

@@ -261,6 +261,33 @@ func (e *Engine) SnapshotSymbols(ctx context.Context) []Symbol {
 	return symbols
 }
 
+// PreviewFileSymbols parses in-memory content as if it lived at relPath
+// (repo-relative) and returns the symbols Grove would index for it. Combine
+// with Diff to compute the structural delta of content that is not on disk
+// yet — e.g. a git merge driver's result, which git writes to the worktree
+// only after the driver exits.
+func (e *Engine) PreviewFileSymbols(relPath string, content []byte) ([]Symbol, error) {
+	return e.parser.ExtractContent(relPath, content)
+}
+
+// DiffAgainstFileContent diffs a snapshot against itself with one file's
+// symbols replaced by those parsed from content: "what would change
+// structurally if relPath had these bytes?".
+func (e *Engine) DiffAgainstFileContent(before []Symbol, relPath string, content []byte) (GraphDiff, error) {
+	preview, err := e.PreviewFileSymbols(relPath, content)
+	if err != nil {
+		return GraphDiff{}, err
+	}
+	after := make([]Symbol, 0, len(before)+len(preview))
+	for _, s := range before {
+		if s.FilePath != relPath {
+			after = append(after, s)
+		}
+	}
+	after = append(after, preview...)
+	return Diff(before, after), nil
+}
+
 // Diff computes the structural delta between two symbol snapshots, matched
 // by stable identity (file path + qualified name + kind) so line shifts and
 // content-SHA churn don't register as changes. This is the primitive behind

@@ -54,6 +54,10 @@ Accuracy, performance, and trust fixes from the 2026-06-11 assessment
 - Edge and symbol writes use prepared statements.
 
 ### Added
+- `PreviewFileSymbols` / `DiffAgainstFileContent` (`pkg/grove`): parse
+  in-memory content as if it lived at a path and diff it against a
+  snapshot — for callers whose result is not on disk yet, like a git merge
+  driver (git writes `%A` to the worktree only after the driver exits).
 - **GraphDiff API** (`pkg/grove`: `SnapshotSymbols`, `Diff`, `DiffSince`):
   structural delta between two snapshots matched by stable identity
   (file path + qualified name + kind), with `BreakingChanges` for exported
