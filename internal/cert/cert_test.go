@@ -269,6 +269,142 @@ func TestCertifyDiffManualReviewPartialTestCoverage(t *testing.T) {
 	}
 }
 
+// TestCertifyDiffContextLinesDoNotMarkNeighboursChanged guards against the
+// bug where hunk ranges were seeded from the @@ header (context lines
+// included), reporting untouched adjacent symbols as changed.
+func TestCertifyDiffContextLinesDoNotMarkNeighboursChanged(t *testing.T) {
+	cg := graph.New()
+	cg.Replace([]core.SymbolRecord{
+		{
+			ID:            "auth.go::Header@sha",
+			FilePath:      "auth.go",
+			BlobSHA:       "sha",
+			Language:      "go",
+			Kind:          core.KindFunction,
+			Name:          "Header",
+			QualifiedName: "Header",
+			Span:          core.LineRange{Start: 1, End: 3},
+		},
+		{
+			ID:            "auth.go::Login@sha",
+			FilePath:      "auth.go",
+			BlobSHA:       "sha",
+			Language:      "go",
+			Kind:          core.KindFunction,
+			Name:          "Login",
+			QualifiedName: "Login",
+			Span:          core.LineRange{Start: 4, End: 8},
+		},
+	}, 1)
+
+	// Only line 6 changes; lines 1-3 (the whole Header symbol) are context.
+	report := CertifyDiff(cg, core.DiffInput{UnifiedDiff: `diff --git a/auth.go b/auth.go
+--- a/auth.go
++++ b/auth.go
+@@ -1,8 +1,8 @@
+ func Header() string {
+ 	return "h"
+ }
+ func Login() bool {
+ 	x := 1
+-	return false
++	return true
+ 	_ = x
+ }
+`})
+
+	if len(report.ChangedSymbols) != 1 || report.ChangedSymbols[0].Name != "Login" {
+		t.Fatalf("changed symbols = %+v, want only Login", report.ChangedSymbols)
+	}
+}
+
+// TestCertifyDiffDeletionOnlyHunkMapsToSymbol verifies that a hunk containing
+// only deletions still attributes the change to the enclosing symbol.
+func TestCertifyDiffDeletionOnlyHunkMapsToSymbol(t *testing.T) {
+	cg := graph.New()
+	cg.Replace([]core.SymbolRecord{
+		{
+			ID:            "auth.go::Login@sha",
+			FilePath:      "auth.go",
+			BlobSHA:       "sha",
+			Language:      "go",
+			Kind:          core.KindFunction,
+			Name:          "Login",
+			QualifiedName: "Login",
+			Span:          core.LineRange{Start: 3, End: 7},
+		},
+	}, 1)
+
+	report := CertifyDiff(cg, core.DiffInput{UnifiedDiff: `diff --git a/auth.go b/auth.go
+--- a/auth.go
++++ b/auth.go
+@@ -4,3 +4,2 @@
+ 	x := 1
+-	log.Println(x)
+ 	return true
+`})
+
+	if len(report.ChangedSymbols) != 1 || report.ChangedSymbols[0].Name != "Login" {
+		t.Fatalf("changed symbols = %+v, want Login for deletion-only hunk", report.ChangedSymbols)
+	}
+}
+
+// TestCertifyDiffStaleIndexEscalatesToManualReview verifies the index_stale
+// gate: when the indexed blob SHA no longer matches the file on disk, the
+// verdict must not be allow.
+func TestCertifyDiffStaleIndexEscalatesToManualReview(t *testing.T) {
+	cg := graph.New()
+	cg.Replace([]core.SymbolRecord{
+		{
+			ID:            "auth.go::Login@indexedsha",
+			FilePath:      "auth.go",
+			BlobSHA:       "indexedsha",
+			Language:      "go",
+			Kind:          core.KindFunction,
+			Name:          "Login",
+			QualifiedName: "Login",
+			Span:          core.LineRange{Start: 3, End: 6},
+		},
+	}, 1)
+
+	diff := core.DiffInput{UnifiedDiff: `diff --git a/auth.go b/auth.go
+--- a/auth.go
++++ b/auth.go
+@@ -3,4 +3,4 @@
+ func Login() bool {
+-	return false
++	return true
+ }
+`}
+
+	stale := CertifyDiffWithStaleness(cg, diff, func(string) (string, bool) { return "differentsha", true })
+	if stale.Verdict != core.VerdictManualReview {
+		t.Fatalf("stale verdict = %q, want manual_review", stale.Verdict)
+	}
+	if len(stale.Unknowns) != 1 || stale.Unknowns[0].Code != "index_stale" {
+		t.Fatalf("stale unknowns = %+v", stale.Unknowns)
+	}
+
+	missing := CertifyDiffWithStaleness(cg, diff, func(string) (string, bool) { return "", false })
+	if missing.Verdict != core.VerdictManualReview {
+		t.Fatalf("missing-file verdict = %q, want manual_review", missing.Verdict)
+	}
+
+	fresh := CertifyDiffWithStaleness(cg, diff, func(string) (string, bool) { return "indexedsha", true })
+	if fresh.Verdict != core.VerdictAllow {
+		t.Fatalf("fresh verdict = %q, want allow; unknowns=%+v", fresh.Verdict, fresh.Unknowns)
+	}
+}
+
+// TestCleanDiffPathStripsTimestampSuffix covers traditional `diff -u` headers
+// that append "\t<timestamp>" to the path.
+func TestCleanDiffPathStripsTimestampSuffix(t *testing.T) {
+	got := cleanDiffPath("b/auth.go\t2026-06-11 10:00:00.000000000 +0000")
+	if got != "auth.go" {
+		t.Fatalf("cleanDiffPath = %q, want auth.go", got)
+	}
+}
+
 func TestParseUnifiedDiffChmodOnly(t *testing.T) {
 	files, err := ParseUnifiedDiff(`diff --git a/auth.go b/auth.go
 old mode 100644

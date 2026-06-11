@@ -17,10 +17,32 @@ const (
 	invalidHunkRangeError = "diff_malformed: invalid hunk range %q"
 )
 
+// FileSHAFunc returns the current content SHA for a repo-relative path.
+// ok=false means the file could not be read (missing, unreadable).
+type FileSHAFunc func(path string) (sha string, ok bool)
+
+// RepoFileSHA returns a FileSHAFunc that hashes repo-relative paths under
+// root with the same content hash the indexer records per file.
+func RepoFileSHA(root string) FileSHAFunc {
+	return func(path string) (string, bool) {
+		sha, err := parser.FileBlobSHA(filepath.Join(root, filepath.FromSlash(path)))
+		return sha, err == nil
+	}
+}
+
 // CertifyDiff maps a unified diff onto the indexed graph and emits a
 // conservative report. It only certifies structural facts Grove can observe;
 // unresolved or heuristic-only coverage is surfaced as manual review.
 func CertifyDiff(codeGraph *graph.CodeGraph, input core.DiffInput) core.CertificationReport {
+	return CertifyDiffWithStaleness(codeGraph, input, nil)
+}
+
+// CertifyDiffWithStaleness is CertifyDiff plus an index-freshness gate: when
+// fileSHA is provided, every changed file whose indexed blob SHA no longer
+// matches the content on disk is reported as index_stale and escalated to
+// manual review. Without this check a stale index would map hunk line
+// numbers onto outdated symbol spans and silently certify the wrong symbols.
+func CertifyDiffWithStaleness(codeGraph *graph.CodeGraph, input core.DiffInput, fileSHA FileSHAFunc) core.CertificationReport {
 	policy := input.Policy
 	report := core.CertificationReport{
 		Version: reportVersion,
@@ -41,7 +63,7 @@ func CertifyDiff(codeGraph *graph.CodeGraph, input core.DiffInput) core.Certific
 	}
 
 	symbols, edges := codeGraph.Snapshot()
-	report.ChangedSymbols = sortedSymbols(collectChangedSymbols(files, symbolsByFile(symbols), &report))
+	report.ChangedSymbols = sortedSymbols(collectChangedSymbols(files, symbolsByFile(symbols), &report, fileSHA))
 	addDerivedGraphFacts(&report, symbols, edges)
 
 	if policy.RequireTestsForCode {
@@ -54,7 +76,7 @@ func CertifyDiff(codeGraph *graph.CodeGraph, input core.DiffInput) core.Certific
 	return report
 }
 
-func collectChangedSymbols(files []DiffFile, byFile map[string][]core.SymbolRecord, report *core.CertificationReport) map[string]core.SymbolRecord {
+func collectChangedSymbols(files []DiffFile, byFile map[string][]core.SymbolRecord, report *core.CertificationReport, fileSHA FileSHAFunc) map[string]core.SymbolRecord {
 	changedByID := map[string]core.SymbolRecord{}
 	for _, file := range files {
 		fileSymbols := byFile[file.Path]
@@ -62,6 +84,14 @@ func collectChangedSymbols(files []DiffFile, byFile map[string][]core.SymbolReco
 		if ok {
 			report.Unknowns = append(report.Unknowns, unknown)
 			continue
+		}
+		if fileSHA != nil {
+			current, ok := fileSHA(file.Path)
+			if !ok || current != fileSymbols[0].BlobSHA {
+				report.Unknowns = append(report.Unknowns, fileUnknown(file.Path, "index_stale",
+					"indexed content does not match the file on disk; reindex before certifying"))
+				continue
+			}
 		}
 		if !addChangedSymbolsForFile(file, fileSymbols, changedByID) {
 			report.Unknowns = append(report.Unknowns, fileUnknown(file.Path, "hunk_unmapped", "changed lines did not intersect any indexed symbol span"))
@@ -124,8 +154,18 @@ func impactedSymbols(changed []core.SymbolRecord, symbols []core.SymbolRecord, e
 	byID := symbolMap(symbols)
 	visited := make(map[string]int, len(changed))
 	queue := seedTraversal(changed, visited)
-	traverseInbound(edges, visited, queue, maxDepth)
+	traverseInbound(inboundIndex(edges), visited, queue, maxDepth)
 	return materializeVisited(visited, byID)
+}
+
+// inboundIndex maps node → inbound edges so BFS is O(V+E) instead of one
+// full edge scan per visited node.
+func inboundIndex(edges []core.Edge) map[string][]*core.Edge {
+	idx := make(map[string][]*core.Edge, len(edges))
+	for i := range edges {
+		idx[edges[i].To] = append(idx[edges[i].To], &edges[i])
+	}
+	return idx
 }
 
 func symbolMap(symbols []core.SymbolRecord) map[string]core.SymbolRecord {
@@ -145,30 +185,24 @@ func seedTraversal(changed []core.SymbolRecord, visited map[string]int) []string
 	return queue
 }
 
-func traverseInbound(edges []core.Edge, visited map[string]int, queue []string, maxDepth int) {
+func traverseInbound(inbound map[string][]*core.Edge, visited map[string]int, queue []string, maxDepth int) {
 	for len(queue) > 0 {
 		node := queue[0]
 		queue = queue[1:]
 		if visited[node] >= maxDepth {
 			continue
 		}
-		queue = append(queue, inboundNeighbors(node, edges, visited)...)
-	}
-}
-
-func inboundNeighbors(node string, edges []core.Edge, visited map[string]int) []string {
-	var next []string
-	for _, edge := range edges {
-		if edge.To != node || !impactEdge(edge.Type) {
-			continue
+		for _, edge := range inbound[node] {
+			if !impactEdge(edge.Type) {
+				continue
+			}
+			if _, ok := visited[edge.From]; ok {
+				continue
+			}
+			visited[edge.From] = visited[node] + 1
+			queue = append(queue, edge.From)
 		}
-		if _, ok := visited[edge.From]; ok {
-			continue
-		}
-		visited[edge.From] = visited[node] + 1
-		next = append(next, edge.From)
 	}
-	return next
 }
 
 func materializeVisited(visited map[string]int, byID map[string]core.SymbolRecord) map[string]core.SymbolRecord {
@@ -197,12 +231,13 @@ func missingTestFindings(changed []core.SymbolRecord, tests []core.SymbolRecord,
 	for _, t := range tests {
 		testIDs[t.ID] = struct{}{}
 	}
+	inbound := inboundIndex(edges)
 	var findings []core.CertificationFinding
 	for _, symbol := range changed {
 		if !requiresTestEvidence(symbol) {
 			continue
 		}
-		if !symbolHasCoveringTest(symbol.ID, testIDs, edges) {
+		if !symbolHasCoveringTest(symbol.ID, testIDs, inbound) {
 			findings = append(findings, core.CertificationFinding{
 				Severity: core.FindingWarning,
 				Code:     "tests_unknown",
@@ -214,12 +249,10 @@ func missingTestFindings(changed []core.SymbolRecord, tests []core.SymbolRecord,
 	return findings
 }
 
-func symbolHasCoveringTest(symbolID string, testIDs map[string]struct{}, edges []core.Edge) bool {
-	for _, edge := range edges {
-		if edge.To == symbolID {
-			if _, ok := testIDs[edge.From]; ok {
-				return true
-			}
+func symbolHasCoveringTest(symbolID string, testIDs map[string]struct{}, inbound map[string][]*core.Edge) bool {
+	for _, edge := range inbound[symbolID] {
+		if _, ok := testIDs[edge.From]; ok {
+			return true
 		}
 	}
 	return false
@@ -230,17 +263,7 @@ func requiresTestEvidence(symbol core.SymbolRecord) bool {
 }
 
 func isTestSymbol(symbol core.SymbolRecord) bool {
-	base := filepath.Base(symbol.FilePath)
-	lower := strings.ToLower(base)
-	return strings.HasSuffix(lower, "_test.go") ||
-		(strings.HasPrefix(lower, "test_") && strings.HasSuffix(lower, ".py")) ||
-		strings.HasSuffix(lower, "_test.py") ||
-		strings.HasSuffix(lower, ".test.ts") ||
-		strings.HasSuffix(lower, ".spec.ts") ||
-		strings.HasSuffix(lower, ".test.js") ||
-		strings.HasSuffix(lower, ".spec.js") ||
-		strings.HasSuffix(base, "Test.java") ||
-		strings.HasSuffix(base, "Spec.java")
+	return core.IsTestSymbol(&symbol)
 }
 
 func impactEdge(edgeType core.EdgeType) bool {
@@ -397,11 +420,15 @@ func (p *diffParser) startHunk(line string) error {
 	if p.current == nil {
 		return errors.New("diff_malformed: hunk before file header")
 	}
-	start, count, err := parseNewRange(line)
+	start, _, err := parseNewRange(line)
 	if err != nil {
 		return err
 	}
-	p.current.Hunks = append(p.current.Hunks, DiffHunk{NewRange: hunkRange(start, count)})
+	// NewRange starts empty and is grown from the actual +/- lines by
+	// handleHunkLine. Seeding it from the @@ header would cover the whole
+	// hunk including context lines, misreporting untouched neighbouring
+	// symbols as changed.
+	p.current.Hunks = append(p.current.Hunks, DiffHunk{})
 	p.hunk = &p.current.Hunks[len(p.current.Hunks)-1]
 	p.newLine = start
 	return nil
@@ -420,6 +447,10 @@ func (p *diffParser) handleHunkLine(line string) error {
 		extendHunkRange(p.hunk, p.newLine)
 		p.newLine++
 	case '-':
+		// A deletion has no post-image line of its own; attribute it to the
+		// post-image position it was removed from so the enclosing symbol is
+		// still reported as changed for deletion-only hunks.
+		extendHunkRange(p.hunk, p.newLine)
 	case ' ':
 		p.newLine++
 	default:
@@ -464,6 +495,10 @@ func binaryPath(line string) string {
 }
 
 func cleanDiffPath(path string) string {
+	// Traditional `diff -u` appends "\t<timestamp>" to header paths.
+	if i := strings.IndexByte(path, '\t'); i >= 0 {
+		path = path[:i]
+	}
 	path = strings.TrimSpace(path)
 	path = strings.TrimPrefix(path, "a/")
 	path = strings.TrimPrefix(path, "b/")
@@ -511,14 +546,6 @@ func rangeCount(parts []string) (int, error) {
 		return 1, nil
 	}
 	return atoiNonNegative(parts[1])
-}
-
-func hunkRange(start, count int) core.LineRange {
-	rangeEnd := start + count - 1
-	if count == 0 {
-		rangeEnd = start
-	}
-	return core.LineRange{Start: start, End: rangeEnd}
 }
 
 func atoiNonNegative(value string) (int, error) {
