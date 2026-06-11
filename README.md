@@ -145,7 +145,7 @@ Grove is the graph backend for the toolchain. Prism and Fuse consume the embedde
 | Shale (planned) | Embedded Go API | Intent-to-diff conformance |
 | Custom automation | `pkg/grove` | In-process Go integration |
 
-For most AI agent use cases, running Grove directly is only necessary for custom integrations. The normal path is `prism init` in your project, which starts Grove automatically.
+For most AI agent use cases, running Grove directly is only necessary for custom integrations. The normal path is `prism init` in your project — Prism embeds Grove in-process and opens the index itself; nothing is started, installed, or configured separately.
 
 ---
 
