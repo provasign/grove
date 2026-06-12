@@ -116,18 +116,34 @@ Non-code files (`.md`, `.yaml`, `.json`, `.xml`, `.sh`, `.toml`, `.proto`, `.sql
 
 ## Performance
 
-Benchmarks run on macOS against synthetic Go projects (2026-05-27). Numbers reflect a cold index (no prior SHA cache). Subsequent runs on an unchanged project complete in milliseconds regardless of project size — only modified files are re-parsed.
+Measured on real repositories (macOS, Apple Silicon, 2026-06-12), parallel
+parsing and native analyzers enabled:
 
-| Project | Files | Index time | Peak RSS | Query latency |
-|---------|------:|----------:|---------:|--------------:|
-| Small | 61 | 0.06 s | 30 MB | 6 ms |
-| Medium | 801 | 0.85 s | 55 MB | 6 ms |
-| Large | 4,501 | 11.6 s | 117 MB | 9 ms |
-| Monorepo | 9,901 | 34.0 s | 196 MB | 61 ms |
+| Repo | Files indexed | Symbols | Edges | Cold index | One-file change | No-change reindex (CLI) |
+|------|--------------:|--------:|------:|-----------:|----------------:|------------------------:|
+| [prometheus](https://github.com/prometheus/prometheus) | 1,476 | 14k | 259k | 12.2 s | — | 0.7 s |
+| [django](https://github.com/django/django) | 3,792 | 39.5k | 425k | 18.5 s | — | 1.5 s |
+| [grafana](https://github.com/grafana/grafana) | 18,979 | 98.5k | 1.16M | 56.6 s | 18.7 s | 9.5 s |
 
-Query latency covers in-memory ranked symbol search plus BFS graph traversal over a per-node inbound-edge index. A no-change reindex short-circuits: unchanged files are skipped by content hash and the persisted edge set is reused without re-running native analyzers (measured ~35 ms on an 80-file repo; `grove index --force` opts back into the full pass). RSS scales with project size because the in-memory graph is loaded at serve time.
+How to read these:
 
-**Targets:** index 5,000 files < 5 s · BFS depth-3 on 50K nodes < 30 ms · symbol query < 15 ms
+- **Cold index** includes tree-sitter parsing of everything, native
+  analyzers (the TypeScript program check dominates polyglot repos), full
+  edge construction, and persistence.
+- **One-file change** re-parses one file, runs native analyzers only for
+  the changed file's language (untouched languages' edges are carried
+  forward), rebuilds the graph, and diff-syncs the edge table (only changed
+  rows are written). The remaining cost on huge repos is the full
+  in-memory edge rebuild — per-file incremental edge maintenance is the
+  known next step.
+- **No-change reindex (CLI)** is dominated by per-process graph
+  rehydration from SQLite — a long-lived embedded engine (Prism MCP, Fuse)
+  pays it once at open, after which a no-change `Index()` is milliseconds
+  and queries run against the in-memory graph (BFS depth-3 over 50k nodes
+  ≈ 4.5 ms, ranked search ≈ 15 ms at 50k symbols).
+- Native analyzer timeouts default to 5 s per analyzer; very large repos
+  may need `GROVE_NATIVE_TIMEOUT=60s` for `go list`/`tsc` to finish (skips
+  degrade gracefully and are reported in the index diagnostics).
 
 ---
 

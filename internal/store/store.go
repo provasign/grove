@@ -202,39 +202,114 @@ func (s *Store) UpsertFile(ctx context.Context, filePath, blobSHA, language stri
 	return tx.Commit()
 }
 
+// ReplaceEdges makes the edges table equal to the given set. It diffs
+// against what is stored and writes only the difference: a one-file change
+// on a million-edge repo touches hundreds of rows, and the previous
+// delete-everything-reinsert paid the full million-row write every index
+// (21s on a 19k-file monorepo). Inserts are batched multi-row.
 func (s *Store) ReplaceEdges(ctx context.Context, edges []core.Edge) error {
+	type edgeMeta struct {
+		confidence float64
+		source     string
+	}
+	stored := map[string]edgeMeta{}
+	rows, err := s.db.QueryContext(ctx, `SELECT id, confidence, source FROM edges`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var id, source string
+		var conf float64
+		if err := rows.Scan(&id, &conf, &source); err != nil {
+			rows.Close()
+			return err
+		}
+		stored[id] = edgeMeta{confidence: conf, source: source}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	wantIDs := make(map[string]bool, len(edges))
+	var upserts []core.Edge
+	var upsertIDs []string
+	for _, edge := range edges {
+		id := edge.From + "::" + string(edge.Type) + "::" + edge.To
+		if wantIDs[id] {
+			continue // duplicate (from, type, to); first one wins
+		}
+		wantIDs[id] = true
+		if meta, ok := stored[id]; ok && meta.confidence == edge.Confidence && meta.source == string(edge.Source) {
+			continue
+		}
+		upserts = append(upserts, edge)
+		upsertIDs = append(upsertIDs, id)
+	}
+	var deletes []string
+	for id := range stored {
+		if !wantIDs[id] {
+			deletes = append(deletes, id)
+		}
+	}
+	if len(upserts) == 0 && len(deletes) == 0 {
+		return nil
+	}
+
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.ExecContext(ctx, `DELETE FROM edges`); err != nil {
-		return err
+
+	const deleteChunk = 500
+	for start := 0; start < len(deletes); start += deleteChunk {
+		end := start + deleteChunk
+		if end > len(deletes) {
+			end = len(deletes)
+		}
+		chunk := deletes[start:end]
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(chunk)), ",")
+		args := make([]any, len(chunk))
+		for i, id := range chunk {
+			args[i] = id
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM edges WHERE id IN (`+placeholders+`)`, args...); err != nil {
+			return err
+		}
 	}
-	// Prepared once per rewrite: edge counts reach the hundreds of thousands
-	// on large repos, and re-parsing the INSERT per row dominated write time.
-	stmt, err := tx.PrepareContext(ctx,
-		`INSERT INTO edges (id, from_node, to_node, edge_type, confidence, source) VALUES (?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(id) DO UPDATE SET confidence = excluded.confidence, source = excluded.source`)
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
-	for _, edge := range edges {
-		id := fmt.Sprintf("%s::%s::%s", edge.From, edge.Type, edge.To)
-		if _, err := stmt.ExecContext(ctx,
-			id, edge.From, edge.To, string(edge.Type), edge.Confidence, string(edge.Source),
-		); err != nil {
+
+	const insertChunk = 400 // 6 columns × 400 = 2400 parameters per statement
+	for start := 0; start < len(upserts); start += insertChunk {
+		end := start + insertChunk
+		if end > len(upserts) {
+			end = len(upserts)
+		}
+		chunk := upserts[start:end]
+		var sb strings.Builder
+		sb.WriteString(`INSERT INTO edges (id, from_node, to_node, edge_type, confidence, source) VALUES `)
+		args := make([]any, 0, len(chunk)*6)
+		for i, edge := range chunk {
+			if i > 0 {
+				sb.WriteString(",")
+			}
+			sb.WriteString("(?,?,?,?,?,?)")
+			args = append(args, upsertIDs[start+i], edge.From, edge.To, string(edge.Type), edge.Confidence, string(edge.Source))
+		}
+		sb.WriteString(` ON CONFLICT(id) DO UPDATE SET confidence = excluded.confidence, source = excluded.source`)
+		if _, err := tx.ExecContext(ctx, sb.String(), args...); err != nil {
 			return err
 		}
 	}
 	return tx.Commit()
 }
 
-func (s *Store) DeleteFilesNotIn(ctx context.Context, current map[string]bool) (int, error) {
+// FilesNotIn returns the indexed file paths absent from current — the files
+// a delete pass would prune — without deleting anything.
+func (s *Store) FilesNotIn(ctx context.Context, current map[string]bool) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT file_path FROM file_index`)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	defer rows.Close()
 
@@ -242,13 +317,18 @@ func (s *Store) DeleteFilesNotIn(ctx context.Context, current map[string]bool) (
 	for rows.Next() {
 		var filePath string
 		if err := rows.Scan(&filePath); err != nil {
-			return 0, err
+			return nil, err
 		}
 		if !current[filePath] {
 			stale = append(stale, filePath)
 		}
 	}
-	if err := rows.Err(); err != nil {
+	return stale, rows.Err()
+}
+
+func (s *Store) DeleteFilesNotIn(ctx context.Context, current map[string]bool) (int, error) {
+	stale, err := s.FilesNotIn(ctx, current)
+	if err != nil {
 		return 0, err
 	}
 	if len(stale) == 0 {

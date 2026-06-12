@@ -73,6 +73,10 @@ type Request struct {
 type Result struct {
 	Edges       []core.Edge
 	Diagnostics []string
+	// SkippedLanguages lists languages whose analyzers were skipped because
+	// no files of theirs changed; the indexer carries their stored native
+	// edges forward instead of dropping them.
+	SkippedLanguages []string
 }
 
 func PriorityAnalyzers() []Analyzer {
@@ -93,6 +97,16 @@ func Analyze(ctx context.Context, root string, symbols []core.SymbolRecord) Resu
 }
 
 func AnalyzeWithConfig(ctx context.Context, root string, symbols []core.SymbolRecord, cfg Config) Result {
+	return AnalyzeChanged(ctx, root, symbols, cfg, nil)
+}
+
+// AnalyzeChanged is AnalyzeWithConfig scoped to the languages that actually
+// changed. changedLanguages == nil means "analyze everything" (cold index,
+// --force). An analyzer whose languages saw no changed files is skipped and
+// reported as such — its previous edges are carried forward by the indexer.
+// On a polyglot monorepo this is the difference between a one-file Go edit
+// re-running the whole TypeScript program check and not.
+func AnalyzeChanged(ctx context.Context, root string, symbols []core.SymbolRecord, cfg Config, changedLanguages map[string]bool) Result {
 	if !cfg.Enabled {
 		return Result{Diagnostics: []string{"native analyzers disabled"}}
 	}
@@ -104,6 +118,11 @@ func AnalyzeWithConfig(ctx context.Context, root string, symbols []core.SymbolRe
 	for _, analyzer := range PriorityAnalyzers() {
 		if !analyzerEnabled(analyzer, cfg) {
 			combined.Diagnostics = append(combined.Diagnostics, analyzer.Name()+": skipped: disabled by config")
+			continue
+		}
+		if changedLanguages != nil && !touchesLanguages(analyzer, changedLanguages) {
+			combined.Diagnostics = append(combined.Diagnostics, analyzer.Name()+": skipped: no changed files in its languages (previous edges carried forward)")
+			combined.SkippedLanguages = append(combined.SkippedLanguages, analyzer.Languages()...)
 			continue
 		}
 		reqFiles := filterFiles(files, analyzer.Languages())
@@ -124,6 +143,15 @@ func AnalyzeWithConfig(ctx context.Context, root string, symbols []core.SymbolRe
 		combined.Edges = append(combined.Edges, result.Edges...)
 	}
 	return combined
+}
+
+func touchesLanguages(analyzer Analyzer, changed map[string]bool) bool {
+	for _, lang := range analyzer.Languages() {
+		if changed[lang] {
+			return true
+		}
+	}
+	return false
 }
 
 func analyzerEnabled(analyzer Analyzer, cfg Config) bool {

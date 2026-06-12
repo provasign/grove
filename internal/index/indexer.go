@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 
 	"github.com/provasign/grove/internal/core"
@@ -167,6 +168,7 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 
 	// Phase 3 (serial): persist. SQLite has one writer; ordered writes keep
 	// the run reproducible.
+	changedLanguages := map[string]bool{}
 	for idx, task := range tasks {
 		if err := ctx.Err(); err != nil {
 			return nil, result, err
@@ -175,10 +177,19 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 			result.Errors = append(result.Errors, outcomes[idx].err.Error())
 			continue
 		}
-		if err := i.store.UpsertFile(ctx, task.relPath, task.blobSHA, parser.DetectLanguage(task.absPath), outcomes[idx].symbols); err != nil {
+		language := parser.DetectLanguage(task.absPath)
+		if err := i.store.UpsertFile(ctx, task.relPath, task.blobSHA, language, outcomes[idx].symbols); err != nil {
 			return nil, result, err
 		}
+		changedLanguages[language] = true
 		result.FilesUpdated++
+	}
+	prunedFiles, err := i.store.FilesNotIn(ctx, currentFiles)
+	if err != nil {
+		return nil, result, err
+	}
+	for _, pruned := range prunedFiles {
+		changedLanguages[parser.DetectLanguage(pruned)] = true
 	}
 	filesPruned, err := i.store.DeleteFilesNotIn(ctx, currentFiles)
 	if err != nil {
@@ -210,8 +221,25 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 		}
 	}
 
-	nativeResult := native.AnalyzeWithConfig(ctx, root, symbols, i.nativeConfig)
+	// Scope native analysis to the languages that changed. A cold index
+	// (store was empty before this run) or Force analyzes everything.
+	scope := changedLanguages
+	if opts.Force || result.FilesUpdated == result.FilesSeen {
+		scope = nil
+	}
+	nativeResult := native.AnalyzeChanged(ctx, root, symbols, i.nativeConfig, scope)
 	result.Native = append(result.Native, nativeResult.Diagnostics...)
+
+	// Carry forward stored native edges for the skipped analyzers' languages:
+	// their facts didn't change, and rebuilding edges from scratch below
+	// would otherwise drop them.
+	if len(nativeResult.SkippedLanguages) > 0 {
+		carried, err := i.carriedNativeEdges(ctx, symbols, nativeResult.SkippedLanguages)
+		if err != nil {
+			return nil, result, err
+		}
+		nativeResult.Edges = append(nativeResult.Edges, carried...)
+	}
 
 	codeGraph := graph.New()
 	codeGraph.ReplaceWithEdges(symbols, nativeResult.Edges, result.FilesSeen)
@@ -223,4 +251,54 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 	result.SymbolCount = len(symbols)
 	result.EdgeCount = len(edges)
 	return codeGraph, result, nil
+}
+
+// carriedNativeEdges returns the stored native-analyzer edges whose source
+// endpoint belongs to one of the skipped languages and whose endpoints still
+// resolve against the current symbol set. Skipping an analyzer must not
+// erase the facts it produced last run.
+func (i *Indexer) carriedNativeEdges(ctx context.Context, symbols []core.SymbolRecord, skippedLanguages []string) ([]core.Edge, error) {
+	stored, err := i.store.AllEdges(ctx)
+	if err != nil {
+		return nil, err
+	}
+	skipped := make(map[string]bool, len(skippedLanguages))
+	for _, l := range skippedLanguages {
+		skipped[l] = true
+	}
+	symLang := make(map[string]string, len(symbols))
+	fileLang := map[string]string{}
+	for idx := range symbols {
+		s := &symbols[idx]
+		symLang[s.ID] = s.Language
+		if _, ok := fileLang[s.FilePath]; !ok {
+			fileLang[s.FilePath] = s.Language
+		}
+	}
+	nodeLang := func(node string) (string, bool) {
+		if l, ok := symLang[node]; ok {
+			return l, true
+		}
+		if rest, ok := strings.CutPrefix(node, "file:"); ok {
+			if l, ok2 := fileLang[rest]; ok2 {
+				return l, true
+			}
+		}
+		return "", false
+	}
+	var out []core.Edge
+	for _, e := range stored {
+		if e.Source != core.EvidenceSourceNative {
+			continue
+		}
+		fromLang, ok := nodeLang(e.From)
+		if !ok || !skipped[fromLang] {
+			continue
+		}
+		if _, ok := nodeLang(e.To); !ok {
+			continue // endpoint no longer exists; drop the stale edge
+		}
+		out = append(out, e)
+	}
+	return out, nil
 }

@@ -24,6 +24,15 @@ type edgeIndex struct {
 	// same-directory files (e.g. a 50-file package).
 	dirToFiles map[string][]string
 
+	// dirFilesLower / dirFilesByBase support O(import-depth) resolution of
+	// package/directory imports: a dir matches an import when the import
+	// path equals it or ends with "/"+dir (looked up via the import's
+	// slash-suffixes), or when the dir's last segment equals the import's
+	// last segment. The previous implementation scanned every directory per
+	// import — ~0.5 billion string ops on a 19k-file monorepo.
+	dirFilesLower  map[string][]string
+	dirFilesByBase map[string][]string
+
 	// importPathToFiles maps a slash-separated import path without extension to
 	// files whose path matches that import exactly or by package directory.
 	importPathToFiles map[string][]string
@@ -42,6 +51,8 @@ func newEdgeIndex(symbols []core.SymbolRecord) *edgeIndex {
 		byID:               make(map[string]*core.SymbolRecord),
 		fileImports:        make(map[string]map[string]struct{}),
 		dirToFiles:         make(map[string][]string),
+		dirFilesLower:      make(map[string][]string),
+		dirFilesByBase:     make(map[string][]string),
 		importPathToFiles:  make(map[string][]string),
 		baseToFiles:        make(map[string][]string),
 		importedFilesCache: make(map[string]map[string]struct{}),
@@ -63,6 +74,10 @@ func newEdgeIndex(symbols []core.SymbolRecord) *edgeIndex {
 	for f := range idx.byFile {
 		d := dirOf(f)
 		idx.dirToFiles[d] = append(idx.dirToFiles[d], f)
+		if dLower := strings.ToLower(d); dLower != "" && dLower != "." {
+			idx.dirFilesLower[dLower] = append(idx.dirFilesLower[dLower], f)
+			idx.dirFilesByBase[baseOf(dLower)] = append(idx.dirFilesByBase[baseOf(dLower)], f)
+		}
 		idx.importPathToFiles[strings.ToLower(trimExt(f))] = append(idx.importPathToFiles[strings.ToLower(trimExt(f))], f)
 		idx.baseToFiles[strings.ToLower(baseNameNoExt(f))] = append(idx.baseToFiles[strings.ToLower(baseNameNoExt(f))], f)
 	}
@@ -120,60 +135,48 @@ func (idx *edgeIndex) importedFiles(fromFile string) map[string]struct{} {
 		}
 		segLower := strings.ToLower(seg)
 
-		candidateSet := make(map[string]struct{})
 		// Fast path: direct file-path match (e.g. relative imports, or same-depth imports
 		// where the import string matches the file path exactly after extension strip).
 		for _, f := range idx.importPathToFiles[impNorm] {
 			if f != fromFile {
-				candidateSet[f] = struct{}{}
+				out[f] = struct{}{}
 			}
 		}
-		// Package/directory match: scan dirToFiles keys for suffix/base matches.
-		// This handles module-prefixed imports (e.g. "github.com/foo/internal/calc"
-		// must match files under "internal/calc/") where the module path prefix is
-		// not present in the file paths. O(|dirs|) per import, offset by the
-		// per-file importedFilesCache so each file's imports are resolved only once.
-		for d, dFiles := range idx.dirToFiles {
-			dLower := strings.ToLower(d)
-			if dLower == "" || dLower == "." {
+
+		// (1) Package / directory imports — the common case for Go, Rust,
+		// and Python, where one import names a DIRECTORY and pulls in every
+		// file under it. A directory matches when the (module-prefixed)
+		// import path equals it or ends with "/"+dir — i.e. when one of the
+		// import's slash-suffixes equals the dir — or when the dir's last
+		// segment equals the import's last segment. Suffix lookups make this
+		// O(import-depth) instead of a scan over every directory, which on a
+		// 19k-file monorepo was ~0.5 billion string comparisons per index.
+		parts := strings.Split(impNorm, "/")
+		for i := range parts {
+			suffix := strings.Join(parts[i:], "/")
+			if suffix == "" || suffix == "." {
 				continue
 			}
-			if impNorm == dLower || strings.HasSuffix(impNorm, "/"+dLower) || baseOf(dLower) == segLower {
-				for _, f := range dFiles {
-					if f != fromFile {
-						candidateSet[f] = struct{}{}
-					}
+			for _, f := range idx.dirFilesLower[suffix] {
+				if f != fromFile {
+					out[f] = struct{}{}
 				}
 			}
 		}
-		// Basename match: for JS/TS file-name imports (e.g. "./auth" → "auth.ts").
-		for _, f := range idx.baseToFiles[segLower] {
+		for _, f := range idx.dirFilesByBase[segLower] {
 			if f != fromFile {
-				candidateSet[f] = struct{}{}
+				out[f] = struct{}{}
 			}
 		}
 
-		for c := range candidateSet {
-			lower := strings.ToLower(c)
-			base := strings.ToLower(baseNameNoExt(c))
-
-			// (1) Package / directory imports — the common case for Go, Rust,
-			// and Python, where one import names a DIRECTORY and pulls in every
-			// file under it. Resolve by directory, not by a file that happens to
-			// be named after the package. Without this, every cross-package call
-			// edge in a Go repo is dropped: import ".../internal/ranking" never
-			// matches the file "internal/ranking/budget.go", so the call graph
-			// collapses to same-file only.
-			dir := strings.ToLower(dirOf(c)) // e.g. "internal/ranking"
-			if dir != "" && dir != "." &&
-				(impNorm == dir || strings.HasSuffix(impNorm, "/"+dir) ||
-					baseOf(dir) == segLower) {
-				out[c] = struct{}{}
+		// (2) File-name imports — e.g. a JS/TS relative import "./auth"
+		// resolving to "auth.ts".
+		for _, c := range idx.baseToFiles[segLower] {
+			if c == fromFile {
 				continue
 			}
-
-			// (2) File-name imports — e.g. a JS/TS relative import "./auth"
-			// resolving to "auth.ts".
+			lower := strings.ToLower(c)
+			base := strings.ToLower(baseNameNoExt(c))
 			if base == segLower || strings.HasSuffix(lower, "/"+segLower) ||
 				strings.HasSuffix(lower, "/"+segLower+".go") ||
 				strings.HasSuffix(lower, "/"+segLower+".py") ||
