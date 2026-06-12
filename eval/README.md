@@ -118,25 +118,27 @@ Grove's recall against it is meaningful while precision is a lower bound
 
 | Repo | Universe match | Precision* | Recall | F1 |
 |---|---|---|---|---|
-| requests (`6f66281a`) | 100% | 0.7653 | 0.5971 | 0.6708 |
-| flask (`36e4a824`) | 97.9% | 0.7276 | 0.4865 | 0.5831 |
+| requests (`6f66281a`) | 100% | 0.7682 | 0.6190 | 0.6856 |
+| flask (`36e4a824`) | 97.9% | 0.7599 | 0.5963 | 0.6682 |
 
-(flask improved from F1 0.4614 the same day via decorator wrapper→wrapped
-call edges — `@setupmethod`-style wrappers now produce wrapper→wrapped and
-caller→wrapper edges when the decorator resolves to an in-repo function.)
+flask same-day progression: F1 0.4614 → 0.5831 (decorator wrapper→wrapped
+edges) → 0.6682 (property-read edges: astkit v0.4.3 emits attribute-access
+sites, resolved strictly against @property-annotated methods).
 
 *lower bound — see the partial-oracle caveat above.
 
 The recall gap decomposes into three buckets (flask FN sample):
 
 1. **Property access** — `request.blueprints` executes `@property` code with
-   no call syntax, so no CallSite exists. Needs attribute-access modeling.
+   no call syntax. SOLVED: astkit v0.4.3 emits attribute-access sites
+   (`AttrSites`); Grove resolves them against property-annotated methods
+   only, so plain field reads never produce edges.
 2. **Decorator wrappers** — `@setupmethod`-style wrappers call the wrapped
-   function; Grove sees the decoration (in `Annotations`) but emits no
-   wrapper→wrapped edge yet.
+   function. SOLVED: wrapper→wrapped and caller→wrapper calls edges when
+   the decorator resolves to one in-repo function.
 3. **Registry dispatch** — `dispatch_request` → view functions through
-   Flask's routing table. Fundamentally dynamic; a fair ceiling for static
-   structure.
+   Flask's routing table. Fundamentally dynamic; the remaining fair ceiling
+   for static structure.
 
 Class instantiation (`Flask(...)` → `Flask.__init__`, ~7% of flask's truth
 edges) is already handled: class-named calls route to the constructor.
@@ -161,8 +163,8 @@ confidence tiers let consumers trade precision for reach.
 
 | Repo | Edge precision | Function hit rate |
 |---|---|---|
-| requests | 0.8110 | 0.4702 (79/168) |
-| flask | 0.5337 | 0.3119 (92/295) |
+| requests | 0.8176 | 0.5060 (85/168) |
+| flask | 0.5669 | 0.3356 (99/295) |
 
 Before this round Grove's tests edges were effectively broken for
 qualified call sites (26 in-universe edges on flask, 6% hit rate): the
@@ -173,7 +175,6 @@ qualifiers had made nearly all of them.
 
 - raise the flask tests-edge hit rate: werkzeug test-client indirection
   (`client.get("/")` → WSGI → view) is the dominant unreachable bucket
-- property-access edges (flask calls bucket 1; needs astkit attribute sites)
 - TS/JS oracle (TypeScript compiler API) over express/socket.io pins
 - Go tests-edge truth (`go test -coverprofile` per package)
 - django pin once flask recall improves (same patterns, 100× the surface)

@@ -75,6 +75,7 @@ func (s *Store) runAlterMigrations(ctx context.Context) error {
 		`ALTER TABLE symbols ADD COLUMN annotations     TEXT NOT NULL DEFAULT '[]'`,
 		`ALTER TABLE symbols ADD COLUMN call_sites      TEXT NOT NULL DEFAULT '[]'`,
 		`ALTER TABLE edges ADD COLUMN source            TEXT NOT NULL DEFAULT 'unknown'`,
+		`ALTER TABLE symbols ADD COLUMN attr_sites      TEXT NOT NULL DEFAULT '[]'`,
 		// The FTS5 mirror was never queried by any retrieval path (search
 		// runs in-memory over the graph), yet its sync triggers doubled the
 		// cost of every symbol write and the table duplicated symbol text
@@ -134,8 +135,8 @@ func (s *Store) UpsertFile(ctx context.Context, filePath, blobSHA, language stri
 		INSERT INTO symbols
 			(id, file_path, blob_sha, language, kind, name, qualified_name, signature,
 			 docstring, span_start, span_end, imports, exports, raw_text, parent_symbol, token_estimate,
-			 modifiers, type_parameters, annotations, call_sites)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 modifiers, type_parameters, annotations, call_sites, attr_sites)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -171,6 +172,10 @@ func (s *Store) UpsertFile(ctx context.Context, filePath, blobSHA, language stri
 		if err != nil {
 			return err
 		}
+		attrSites, err := json.Marshal(nilToEmpty(symbol.AttrSites))
+		if err != nil {
+			return err
+		}
 		exports := 0
 		if symbol.Exports {
 			exports = 1
@@ -180,7 +185,7 @@ func (s *Store) UpsertFile(ctx context.Context, filePath, blobSHA, language stri
 			symbol.Name, symbol.QualifiedName, symbol.Signature, symbol.Docstring,
 			symbol.Span.Start, symbol.Span.End, string(imports), exports,
 			symbol.RawText, symbol.ParentSymbol, symbol.TokenEstimate,
-			string(modifiers), string(typeParams), string(annotations), string(callSites))
+			string(modifiers), string(typeParams), string(annotations), string(callSites), string(attrSites))
 		if err != nil {
 			return err
 		}
@@ -368,7 +373,8 @@ func (s *Store) AllSymbols(ctx context.Context) ([]core.SymbolRecord, error) {
 		SELECT id, file_path, blob_sha, language, kind, name, qualified_name,
 		       signature, docstring, span_start, span_end, imports, exports,
 		       raw_text, COALESCE(parent_symbol, ''), token_estimate,
-		       modifiers, type_parameters, annotations, call_sites
+		       modifiers, type_parameters, annotations, call_sites,
+		       COALESCE(attr_sites, '[]')
 		FROM symbols
 		ORDER BY file_path, span_start
 	`)
@@ -380,7 +386,7 @@ func (s *Store) AllSymbols(ctx context.Context) ([]core.SymbolRecord, error) {
 	var symbols []core.SymbolRecord
 	for rows.Next() {
 		var symbol core.SymbolRecord
-		var kind, importsJSON, modifiersJSON, typeParamsJSON, annotationsJSON, callSitesJSON string
+		var kind, importsJSON, modifiersJSON, typeParamsJSON, annotationsJSON, callSitesJSON, attrSitesJSON string
 		var exports int
 		if err := rows.Scan(
 			&symbol.ID, &symbol.FilePath, &symbol.BlobSHA, &symbol.Language,
@@ -389,6 +395,7 @@ func (s *Store) AllSymbols(ctx context.Context) ([]core.SymbolRecord, error) {
 			&importsJSON, &exports, &symbol.RawText, &symbol.ParentSymbol,
 			&symbol.TokenEstimate,
 			&modifiersJSON, &typeParamsJSON, &annotationsJSON, &callSitesJSON,
+			&attrSitesJSON,
 		); err != nil {
 			return nil, err
 		}
@@ -397,6 +404,7 @@ func (s *Store) AllSymbols(ctx context.Context) ([]core.SymbolRecord, error) {
 		_ = json.Unmarshal([]byte(typeParamsJSON), &symbol.TypeParameters)
 		_ = json.Unmarshal([]byte(annotationsJSON), &symbol.Annotations)
 		_ = json.Unmarshal([]byte(callSitesJSON), &symbol.CallSites)
+		_ = json.Unmarshal([]byte(attrSitesJSON), &symbol.AttrSites)
 		symbol.Kind = core.SymbolKind(kind)
 		symbol.Exports = exports == 1
 		symbols = append(symbols, symbol)
@@ -568,7 +576,8 @@ CREATE TABLE IF NOT EXISTS symbols (
     modifiers       TEXT NOT NULL DEFAULT '[]',
     type_parameters TEXT NOT NULL DEFAULT '[]',
     annotations     TEXT NOT NULL DEFAULT '[]',
-    call_sites      TEXT NOT NULL DEFAULT '[]'
+    call_sites      TEXT NOT NULL DEFAULT '[]',
+    attr_sites      TEXT NOT NULL DEFAULT '[]'
 );
 
 CREATE INDEX IF NOT EXISTS idx_sym_file      ON symbols(file_path);

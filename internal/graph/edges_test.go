@@ -344,3 +344,48 @@ func TestBuildTests_HelperTransitiveCoverage(t *testing.T) {
 	}
 	t.Fatal("expected tests edge test_login → create_app through the helper")
 }
+
+// Property reads: "self.request.blueprints" must produce a calls edge to the
+// @property method blueprints, and never to a plain (non-property) method.
+func TestBuildCalls_PropertyReadEdges(t *testing.T) {
+	caller := core.SymbolRecord{
+		ID: "ctx.py::AppContext.f@1", FilePath: "ctx.py", BlobSHA: "1",
+		Language: "python", Kind: core.KindMethod,
+		Name: "f", QualifiedName: "AppContext.f", ParentSymbol: "AppContext",
+		Imports:   []string{"wrappers"},
+		AttrSites: []core.CallSite{{Callee: "request.blueprints", Line: 3}, {Callee: "request.environ", Line: 4}},
+	}
+	prop := core.SymbolRecord{
+		ID: "wrappers.py::Request.blueprints@10", FilePath: "wrappers.py", BlobSHA: "1",
+		Language: "python", Kind: core.KindMethod,
+		Name: "blueprints", QualifiedName: "Request.blueprints", ParentSymbol: "Request",
+		Annotations: []string{"property"},
+	}
+	plain := core.SymbolRecord{
+		ID: "wrappers.py::Request.environ@20", FilePath: "wrappers.py", BlobSHA: "1",
+		Language: "python", Kind: core.KindMethod,
+		Name: "environ", QualifiedName: "Request.environ", ParentSymbol: "Request",
+	}
+	edges := BuildEdges([]core.SymbolRecord{caller, prop, plain})
+	var gotProp, gotPlain bool
+	for _, e := range edges {
+		if e.Type != core.EdgeCalls || e.From != caller.ID {
+			continue
+		}
+		switch e.To {
+		case prop.ID:
+			gotProp = true
+			if e.Confidence > 0.75 {
+				t.Errorf("property edge confidence = %v, want reduced", e.Confidence)
+			}
+		case plain.ID:
+			gotPlain = true
+		}
+	}
+	if !gotProp {
+		t.Error("expected property-read edge to Request.blueprints")
+	}
+	if gotPlain {
+		t.Error("attribute access must not edge to non-property methods")
+	}
+}

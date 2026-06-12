@@ -5,7 +5,7 @@ go 1.26
 require modernc.org/sqlite v1.51.0
 
 require (
-	github.com/provasign/astkit v0.4.2
+	github.com/provasign/astkit v0.4.3
 	golang.org/x/text v0.34.0
 )
 

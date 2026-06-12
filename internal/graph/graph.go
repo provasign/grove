@@ -208,6 +208,11 @@ func deepCopySymbol(s core.SymbolRecord) core.SymbolRecord {
 		copy(c, s.CallSites)
 		s.CallSites = c
 	}
+	if s.AttrSites != nil {
+		c := make([]core.CallSite, len(s.AttrSites))
+		copy(c, s.AttrSites)
+		s.AttrSites = c
+	}
 	return s
 }
 

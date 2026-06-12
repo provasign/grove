@@ -183,6 +183,7 @@ func projectSymbol(s astkit.Symbol, filePath, blobSHA, language string, fileImpo
 		TypeParameters: append([]string(nil), s.TypeParameters...),
 		Annotations:    append([]string(nil), s.Annotations...),
 		CallSites:      projectCallSites(s.CallSites),
+		AttrSites:      projectCallSites(s.AttrSites),
 		TokenEstimate:  estimateTokens(s.Body),
 	}
 }

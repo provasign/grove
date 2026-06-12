@@ -56,6 +56,7 @@ type SymbolRecord struct {
 	TypeParameters []string   `json:"typeParameters,omitempty"` // generics
 	Annotations    []string   `json:"annotations,omitempty"`    // @Override, #[derive(...)], decorators
 	CallSites      []CallSite `json:"callSites,omitempty"`      // AST-extracted call invocations
+	AttrSites      []CallSite `json:"attrSites,omitempty"`      // attribute accesses outside call position (property reads)
 }
 
 type EdgeType string

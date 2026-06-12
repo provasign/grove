@@ -693,6 +693,34 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 		}
 		scope := idx.importedFiles(symbol.FilePath)
 
+		// ── Property reads (AST-extracted AttrSites) ────────────────────────
+		// An attribute access ("request.blueprints") executes @property code
+		// with no call syntax. Resolve strictly against property-annotated
+		// methods so plain field reads never produce edges. Independent of
+		// CallSites: a function may only read properties.
+		if len(symbol.AttrSites) > 0 {
+			attrSelfVars := callerSelfQualifiers(&symbol)
+			for _, as := range symbol.AttrSites {
+				name := as.Callee
+				qualifier := ""
+				if idx := strings.LastIndexByte(name, '.'); idx >= 0 {
+					qualifier = name[:idx]
+					name = name[idx+1:]
+				}
+				if j := strings.LastIndexByte(qualifier, '.'); j >= 0 {
+					qualifier = qualifier[j+1:]
+				}
+				if name == "" {
+					continue
+				}
+				cands := resolvePropertyTargets(idx, &symbol, name, scope)
+				cands = narrowByReceiver(cands, &symbol, qualifier, attrSelfVars)
+				for _, cand := range cands {
+					addEdge(symbol.ID, cand.ID, 0.7)
+				}
+			}
+		}
+
 		// ── High-confidence path: AST-extracted CallSites ───────────────────
 		if len(symbol.CallSites) > 0 {
 			selfVars := callerSelfQualifiers(&symbol)
@@ -853,6 +881,46 @@ func filterByParent(cands []*core.SymbolRecord, parent string) []*core.SymbolRec
 		}
 	}
 	return out
+}
+
+// resolvePropertyTargets finds in-scope property-annotated methods matching
+// an attribute access name. Same-file candidates win; cross-file fan-out is
+// capped like calls resolution.
+func resolvePropertyTargets(idx *edgeIndex, symbol *core.SymbolRecord, name string, scope map[string]struct{}) []*core.SymbolRecord {
+	var sameFile, crossFile []*core.SymbolRecord
+	for _, cand := range idx.byName[strings.ToLower(name)] {
+		if cand.ID == symbol.ID || cand.Name != name || cand.Kind != core.KindMethod {
+			continue
+		}
+		if !hasPropertyAnnotation(cand) {
+			continue
+		}
+		if _, ok := scope[cand.FilePath]; !ok {
+			continue
+		}
+		if cand.FilePath == symbol.FilePath {
+			sameFile = append(sameFile, cand)
+		} else {
+			crossFile = append(crossFile, cand)
+		}
+	}
+	if len(sameFile) > 0 {
+		return sameFile
+	}
+	if len(crossFile) > maxCalleeFanout {
+		return nil
+	}
+	return crossFile
+}
+
+func hasPropertyAnnotation(s *core.SymbolRecord) bool {
+	for _, ann := range s.Annotations {
+		if ann == "property" || ann == "cached_property" ||
+			strings.HasSuffix(ann, ".setter") || strings.HasSuffix(ann, ".getter") || strings.HasSuffix(ann, ".deleter") {
+			return true
+		}
+	}
+	return false
 }
 
 // constructorTargets resolves a class-named call ("Flask(...)") to the
