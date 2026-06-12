@@ -10,5 +10,17 @@
     "precision": 0.7599,
     "recall": 0.5963,
     "tolerance": 0.005
+  },
+  "socket.io": {
+    "commit": "3ad4e1f2",
+    "precision": 0.8241,
+    "recall": 0.9061,
+    "tolerance": 0.005
+  },
+  "express": {
+    "commit": "dae209ae",
+    "precision": 0.75,
+    "recall": 0.7143,
+    "tolerance": 0.02
   }
 }

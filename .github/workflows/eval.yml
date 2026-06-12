@@ -81,3 +81,38 @@ jobs:
         with:
           name: flask-scorecards
           path: /tmp/eval-out/
+
+  ts-accuracy:
+    name: calls edges vs ts-compiler-api (socket.io, express)
+    runs-on: ubuntu-latest
+    env:
+      SOCKETIO_COMMIT: 3ad4e1f2
+      EXPRESS_COMMIT: dae209ae
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            eval/go.sum
+      - name: Clone pins
+        run: |
+          git clone --quiet https://github.com/socketio/socket.io.git /tmp/socket.io
+          git -C /tmp/socket.io checkout --quiet "$SOCKETIO_COMMIT"
+          git clone --quiet https://github.com/expressjs/express.git /tmp/express
+          git -C /tmp/express checkout --quiet "$EXPRESS_COMMIT"
+      - name: Build grove-eval
+        working-directory: eval
+        run: go build -o /tmp/grove-eval ./cmd/grove-eval
+      - name: Score socket.io against snapshot baseline
+        run: /tmp/grove-eval score --repo /tmp/socket.io --truth eval/testdata/socket.io@$SOCKETIO_COMMIT/calls-truth.jsonl.gz --out-dir /tmp/eval-out/socketio --baseline eval/baseline.json
+      - name: Score express against snapshot baseline
+        run: /tmp/grove-eval score --repo /tmp/express --truth eval/testdata/express@$EXPRESS_COMMIT/calls-truth.jsonl.gz --out-dir /tmp/eval-out/express --baseline eval/baseline.json
+      - name: Upload scorecards
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ts-scorecards
+          path: /tmp/eval-out/

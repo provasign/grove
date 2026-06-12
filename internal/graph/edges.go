@@ -116,6 +116,21 @@ func (idx *edgeIndex) importedFiles(fromFile string) map[string]struct{} {
 		return out
 	}
 	for imp := range imports {
+		raw := strings.Trim(imp, "\"' ;")
+		// Relative imports name one specific file or directory: resolve them
+		// against the importing file's location and skip fuzzy matching —
+		// basename fallback would pull every same-named file in a monorepo
+		// ("./socket" matching all socket.ts files) into scope.
+		if strings.HasPrefix(raw, "./") || strings.HasPrefix(raw, "../") {
+			if resolved := idx.resolveRelativeImport(fromFile, raw); len(resolved) > 0 {
+				for _, f := range resolved {
+					if f != fromFile {
+						out[f] = struct{}{}
+					}
+				}
+				continue
+			}
+		}
 		impNorm := strings.ToLower(strings.Trim(imp, "\"' ;"))
 		impNorm = strings.TrimPrefix(impNorm, "./")
 		impNorm = strings.TrimSuffix(impNorm, ".go")
@@ -192,6 +207,45 @@ func (idx *edgeIndex) importedFiles(fromFile string) map[string]struct{} {
 	}
 	idx.importedFilesCache[fromFile] = out
 	return out
+}
+
+// resolveRelativeImport maps "./socket" / "../parser/index.js" to concrete
+// indexed files: exact file (with source-extension probing), or a directory
+// (returning its files).
+func (idx *edgeIndex) resolveRelativeImport(fromFile, raw string) []string {
+	base := dirOf(fromFile)
+	joined := strings.ToLower(pathJoin(base, raw))
+	var out []string
+	if files, ok := idx.dirFilesLower[joined]; ok {
+		out = append(out, files...)
+	}
+	out = append(out, idx.importPathToFiles[joined]...)
+	for _, ext := range []string{".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs", ".py", ".rs"} {
+		out = append(out, idx.importPathToFiles[strings.TrimSuffix(joined, ext)]...)
+	}
+	// index-file convention: "./parser" → parser/index.ts
+	out = append(out, idx.importPathToFiles[joined+"/index"]...)
+	return out
+}
+
+// pathJoin resolves "." and ".." segments without touching the filesystem.
+func pathJoin(base, rel string) string {
+	segs := []string{}
+	if base != "" && base != "." {
+		segs = strings.Split(base, "/")
+	}
+	for _, s := range strings.Split(rel, "/") {
+		switch s {
+		case "", ".":
+		case "..":
+			if len(segs) > 0 {
+				segs = segs[:len(segs)-1]
+			}
+		default:
+			segs = append(segs, s)
+		}
+	}
+	return strings.Join(segs, "/")
 }
 
 func lastImportSegment(imp string) string {
@@ -740,7 +794,10 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 				if j := strings.LastIndexByte(qualifier, '.'); j >= 0 {
 					qualifier = qualifier[j+1:]
 				}
-				if calleeName == "" {
+				if calleeName == "" || calleeName == "constructor" || calleeName == "super" {
+					// "new X" and "super(...)" are invocation forms, not names:
+					// a bare "constructor" callee would match every class's
+					// constructor in scope.
 					continue
 				}
 				// AST-extracted names are exact by construction: case-insensitive
@@ -798,6 +855,9 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 		for _, m := range callIdentRe.FindAllStringSubmatch(stripped, -1) {
 			calleeName := m[1]
 			if seenCallee[calleeName] {
+				continue
+			}
+			if calleeName == "constructor" || calleeName == "super" {
 				continue
 			}
 			seenCallee[calleeName] = true

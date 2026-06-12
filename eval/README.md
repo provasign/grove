@@ -143,6 +143,40 @@ The recall gap decomposes into three buckets (flask FN sample):
 Class instantiation (`Flask(...)` → `Flask.__init__`, ~7% of flask's truth
 edges) is already handled: class-named calls route to the constructor.
 
+## TS / JS (compiler-API oracle)
+
+`tstruth/gen_truth.mjs` (node + the `typescript` package) resolves every
+call/new expression through the TypeScript checker — `checkJs` covers plain
+JS. Overload signatures normalize to their implementation; module-scope
+function values take their binding's name (`const f =`, `app.listen =
+function()`, `exports.render =`); nested function values are closures and
+attribute to the enclosing declaration.
+
+### Baseline (2026-06-12, calls edges)
+
+| Repo | Universe match | Precision | Recall | F1 |
+|---|---|---|---|---|
+| socket.io (`3ad4e1f2`, TS monorepo) | 98.7% | 0.8241 | 0.9061 | 0.8632 |
+| express (`dae209ae`, CommonJS) | 90.3% | 0.7500 | 0.7143 | 0.7317 |
+
+Day-one findings, fixed same day:
+
+1. **Abstract classes were invisible** — astkit handled only
+   `class_declaration`; `abstract_class_declaration` (and abstract method
+   signatures, the dispatch points overrides implement) produced no symbols
+   at all. Fixed in astkit v0.4.4 (socket.io universe 79% → 98.7%).
+2. **CommonJS assignment declarations were invisible** — `app.listen =
+   function(){}` / `exports.render =` / `X.prototype.method =` produced no
+   symbols (express: 2 of ~30 functions in application.js). Fixed in astkit
+   v0.4.5.
+3. **`constructor` matched every constructor** — TS constructors' raw text
+   starts with `constructor(`, and the fallback path resolved it as a
+   callee. `constructor`/`super` are invocation forms, not names; skipped.
+4. **Relative imports resolved by basename** — `./socket` pulled every
+   socket.ts in the monorepo into scope. Relative imports now resolve
+   exactly against the importing file's directory (with index-file
+   convention) before any fuzzy matching (socket.io P 0.63 → 0.82).
+
 ## Tests edges (runtime coverage oracle)
 
 `gen_truth.py --tests-out` also records which in-repo functions each test
@@ -202,7 +236,6 @@ the sweep.
   (`client.get("/")` → WSGI → view) is the dominant unreachable bucket
 - impact baseline gate (score-impact is in place; add floors once more
   corpus repos are measured)
-- TS/JS oracle (TypeScript compiler API) over express/socket.io pins
 - Go tests-edge truth (`go test -coverprofile` per package)
 - django pin once flask recall improves (same patterns, 100× the surface)
 - tests-edge baseline + CI gate once the metric stabilizes
