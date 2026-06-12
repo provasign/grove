@@ -51,6 +51,7 @@ capped false-positive/false-negative examples for debugging.
 | 2026-06-12 | receiver-aware narrowing + closure-fair oracle | 0.7632 | 0.8657 | 0.8112 | 0.9876 |
 | 2026-06-12 | exact-case CallSite resolution | 0.8522 | 0.8657 | 0.8589 | 0.9907 |
 | 2026-06-12 | interface satisfaction → overrides edges + dispatch rescue | 0.8576 | 0.9258 | 0.8904 | 0.9907 |
+| 2026-06-12 | astkit v0.4.2 call-site qualifiers + import-qualified narrowing | 0.9034 | 0.9258 | 0.9145 | 0.9969 |
 
 `eval/baseline.json` records the accepted floor; CI
 (`.github/workflows/eval.yml`) regenerates gin's ground truth at the corpus
@@ -76,11 +77,18 @@ Day-one findings, all surfaced by the false-positive/negative examples:
    177 `overrides` edges on gin), and a capped call site whose method an
    in-scope interface declares is rescued as dispatch edges at 0.7
    confidence.
+5. **astkit discarded receiver qualifiers** — every call site arrived as a
+   bare name ("WriteContentType", not "r.WriteContentType"), so receiver
+   narrowing couldn't fire. Fixed in astkit v0.4.2 across all five
+   languages; Grove additionally narrows package-qualified calls by import
+   (an external import drops candidates; an in-repo import restricts to its
+   files, case-exact so a `Session` field isn't confused with an
+   `internal/session` package).
 
 What remains is the hard tier: calls through unknown-typed local variables
-(`c.Writer.Header().Set` claiming `Context.Set`). That needs lightweight
-local type inference — the next accuracy investment, and this harness is
-how we'll know it worked.
+(`ip.String()` matching a same-file method). That needs lightweight local
+type inference from declarations and field types — the next accuracy
+investment, and this harness is how we'll know it worked.
 
 ## Roadmap
 

@@ -229,3 +229,67 @@ func TestBuildCalls_UnknownReceiverPassesThrough(t *testing.T) {
 		t.Fatalf("unknown receiver should keep both candidates, got %d edges", got)
 	}
 }
+
+// "template.New(...)" where html/template is an external import must not
+// resolve to the same-package function New.
+func TestBuildCalls_ExternalImportQualifierDrops(t *testing.T) {
+	caller := core.SymbolRecord{
+		ID: "gin.go::Engine.LoadHTMLGlob@1", FilePath: "gin.go", BlobSHA: "1",
+		Language: "go", Kind: core.KindMethod,
+		Name: "LoadHTMLGlob", QualifiedName: "Engine.LoadHTMLGlob", ParentSymbol: "Engine",
+		Signature: "func (engine *Engine) LoadHTMLGlob(pattern string)",
+		Imports:   []string{"html/template"},
+		CallSites: []core.CallSite{{Callee: "template.New", Line: 3}},
+	}
+	callee := core.SymbolRecord{
+		ID: "gin.go::New@1", FilePath: "gin.go", BlobSHA: "1",
+		Language: "go", Kind: core.KindFunction,
+		Name: "New", QualifiedName: "New",
+	}
+	for _, e := range BuildEdges([]core.SymbolRecord{caller, callee}) {
+		if e.Type == core.EdgeCalls && e.From == caller.ID && e.To == callee.ID {
+			t.Fatalf("external package call must not resolve to same-package New: %+v", e)
+		}
+	}
+}
+
+// "store.Open(...)" where internal/store IS in the repo must restrict to that
+// package's functions, not same-package same-named candidates.
+func TestBuildCalls_InRepoImportQualifierRestricts(t *testing.T) {
+	caller := core.SymbolRecord{
+		ID: "pkg/a.go::Run@1", FilePath: "pkg/a.go", BlobSHA: "1",
+		Language: "go", Kind: core.KindFunction,
+		Name: "Run", QualifiedName: "Run",
+		Imports:   []string{"example.com/mod/internal/store"},
+		CallSites: []core.CallSite{{Callee: "store.Open", Line: 3}},
+	}
+	right := core.SymbolRecord{
+		ID: "internal/store/store.go::Open@1", FilePath: "internal/store/store.go", BlobSHA: "1",
+		Language: "go", Kind: core.KindFunction,
+		Name: "Open", QualifiedName: "Open",
+	}
+	wrong := core.SymbolRecord{
+		ID: "pkg/b.go::Open@1", FilePath: "pkg/b.go", BlobSHA: "1",
+		Language: "go", Kind: core.KindFunction,
+		Name: "Open", QualifiedName: "Open",
+	}
+	edges := BuildEdges([]core.SymbolRecord{caller, right, wrong})
+	var gotRight, gotWrong bool
+	for _, e := range edges {
+		if e.Type != core.EdgeCalls || e.From != caller.ID {
+			continue
+		}
+		switch e.To {
+		case right.ID:
+			gotRight = true
+		case wrong.ID:
+			gotWrong = true
+		}
+	}
+	if !gotRight {
+		t.Fatal("expected edge to the imported package's Open")
+	}
+	if gotWrong {
+		t.Fatal("package-qualified call must not reach same-package Open")
+	}
+}

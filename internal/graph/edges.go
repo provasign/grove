@@ -676,8 +676,13 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 				// matching here let "writeContentType" (free function) claim every
 				// type's "WriteContentType" method.
 				cands, capped := resolveCallees(idx, &symbol, calleeName, scope, true)
-				cands = narrowByReceiver(cands, &symbol, qualifier, selfVars)
-				for _, cand := range cands {
+				narrowed := narrowByReceiver(cands, &symbol, qualifier, selfVars)
+				if len(narrowed) == len(cands) {
+					// Receiver narrowing didn't fire; a package-qualified call
+					// can still be pinned to (or excluded by) its import.
+					narrowed = narrowByImport(idx, &symbol, qualifier, cands)
+				}
+				for _, cand := range narrowed {
 					addEdge(symbol.ID, cand.ID, 0.95)
 				}
 				// Fan-out the cap dropped is legitimate dynamic dispatch when an
@@ -786,6 +791,81 @@ func filterByParent(cands []*core.SymbolRecord, parent string) []*core.SymbolRec
 		}
 	}
 	return out
+}
+
+// narrowByImport handles package-qualified call sites ("json.Marshal",
+// "render.New"): when the qualifier exactly matches the last segment of one
+// of the caller file's imports, the call most likely targets that package —
+// so candidates restrict to that import's in-repo files. An import that
+// resolves to no in-repo file is an external dependency: the call can't
+// target anything we index, so all candidates drop. Qualifiers that match no
+// import pass through unchanged.
+//
+// Matching is case-exact: a field named "Session" must not be confused with
+// an "internal/session" import. Methods stay in the restriction — the Go
+// pattern of naming a field after its package ("h.grove.Index()") means a
+// package-looking qualifier can still be a value receiver.
+func narrowByImport(idx *edgeIndex, symbol *core.SymbolRecord, qualifier string, cands []*core.SymbolRecord) []*core.SymbolRecord {
+	if qualifier == "" || len(cands) == 0 || strings.HasSuffix(qualifier, "()") {
+		return cands
+	}
+	files, isImport := idx.importFilesForQualifier(symbol.FilePath, qualifier)
+	if !isImport {
+		return cands
+	}
+	var out []*core.SymbolRecord
+	for _, cand := range cands {
+		if _, ok := files[cand.FilePath]; ok {
+			out = append(out, cand)
+		}
+	}
+	return out
+}
+
+// importFilesForQualifier resolves the import whose last segment equals the
+// qualifier (case-exact) to its in-repo files, using only the precise
+// resolvers: exact path match and slash-suffix directory match. The fuzzy
+// basename resolvers importedFiles uses for scope would mis-resolve external
+// imports to same-named in-repo dirs here ("encoding/json" → internal/json).
+// The second return reports whether such an import exists at all.
+func (idx *edgeIndex) importFilesForQualifier(fromFile, qualifier string) (map[string]struct{}, bool) {
+	imports, ok := idx.fileImports[fromFile]
+	if !ok {
+		return nil, false
+	}
+	found := false
+	out := map[string]struct{}{}
+	for imp := range imports {
+		if lastImportSegment(imp) != qualifier {
+			continue
+		}
+		found = true
+		impNorm := strings.ToLower(strings.Trim(imp, "\"' ;"))
+		impNorm = strings.TrimPrefix(impNorm, "./")
+		// Trim only known source extensions — a naive last-dot trim would
+		// truncate module paths at their domain ("example.com/…" → "example").
+		for _, ext := range []string{".go", ".py", ".ts", ".tsx", ".js", ".jsx", ".java", ".rs"} {
+			impNorm = strings.TrimSuffix(impNorm, ext)
+		}
+		for _, f := range idx.importPathToFiles[impNorm] {
+			if f != fromFile {
+				out[f] = struct{}{}
+			}
+		}
+		parts := strings.Split(impNorm, "/")
+		for i := range parts {
+			suffix := strings.Join(parts[i:], "/")
+			if suffix == "" || suffix == "." {
+				continue
+			}
+			for _, f := range idx.dirFilesLower[suffix] {
+				if f != fromFile {
+					out[f] = struct{}{}
+				}
+			}
+		}
+	}
+	return out, found
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────

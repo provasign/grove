@@ -85,8 +85,8 @@ export class UserService<T extends Base, U> {
 	for _, cs := range save.CallSites {
 		gotCalls[cs.Callee] = true
 	}
-	if !gotCalls["set"] || !gotCalls["persist"] {
-		t.Errorf("save.CallSites = %#v, want at least {set, persist}", save.CallSites)
+	if !gotCalls["cache.set"] || !gotCalls["repo.persist"] {
+		t.Errorf("save.CallSites = %#v, want at least {cache.set, repo.persist}", save.CallSites)
 	}
 }
 
@@ -192,13 +192,13 @@ public class Repo<T extends Entity> {
 	if !containsStr(find.Annotations, "Override") {
 		t.Errorf("find.Annotations = %v, want Override", find.Annotations)
 	}
-	// CallSite: db.lookup(id) → lookup
+	// CallSite: db.lookup(id) → "db.lookup" (receiver-qualified)
 	gotCallees := map[string]bool{}
 	for _, cs := range find.CallSites {
 		gotCallees[cs.Callee] = true
 	}
-	if !gotCallees["lookup"] {
-		t.Errorf("find.CallSites = %#v, want contains lookup", find.CallSites)
+	if !gotCallees["db.lookup"] {
+		t.Errorf("find.CallSites = %#v, want contains db.lookup", find.CallSites)
 	}
 }
 
@@ -245,8 +245,17 @@ impl<T> Service<T> {
 	for _, cs := range newFn.CallSites {
 		gotCallees[cs.Callee] = true
 	}
-	if !gotCallees["trim"] && !gotCallees["to_string"] {
-		t.Errorf("new.CallSites = %#v, want at least one of {trim, to_string}", newFn.CallSites)
+	var hasTrim, hasToString bool
+	for callee := range gotCallees {
+		if callee == "trim" || strings.HasSuffix(callee, ".trim") || strings.HasSuffix(callee, "().trim") {
+			hasTrim = true
+		}
+		if callee == "to_string" || strings.HasSuffix(callee, ".to_string") || strings.HasSuffix(callee, "().to_string") {
+			hasToString = true
+		}
+	}
+	if !hasTrim && !hasToString {
+		t.Errorf("new.CallSites = %#v, want at least one of trim/to_string (any qualification)", newFn.CallSites)
 	}
 }
 
