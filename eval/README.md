@@ -171,10 +171,37 @@ qualified call sites (26 in-universe edges on flask, 6% hit rate): the
 call-site evidence path skipped every dotted callee, which astkit v0.4.2's
 qualifiers had made nearly all of them.
 
+## Impact (blast radius) accuracy
+
+`grove-eval score-impact` measures reverse reachability: for every truth
+function as a seed, the set of callers within N hops over Grove's calls
+edges vs the oracle call graph (per-seed precision/recall, averaged).
+`--sweep` tables a path-confidence pruning threshold (the product of edge
+confidences along the path must stay above it).
+
+### gin, 2026-06-12
+
+| Depth | Pruning | Mean P | Mean R | Mean F1 | Mean radius (grove/truth) |
+|---|---|---|---|---|---|
+| 2 | none | 0.9213 | 0.9361 | 0.8784 | 7.1 / 6.7 |
+| 2 | ≥0.7 path conf | 0.9249 | 0.7396 | 0.7127 | 4.1 / 6.7 |
+| 3 | none | 0.8895 | 0.9263 | 0.8522 | 11.3 / 10.3 |
+
+**Measured decision: do NOT confidence-prune Impact traversal.** The sweep
+is flat up to 0.6 (today's resolved edges sit at 0.85–0.95, so products
+rarely dip), and beyond 0.7 pruning trades ~20 points of recall for ~0.4
+points of precision — the 0.7-confidence dispatch edges carry real impact
+paths, and two strong hops (0.85²=0.72) already fall under a 0.75 cut.
+Blast radius accuracy is a consequence of edge accuracy, not a separate
+knob. This section exists so nobody "optimizes" this without re-running
+the sweep.
+
 ## Roadmap
 
 - raise the flask tests-edge hit rate: werkzeug test-client indirection
   (`client.get("/")` → WSGI → view) is the dominant unreachable bucket
+- impact baseline gate (score-impact is in place; add floors once more
+  corpus repos are measured)
 - TS/JS oracle (TypeScript compiler API) over express/socket.io pins
 - Go tests-edge truth (`go test -coverprofile` per package)
 - django pin once flask recall improves (same patterns, 100× the surface)

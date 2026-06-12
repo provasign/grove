@@ -29,6 +29,8 @@ func main() {
 		err = cmdScore(os.Args[2:])
 	case "score-tests":
 		err = cmdScoreTests(os.Args[2:])
+	case "score-impact":
+		err = cmdScoreImpact(os.Args[2:])
 	case "run":
 		err = cmdRun(os.Args[2:])
 	default:
@@ -136,6 +138,35 @@ func cmdScoreTests(args []string) error {
 		card.FunctionHitRate, card.FunctionsHit, card.FunctionsCovered)
 	if *baseline != "" {
 		return gateTests(card, *baseline)
+	}
+	return nil
+}
+
+func cmdScoreImpact(args []string) error {
+	fs := flag.NewFlagSet("score-impact", flag.ExitOnError)
+	repo := fs.String("repo", "", "repository root")
+	truth := fs.String("truth", "", "calls truth JSONL path")
+	depth := fs.Int("depth", 2, "reverse-reachability depth")
+	minConf := fs.Float64("min-path-conf", 0, "prune when path confidence product falls below this")
+	sweep := fs.Bool("sweep", false, "print a table over thresholds instead of one run")
+	_ = fs.Parse(args)
+	if *repo == "" || *truth == "" {
+		return fmt.Errorf("score-impact: --repo and --truth are required")
+	}
+	header, edges, err := eval.ReadTruth(*truth)
+	if err != nil {
+		return err
+	}
+	thresholds := []float64{*minConf}
+	if *sweep {
+		thresholds = []float64{0, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9}
+	}
+	for _, t := range thresholds {
+		card, err := eval.ScoreImpact(context.Background(), *repo, header, edges, *depth, t)
+		if err != nil {
+			return err
+		}
+		fmt.Println("score-impact:", card.SummaryLine())
 	}
 	return nil
 }
