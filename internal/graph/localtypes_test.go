@@ -151,3 +151,76 @@ func TestBuildCalls_InterfaceParamDispatches(t *testing.T) {
 		t.Fatalf("dispatch edges must carry reduced confidence, got %v", got)
 	}
 }
+
+func TestPyLocalTypes_AnnotationsAndSuper(t *testing.T) {
+	base := core.SymbolRecord{
+		ID: "scaffold.py::Scaffold@1", FilePath: "scaffold.py", BlobSHA: "1",
+		Language: "python", Kind: core.KindClass,
+		Name: "Scaffold", QualifiedName: "Scaffold",
+		Signature: "class Scaffold:",
+	}
+	baseInit := core.SymbolRecord{
+		ID: "scaffold.py::Scaffold.__init__@5", FilePath: "scaffold.py", BlobSHA: "1",
+		Language: "python", Kind: core.KindMethod,
+		Name: "__init__", QualifiedName: "Scaffold.__init__", ParentSymbol: "Scaffold",
+	}
+	cls := core.SymbolRecord{
+		ID: "blueprints.py::Blueprint@1", FilePath: "blueprints.py", BlobSHA: "1",
+		Language: "python", Kind: core.KindClass,
+		Name: "Blueprint", QualifiedName: "Blueprint",
+		Signature: "class Blueprint(Scaffold):",
+		RawText:   "class Blueprint(Scaffold):\n    session_class = SessionA\n",
+	}
+	sessionA := core.SymbolRecord{
+		ID: "sess.py::SessionA@1", FilePath: "sess.py", BlobSHA: "1",
+		Language: "python", Kind: core.KindClass,
+		Name: "SessionA", QualifiedName: "SessionA",
+	}
+	sessionInit := core.SymbolRecord{
+		ID: "sess.py::SessionA.__init__@3", FilePath: "sess.py", BlobSHA: "1",
+		Language: "python", Kind: core.KindMethod,
+		Name: "__init__", QualifiedName: "SessionA.__init__", ParentSymbol: "SessionA",
+	}
+	saveA := core.SymbolRecord{
+		ID: "sess.py::SessionA.save@10", FilePath: "sess.py", BlobSHA: "1",
+		Language: "python", Kind: core.KindMethod,
+		Name: "save", QualifiedName: "SessionA.save", ParentSymbol: "SessionA",
+	}
+	saveB := core.SymbolRecord{
+		ID: "other.py::Other.save@10", FilePath: "other.py", BlobSHA: "1",
+		Language: "python", Kind: core.KindMethod,
+		Name: "save", QualifiedName: "Other.save", ParentSymbol: "Other",
+	}
+	method := core.SymbolRecord{
+		ID: "blueprints.py::Blueprint.run@20", FilePath: "blueprints.py", BlobSHA: "1",
+		Language: "python", Kind: core.KindMethod,
+		Name: "run", QualifiedName: "Blueprint.run", ParentSymbol: "Blueprint",
+		Imports: []string{"sess", "other", "scaffold"},
+		RawText: "def run(self, s: SessionA):\n    super().__init__()\n    s.save()\n    obj = self.session_class()\n",
+		CallSites: []core.CallSite{
+			{Callee: "super().__init__", Line: 2},
+			{Callee: "s.save", Line: 3},
+			{Callee: "session_class", Line: 4},
+		},
+	}
+	symbols := []core.SymbolRecord{base, baseInit, cls, sessionA, sessionInit, saveA, saveB, method}
+	edges := BuildEdges(symbols)
+	got := map[string]bool{}
+	for _, e := range edges {
+		if e.Type == core.EdgeCalls && e.From == method.ID {
+			got[e.To] = true
+		}
+	}
+	if !got[baseInit.ID] {
+		t.Error("super().__init__() must resolve to the base class __init__")
+	}
+	if !got[saveA.ID] {
+		t.Error("annotated param s: SessionA must narrow s.save() to SessionA.save")
+	}
+	if got[saveB.ID] {
+		t.Error("annotated param must exclude Other.save")
+	}
+	if !got[sessionInit.ID] {
+		t.Error("class-attribute call self.session_class() must construct SessionA")
+	}
+}

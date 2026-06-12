@@ -7,8 +7,8 @@
   },
   "flask": {
     "commit": "36e4a824",
-    "precision": 0.7599,
-    "recall": 0.5963,
+    "precision": 0.823,
+    "recall": 0.6066,
     "tolerance": 0.005
   },
   "socket.io": {

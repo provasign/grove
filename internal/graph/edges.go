@@ -769,6 +769,11 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 				}
 				cands := resolvePropertyTargets(idx, &symbol, name, scope)
 				cands = narrowByReceiver(cands, &symbol, qualifier, attrSelfVars)
+				if _, isSelf := attrSelfVars[qualifier]; isSelf && symbol.Language == "python" && len(filterByParent(cands, symbol.ParentSymbol)) == 0 {
+					if inherited := inheritedTargets(idx, &symbol, name, true); len(inherited) > 0 {
+						cands = inherited
+					}
+				}
 				for _, cand := range cands {
 					addEdge(symbol.ID, cand.ID, 0.7)
 				}
@@ -779,8 +784,11 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 		if len(symbol.CallSites) > 0 {
 			selfVars := callerSelfQualifiers(&symbol)
 			var localTypes map[string]string
-			if symbol.Language == "go" {
+			switch symbol.Language {
+			case "go":
 				localTypes = goLocalTypes(idx, &symbol)
+			case "python":
+				localTypes = pyLocalTypes(idx, &symbol)
 			}
 			for _, cs := range symbol.CallSites {
 				calleeName := cs.Callee
@@ -804,7 +812,26 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 				// matching here let "writeContentType" (free function) claim every
 				// type's "WriteContentType" method.
 				cands, capped := resolveCallees(idx, &symbol, calleeName, scope, true)
+				// super().method() resolves on the caller's base classes.
+				if qualifier == "super()" {
+					for _, cand := range narrowBySuper(idx, &symbol, cands) {
+						addEdge(symbol.ID, cand.ID, 0.85)
+					}
+					continue
+				}
 				narrowed := narrowByReceiver(cands, &symbol, qualifier, selfVars)
+				if _, isSelf := selfVars[qualifier]; isSelf && symbol.Language == "python" {
+					if len(filterByParent(narrowed, symbol.ParentSymbol)) == 0 {
+						// Not a method on the caller's own class: inheritance
+						// reaches files import scope never sees.
+						if inherited := inheritedTargets(idx, &symbol, calleeName, false); len(inherited) > 0 {
+							for _, cand := range inherited {
+								addEdge(symbol.ID, cand.ID, 0.85)
+							}
+							continue
+						}
+					}
+				}
 				if len(narrowed) == len(cands) {
 					// Receiver narrowing didn't fire; try the inferred type of
 					// the receiver variable, then import qualification.
@@ -824,9 +851,18 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 					addEdge(symbol.ID, cand.ID, 0.95)
 				}
 				// Class instantiation: "Flask(...)" executes Flask.__init__.
-				// Route class-named calls to the class's constructor method.
+				// Route class-named calls to the class's constructor method;
+				// "cls(...)" constructs the caller's own class, and a variable
+				// holding a class (null_session_class = NullSession) constructs
+				// the held class.
 				if len(narrowed) == 0 && !capped {
-					for _, ctor := range constructorTargets(idx, calleeName, scope) {
+					ctorName := calleeName
+					if calleeName == "cls" && symbol.ParentSymbol != "" {
+						ctorName = symbol.ParentSymbol
+					} else if held, ok := localTypes[calleeName]; ok && strings.HasPrefix(held, "class:") {
+						ctorName = strings.TrimPrefix(held, "class:")
+					}
+					for _, ctor := range constructorTargets(idx, ctorName, scope) {
 						if ctor.ID != symbol.ID {
 							addEdge(symbol.ID, ctor.ID, 0.85)
 						}
@@ -878,7 +914,7 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 // my own type" inside this symbol's body: self/this plus, for Go, the
 // receiver variable parsed from the method signature ("func (r JSON) ...").
 func callerSelfQualifiers(symbol *core.SymbolRecord) map[string]struct{} {
-	out := map[string]struct{}{"self": {}, "this": {}}
+	out := map[string]struct{}{"self": {}, "this": {}, "cls": {}}
 	if symbol.Language == "go" && symbol.Kind == core.KindMethod {
 		if v := goReceiverVar(symbol.Signature); v != "" {
 			out[v] = struct{}{}

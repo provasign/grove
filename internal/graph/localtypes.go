@@ -266,6 +266,9 @@ func narrowByLocalType(idx *edgeIndex, sat *interfaceSatisfaction, localTypes ma
 	if !ok {
 		return cands, nil, false
 	}
+	// A variable holding a class still narrows method calls to that class
+	// (classmethods, attribute access through the class object).
+	typ = strings.TrimPrefix(typ, "class:")
 	if byType := filterByParent(cands, typ); len(byType) > 0 {
 		return byType, nil, true
 	}

@@ -118,12 +118,25 @@ Grove's recall against it is meaningful while precision is a lower bound
 
 | Repo | Universe match | Precision* | Recall | F1 |
 |---|---|---|---|---|
-| requests (`6f66281a`) | 100% | 0.7682 | 0.6190 | 0.6856 |
-| flask (`36e4a824`) | 97.9% | 0.7599 | 0.5963 | 0.6682 |
+| requests (`6f66281a`) | 100% | 0.7887 | 0.6154 | 0.6914 |
+| flask (`36e4a824`) | 97.9% | 0.8230 | 0.6066 | 0.6984 |
 
-flask same-day progression: F1 0.4614 → 0.5831 (decorator wrapper→wrapped
-edges) → 0.6682 (property-read edges: astkit v0.4.3 emits attribute-access
-sites, resolved strictly against @property-annotated methods).
+flask same-day progression: F1 0.4614 → 0.5831 (decorator edges) → 0.6682
+(property-read edges) → 0.6984 (annotation-driven local types, super()/cls()
+resolution, inherited members through the ancestor chain).
+
+**Python's static ceiling — measured.** The remaining recall gap is
+dynamic dispatch a static graph cannot see: registry dispatch
+(dispatch_request → view functions), dunder protocols (`g.x` →
+`__setattr__`, `with x:` → `__enter__`, descriptors' `__get__`),
+werkzeug LocalProxy indirection, and `getattr(module, name)()`. These are
+exactly the edges only the dynamic oracle records. Treat ~0.60–0.65 recall
+against a dynamic oracle as the honest static bound for idiomatic
+framework Python; precision is the lever that still moves (0.66 → 0.82
+today via typed narrowing). Tests-edge floors trade the same way:
+annotation narrowing took flask edge precision 0.567 → 0.681 while
+function hit rate eased 0.336 → 0.315 — fewer, truer suggestions, the
+right direction for a review signal.
 
 *lower bound — see the partial-oracle caveat above.
 
