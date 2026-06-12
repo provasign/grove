@@ -2,6 +2,7 @@ package graph
 
 import (
 	"sort"
+	"strings"
 
 	"github.com/provasign/grove/internal/core"
 )
@@ -65,11 +66,117 @@ func DiffSymbols(before, after []core.SymbolRecord) core.GraphDiff {
 		}
 	}
 
+	detectRenames(&diff)
+
 	sortSymbols(diff.Added)
 	sortSymbols(diff.Removed)
 	sortChanges(diff.Changed)
+	sortChanges(diff.Renamed)
 	sortChanges(diff.BreakingChanges)
 	return diff
+}
+
+// minRenameBodyLen guards against pairing trivially identical bodies
+// (`{ return nil }` boilerplate) as renames. Short-bodied renames stay in
+// Added/Removed — a false "removed" is conservative, a false rename is not.
+const minRenameBodyLen = 24
+
+// detectRenames pairs removed and added symbols whose bodies are identical
+// after substituting their own name. A rename otherwise reports as a
+// removal (breaking) plus an unrelated addition, which both overstates the
+// break and hides the continuity a merge tool or drift consumer needs.
+// Only unambiguous 1:1 matches per (kind, normalized body) pair; ambiguous
+// groups are left as-is.
+func detectRenames(diff *core.GraphDiff) {
+	if len(diff.Added) == 0 || len(diff.Removed) == 0 {
+		return
+	}
+	removedByBody := map[string][]int{}
+	for i := range diff.Removed {
+		if key, ok := renameKey(&diff.Removed[i]); ok {
+			removedByBody[key] = append(removedByBody[key], i)
+		}
+	}
+	addedByBody := map[string][]int{}
+	for i := range diff.Added {
+		if key, ok := renameKey(&diff.Added[i]); ok {
+			addedByBody[key] = append(addedByBody[key], i)
+		}
+	}
+
+	usedRemoved := map[int]bool{}
+	usedAdded := map[int]bool{}
+	for key, removedIdx := range removedByBody {
+		addedIdx := addedByBody[key]
+		if len(removedIdx) != 1 || len(addedIdx) != 1 {
+			continue
+		}
+		before := diff.Removed[removedIdx[0]]
+		after := diff.Added[addedIdx[0]]
+		change := core.SymbolChange{
+			Before:           &before,
+			After:            &after,
+			SignatureChanged: before.Signature != after.Signature,
+		}
+		diff.Renamed = append(diff.Renamed, change)
+		usedRemoved[removedIdx[0]] = true
+		usedAdded[addedIdx[0]] = true
+		// A renamed exported symbol still breaks callers of the old name.
+		// A pure file move (same qualified name, body untouched) does not.
+		if before.Exports && before.QualifiedName != after.QualifiedName {
+			diff.BreakingChanges = append(diff.BreakingChanges, change)
+		}
+	}
+	if len(usedRemoved) == 0 {
+		return
+	}
+	diff.Removed = withoutIndices(diff.Removed, usedRemoved)
+	diff.Added = withoutIndices(diff.Added, usedAdded)
+	// Pull the paired removals back out of BreakingChanges: they were
+	// recorded as breaking removals before rename pairing ran, and the
+	// rename entry above already carries the breaking signal when due.
+	kept := diff.BreakingChanges[:0]
+	for _, change := range diff.BreakingChanges {
+		if change.After == nil && isRenamedBefore(diff.Renamed, change.Before) {
+			continue
+		}
+		kept = append(kept, change)
+	}
+	diff.BreakingChanges = kept
+}
+
+// renameKey returns a kind-scoped body fingerprint with the symbol's own
+// name blanked out, so `func Login(...)` and `func SignIn(...)` with the
+// same body collide on the same key.
+func renameKey(s *core.SymbolRecord) (string, bool) {
+	body := strings.TrimSpace(s.RawText)
+	if len(body) < minRenameBodyLen || s.Name == "" {
+		return "", false
+	}
+	normalized := strings.ReplaceAll(body, s.Name, "\x00")
+	return string(s.Kind) + "\x00" + normalized, true
+}
+
+func isRenamedBefore(renamed []core.SymbolChange, before *core.SymbolRecord) bool {
+	if before == nil {
+		return false
+	}
+	for _, r := range renamed {
+		if r.Before != nil && r.Before.ID == before.ID {
+			return true
+		}
+	}
+	return false
+}
+
+func withoutIndices(symbols []core.SymbolRecord, drop map[int]bool) []core.SymbolRecord {
+	out := symbols[:0]
+	for i := range symbols {
+		if !drop[i] {
+			out = append(out, symbols[i])
+		}
+	}
+	return out
 }
 
 // identityKey is the stable cross-snapshot identity of a symbol.

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **GraphDiff rename detection:** a removed symbol whose body matches an
+  added one (modulo its own name) is reported as `renamed` instead of an
+  unrelated removal + addition. Only unambiguous 1:1 body matches pair;
+  trivial bodies never pair. An exported rename is a breaking change
+  (callers of the old name break); a pure file move is not.
+
 Accuracy, performance, and trust fixes from the 2026-06-11 assessment
 (`docs/grove-assessment-2026-06-11.md`).
 

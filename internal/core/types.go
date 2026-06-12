@@ -141,14 +141,19 @@ type GraphDiff struct {
 	Added   []SymbolRecord `json:"added"`
 	Removed []SymbolRecord `json:"removed"`
 	Changed []SymbolChange `json:"changed"`
-	// BreakingChanges are exported symbols that were removed or whose
-	// signature changed — the contract surface consumers depend on.
+	// Renamed pairs a removed symbol with an added one whose body is
+	// identical modulo its own name — a rename or a move, not churn. Only
+	// unambiguous 1:1 body matches are paired; everything else stays in
+	// Added/Removed.
+	Renamed []SymbolChange `json:"renamed,omitempty"`
+	// BreakingChanges are exported symbols that were removed, renamed, or
+	// whose signature changed — the contract surface consumers depend on.
 	BreakingChanges []SymbolChange `json:"breakingChanges"`
 }
 
 // Empty reports whether the diff carries no structural change.
 func (d GraphDiff) Empty() bool {
-	return len(d.Added) == 0 && len(d.Removed) == 0 && len(d.Changed) == 0
+	return len(d.Added) == 0 && len(d.Removed) == 0 && len(d.Changed) == 0 && len(d.Renamed) == 0
 }
 
 type Verdict string
