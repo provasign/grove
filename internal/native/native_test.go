@@ -1041,10 +1041,15 @@ func TestJavaSemanticEdgesResolveClassAwareBindings(t *testing.T) {
 	edges := javaSemanticEdges(symbols)
 	assertNativeEdge(t, edges, "src/App.java::Controller@1", "src/App.java::BaseController@1", core.EdgeExtends)
 	assertNativeEdge(t, edges, "src/App.java::Controller@1", "src/App.java::Runnable@1", core.EdgeImplements)
-	assertNativeEdge(t, edges, "src/App.java::handle@1", "src/App.java::helper@1", core.EdgeCalls)
-	assertNativeEdge(t, edges, "src/App.java::handle@1", "src/App.java::save@1", core.EdgeCalls)
-	assertNativeEdge(t, edges, "src/App.java::handle@1", "src/App.java::Repo_ctor@1", core.EdgeCalls)
 	assertNativeEdge(t, edges, "src/App.java::handle@1", "src/App.java::Repo@1", core.EdgeUsesType)
+	// Calls edges are deliberately NOT native anymore: text matching edged
+	// every overload (6x explosion on commons-lang). The graph layer's
+	// arity- and type-narrowed resolution of astkit call sites owns calls.
+	for _, e := range edges {
+		if e.Type == core.EdgeCalls {
+			t.Fatalf("native java pass must not emit calls edges, got %+v", e)
+		}
+	}
 }
 
 func TestCSharpSemanticEdgesResolveClassAwareBindings(t *testing.T) {

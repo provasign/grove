@@ -224,3 +224,47 @@ func TestPyLocalTypes_AnnotationsAndSuper(t *testing.T) {
 		t.Error("class-attribute call self.session_class() must construct SessionA")
 	}
 }
+
+func TestJavaOverloadNarrowing(t *testing.T) {
+	caller := core.SymbolRecord{
+		ID: "A.java::Utils.addFirst@1", FilePath: "A.java", BlobSHA: "1",
+		Language: "java", Kind: core.KindMethod,
+		Name: "addFirst", QualifiedName: "Utils.addFirst", ParentSymbol: "Utils",
+		RawText:   "public static boolean[] addFirst(final boolean[] array, final boolean element) {\n    return add(array, element);\n}",
+		CallSites: []core.CallSite{{Callee: "add", Line: 2, Argc: 2, Args: []string{"array", "element"}}},
+	}
+	boolAdd := core.SymbolRecord{
+		ID: "A.java::Utils.add.bool@10", FilePath: "A.java", BlobSHA: "1",
+		Language: "java", Kind: core.KindMethod,
+		Name: "add", QualifiedName: "Utils.add", ParentSymbol: "Utils",
+		Signature: "public static boolean[] add(final boolean[] array, final boolean element)",
+	}
+	longAdd := core.SymbolRecord{
+		ID: "A.java::Utils.add.long@20", FilePath: "A.java", BlobSHA: "1",
+		Language: "java", Kind: core.KindMethod,
+		Name: "add", QualifiedName: "Utils.add", ParentSymbol: "Utils",
+		Signature: "public static long[] add(final long[] array, final long element)",
+	}
+	threeArg := core.SymbolRecord{
+		ID: "A.java::Utils.add.three@30", FilePath: "A.java", BlobSHA: "1",
+		Language: "java", Kind: core.KindMethod,
+		Name: "add", QualifiedName: "Utils.add", ParentSymbol: "Utils",
+		Signature: "public static boolean[] add(final boolean[] array, final int index, final boolean element)",
+	}
+	edges := BuildEdges([]core.SymbolRecord{caller, boolAdd, longAdd, threeArg})
+	got := map[string]bool{}
+	for _, e := range edges {
+		if e.Type == core.EdgeCalls && e.From == caller.ID {
+			got[e.To] = true
+		}
+	}
+	if !got[boolAdd.ID] {
+		t.Error("expected edge to the boolean[] overload")
+	}
+	if got[longAdd.ID] {
+		t.Error("long[] overload conflicts with boolean[] argument types")
+	}
+	if got[threeArg.ID] {
+		t.Error("three-arg overload conflicts with argc 2")
+	}
+}

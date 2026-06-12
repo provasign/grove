@@ -61,12 +61,21 @@ func cmdTruth(args []string) error {
 	repo := fs.String("repo", "", "repository root")
 	out := fs.String("out", "", "output truth JSONL path")
 	commit := fs.String("commit", "", "commit SHA recorded in the header")
+	lang := fs.String("lang", "go", "oracle language: go (ssa+vta) or java (javac+javap)")
 	includeTests := fs.Bool("include-tests", false, "include _test.go packages")
 	_ = fs.Parse(args)
 	if *repo == "" || *out == "" {
 		return fmt.Errorf("truth: --repo and --out are required")
 	}
-	header, edges, err := generateTruth(*repo, *commit, *includeTests)
+	var header eval.TruthFile
+	var edges []eval.TruthEdge
+	var err error
+	if *lang == "java" {
+		header, edges, err = eval.JavaCallTruth(*repo)
+		header.Commit = *commit
+	} else {
+		header, edges, err = generateTruth(*repo, *commit, *includeTests)
+	}
 	if err != nil {
 		return err
 	}
@@ -215,7 +224,13 @@ type baselineEntry struct {
 	Commit    string  `json:"commit"`
 	Precision float64 `json:"precision"`
 	Recall    float64 `json:"recall"`
-	Tolerance float64 `json:"tolerance"`
+	// MinUniverse is the symbol-match floor — the language-version-drift
+	// canary. When a tree-sitter grammar falls behind new syntax, symbols
+	// stop being extracted and drop out of universe matching before edge
+	// scores move. Truth snapshots are pinned, so this is the first metric
+	// to sag when a grammar bump (or extractor regression) loses symbols.
+	MinUniverse float64 `json:"minUniverse"`
+	Tolerance   float64 `json:"tolerance"`
 }
 
 func gate(card eval.Scorecard, baselinePath string) error {
@@ -238,6 +253,9 @@ func gate(card eval.Scorecard, baselinePath string) error {
 	}
 	if card.Recall < entry.Recall-tol {
 		failures = append(failures, fmt.Sprintf("recall %.4f < baseline %.4f (tol %.4f)", card.Recall, entry.Recall, tol))
+	}
+	if entry.MinUniverse > 0 && card.SymbolMatchRate < entry.MinUniverse-tol {
+		failures = append(failures, fmt.Sprintf("universe match %.4f < floor %.4f — symbol extraction lost declarations (grammar drift?)", card.SymbolMatchRate, entry.MinUniverse))
 	}
 	if len(failures) > 0 {
 		return fmt.Errorf("gate: %s regressed: %s", card.Repo, strings.Join(failures, "; "))

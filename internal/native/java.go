@@ -99,26 +99,15 @@ func javaSemanticEdges(symbols []core.SymbolRecord) []core.Edge {
 		if !callableKind(symbol.Kind) || symbol.RawText == "" {
 			continue
 		}
-		for _, method := range idx.methodsByCls[symbol.ParentSymbol] {
-			if method.ID != symbol.ID && containsCall(symbol.RawText, method.Name) {
-				add(symbolEdge(symbol, method, core.EdgeCalls, 0.96))
-			}
-		}
-		for _, call := range javaQualifiedCalls(symbol.RawText) {
-			for _, method := range idx.methods[call.Qualifier+"."+call.Method] {
-				if method.ID != symbol.ID {
-					add(symbolEdge(symbol, method, core.EdgeCalls, 0.97))
-				}
-			}
-		}
+		// Call edges intentionally NOT emitted here: the text-matching
+		// approach edged every overload of every name it saw (a 6x edge
+		// explosion on overload-heavy code). astkit emits qualified,
+		// arity-tagged call sites for Java, so the graph layer's narrowed
+		// resolution is authoritative. This pass keeps what text matching
+		// is still good for: inheritance and type-usage evidence.
 		for _, className := range javaConstructedTypes(symbol.RawText) {
 			if target, ok := javaBestType(idx, className, symbol.FilePath); ok && target.ID != symbol.ID {
 				add(symbolEdge(symbol, target, core.EdgeUsesType, 0.96))
-			}
-			for _, ctor := range idx.ctors[className] {
-				if ctor.ID != symbol.ID {
-					add(symbolEdge(symbol, ctor, core.EdgeCalls, 0.97))
-				}
 			}
 		}
 		for name := range idx.typesByName {

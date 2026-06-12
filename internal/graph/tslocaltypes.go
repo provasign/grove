@@ -88,7 +88,7 @@ func baseClassesFor(idx *edgeIndex, language, className, preferDir string) []str
 	switch language {
 	case "python":
 		return pyBaseClasses(idx, className, preferDir)
-	case "typescript", "javascript":
+	case "typescript", "javascript", "java":
 		return tsBaseClasses(idx, className, preferDir)
 	}
 	return nil

@@ -200,6 +200,37 @@ Day-one findings, fixed same day:
    exactly against the importing file's directory (with index-file
    convention) before any fuzzy matching (socket.io P 0.63 → 0.82).
 
+## Java (bytecode oracle)
+
+`grove-eval truth --lang java` needs nothing beyond a JDK: compile with
+`javac -g`, then read invoke* instructions and LineNumberTables out of
+javap. Bytecode sees through overloads and static dispatch exactly;
+overload targets resolve by arity. Lambdas/synthetic accessors skipped.
+Pin: commons-lang (zero-dependency, and the overload stress test — ten
+same-arity `isEmpty`/`indexOf`/`add` variants per name).
+
+### Baseline (2026-06-12, calls edges)
+
+| Repo | Universe | Precision | Recall | F1 |
+|---|---|---|---|---|
+| commons-lang (`44298fe`) | 96.6% | 0.4552 | 0.7055 | 0.5534 |
+
+Day-one findings, fixed same day:
+
+1. **Native text-matching exploded edges 6×** — the legacy Java analyzer
+   edged every overload of every name appearing in a body (22k edges vs
+   the oracle's 3.8k, P 0.15). Retired in favor of the graph layer's
+   narrowed resolution; the native pass keeps inheritance + type-usage.
+2. **Arity narrowing** (astkit v0.4.7 records `Argc`) and **argument-type
+   conflict rejection** (v0.4.8 records bare-identifier `Args`; conflicts
+   with known local/param types drop candidates, neutrality never does:
+   varargs, type variables, and widening supertypes pass through).
+3. Same-package scope (a Java directory is a package, like Go) and
+   extends-based inheritance reuse the existing machinery.
+
+Residual gap: same-arity same-type-shape overload sets and erasure-vs-
+source attribution — Java's structural ceiling without full type binding.
+
 ## Tests edges (runtime coverage oracle)
 
 `gen_truth.py --tests-out` also records which in-repo functions each test

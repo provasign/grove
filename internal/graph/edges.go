@@ -101,7 +101,9 @@ func (idx *edgeIndex) importedFiles(fromFile string) map[string]struct{} {
 	// scope. This is NOT true for TS/JS/Java/Python, where imports are always
 	// explicit per file regardless of directory — so we gate on language to
 	// avoid linking unrelated same-folder modules there.
-	if fileLanguage(idx, fromFile) == "go" {
+	if lang := fileLanguage(idx, fromFile); lang == "go" || lang == "java" {
+		// Go: a directory IS a package. Java: a directory is a package too —
+		// same-package classes need no import.
 		fromDir := dirOf(fromFile)
 		for _, f := range idx.dirToFiles[fromDir] {
 			if f != fromFile {
@@ -791,7 +793,10 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 				localTypes = pyLocalTypes(idx, &symbol)
 			case "typescript", "javascript":
 				localTypes = tsLocalTypes(idx, &symbol)
+			case "java":
+				localTypes = javaLocalTypes(idx, &symbol)
 			}
+			var javaArgTypeCache map[string]string
 			for _, cs := range symbol.CallSites {
 				calleeName := cs.Callee
 				// Split receiver prefix (e.g. "user.save" → qualifier "user",
@@ -814,6 +819,18 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 				// matching here let "writeContentType" (free function) claim every
 				// type's "WriteContentType" method.
 				cands, capped := resolveCallees(idx, &symbol, calleeName, scope, true)
+				if symbol.Language == "java" {
+					// Overload disambiguation: arity first, then exact
+					// argument-type evidence (positive matches only — see
+					// narrowOverloadsByArgTypes).
+					cands = filterByArgc(cands, cs.Argc)
+					if len(cands) > 1 && len(cs.Args) > 0 {
+						if javaArgTypeCache == nil {
+							javaArgTypeCache = javaArgTypes(&symbol)
+						}
+						cands = narrowOverloadsByArgTypes(cands, cs.Args, javaArgTypeCache)
+					}
+				}
 				// super().method() / super.method() resolves on the caller's
 				// base classes; bare super() invokes the base constructor.
 				if qualifier == "super()" || qualifier == "super" {
@@ -936,7 +953,7 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 // classLanguage reports whether the language has class inheritance our
 // base-class parsers understand.
 func classLanguage(lang string) bool {
-	return lang == "python" || lang == "typescript" || lang == "javascript"
+	return lang == "python" || lang == "typescript" || lang == "javascript" || lang == "java"
 }
 
 // callerSelfQualifiers returns the receiver spellings that mean "a method on
@@ -1046,6 +1063,56 @@ func hasPropertyAnnotation(s *core.SymbolRecord) bool {
 		}
 	}
 	return false
+}
+
+// filterByArgc keeps candidates whose declared parameter count is
+// compatible with the call site's argument count: exact match, or varargs
+// ("...") accepting argc >= fixed params. Candidates whose parameter list
+// can't be parsed pass through.
+func filterByArgc(cands []*core.SymbolRecord, argc int) []*core.SymbolRecord {
+	if len(cands) < 2 {
+		return cands
+	}
+	var out []*core.SymbolRecord
+	for _, cand := range cands {
+		n, variadic, ok := declParamCount(cand)
+		if !ok || n == argc || (variadic && argc >= n-1) {
+			out = append(out, cand)
+		}
+	}
+	if len(out) == 0 {
+		return cands
+	}
+	return out
+}
+
+// declParamCount counts declared parameters from a callable's first
+// balanced paren group (signature if complete, else raw text).
+func declParamCount(s *core.SymbolRecord) (int, bool, bool) {
+	src := s.Signature
+	if !strings.Contains(src, ")") {
+		src = s.RawText
+	}
+	params := tsDeclParams(src)
+	if params == "" {
+		if strings.Contains(src, "()") {
+			return 0, false, true
+		}
+		return 0, false, false
+	}
+	groups := splitTopLevel(params, ',')
+	n := 0
+	variadic := false
+	for _, g := range groups {
+		if strings.TrimSpace(g) == "" {
+			continue
+		}
+		n++
+		if strings.Contains(g, "...") {
+			variadic = true
+		}
+	}
+	return n, variadic, true
 }
 
 // constructorTargets resolves a class-named call ("Flask(...)") to the
