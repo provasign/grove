@@ -268,7 +268,7 @@ func inheritedTargets(idx *edgeIndex, symbol *core.SymbolRecord, calleeName stri
 	if len(all) == 0 {
 		return nil
 	}
-	bases := pyBaseClasses(idx, symbol.ParentSymbol, dirOf(symbol.FilePath))
+	bases := baseClassesFor(idx, symbol.Language, symbol.ParentSymbol, dirOf(symbol.FilePath))
 	for level := 0; level < 4 && len(bases) > 0; level++ {
 		var matched []*core.SymbolRecord
 		for _, base := range bases {
@@ -279,7 +279,7 @@ func inheritedTargets(idx *edgeIndex, symbol *core.SymbolRecord, calleeName stri
 		}
 		var next []string
 		for _, base := range bases {
-			next = append(next, pyBaseClasses(idx, base, dirOf(symbol.FilePath))...)
+			next = append(next, baseClassesFor(idx, symbol.Language, base, dirOf(symbol.FilePath))...)
 		}
 		bases = next
 	}
@@ -292,7 +292,7 @@ func narrowBySuper(idx *edgeIndex, symbol *core.SymbolRecord, cands []*core.Symb
 	if symbol.ParentSymbol == "" || len(cands) == 0 {
 		return nil
 	}
-	bases := pyBaseClasses(idx, symbol.ParentSymbol, dirOf(symbol.FilePath))
+	bases := baseClassesFor(idx, symbol.Language, symbol.ParentSymbol, dirOf(symbol.FilePath))
 	for level := 0; level < 3 && len(bases) > 0; level++ {
 		var matched []*core.SymbolRecord
 		for _, base := range bases {
@@ -303,7 +303,7 @@ func narrowBySuper(idx *edgeIndex, symbol *core.SymbolRecord, cands []*core.Symb
 		}
 		var next []string
 		for _, base := range bases {
-			next = append(next, pyBaseClasses(idx, base, dirOf(symbol.FilePath))...)
+			next = append(next, baseClassesFor(idx, symbol.Language, base, dirOf(symbol.FilePath))...)
 		}
 		bases = next
 	}

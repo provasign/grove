@@ -769,7 +769,7 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 				}
 				cands := resolvePropertyTargets(idx, &symbol, name, scope)
 				cands = narrowByReceiver(cands, &symbol, qualifier, attrSelfVars)
-				if _, isSelf := attrSelfVars[qualifier]; isSelf && symbol.Language == "python" && len(filterByParent(cands, symbol.ParentSymbol)) == 0 {
+				if _, isSelf := attrSelfVars[qualifier]; isSelf && classLanguage(symbol.Language) && len(filterByParent(cands, symbol.ParentSymbol)) == 0 {
 					if inherited := inheritedTargets(idx, &symbol, name, true); len(inherited) > 0 {
 						cands = inherited
 					}
@@ -789,6 +789,8 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 				localTypes = goLocalTypes(idx, &symbol)
 			case "python":
 				localTypes = pyLocalTypes(idx, &symbol)
+			case "typescript", "javascript":
+				localTypes = tsLocalTypes(idx, &symbol)
 			}
 			for _, cs := range symbol.CallSites {
 				calleeName := cs.Callee
@@ -812,15 +814,36 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 				// matching here let "writeContentType" (free function) claim every
 				// type's "WriteContentType" method.
 				cands, capped := resolveCallees(idx, &symbol, calleeName, scope, true)
-				// super().method() resolves on the caller's base classes.
-				if qualifier == "super()" {
+				// super().method() / super.method() resolves on the caller's
+				// base classes; bare super() invokes the base constructor.
+				if qualifier == "super()" || qualifier == "super" {
 					for _, cand := range narrowBySuper(idx, &symbol, cands) {
 						addEdge(symbol.ID, cand.ID, 0.85)
 					}
 					continue
 				}
+				if calleeName == "super()" && symbol.ParentSymbol != "" {
+					for _, base := range baseClassesFor(idx, symbol.Language, symbol.ParentSymbol, dirOf(symbol.FilePath)) {
+						targets := constructorTargets(idx, base, scope)
+						if len(targets) == 0 {
+							// Inheritance crosses imports — but prefer the twin
+							// in the caller's own package over same-named
+							// classes elsewhere in a monorepo.
+							for _, cand := range idx.byName["constructor"] {
+								if cand.ParentSymbol == base && cand.Kind == core.KindConstructor &&
+									samePackageRoot(cand.FilePath, symbol.FilePath) {
+									targets = append(targets, cand)
+								}
+							}
+						}
+						for _, ctor := range targets {
+							addEdge(symbol.ID, ctor.ID, 0.85)
+						}
+					}
+					continue
+				}
 				narrowed := narrowByReceiver(cands, &symbol, qualifier, selfVars)
-				if _, isSelf := selfVars[qualifier]; isSelf && symbol.Language == "python" {
+				if _, isSelf := selfVars[qualifier]; isSelf && classLanguage(symbol.Language) {
 					if len(filterByParent(narrowed, symbol.ParentSymbol)) == 0 {
 						// Not a method on the caller's own class: inheritance
 						// reaches files import scope never sees.
@@ -908,6 +931,12 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 		}
 	}
 	return edges
+}
+
+// classLanguage reports whether the language has class inheritance our
+// base-class parsers understand.
+func classLanguage(lang string) bool {
+	return lang == "python" || lang == "typescript" || lang == "javascript"
 }
 
 // callerSelfQualifiers returns the receiver spellings that mean "a method on
@@ -1022,7 +1051,8 @@ func hasPropertyAnnotation(s *core.SymbolRecord) bool {
 // constructorTargets resolves a class-named call ("Flask(...)") to the
 // class's constructor method (__init__, constructor, or any
 // KindConstructor child) so instantiation produces a call edge to the code
-// that actually runs.
+// that actually runs. A class without its own constructor inherits one:
+// the base-class chain is walked until a constructor is found.
 func constructorTargets(idx *edgeIndex, calleeName string, scope map[string]struct{}) []*core.SymbolRecord {
 	var out []*core.SymbolRecord
 	for _, cls := range idx.byName[strings.ToLower(calleeName)] {
@@ -1035,17 +1065,59 @@ func constructorTargets(idx *edgeIndex, calleeName string, scope map[string]stru
 		if _, ok := scope[cls.FilePath]; !ok {
 			continue
 		}
-		for _, cand := range idx.byFile[cls.FilePath] {
-			if cand.ParentSymbol != cls.Name {
-				continue
-			}
-			if cand.Kind == core.KindConstructor ||
-				(cand.Kind == core.KindMethod && (cand.Name == "__init__" || cand.Name == "constructor")) {
-				out = append(out, cand)
+		out = append(out, classConstructors(idx, cls.Name, cls.FilePath)...)
+		if len(out) == 0 {
+			bases := baseClassesFor(idx, languageOfFile(idx, cls.FilePath), cls.Name, dirOf(cls.FilePath))
+			for level := 0; level < 3 && len(bases) > 0 && len(out) == 0; level++ {
+				var next []string
+				for _, base := range bases {
+					for _, baseCls := range idx.byName[strings.ToLower(base)] {
+						if baseCls.Name == base && baseCls.Kind == core.KindClass {
+							out = append(out, classConstructors(idx, base, baseCls.FilePath)...)
+							next = append(next, baseClassesFor(idx, languageOfFile(idx, baseCls.FilePath), base, dirOf(baseCls.FilePath))...)
+							break
+						}
+					}
+				}
+				bases = next
 			}
 		}
 	}
 	return out
+}
+
+func classConstructors(idx *edgeIndex, className, filePath string) []*core.SymbolRecord {
+	var out []*core.SymbolRecord
+	for _, cand := range idx.byFile[filePath] {
+		if cand.ParentSymbol != className {
+			continue
+		}
+		if cand.Kind == core.KindConstructor ||
+			(cand.Kind == core.KindMethod && (cand.Name == "__init__" || cand.Name == "constructor")) {
+			out = append(out, cand)
+		}
+	}
+	return out
+}
+
+func languageOfFile(idx *edgeIndex, filePath string) string {
+	for _, s := range idx.byFile[filePath] {
+		if s.Language != "" {
+			return s.Language
+		}
+	}
+	return ""
+}
+
+// samePackageRoot reports whether two repo-relative paths share their first
+// two path segments ("packages/engine.io/...") — the monorepo package
+// boundary heuristic.
+func samePackageRoot(a, b string) bool {
+	segA, segB := strings.SplitN(a, "/", 3), strings.SplitN(b, "/", 3)
+	if len(segA) < 2 || len(segB) < 2 {
+		return dirOf(a) == dirOf(b)
+	}
+	return segA[0] == segB[0] && segA[1] == segB[1]
 }
 
 // narrowByImport handles package-qualified call sites ("json.Marshal",

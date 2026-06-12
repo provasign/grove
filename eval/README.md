@@ -169,8 +169,18 @@ attribute to the enclosing declaration.
 
 | Repo | Universe match | Precision | Recall | F1 |
 |---|---|---|---|---|
-| socket.io (`3ad4e1f2`, TS monorepo) | 98.7% | 0.8241 | 0.9061 | 0.8632 |
+| socket.io (`3ad4e1f2`, TS monorepo) | 98.7% | 0.8407 | 0.9406 | 0.8878 |
 | express (`dae209ae`, CommonJS) | 90.3% | 0.7500 | 0.7143 | 0.7317 |
+
+The TS ceiling round (same playbook as Python) added: typed-class-field
+local types (field symbols already carry "public transport: Transport"
+signatures; plain `this.x = param` ctor assignments inherit the param's
+annotation), super()/super.method() resolution through extends (astkit
+v0.4.6 emits the call sites), inherited members across import scope, and
+inherited constructors (`new Server()` walking to the base class ctor —
+which also lifted flask). Remaining socket.io gap: twin classes across
+monorepo packages (engine.io and engine.io-client both define Transport)
+and callback-driven flows — the structural ceiling for a name-based graph.
 
 Day-one findings, fixed same day:
 
