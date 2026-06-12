@@ -94,26 +94,40 @@ func TestUsesTypeScopedToImports(t *testing.T) {
 // ─── calls: scoping + comment/string stripping ───────────────────────────────
 
 func TestCallsRespectsCommentAndStringStripping(t *testing.T) {
+	// The regex fallback only serves languages without AST call-site
+	// extraction; its comment/string stripping is exercised with one of
+	// those. For AST languages an empty CallSites list is authoritative.
 	g := New()
 	g.Replace([]core.SymbolRecord{
-		{ID: "a.go::Caller@sha", FilePath: "a.go", Language: "go", Kind: core.KindFunction, Name: "Caller", QualifiedName: "Caller",
-			RawText: "func Caller() {\n\t// Real() should be ignored in comments\n\t/* Real(1,2) */\n\ts := \"Real(literal)\"\n\t_ = s\n}"},
-		{ID: "a.go::Real@sha", FilePath: "a.go", Language: "go", Kind: core.KindFunction, Name: "Real", QualifiedName: "Real",
-			RawText: "func Real() {}"},
+		{ID: "a.cs::Caller@sha", FilePath: "a.cs", Language: "csharp", Kind: core.KindFunction, Name: "Caller", QualifiedName: "Caller",
+			RawText: "void Caller() {\n\t// Real() should be ignored in comments\n\t/* Real(1,2) */\n\tvar s = \"Real(literal)\";\n}"},
+		{ID: "a.cs::Real@sha", FilePath: "a.cs", Language: "csharp", Kind: core.KindFunction, Name: "Real", QualifiedName: "Real",
+			RawText: "void Real() {}"},
 	}, 1)
-	if hasEdge(g, core.EdgeCalls, "a.go::Caller@sha", "a.go::Real@sha") {
+	if hasEdge(g, core.EdgeCalls, "a.cs::Caller@sha", "a.cs::Real@sha") {
 		t.Fatalf("calls edge should not be emitted from comments or strings")
 	}
 
-	// Sanity: a real call must still produce the edge.
+	// Sanity: a real call must still produce the edge (fallback language).
+	g.Replace([]core.SymbolRecord{
+		{ID: "a.cs::Caller@sha", FilePath: "a.cs", Language: "csharp", Kind: core.KindFunction, Name: "Caller", QualifiedName: "Caller",
+			RawText: "void Caller() { Real(); }"},
+		{ID: "a.cs::Real@sha", FilePath: "a.cs", Language: "csharp", Kind: core.KindFunction, Name: "Real", QualifiedName: "Real",
+			RawText: "void Real() {}"},
+	}, 1)
+	if !hasEdge(g, core.EdgeCalls, "a.cs::Caller@sha", "a.cs::Real@sha") {
+		t.Fatalf("expected calls edge for genuine call")
+	}
+
+	// AST language with an extracted call site still edges normally.
 	g.Replace([]core.SymbolRecord{
 		{ID: "a.go::Caller@sha", FilePath: "a.go", Language: "go", Kind: core.KindFunction, Name: "Caller", QualifiedName: "Caller",
-			RawText: "func Caller() { Real() }"},
+			RawText: "func Caller() { Real() }", CallSites: []core.CallSite{{Callee: "Real", Line: 1}}},
 		{ID: "a.go::Real@sha", FilePath: "a.go", Language: "go", Kind: core.KindFunction, Name: "Real", QualifiedName: "Real",
 			RawText: "func Real() {}"},
 	}, 1)
 	if !hasEdge(g, core.EdgeCalls, "a.go::Caller@sha", "a.go::Real@sha") {
-		t.Fatalf("expected calls edge for genuine call")
+		t.Fatalf("expected calls edge from AST call site")
 	}
 }
 
@@ -121,7 +135,8 @@ func TestCallsAcrossImportedFiles(t *testing.T) {
 	g := New()
 	g.Replace([]core.SymbolRecord{
 		{ID: "cmd/main.go::Run@sha", FilePath: "cmd/main.go", Language: "go", Kind: core.KindFunction, Name: "Run", QualifiedName: "Run",
-			RawText: "func Run() { Login() }", Imports: []string{"github.com/provasign/grove/internal/auth"}},
+			RawText: "func Run() { Login() }", Imports: []string{"github.com/provasign/grove/internal/auth"},
+			CallSites: []core.CallSite{{Callee: "Login", Line: 1}}},
 		{ID: "internal/auth/auth.go::Login@sha", FilePath: "internal/auth/auth.go", Language: "go", Kind: core.KindFunction, Name: "Login", QualifiedName: "Login",
 			RawText: "func Login() {}"},
 		// Same name in a non-imported file: must NOT be linked.

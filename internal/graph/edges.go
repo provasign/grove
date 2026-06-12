@@ -712,9 +712,9 @@ func resolveCallees(idx *edgeIndex, symbol *core.SymbolRecord, calleeName string
 		return sameFile, false
 	}
 	if len(crossFile) > maxCalleeFanout {
-		// Dropped, not resolved: the caller may rescue this as interface
-		// dispatch when an in-scope interface declares the method.
-		return nil, true
+		// Over the fan-out cap — but narrowing may still pin these down, so
+		// return them with the flag; the caller caps AFTER narrowing.
+		return crossFile, true
 	}
 	return crossFile, false
 }
@@ -819,6 +819,13 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 				// matching here let "writeContentType" (free function) claim every
 				// type's "WriteContentType" method.
 				cands, capped := resolveCallees(idx, &symbol, calleeName, scope, true)
+				if capped && symbol.Language != "java" {
+					// Only Java's narrowing has the evidence (arity, arg
+					// types) to pin down very large same-name sets; for other
+					// languages an over-cap set stays dropped (dispatch
+					// rescue below still applies).
+					cands = nil
+				}
 				if symbol.Language == "java" {
 					// Overload disambiguation: arity first, then exact
 					// argument-type evidence (positive matches only — see
@@ -828,7 +835,37 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 						if javaArgTypeCache == nil {
 							javaArgTypeCache = javaArgTypes(&symbol)
 						}
+						javaResolveCallReturnTypes(idx, cs.Args, scope, javaArgTypeCache)
 						cands = narrowOverloadsByArgTypes(cands, cs.Args, javaArgTypeCache)
+					}
+					// Static typing makes unknowns meaningful: a lowercase
+					// receiver with no inferable type is almost always a JDK
+					// or library object (map.isEmpty, list.forEach) — its
+					// methods aren't in our index, so name collisions are
+					// noise. Call-result receivers resolve through the inner
+					// call's return type (append().append keeps builder
+					// chains); unresolvable ones drop too.
+					if qualifier != "" && qualifier != "super" {
+						if localTypes == nil {
+							localTypes = javaLocalTypes(idx, &symbol)
+						}
+						_, isSelf := selfVars[qualifier]
+						_, typed := localTypes[qualifier]
+						if !isSelf && !typed && !typeSymbolExists(idx, qualifier) {
+							if strings.HasSuffix(qualifier, "()") {
+								if ret := javaCallResultType(idx, qualifier, scope); ret != "" {
+									if byType := filterByParent(cands, ret); len(byType) > 0 {
+										cands = byType
+									} else {
+										cands = nil
+									}
+								} else {
+									cands = nil
+								}
+							} else if qualifier[0] >= 'a' && qualifier[0] <= 'z' {
+								cands = nil
+							}
+						}
 					}
 				}
 				// super().method() / super.method() resolves on the caller's
@@ -887,6 +924,14 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 						narrowed = narrowByImport(idx, &symbol, qualifier, cands)
 					}
 				}
+				if len(narrowed) > maxCalleeFanout {
+					// Still unresolvably broad after every narrowing pass:
+					// drop (the dispatch rescue below may still apply).
+					narrowed = nil
+					capped = true
+				} else if len(narrowed) > 0 {
+					capped = false
+				}
 				for _, cand := range narrowed {
 					addEdge(symbol.ID, cand.ID, 0.95)
 				}
@@ -902,7 +947,17 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 					} else if held, ok := localTypes[calleeName]; ok && strings.HasPrefix(held, "class:") {
 						ctorName = strings.TrimPrefix(held, "class:")
 					}
-					for _, ctor := range constructorTargets(idx, ctorName, scope) {
+					ctors := constructorTargets(idx, ctorName, scope)
+					if symbol.Language == "java" {
+						ctors = filterByArgc(ctors, cs.Argc)
+						if len(ctors) > 1 && len(cs.Args) > 0 {
+							if javaArgTypeCache == nil {
+								javaArgTypeCache = javaArgTypes(&symbol)
+							}
+							ctors = narrowOverloadsByArgTypes(ctors, cs.Args, javaArgTypeCache)
+						}
+					}
+					for _, ctor := range ctors {
 						if ctor.ID != symbol.ID {
 							addEdge(symbol.ID, ctor.ID, 0.85)
 						}
@@ -923,6 +978,13 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 		}
 
 		// ── Fallback: one identifier-extraction pass over the stripped body ──
+		// Only for languages without AST call-site extraction: where the
+		// extractor ran, an empty CallSites list is authoritative — a method
+		// with zero calls would otherwise regex-match its own signature
+		// ("append(final int value)" edging every sibling overload).
+		if astCallSiteLanguages[symbol.Language] {
+			continue
+		}
 		if symbol.RawText == "" {
 			continue
 		}
@@ -937,7 +999,11 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 				continue
 			}
 			seenCallee[calleeName] = true
-			cands, _ := resolveCallees(idx, &symbol, calleeName, scope, true)
+			cands, fbCapped := resolveCallees(idx, &symbol, calleeName, scope, true)
+			if fbCapped {
+				// The fallback has no narrowing evidence; over-cap stays dropped.
+				continue
+			}
 			for _, cand := range cands {
 				confidence := 0.6
 				if cand.FilePath == symbol.FilePath {
@@ -948,6 +1014,14 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 		}
 	}
 	return edges
+}
+
+// astCallSiteLanguages lists the languages whose astkit extractors emit
+// CallSites; for them the AST path is authoritative and the regex fallback
+// never runs.
+var astCallSiteLanguages = map[string]bool{
+	"go": true, "python": true, "javascript": true, "typescript": true,
+	"java": true, "rust": true,
 }
 
 // classLanguage reports whether the language has class inheritance our
@@ -1205,6 +1279,13 @@ func narrowByImport(idx *edgeIndex, symbol *core.SymbolRecord, qualifier string,
 	}
 	files, isImport := idx.importFilesForQualifier(symbol.FilePath, qualifier)
 	if !isImport {
+		// Java: an uppercase qualifier is a class reference. With no import
+		// and no indexed type of that name, it's an implicit-JDK class
+		// (System, Math, Objects...) — the call can't target our index.
+		if symbol.Language == "java" && qualifier[0] >= 'A' && qualifier[0] <= 'Z' &&
+			!typeSymbolExists(idx, qualifier) {
+			return nil
+		}
 		return cands
 	}
 	var out []*core.SymbolRecord
@@ -1236,6 +1317,11 @@ func (idx *edgeIndex) importFilesForQualifier(fromFile, qualifier string) (map[s
 		found = true
 		impNorm := strings.ToLower(strings.Trim(imp, "\"' ;"))
 		impNorm = strings.TrimPrefix(impNorm, "./")
+		// Java/Kotlin imports are dot-separated paths; the precise
+		// resolvers below are slash-keyed.
+		if !strings.Contains(impNorm, "/") && strings.Contains(impNorm, ".") {
+			impNorm = strings.ReplaceAll(impNorm, ".", "/")
+		}
 		// Trim only known source extensions — a naive last-dot trim would
 		// truncate module paths at their domain ("example.com/…" → "example").
 		for _, ext := range []string{".go", ".py", ".ts", ".tsx", ".js", ".jsx", ".java", ".rs"} {
@@ -1255,6 +1341,28 @@ func (idx *edgeIndex) importFilesForQualifier(fromFile, qualifier string) (map[s
 			for _, f := range idx.dirFilesLower[suffix] {
 				if f != fromFile {
 					out[f] = struct{}{}
+				}
+			}
+		}
+		// Maven/Gradle layouts prefix source dirs ("src/main/java/org/..."),
+		// so the import path is a SUFFIX of the dir or file, not equal to it.
+		if len(out) == 0 {
+			for dir, files := range idx.dirFilesLower {
+				if strings.HasSuffix(dir, "/"+impNorm) || dir == impNorm {
+					for _, f := range files {
+						if f != fromFile {
+							out[f] = struct{}{}
+						}
+					}
+				}
+			}
+			for pathKey, files := range idx.importPathToFiles {
+				if strings.HasSuffix(pathKey, "/"+impNorm) {
+					for _, f := range files {
+						if f != fromFile {
+							out[f] = struct{}{}
+						}
+					}
 				}
 			}
 		}

@@ -1,22 +1,22 @@
 {
   "gin": {
     "commit": "d75fcd4",
-    "precision": 0.9259,
+    "precision": 0.9339,
     "recall": 0.9488,
     "tolerance": 0.005,
     "minUniverse": 0.99
   },
   "flask": {
     "commit": "36e4a824",
-    "precision": 0.8235,
+    "precision": 0.8473,
     "recall": 0.6087,
     "tolerance": 0.005,
     "minUniverse": 0.97
   },
   "socket.io": {
     "commit": "3ad4e1f2",
-    "precision": 0.8407,
-    "recall": 0.9406,
+    "precision": 0.8476,
+    "recall": 0.9599,
     "tolerance": 0.005,
     "minUniverse": 0.98
   },
@@ -29,8 +29,8 @@
   },
   "commons-lang": {
     "commit": "44298fe",
-    "precision": 0.4552,
-    "recall": 0.7055,
+    "precision": 0.6798,
+    "recall": 0.8413,
     "minUniverse": 0.96,
     "tolerance": 0.005
   }

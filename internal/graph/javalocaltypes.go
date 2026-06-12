@@ -126,11 +126,24 @@ func narrowOverloadsByArgTypes(cands []*core.SymbolRecord, args []string, argTyp
 			if argName == "" {
 				continue
 			}
-			argType, known := argTypes[argName]
-			if !known {
-				continue
+			var argType string
+			if argName[0] == '#' {
+				argType = javaNormalizeTypeToken(argName[1:])
+			} else if strings.HasPrefix(argName, "call:") {
+				t, known := argTypes[argName] // pre-resolved return type
+				if !known {
+					continue
+				}
+				argType = t
+			} else {
+				t, known := argTypes[argName]
+				if !known {
+					continue
+				}
+				argType = t
 			}
-			if paramTypes[i] != argType && !javaWildcardParam(paramTypes[i], cand) {
+			if paramTypes[i] != argType && !javaWildcardParam(paramTypes[i], cand) &&
+				!javaLiteralCompatible(argType, paramTypes[i], argName[0] == '#') {
 				conflict = true
 				break
 			}
@@ -143,6 +156,150 @@ func narrowOverloadsByArgTypes(cands []*core.SymbolRecord, args []string, argTyp
 		return cands
 	}
 	return kept
+}
+
+// javaNormalizeTypeToken reduces a cast/declared type token to the bare
+// comparison form used by javaParamTypes (last dotted segment, arrays kept).
+func javaNormalizeTypeToken(t string) string {
+	t = strings.TrimSpace(t)
+	arr := strings.HasSuffix(t, "[]")
+	t = strings.TrimSuffix(t, "[]")
+	if j := strings.LastIndexByte(t, '.'); j >= 0 {
+		t = t[j+1:]
+	}
+	if arr {
+		t += "[]"
+	}
+	return t
+}
+
+// javaResolveCallReturnTypes resolves "call:name" argument markers to the
+// called function's declared return type, when the name resolves to
+// declarations that all agree on it.
+func javaResolveCallReturnTypes(idx *edgeIndex, args []string, scope map[string]struct{}, argTypes map[string]string) {
+	for _, a := range args {
+		if !strings.HasPrefix(a, "call:") {
+			continue
+		}
+		if _, done := argTypes[a]; done {
+			continue
+		}
+		name := a[len("call:"):]
+		ret := ""
+		agree := true
+		for _, cand := range idx.byName[strings.ToLower(name)] {
+			if cand.Name != name {
+				continue
+			}
+			if cand.Kind != core.KindFunction && cand.Kind != core.KindMethod {
+				continue
+			}
+			if _, ok := scope[cand.FilePath]; !ok {
+				continue
+			}
+			r := javaReturnType(cand)
+			if r == "" {
+				agree = false
+				break
+			}
+			if ret == "" {
+				ret = r
+			} else if ret != r {
+				agree = false
+				break
+			}
+		}
+		if agree && ret != "" {
+			argTypes[a] = ret
+		}
+	}
+}
+
+// javaCallResultType resolves a "name()" qualifier to the named function's
+// declared return type, when all in-scope declarations agree.
+func javaCallResultType(idx *edgeIndex, qualifier string, scope map[string]struct{}) string {
+	name := strings.TrimSuffix(qualifier, "()")
+	ret := ""
+	for _, cand := range idx.byName[strings.ToLower(name)] {
+		if cand.Name != name {
+			continue
+		}
+		if cand.Kind != core.KindFunction && cand.Kind != core.KindMethod {
+			continue
+		}
+		if _, ok := scope[cand.FilePath]; !ok {
+			continue
+		}
+		r := javaReturnType(cand)
+		if r == "" {
+			return ""
+		}
+		if ret == "" {
+			ret = r
+		} else if ret != r {
+			return ""
+		}
+	}
+	return ret
+}
+
+// javaReturnType parses the declared return type token from a method
+// signature ("public static boolean[] clone(final boolean[] array)").
+func javaReturnType(s *core.SymbolRecord) string {
+	src := s.Signature
+	if !strings.Contains(src, "(") {
+		src = s.RawText
+	}
+	head := src
+	if i := strings.IndexByte(head, '('); i >= 0 {
+		head = head[:i]
+	}
+	fields := strings.Fields(head)
+	if len(fields) < 2 {
+		return ""
+	}
+	// last field is the method name; the one before it is the return type
+	typ := fields[len(fields)-2]
+	switch typ {
+	case "public", "private", "protected", "static", "final", "void", "abstract", "synchronized", "native", "default":
+		return ""
+	}
+	if strings.HasPrefix(typ, "<") || strings.HasPrefix(typ, "@") {
+		return ""
+	}
+	if i := strings.IndexByte(typ, '<'); i > 0 {
+		end := strings.LastIndexByte(typ, '>')
+		if end > i {
+			typ = typ[:i] + typ[end+1:]
+		} else {
+			return ""
+		}
+	}
+	return javaNormalizeTypeToken(typ)
+}
+
+// javaLiteralCompatible reports whether a literal of type lit can bind a
+// parameter of type param through Java's implicit conversions (widening,
+// boxing). Identifier-typed args use exact matching; literals widen.
+func javaLiteralCompatible(lit, param string, isLiteral bool) bool {
+	if !isLiteral {
+		return false
+	}
+	compat := map[string][]string{
+		"int":     {"int", "long", "float", "double", "short", "byte", "Integer"},
+		"long":    {"long", "float", "double", "Long"},
+		"float":   {"float", "double", "Float"},
+		"double":  {"double", "Double"},
+		"char":    {"char", "int", "long", "float", "double", "Character"},
+		"boolean": {"boolean", "Boolean"},
+		"String":  {"String"},
+	}
+	for _, ok := range compat[lit] {
+		if param == ok {
+			return true
+		}
+	}
+	return false
 }
 
 // javaWildcardParam reports whether a parameter type can legally bind many

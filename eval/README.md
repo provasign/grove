@@ -213,7 +213,21 @@ same-arity `isEmpty`/`indexOf`/`add` variants per name).
 
 | Repo | Universe | Precision | Recall | F1 |
 |---|---|---|---|---|
-| commons-lang (`44298fe`) | 96.6% | 0.4552 | 0.7055 | 0.5534 |
+| commons-lang (`44298fe`) | 96.7% | 0.6798 | 0.8413 | 0.7520 |
+
+Second-day progression (0.553 → 0.752), each step measured:
+
+| Fix | F1 |
+|---|---|
+| baseline (arity-narrowed) | 0.5534 |
+| oracle bug: overload targets resolved by arity tie — descriptor-exact now | 0.6533 |
+| maven-layout import suffix inversion; implicit-JDK qualifier drop | 0.6747 |
+| AST-empty CallSites authoritative (regex fallback gated to non-AST langs) | 0.7169 |
+| unknown-typed receivers drop (static typing: unknown = external); call-result receivers resolve via return type | 0.7520 |
+
+The fallback gating and import fixes lifted every language: gin 0.9372 →
+0.9413, flask 0.700 → 0.708 (tests P 0.681 → 0.742, hit 31.5% → 36.3%),
+socket.io 0.888 → 0.900 (R 0.96).
 
 Day-one findings, fixed same day:
 

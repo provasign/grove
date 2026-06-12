@@ -18,27 +18,28 @@ import (
 // the Go VTA oracle. Lambdas and synthetic accessors are skipped.
 
 var (
-	javapSourceRe = regexp.MustCompile(`^Compiled from "([^"]+)"`)
+	javapSourceRe = regexp.MustCompile(`^\s*Compiled from "([^"]+)"`)
 	// "  public int run(java.lang.String);"  /  "  public demo.Demo();"
 	javapMethodRe = regexp.MustCompile(`^  [\w<>\[\].$, ]*?([\w$.]+|"<init>")\((.*)\);$`)
 	// 5: invokevirtual #16  // Method demo/Helper.size:(...)I
 	javapInvokeRe = regexp.MustCompile(`// (?:Interface)?Method (?:([\w/$]+)\.)?"?([\w$<>]+)"?:(\(.*?\)\S+)`)
-	javapLineRe   = regexp.MustCompile(`^        line (\d+): \d+`)
+	javapLineRe   = regexp.MustCompile(`^\s+line (\d+): \d+`)
+	javapDescRe   = regexp.MustCompile(`^    descriptor: (\(.*)$`)
 )
 
 type javaMethod struct {
-	classFQN string
-	name     string // "<init>" for constructors
-	argc     int    // parameter count, for overload disambiguation
-	file     string // repo-relative source path
-	line     int    // first LineNumberTable line (inside the body)
-	invokes  []javaInvoke
+	classFQN   string
+	name       string // "<init>" for constructors
+	descriptor string // exact JVM descriptor from javap -v
+	file       string // repo-relative source path
+	line       int    // first LineNumberTable line (inside the body)
+	invokes    []javaInvoke
 }
 
 type javaInvoke struct {
-	classFQN string
-	name     string
-	argc     int
+	classFQN   string
+	name       string
+	descriptor string
 }
 
 // JavaCallTruth compiles the repo's main sources and derives caller→callee
@@ -90,14 +91,14 @@ func JavaCallTruth(repoRoot string) (TruthFile, []TruthEdge, error) {
 		return nil
 	})
 
-	methods := map[string][]*javaMethod{} // FQN.name → overloads
+	methods := map[string]*javaMethod{} // FQN.name:descriptor → method
 	var ordered []*javaMethod
 	for _, cf := range classFiles {
 		fqn := strings.TrimSuffix(filepath.ToSlash(strings.TrimPrefix(cf, classesDir+string(filepath.Separator))), ".class")
 		if isSyntheticJavaName(lastSegment(fqn, '/')) {
 			continue
 		}
-		out, err := exec.Command("javap", "-c", "-p", "-l", cf).Output()
+		out, err := exec.Command("javap", "-v", "-p", cf).Output()
 		if err != nil {
 			continue
 		}
@@ -115,8 +116,7 @@ func JavaCallTruth(repoRoot string) (TruthFile, []TruthEdge, error) {
 				continue
 			}
 			m.file = filepath.ToSlash(rel)
-			key := m.classFQN + "." + m.name
-			methods[key] = append(methods[key], m)
+			methods[m.classFQN+"."+m.name+":"+m.descriptor] = m
 			ordered = append(ordered, m)
 		}
 	}
@@ -141,19 +141,9 @@ func JavaCallTruth(repoRoot string) (TruthFile, []TruthEdge, error) {
 			if isSyntheticJavaName(inv.name) {
 				continue
 			}
-			overloads := methods[strings.ReplaceAll(inv.classFQN, "/", ".")+"."+inv.name]
-			var target *javaMethod
-			for _, cand := range overloads {
-				if cand.argc == inv.argc {
-					target = cand
-					break
-				}
-			}
-			if target == nil && len(overloads) == 1 {
-				target = overloads[0]
-			}
+			target := methods[strings.ReplaceAll(inv.classFQN, "/", ".")+"."+inv.name+":"+inv.descriptor]
 			if target == nil {
-				continue // outside the repo (JDK, deps), or unmatched overload
+				continue // outside the repo (JDK, deps)
 			}
 			callee := refOf(target)
 			funcs[callee.funcKey()] = true
@@ -202,15 +192,21 @@ func parseJavap(out, classFQN string) []*javaMethod {
 			if strings.ContainsRune(name, '.') {
 				name = "<init>" // constructor headers carry the class FQN
 			}
-			cur = &javaMethod{classFQN: classFQN, name: name, file: sourceFile, argc: javaHeaderArgc(m[2])}
+			cur = &javaMethod{classFQN: classFQN, name: name, file: sourceFile}
 			methods = append(methods, cur)
 			inLineTable = false
 			continue
 		}
+		if cur != nil && cur.descriptor == "" {
+			if m := javapDescRe.FindStringSubmatch(line); m != nil {
+				cur.descriptor = strings.TrimSpace(m[1])
+				continue
+			}
+		}
 		if cur == nil {
 			continue
 		}
-		if strings.HasPrefix(line, "      LineNumberTable:") {
+		if strings.Contains(line, "LineNumberTable:") {
 			inLineTable = true
 			continue
 		}
@@ -229,67 +225,16 @@ func parseJavap(out, classFQN string) []*javaMethod {
 				cls = strings.ReplaceAll(classFQN, ".", "/")
 			}
 			cur.invokes = append(cur.invokes, javaInvoke{
-				classFQN: cls,
-				name:     strings.Trim(m[2], `"`),
-				argc:     javaDescriptorArgc(m[3]),
+				classFQN:   cls,
+				name:       strings.Trim(m[2], `"`),
+				descriptor: m[3],
 			})
 		}
 	}
 	return methods
 }
 
-// javaHeaderArgc counts parameters in a javap method header's Java-syntax
-// parameter list ("java.lang.String, int...").
-func javaHeaderArgc(params string) int {
-	params = strings.TrimSpace(params)
-	if params == "" {
-		return 0
-	}
-	depth, n := 0, 1
-	for i := 0; i < len(params); i++ {
-		switch params[i] {
-		case '<':
-			depth++
-		case '>':
-			depth--
-		case ',':
-			if depth == 0 {
-				n++
-			}
-		}
-	}
-	return n
-}
 
-// javaDescriptorArgc counts parameters in a JVM method descriptor
-// ("(Ljava/lang/String;I[J)V" → 3).
-func javaDescriptorArgc(desc string) int {
-	inner := desc
-	if i := strings.IndexByte(inner, '('); i >= 0 {
-		inner = inner[i+1:]
-	}
-	if i := strings.IndexByte(inner, ')'); i >= 0 {
-		inner = inner[:i]
-	}
-	n := 0
-	for i := 0; i < len(inner); {
-		switch inner[i] {
-		case '[':
-			i++
-			continue
-		case 'L':
-			j := strings.IndexByte(inner[i:], ';')
-			if j < 0 {
-				return n
-			}
-			i += j + 1
-		default:
-			i++
-		}
-		n++
-	}
-	return n
-}
 
 func isSyntheticJavaName(name string) bool {
 	return strings.Contains(name, "lambda$") || strings.Contains(name, "access$") ||
