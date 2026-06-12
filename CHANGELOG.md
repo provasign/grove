@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.6.0 - 2026-06-11
 
 - **GraphDiff rename detection:** a removed symbol whose body matches an
   added one (modulo its own name) is reported as `renamed` instead of an
