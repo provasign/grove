@@ -50,6 +50,11 @@ capped false-positive/false-negative examples for debugging.
 | 2026-06-12 | initial measurement | 0.7282 | 0.8571 | 0.7874 | 0.9728 |
 | 2026-06-12 | receiver-aware narrowing + closure-fair oracle | 0.7632 | 0.8657 | 0.8112 | 0.9876 |
 | 2026-06-12 | exact-case CallSite resolution | 0.8522 | 0.8657 | 0.8589 | 0.9907 |
+| 2026-06-12 | interface satisfaction → overrides edges + dispatch rescue | 0.8576 | 0.9258 | 0.8904 | 0.9907 |
+
+`eval/baseline.json` records the accepted floor; CI
+(`.github/workflows/eval.yml`) regenerates gin's ground truth at the corpus
+pin and fails any change that drops precision or recall below it.
 
 Day-one findings, all surfaced by the false-positive/negative examples:
 
@@ -65,10 +70,17 @@ Day-one findings, all surfaced by the false-positive/negative examples:
    enclosing declaration (right for blast radius); the oracle now mirrors
    that instead of dropping anonymous functions.
 
+4. **Capped fan-out hid dynamic dispatch** — `maxCalleeFanout` silently
+   dropped gin's ~18 `Render` implementations. Fixed: Grove now derives Go
+   interface satisfaction by method-set inclusion (zero → 89 `implements` +
+   177 `overrides` edges on gin), and a capped call site whose method an
+   in-scope interface declares is rescued as dispatch edges at 0.7
+   confidence.
+
 What remains is the hard tier: calls through unknown-typed local variables
-and interface dispatch not reaching concrete implementations. That's the
-`overrides` edge + interface modeling work — the next accuracy investment,
-and this harness is how we'll know it worked.
+(`c.Writer.Header().Set` claiming `Context.Set`). That needs lightweight
+local type inference — the next accuracy investment, and this harness is
+how we'll know it worked.
 
 ## Roadmap
 

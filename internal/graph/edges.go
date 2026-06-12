@@ -592,7 +592,7 @@ const maxCalleeFanout = 16
 // A same-file match wins outright: in every supported language a local
 // definition shadows imported ones. Cross-file matches are returned only
 // when unambiguous enough to be meaningful.
-func resolveCallees(idx *edgeIndex, symbol *core.SymbolRecord, calleeName string, scope map[string]struct{}, exactCase bool) []*core.SymbolRecord {
+func resolveCallees(idx *edgeIndex, symbol *core.SymbolRecord, calleeName string, scope map[string]struct{}, exactCase bool) ([]*core.SymbolRecord, bool) {
 	var sameFile, crossFile []*core.SymbolRecord
 	for _, cand := range idx.byName[strings.ToLower(calleeName)] {
 		if cand.ID == symbol.ID {
@@ -614,12 +614,14 @@ func resolveCallees(idx *edgeIndex, symbol *core.SymbolRecord, calleeName string
 		}
 	}
 	if len(sameFile) > 0 {
-		return sameFile
+		return sameFile, false
 	}
 	if len(crossFile) > maxCalleeFanout {
-		return nil
+		// Dropped, not resolved: the caller may rescue this as interface
+		// dispatch when an in-scope interface declares the method.
+		return nil, true
 	}
-	return crossFile
+	return crossFile, false
 }
 
 // buildCalls emits same-file + imported-file call edges with strings/comments
@@ -630,7 +632,7 @@ func resolveCallees(idx *edgeIndex, symbol *core.SymbolRecord, calleeName string
 // implementation matched a per-callable compiled regex against every other
 // callable's body — O(callables²) regex scans, which on a 10K-symbol
 // single-package corpus took ~40s.
-func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
+func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatisfaction) []core.Edge {
 	var edges []core.Edge
 	seen := make(map[string]bool)
 
@@ -673,10 +675,20 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
 				// AST-extracted names are exact by construction: case-insensitive
 				// matching here let "writeContentType" (free function) claim every
 				// type's "WriteContentType" method.
-				cands := resolveCallees(idx, &symbol, calleeName, scope, true)
+				cands, capped := resolveCallees(idx, &symbol, calleeName, scope, true)
 				cands = narrowByReceiver(cands, &symbol, qualifier, selfVars)
 				for _, cand := range cands {
 					addEdge(symbol.ID, cand.ID, 0.95)
+				}
+				// Fan-out the cap dropped is legitimate dynamic dispatch when an
+				// in-scope interface declares the method: emit edges to its
+				// implementations at reduced confidence.
+				if capped && sat != nil {
+					for _, m := range sat.dispatchTargets(calleeName, scope) {
+						if m.ID != symbol.ID {
+							addEdge(symbol.ID, m.ID, 0.7)
+						}
+					}
 				}
 			}
 			continue // CallSites authoritative; skip regex fallback for this symbol
@@ -694,7 +706,8 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
 				continue
 			}
 			seenCallee[calleeName] = true
-			for _, cand := range resolveCallees(idx, &symbol, calleeName, scope, true) {
+			cands, _ := resolveCallees(idx, &symbol, calleeName, scope, true)
+			for _, cand := range cands {
 				confidence := 0.6
 				if cand.FilePath == symbol.FilePath {
 					confidence = 0.85

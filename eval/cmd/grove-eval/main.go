@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/provasign/grove/eval"
 )
@@ -77,6 +78,7 @@ func cmdScore(args []string) error {
 	repo := fs.String("repo", "", "repository root")
 	truth := fs.String("truth", "", "truth JSONL path")
 	outDir := fs.String("out-dir", "", "directory for scorecard.json/.md")
+	baseline := fs.String("baseline", "", "baseline JSON; exit 1 if precision/recall regress below it")
 	_ = fs.Parse(args)
 	if *repo == "" || *truth == "" || *outDir == "" {
 		return fmt.Errorf("score: --repo, --truth and --out-dir are required")
@@ -85,7 +87,52 @@ func cmdScore(args []string) error {
 	if err != nil {
 		return err
 	}
-	return score(*repo, *outDir, header, edges)
+	card, err := score(*repo, *outDir, header, edges)
+	if err != nil {
+		return err
+	}
+	if *baseline != "" {
+		return gate(card, *baseline)
+	}
+	return nil
+}
+
+// baselineEntry is one repo's accepted floor in a baseline JSON file
+// (keyed by repo name). Tolerance absorbs benign jitter.
+type baselineEntry struct {
+	Commit    string  `json:"commit"`
+	Precision float64 `json:"precision"`
+	Recall    float64 `json:"recall"`
+	Tolerance float64 `json:"tolerance"`
+}
+
+func gate(card eval.Scorecard, baselinePath string) error {
+	raw, err := os.ReadFile(baselinePath)
+	if err != nil {
+		return err
+	}
+	var entries map[string]baselineEntry
+	if err := json.Unmarshal(raw, &entries); err != nil {
+		return fmt.Errorf("%s: %w", baselinePath, err)
+	}
+	entry, ok := entries[card.Repo]
+	if !ok {
+		return fmt.Errorf("gate: no baseline entry for repo %q in %s", card.Repo, baselinePath)
+	}
+	tol := entry.Tolerance
+	var failures []string
+	if card.Precision < entry.Precision-tol {
+		failures = append(failures, fmt.Sprintf("precision %.4f < baseline %.4f (tol %.4f)", card.Precision, entry.Precision, tol))
+	}
+	if card.Recall < entry.Recall-tol {
+		failures = append(failures, fmt.Sprintf("recall %.4f < baseline %.4f (tol %.4f)", card.Recall, entry.Recall, tol))
+	}
+	if len(failures) > 0 {
+		return fmt.Errorf("gate: %s regressed: %s", card.Repo, strings.Join(failures, "; "))
+	}
+	fmt.Printf("gate: %s within baseline (P %.4f ≥ %.4f, R %.4f ≥ %.4f, tol %.4f)\n",
+		card.Repo, card.Precision, entry.Precision, card.Recall, entry.Recall, tol)
+	return nil
 }
 
 func cmdRun(args []string) error {
@@ -110,7 +157,8 @@ func cmdRun(args []string) error {
 		return err
 	}
 	fmt.Printf("truth: %d functions, %d edges -> %s\n", header.Functions, header.Edges, truthPath)
-	return score(*repo, *outDir, header, edges)
+	_, err = score(*repo, *outDir, header, edges)
+	return err
 }
 
 func generateTruth(repo, commit string, includeTests bool) (eval.TruthFile, []eval.TruthEdge, error) {
@@ -126,27 +174,27 @@ func generateTruth(repo, commit string, includeTests bool) (eval.TruthFile, []ev
 	return header, edges, nil
 }
 
-func score(repo, outDir string, header eval.TruthFile, edges []eval.TruthEdge) error {
+func score(repo, outDir string, header eval.TruthFile, edges []eval.TruthEdge) (eval.Scorecard, error) {
 	card, err := eval.ScoreCalls(context.Background(), repo, header, edges)
 	if err != nil {
-		return err
+		return card, err
 	}
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
-		return err
+		return card, err
 	}
 	js, err := json.MarshalIndent(card, "", "  ")
 	if err != nil {
-		return err
+		return card, err
 	}
 	if err := os.WriteFile(filepath.Join(outDir, "scorecard.json"), append(js, '\n'), 0o644); err != nil {
-		return err
+		return card, err
 	}
 	if err := os.WriteFile(filepath.Join(outDir, "scorecard.md"), []byte(card.Markdown()), 0o644); err != nil {
-		return err
+		return card, err
 	}
 	fmt.Printf("score: universe %d/%d (%.1f%%) · grove %d edges · oracle %d edges · P %.4f R %.4f F1 %.4f\n",
 		card.MatchedUniverse, card.TruthFunctions, card.SymbolMatchRate*100,
 		card.GroveEdges, card.TruthEdges, card.Precision, card.Recall, card.F1)
 	fmt.Printf("score: wrote %s and %s\n", filepath.Join(outDir, "scorecard.json"), filepath.Join(outDir, "scorecard.md"))
-	return nil
+	return card, nil
 }

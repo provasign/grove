@@ -69,6 +69,10 @@ const (
 	EdgeUsesType   EdgeType = "uses-type"
 	EdgeTests      EdgeType = "tests"
 	EdgeContains   EdgeType = "contains"
+	// EdgeOverrides links a concrete method to the interface symbol that
+	// declares it. Derived for Go by method-set inclusion, since Go
+	// interface satisfaction is implicit.
+	EdgeOverrides EdgeType = "overrides"
 )
 
 type Edge struct {
