@@ -27,6 +27,8 @@ func main() {
 		err = cmdTruth(os.Args[2:])
 	case "score":
 		err = cmdScore(os.Args[2:])
+	case "score-tests":
+		err = cmdScoreTests(os.Args[2:])
 	case "run":
 		err = cmdRun(os.Args[2:])
 	default:
@@ -94,6 +96,43 @@ func cmdScore(args []string) error {
 	if *baseline != "" {
 		return gate(card, *baseline)
 	}
+	return nil
+}
+
+func cmdScoreTests(args []string) error {
+	fs := flag.NewFlagSet("score-tests", flag.ExitOnError)
+	repo := fs.String("repo", "", "repository root")
+	truth := fs.String("truth", "", "tests truth JSONL path")
+	outDir := fs.String("out-dir", "", "directory for scorecard outputs")
+	_ = fs.Parse(args)
+	if *repo == "" || *truth == "" || *outDir == "" {
+		return fmt.Errorf("score-tests: --repo, --truth and --out-dir are required")
+	}
+	header, edges, err := eval.ReadTruth(*truth)
+	if err != nil {
+		return err
+	}
+	card, err := eval.ScoreTests(context.Background(), *repo, header, edges)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(*outDir, 0o755); err != nil {
+		return err
+	}
+	js, err := json.MarshalIndent(card, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(*outDir, "tests-scorecard.json"), append(js, '\n'), 0o644); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(*outDir, "tests-scorecard.md"), []byte(card.Markdown()), 0o644); err != nil {
+		return err
+	}
+	fmt.Printf("score-tests: universe %d/%d (%.1f%%) · grove %d edges · oracle %d edges · P %.4f R %.4f · fn hit rate %.4f (%d/%d)\n",
+		card.MatchedUniverse, card.TruthFunctions, card.SymbolMatchRate*100,
+		card.GroveEdges, card.TruthEdges, card.Precision, card.Recall,
+		card.FunctionHitRate, card.FunctionsHit, card.FunctionsCovered)
 	return nil
 }
 

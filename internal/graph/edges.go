@@ -494,7 +494,13 @@ func buildUsesType(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
 // Symbols count as tests if they live in a test file or carry a test
 // annotation (Rust #[test], JUnit @Test, xUnit [Fact], …) — the latter allows
 // same-file targets because such tests live alongside production code.
-func buildTests(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
+func buildTests(idx *edgeIndex, symbols []core.SymbolRecord, callEdges []core.Edge) []core.Edge {
+	callAdj := map[string][]string{}
+	for _, e := range callEdges {
+		if e.Type == core.EdgeCalls {
+			callAdj[e.From] = append(callAdj[e.From], e.To)
+		}
+	}
 	var edges []core.Edge
 	seen := make(map[string]bool)
 	for i := range symbols {
@@ -535,19 +541,52 @@ func buildTests(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
 			add(target, annotated, 0.8)
 		}
 
-		// Call-site evidence. Only unqualified callees: a receiver-qualified
-		// call ("t.Run", "user.save") names a variable, not a type, so a
-		// bare-name match would produce exactly the false positives this
-		// scoping exists to prevent.
-		for _, cs := range symbol.CallSites {
-			if strings.ContainsRune(cs.Callee, '.') {
-				continue
-			}
-			for _, target := range idx.byName[strings.ToLower(cs.Callee)] {
-				if target.Kind != core.KindFunction && target.Kind != core.KindMethod && target.Kind != core.KindConstructor {
+		// Call-graph evidence: the calls edges were resolved with the full
+		// narrowing machinery (receiver, local types, imports, dispatch), so
+		// they are the authoritative record of what a test invokes. Walk from
+		// the test through same-test-file helpers (fixtures, builders) to the
+		// production symbols they reach — that's how real suites exercise
+		// code. Production symbols terminate the walk: full transitive
+		// closure would relate every test to everything.
+		type hop struct {
+			id        string
+			depth     int // hops through test-file helpers
+			prodDepth int // hops past the first production symbol
+		}
+		const maxHelperDepth = 3
+		const maxProdDepth = 1
+		visited := map[string]bool{symbol.ID: true}
+		queue := []hop{{symbol.ID, 0, 0}}
+		confByDepth := [maxHelperDepth + 1]float64{0.85, 0.75, 0.65, 0.6}
+		for len(queue) > 0 {
+			cur := queue[0]
+			queue = queue[1:]
+			for _, toID := range callAdj[cur.id] {
+				if visited[toID] {
 					continue
 				}
-				add(target, true, 0.85)
+				visited[toID] = true
+				target := idx.byID[toID]
+				if target == nil {
+					continue
+				}
+				if isTestFile(target.FilePath) {
+					if cur.prodDepth == 0 && cur.depth < maxHelperDepth {
+						queue = append(queue, hop{toID, cur.depth + 1, 0})
+					}
+					continue
+				}
+				if cur.prodDepth == 0 {
+					add(target, true, confByDepth[cur.depth])
+				} else {
+					// One hop past the entry point: what the called function
+					// immediately does is still review-relevant, at low
+					// confidence.
+					add(target, true, 0.55)
+				}
+				if cur.prodDepth < maxProdDepth {
+					queue = append(queue, hop{toID, cur.depth, cur.prodDepth + 1})
+				}
 			}
 		}
 	}

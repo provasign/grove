@@ -161,8 +161,11 @@ func BuildEdges(symbols []core.SymbolRecord) []core.Edge {
 	edges = append(edges, buildUsesType(idx, symbols)...)
 	sat, satEdges := buildInterfaceSatisfaction(idx, symbols)
 	edges = append(edges, satEdges...)
-	edges = append(edges, buildCalls(idx, symbols, sat)...)
-	edges = append(edges, buildTests(idx, symbols)...)
+	callEdges := buildCalls(idx, symbols, sat)
+	edges = append(edges, callEdges...)
+	decoEdges := buildDecoratorEdges(idx, symbols, callEdges)
+	edges = append(edges, decoEdges...)
+	edges = append(edges, buildTests(idx, symbols, append(callEdges, decoEdges...))...)
 	return edges
 }
 

@@ -50,6 +50,11 @@ type Scorecard struct {
 	F1              float64       `json:"f1"`
 	FalsePositives  []EdgeExample `json:"falsePositives,omitempty"`
 	FalseNegatives  []EdgeExample `json:"falseNegatives,omitempty"`
+
+	// Tests-edge scoring only: function-level coverage signal quality.
+	FunctionsCovered int     `json:"functionsCovered,omitempty"`
+	FunctionsHit     int     `json:"functionsHit,omitempty"`
+	FunctionHitRate  float64 `json:"functionHitRate,omitempty"`
 }
 
 // EdgeExample is a human-readable sample of a mismatch, for debugging.

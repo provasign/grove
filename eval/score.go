@@ -7,8 +7,6 @@ import (
 	"strings"
 
 	"github.com/provasign/grove/internal/core"
-	"github.com/provasign/grove/internal/store"
-	"github.com/provasign/grove/pkg/grove"
 )
 
 const maxExamples = 20
@@ -27,28 +25,7 @@ func (r FuncRef) String() string {
 // universe: declarations both Grove and the oracle identified, so symbol
 // extraction differences don't pollute edge accuracy.
 func ScoreCalls(ctx context.Context, repoRoot string, header TruthFile, truth []TruthEdge) (Scorecard, error) {
-	engine, err := grove.Open(ctx, grove.Config{RepoRoot: repoRoot})
-	if err != nil {
-		return Scorecard{}, fmt.Errorf("grove open: %w", err)
-	}
-	if _, err := engine.Index(ctx, repoRoot); err != nil {
-		_ = engine.Close()
-		return Scorecard{}, fmt.Errorf("grove index: %w", err)
-	}
-	if err := engine.Close(); err != nil {
-		return Scorecard{}, err
-	}
-
-	st, err := store.Open(repoRoot)
-	if err != nil {
-		return Scorecard{}, fmt.Errorf("store open: %w", err)
-	}
-	defer st.Close()
-	symbols, err := st.AllSymbols(ctx)
-	if err != nil {
-		return Scorecard{}, err
-	}
-	edges, err := st.AllEdges(ctx)
+	symbols, edges, err := loadGraph(ctx, repoRoot)
 	if err != nil {
 		return Scorecard{}, err
 	}
@@ -59,55 +36,9 @@ func ScoreCalls(ctx context.Context, repoRoot string, header TruthFile, truth []
 		truthFuncs[e.Caller.funcKey()] = e.Caller
 		truthFuncs[e.Callee.funcKey()] = e.Callee
 	}
-
-	// Index Grove's callable symbols by file for span matching.
-	type groveSym struct {
-		id   string
-		name string
-		span core.LineRange
-	}
-	byFile := map[string][]groveSym{}
-	groveCallable := 0
-	for i := range symbols {
-		s := &symbols[i]
-		switch s.Kind {
-		case core.KindFunction, core.KindMethod, core.KindConstructor:
-		default:
-			continue
-		}
-		groveCallable++
-		file := strings.ReplaceAll(s.FilePath, "\\", "/")
-		byFile[file] = append(byFile[file], groveSym{id: s.ID, name: s.Name, span: s.Span})
-	}
-
-	// Match each oracle declaration to the tightest Grove symbol in the same
-	// file whose span contains the declaration line and whose name agrees.
-	groveIDToKey := map[string]string{}
-	keyToGroveID := map[string]string{}
-	for key, ref := range truthFuncs {
-		base := ref.Name
-		if i := strings.LastIndex(base, "."); i >= 0 {
-			base = base[i+1:]
-		}
-		best := ""
-		bestSize := int(^uint(0) >> 1)
-		for _, cand := range byFile[ref.File] {
-			if ref.Line < cand.span.Start || ref.Line > cand.span.End {
-				continue
-			}
-			if cand.name != base && cand.name != ref.Name && !strings.HasSuffix(cand.name, "."+base) {
-				continue
-			}
-			if size := cand.span.End - cand.span.Start; size < bestSize {
-				bestSize = size
-				best = cand.id
-			}
-		}
-		if best != "" {
-			groveIDToKey[best] = key
-			keyToGroveID[key] = best
-		}
-	}
+	m := matchDecls(symbols, truthFuncs)
+	groveIDToKey, keyToGroveID := m.idToKey, m.keyToID
+	groveCallable := m.groveCallable
 
 	// Truth edge set over the matched universe. Self-edges (recursion) are
 	// excluded on both sides — they carry no blast-radius information.
@@ -217,6 +148,11 @@ func (c Scorecard) Markdown() string {
 	fmt.Fprintf(&b, "| **Precision** | **%.4f** |\n", c.Precision)
 	fmt.Fprintf(&b, "| **Recall** | **%.4f** |\n", c.Recall)
 	fmt.Fprintf(&b, "| **F1** | **%.4f** |\n", c.F1)
+	if c.FunctionsCovered > 0 {
+		fmt.Fprintf(&b, "| Covered functions | %d |\n", c.FunctionsCovered)
+		fmt.Fprintf(&b, "| …with ≥1 true related test | %d |\n", c.FunctionsHit)
+		fmt.Fprintf(&b, "| **Function hit rate** | **%.4f** |\n", c.FunctionHitRate)
+	}
 	writeExamples(&b, "False positives (Grove edge, oracle disagrees)", c.FalsePositives)
 	writeExamples(&b, "False negatives (oracle edge Grove missed)", c.FalseNegatives)
 	return b.String()

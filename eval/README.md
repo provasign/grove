@@ -119,7 +119,11 @@ Grove's recall against it is meaningful while precision is a lower bound
 | Repo | Universe match | Precision* | Recall | F1 |
 |---|---|---|---|---|
 | requests (`6f66281a`) | 100% | 0.7653 | 0.5971 | 0.6708 |
-| flask (`36e4a824`) | 97.9% | 0.6693 | 0.3520 | 0.4614 |
+| flask (`36e4a824`) | 97.9% | 0.7276 | 0.4865 | 0.5831 |
+
+(flask improved from F1 0.4614 the same day via decorator wrapper→wrapped
+call edges — `@setupmethod`-style wrappers now produce wrapper→wrapped and
+caller→wrapper edges when the decorator resolves to an in-repo function.)
 
 *lower bound — see the partial-oracle caveat above.
 
@@ -137,12 +141,40 @@ The recall gap decomposes into three buckets (flask FN sample):
 Class instantiation (`Flask(...)` → `Flask.__init__`, ~7% of flask's truth
 edges) is already handled: class-named calls route to the constructor.
 
+## Tests edges (runtime coverage oracle)
+
+`gen_truth.py --tests-out` also records which in-repo functions each test
+actually executed (transitively). `grove-eval score-tests` compares Grove's
+`tests` edges against that. Here precision is fully meaningful — the oracle
+saw everything each test touched, so a Grove tests-edge to an untouched
+function is a real false signal. The headline metric is the **function hit
+rate**: for what share of genuinely covered functions does Grove suggest at
+least one truly-covering test. That's the number RFC #5's "related tests"
+signal lives or dies by.
+
+Grove's tests edges are built from the fully-narrowed call graph: direct
+calls from the test (0.85), through same-test-file helpers/fixtures
+(0.75–0.6), and one hop past the entry point into production code (0.55) —
+confidence tiers let consumers trade precision for reach.
+
+### Baseline (2026-06-12, tests edges, Python)
+
+| Repo | Edge precision | Function hit rate |
+|---|---|---|
+| requests | 0.8110 | 0.4702 (79/168) |
+| flask | 0.5337 | 0.3119 (92/295) |
+
+Before this round Grove's tests edges were effectively broken for
+qualified call sites (26 in-universe edges on flask, 6% hit rate): the
+call-site evidence path skipped every dotted callee, which astkit v0.4.2's
+qualifiers had made nearly all of them.
+
 ## Roadmap
 
-- decorator wrapper→wrapped call edges (flask bucket 2; `Annotations` has
-  the data already)
-- property-access edges (flask bucket 1; needs astkit attribute sites)
+- raise the flask tests-edge hit rate: werkzeug test-client indirection
+  (`client.get("/")` → WSGI → view) is the dominant unreachable bucket
+- property-access edges (flask calls bucket 1; needs astkit attribute sites)
 - TS/JS oracle (TypeScript compiler API) over express/socket.io pins
-- `tests` edge scoring against runtime coverage — `gen_truth.py` is the
-  natural base: it already traces test→function execution
+- Go tests-edge truth (`go test -coverprofile` per package)
 - django pin once flask recall improves (same patterns, 100× the surface)
+- tests-edge baseline + CI gate once the metric stabilizes

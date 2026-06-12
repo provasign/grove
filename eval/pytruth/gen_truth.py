@@ -70,6 +70,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--tests-out", default="", help="also emit test→function coverage truth JSONL")
     ap.add_argument("--commit", default="")
     ap.add_argument("--pytest-arg", action="append", default=[], dest="pytest_args")
     args = ap.parse_args()
@@ -104,6 +105,31 @@ def main() -> int:
         return (rel.replace(os.sep, "/"), line, qual)
 
     main_thread = threading.get_ident()
+    test_edges = set()
+
+    class TestTracker:
+        """Pytest plugin: tracks the currently executing test so the
+        profiler can attribute covered functions to it."""
+
+        def __init__(self):
+            self.current = None
+
+        def pytest_runtest_setup(self, item):
+            path, line0, name = item.location
+            # Strip parametrization ("test_x[301]" → "test_x") so instances
+            # collapse onto the declared function and match symbol extractors.
+            if "[" in name:
+                name = name[: name.index("[")]
+            self.current = (
+                path.replace(os.sep, "/"),
+                (line0 or 0) + 1,
+                name.replace("::", "."),
+            )
+
+        def pytest_runtest_teardown(self, item):
+            self.current = None
+
+    tracker = TestTracker()
 
     def profiler(frame, event, arg):
         if event != "call" or threading.get_ident() != main_thread:
@@ -112,6 +138,8 @@ def main() -> int:
         if callee is None:
             return
         funcs.add(callee)
+        if tracker.current is not None:
+            test_edges.add((tracker.current, callee))
         back = frame.f_back
         while back is not None:
             caller = ref_for(back.f_code)
@@ -130,7 +158,7 @@ def main() -> int:
     sys.setprofile(profiler)
     threading.setprofile(profiler)
     try:
-        pytest.main(pytest_args)
+        pytest.main(pytest_args, plugins=[tracker])
     finally:
         sys.setprofile(None)
         threading.setprofile(None)
@@ -151,6 +179,25 @@ def main() -> int:
                 "callee": {"file": ef, "line": el, "name": en},
             }) + "\n")
     print(f"truth: {len(funcs)} functions, {len(edges)} edges -> {args.out}", file=sys.stderr)
+
+    if args.tests_out:
+        tests = {t for t, _ in test_edges}
+        theader = {
+            "schema": "grove-eval/tests/v1",
+            "repo": os.path.basename(repo),
+            "commit": args.commit,
+            "generator": "py-dynamic-pytest",
+            "functions": len(tests),
+            "edges": len(test_edges),
+        }
+        with open(args.tests_out, "w", encoding="utf-8") as f:
+            f.write(json.dumps(theader) + "\n")
+            for (tf, tl, tn), (ef, el, en) in sorted(test_edges):
+                f.write(json.dumps({
+                    "caller": {"file": tf, "line": tl, "name": tn},
+                    "callee": {"file": ef, "line": el, "name": en},
+                }) + "\n")
+        print(f"tests truth: {len(tests)} tests, {len(test_edges)} coverage edges -> {args.tests_out}", file=sys.stderr)
     return 0
 
 

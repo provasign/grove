@@ -313,3 +313,34 @@ func itoa(i int) string {
 	}
 	return string(out)
 }
+
+// Tests edges must follow call edges through same-test-file helpers
+// (fixtures/builders) to the production symbols they reach.
+func TestBuildTests_HelperTransitiveCoverage(t *testing.T) {
+	test := core.SymbolRecord{
+		ID: "tests/test_app.py::test_login@1", FilePath: "tests/test_app.py", BlobSHA: "1",
+		Language: "python", Kind: core.KindFunction,
+		Name: "test_login", QualifiedName: "test_login",
+		Imports:   []string{"app"},
+		CallSites: []core.CallSite{{Callee: "make_client", Line: 2}},
+	}
+	helper := core.SymbolRecord{
+		ID: "tests/test_app.py::make_client@10", FilePath: "tests/test_app.py", BlobSHA: "1",
+		Language: "python", Kind: core.KindFunction,
+		Name: "make_client", QualifiedName: "make_client",
+		Imports:   []string{"app"},
+		CallSites: []core.CallSite{{Callee: "create_app", Line: 11}},
+	}
+	target := core.SymbolRecord{
+		ID: "app.py::create_app@5", FilePath: "app.py", BlobSHA: "1",
+		Language: "python", Kind: core.KindFunction,
+		Name: "create_app", QualifiedName: "create_app",
+	}
+	edges := BuildEdges([]core.SymbolRecord{test, helper, target})
+	for _, e := range edges {
+		if e.Type == core.EdgeTests && e.From == test.ID && e.To == target.ID {
+			return
+		}
+	}
+	t.Fatal("expected tests edge test_login → create_app through the helper")
+}
