@@ -99,6 +99,40 @@ Non-code files (`.md`, `.yaml`, `.json`, `.xml`, `.sh`, `.toml`, `.proto`, `.sql
 
 ---
 
+## Measured Accuracy
+
+Grove's edges are scored against typed-toolchain ground truth on pinned
+real-world repos, and CI fails any change that regresses below the recorded
+floors (see [eval/README.md](eval/README.md) for methodology, oracles, and
+the full progression history). Calls-edge accuracy, 2026-06-12:
+
+| Repo (pin) | Language | Oracle | Precision | Recall | F1 |
+|---|---|---|---|---|---|
+| gin | Go | go/ssa + VTA callgraph | 0.93 | 0.95 | **0.94** |
+| socket.io | TypeScript | TypeScript compiler API | 0.85 | 0.96 | **0.90** |
+| commons-lang | Java | javac + javap bytecode | 0.68 | 0.84 | **0.75** |
+| express | JavaScript (CJS) | TypeScript compiler API (checkJs) | 0.75 | 0.71 | **0.73** |
+| flask | Python | dynamic (pytest runtime trace) | 0.85 | 0.61 | **0.71** |
+
+Notes on reading these honestly:
+
+- The Python oracle is **runtime execution**, so it records edges no static
+  tool can see (registry dispatch, dunder protocols, proxies); Python
+  recall against it is a conservative lower bound, and precision is the
+  lever that matters.
+- Test-relatedness edges are scored against per-test runtime coverage:
+  flask edge precision 0.74, with a truly-covering test suggested for 36%
+  of covered functions. Blast radius (depth-2 reverse reachability on gin)
+  scores F1 0.88.
+- Every number above is a CI gate (`.github/workflows/eval.yml`), including
+  a universe-match floor that catches tree-sitter grammar drift when new
+  language syntax ships.
+
+Ground truths are tool-agnostic JSONL — score your own code graph against
+them.
+
+---
+
 ## Graph Edge Types
 
 | Edge | Meaning |
@@ -111,6 +145,7 @@ Non-code files (`.md`, `.yaml`, `.json`, `.xml`, `.sh`, `.toml`, `.proto`, `.sql
 | `calls` | Function calls another function (scoped) |
 | `uses-type` | Function/field uses a type (scoped) |
 | `tests` | Test function covers a named symbol |
+| `overrides` | Concrete method implements an interface/abstract declaration |
 
 ---
 
