@@ -2,9 +2,12 @@ package eval
 
 import (
 	"bufio"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
+	"strings"
 )
 
 // WriteTruth writes the header followed by one TruthEdge per line.
@@ -27,14 +30,25 @@ func WriteTruth(path string, header TruthFile, edges []TruthEdge) error {
 	return w.Flush()
 }
 
-// ReadTruth reads a truth JSONL file produced by WriteTruth.
+// ReadTruth reads a truth JSONL file produced by WriteTruth. Files ending
+// in .gz are decompressed transparently (truth snapshots are stored
+// compressed).
 func ReadTruth(path string) (TruthFile, []TruthEdge, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return TruthFile{}, nil, err
 	}
 	defer f.Close()
-	sc := bufio.NewScanner(f)
+	var r io.Reader = f
+	if strings.HasSuffix(path, ".gz") {
+		gz, err := gzip.NewReader(f)
+		if err != nil {
+			return TruthFile{}, nil, fmt.Errorf("%s: %w", path, err)
+		}
+		defer gz.Close()
+		r = gz
+	}
+	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 1024*1024), 16*1024*1024)
 	if !sc.Scan() {
 		return TruthFile{}, nil, fmt.Errorf("%s: empty truth file", path)

@@ -104,6 +104,7 @@ func cmdScoreTests(args []string) error {
 	repo := fs.String("repo", "", "repository root")
 	truth := fs.String("truth", "", "tests truth JSONL path")
 	outDir := fs.String("out-dir", "", "directory for scorecard outputs")
+	baseline := fs.String("baseline", "", "tests baseline JSON; exit 1 if precision/hit-rate regress")
 	_ = fs.Parse(args)
 	if *repo == "" || *truth == "" || *outDir == "" {
 		return fmt.Errorf("score-tests: --repo, --truth and --out-dir are required")
@@ -133,6 +134,47 @@ func cmdScoreTests(args []string) error {
 		card.MatchedUniverse, card.TruthFunctions, card.SymbolMatchRate*100,
 		card.GroveEdges, card.TruthEdges, card.Precision, card.Recall,
 		card.FunctionHitRate, card.FunctionsHit, card.FunctionsCovered)
+	if *baseline != "" {
+		return gateTests(card, *baseline)
+	}
+	return nil
+}
+
+// testsBaselineEntry is one repo's accepted tests-edge floor: edge precision
+// plus the function hit rate (the RFC #5 signal-quality metric).
+type testsBaselineEntry struct {
+	Commit    string  `json:"commit"`
+	Precision float64 `json:"precision"`
+	HitRate   float64 `json:"hitRate"`
+	Tolerance float64 `json:"tolerance"`
+}
+
+func gateTests(card eval.Scorecard, baselinePath string) error {
+	raw, err := os.ReadFile(baselinePath)
+	if err != nil {
+		return err
+	}
+	var entries map[string]testsBaselineEntry
+	if err := json.Unmarshal(raw, &entries); err != nil {
+		return fmt.Errorf("%s: %w", baselinePath, err)
+	}
+	entry, ok := entries[card.Repo]
+	if !ok {
+		return fmt.Errorf("gate: no tests baseline entry for repo %q in %s", card.Repo, baselinePath)
+	}
+	tol := entry.Tolerance
+	var failures []string
+	if card.Precision < entry.Precision-tol {
+		failures = append(failures, fmt.Sprintf("precision %.4f < baseline %.4f (tol %.4f)", card.Precision, entry.Precision, tol))
+	}
+	if card.FunctionHitRate < entry.HitRate-tol {
+		failures = append(failures, fmt.Sprintf("function hit rate %.4f < baseline %.4f (tol %.4f)", card.FunctionHitRate, entry.HitRate, tol))
+	}
+	if len(failures) > 0 {
+		return fmt.Errorf("gate: %s tests edges regressed: %s", card.Repo, strings.Join(failures, "; "))
+	}
+	fmt.Printf("gate: %s tests edges within baseline (P %.4f ≥ %.4f, hit %.4f ≥ %.4f, tol %.4f)\n",
+		card.Repo, card.Precision, entry.Precision, card.FunctionHitRate, entry.HitRate, tol)
 	return nil
 }
 
