@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.6.3 - 2026-06-12
+
+Two precision fixes found by Prism's grafana-scale benchmark
+(prism/docs/AB-Test-Payflow-2026-06-12.md):
+
+- **TestsFor traversal confidence gate:** the "tests for X" closure no
+  longer follows low-confidence fallback edges (ambiguous cross-file
+  bare-name call matches at 0.6, type-use guesses at 0.5), which connected
+  unrelated subsystems on monorepos. Direct `tests` edges are unaffected.
+  Known limitation: residual cross-subsystem noise can still arrive over
+  high-confidence edges when a bare callee name resolves to ≤16 candidates
+  (all get 0.95 edges); the durable fix is type-aware callee resolution.
+- **GraphDiff rename pairing for common and partially-renamed names:**
+  body normalization now blanks only standalone identifier occurrences of
+  the symbol's own name (a substring ReplaceAll mangled "Get" inside
+  "GetKeys" and broke pairing for short names), and a bounded pairwise
+  second pass blanks BOTH names on both sides so mechanical renames that
+  leave the old name in the doc comment ("// Get an item…") still pair.
+  Both cases previously fell back to removed+addition — breaking flag
+  correct, continuity signal lost.
+
 ## v0.6.2 - 2026-06-12
 
 Real-repo validation pass (prometheus / django / grafana) plus token

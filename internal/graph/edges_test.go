@@ -153,14 +153,20 @@ func TestTestsForFollowsTestsEdge(t *testing.T) {
 }
 
 func TestTestsForTransitiveCaller(t *testing.T) {
+	// CallSites are populated as the parser would on real code: the closure
+	// follows AST-evidenced call edges (0.95). Cross-file regex-fallback
+	// edges (0.6) are deliberately below the traversal cut — see
+	// TestTestsForSkipsLowConfidenceEdges.
 	g := New()
 	g.Replace([]core.SymbolRecord{
 		{ID: "auth.go::Login@sha", FilePath: "auth.go", Language: "go", Kind: core.KindFunction, Name: "Login", QualifiedName: "Login",
 			RawText: "func Login() {}"},
 		{ID: "handler.go::Handle@sha", FilePath: "handler.go", Language: "go", Kind: core.KindFunction, Name: "Handle", QualifiedName: "Handle",
-			RawText: "func Handle() { Login() }", Imports: []string{"github.com/provasign/grove/auth"}},
+			RawText: "func Handle() { Login() }", Imports: []string{"github.com/provasign/grove/auth"},
+			CallSites: []core.CallSite{{Callee: "Login", Line: 1}}},
 		{ID: "service.go::Serve@sha", FilePath: "service.go", Language: "go", Kind: core.KindFunction, Name: "Serve", QualifiedName: "Serve",
-			RawText: "func Serve() { Handle() }", Imports: []string{"github.com/provasign/grove/handler"}},
+			RawText: "func Serve() { Handle() }", Imports: []string{"github.com/provasign/grove/handler"},
+			CallSites: []core.CallSite{{Callee: "Handle", Line: 1}}},
 		{ID: "handler_test.go::TestHandle@sha", FilePath: "handler_test.go", Language: "go", Kind: core.KindFunction, Name: "TestHandle", QualifiedName: "TestHandle"},
 		{ID: "service_test.go::TestServe@sha", FilePath: "service_test.go", Language: "go", Kind: core.KindFunction, Name: "TestServe", QualifiedName: "TestServe"},
 	}, 3)

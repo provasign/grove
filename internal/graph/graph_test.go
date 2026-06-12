@@ -234,3 +234,35 @@ func TestComputeICRNoMatchReturnsEmptyLowConfidenceRegion(t *testing.T) {
 		t.Fatalf("two no-match ICRs must not conflict, got %+v", conflict)
 	}
 }
+
+// TestsFor's closure must not traverse low-confidence fallback edges:
+// ambiguous bare-name call matches (0.6) connect unrelated subsystems on
+// large repos and swept in tests from across the monorepo (grafana,
+// 2026-06-12).
+func TestTestsForSkipsLowConfidenceEdges(t *testing.T) {
+	g := New()
+	syms := []core.SymbolRecord{
+		{ID: "a.go::Target@1", FilePath: "a.go", Kind: core.KindFunction, Name: "Target", QualifiedName: "Target", RawText: "func Target() {}"},
+		{ID: "b.go::Caller@1", FilePath: "b.go", Kind: core.KindFunction, Name: "Caller", QualifiedName: "Caller", RawText: "func Caller() { Target() }"},
+		{ID: "c.go::FarAway@1", FilePath: "c.go", Kind: core.KindFunction, Name: "FarAway", QualifiedName: "FarAway", RawText: "func FarAway() {}"},
+		{ID: "b_test.go::TestCaller@1", FilePath: "b_test.go", Kind: core.KindFunction, Name: "TestCaller", QualifiedName: "TestCaller", RawText: "func TestCaller(t *testing.T) { Caller() }"},
+		{ID: "c_test.go::TestFarAway@1", FilePath: "c_test.go", Kind: core.KindFunction, Name: "TestFarAway", QualifiedName: "TestFarAway", RawText: "func TestFarAway(t *testing.T) { FarAway() }"},
+	}
+	edges := []core.Edge{
+		{From: "b.go::Caller@1", To: "a.go::Target@1", Type: core.EdgeCalls, Confidence: 0.95},
+		{From: "b_test.go::TestCaller@1", To: "b.go::Caller@1", Type: core.EdgeTests, Confidence: 0.85},
+		// Fallback edge from an unrelated subsystem: ambiguous name match.
+		{From: "c.go::FarAway@1", To: "a.go::Target@1", Type: core.EdgeCalls, Confidence: 0.6},
+		{From: "c_test.go::TestFarAway@1", To: "c.go::FarAway@1", Type: core.EdgeTests, Confidence: 0.85},
+	}
+	g.ReplaceWithStoredEdges(syms, edges, 5)
+
+	tests := g.TestsFor("Target")
+	names := make([]string, 0, len(tests))
+	for _, ts := range tests {
+		names = append(names, ts.Name)
+	}
+	if len(tests) != 1 || tests[0].Name != "TestCaller" {
+		t.Fatalf("want only TestCaller via the high-confidence path, got %v", names)
+	}
+}

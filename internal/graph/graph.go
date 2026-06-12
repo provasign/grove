@@ -414,6 +414,11 @@ func (g *CodeGraph) Impact(query string, maxDepth int) []core.SymbolRecord {
 //     dependency closure (calls/contains/implements/extends/uses-type/tests)
 //     and gather every test symbol that reaches any node in that closure.
 //  2. Fallback: substring search in test files (for free-text queries).
+// minTestTraversalConfidence bounds which edges the TestsFor closure walks.
+// Resolved call edges carry 0.85–0.95, containment 1.0; the fallback tiers
+// (ambiguous name-matched calls 0.6, type-use 0.5) sit below the cut.
+const minTestTraversalConfidence = 0.7
+
 func (g *CodeGraph) TestsFor(query string) []core.SymbolRecord {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
@@ -433,8 +438,12 @@ func (g *CodeGraph) TestsFor(query string) []core.SymbolRecord {
 		}
 	}
 
-	// Phase 2: walk the full inbound dependency closure from each target.
+	// Phase 2: walk the inbound dependency closure from each target.
 	// Any test symbol that reaches any node in that closure is included.
+	// Traversal follows only evidence-backed edges: low-confidence fallback
+	// edges (ambiguous bare-name call matches at 0.6, type-use guesses at
+	// 0.5) connect unrelated subsystems on large repos and made "tests for
+	// X" sweep in tests from across a monorepo.
 	tests := make(map[string]core.SymbolRecord)
 	if len(targets) > 0 {
 		visited := make(map[string]bool, len(targets))
@@ -454,6 +463,9 @@ func (g *CodeGraph) TestsFor(query string) []core.SymbolRecord {
 						tests[t.ID] = t
 					}
 				case core.EdgeCalls, core.EdgeContains, core.EdgeImplements, core.EdgeExtends, core.EdgeUsesType:
+					if edge.Confidence < minTestTraversalConfidence {
+						continue
+					}
 					if !visited[edge.From] {
 						visited[edge.From] = true
 						queue = append(queue, edge.From)

@@ -106,27 +106,39 @@ func detectRenames(diff *core.GraphDiff) {
 
 	usedRemoved := map[int]bool{}
 	usedAdded := map[int]bool{}
-	for key, removedIdx := range removedByBody {
-		addedIdx := addedByBody[key]
-		if len(removedIdx) != 1 || len(addedIdx) != 1 {
-			continue
-		}
-		before := diff.Removed[removedIdx[0]]
-		after := diff.Added[addedIdx[0]]
+	pair := func(ri, ai int) {
+		before := diff.Removed[ri]
+		after := diff.Added[ai]
 		change := core.SymbolChange{
 			Before:           &before,
 			After:            &after,
 			SignatureChanged: before.Signature != after.Signature,
 		}
 		diff.Renamed = append(diff.Renamed, change)
-		usedRemoved[removedIdx[0]] = true
-		usedAdded[addedIdx[0]] = true
+		usedRemoved[ri] = true
+		usedAdded[ai] = true
 		// A renamed exported symbol still breaks callers of the old name.
 		// A pure file move (same qualified name, body untouched) does not.
 		if before.Exports && before.QualifiedName != after.QualifiedName {
 			diff.BreakingChanges = append(diff.BreakingChanges, change)
 		}
 	}
+	for key, removedIdx := range removedByBody {
+		addedIdx := addedByBody[key]
+		if len(removedIdx) != 1 || len(addedIdx) != 1 {
+			continue
+		}
+		pair(removedIdx[0], addedIdx[0])
+	}
+
+	// Second pass for partial renames: the declaration was renamed but the
+	// old name survives elsewhere in the body — typically the doc comment
+	// ("// Get an item...") after a mechanical symbol rename. Blanking only
+	// each side's own name leaves those occurrences asymmetric, so compare
+	// with BOTH names blanked on both sides. Pairwise and bounded; still
+	// 1:1-unambiguous only.
+	detectPartialRenames(diff, usedRemoved, usedAdded, pair)
+
 	if len(usedRemoved) == 0 {
 		return
 	}
@@ -145,6 +157,58 @@ func detectRenames(diff *core.GraphDiff) {
 	diff.BreakingChanges = kept
 }
 
+// maxPairwiseRename bounds the quadratic partial-rename pass; diffs churning
+// more symbols than this per file get keyed matching only.
+const maxPairwiseRename = 12
+
+// detectPartialRenames pairs remaining removed/added symbols whose bodies
+// match once both the old and the new name are blanked on both sides.
+func detectPartialRenames(diff *core.GraphDiff, usedRemoved, usedAdded map[int]bool, pair func(ri, ai int)) {
+	if len(diff.Removed) > maxPairwiseRename || len(diff.Added) > maxPairwiseRename {
+		return
+	}
+	dualKey := func(s *core.SymbolRecord, oldName, newName string) (string, bool) {
+		body := strings.TrimSpace(s.RawText)
+		if len(body) < minRenameBodyLen {
+			return "", false
+		}
+		body = replaceWholeIdent(body, oldName)
+		body = replaceWholeIdent(body, newName)
+		return string(s.Kind) + "\x00" + body, true
+	}
+	type match struct{ ri, ai int }
+	matchesByRemoved := map[int][]int{}
+	matchesByAdded := map[int][]int{}
+	var candidates []match
+	for ri := range diff.Removed {
+		if usedRemoved[ri] || diff.Removed[ri].Name == "" {
+			continue
+		}
+		for ai := range diff.Added {
+			if usedAdded[ai] || diff.Added[ai].Name == "" {
+				continue
+			}
+			r, a := &diff.Removed[ri], &diff.Added[ai]
+			if r.Kind != a.Kind {
+				continue
+			}
+			rk, ok1 := dualKey(r, r.Name, a.Name)
+			ak, ok2 := dualKey(a, r.Name, a.Name)
+			if !ok1 || !ok2 || rk != ak {
+				continue
+			}
+			candidates = append(candidates, match{ri, ai})
+			matchesByRemoved[ri] = append(matchesByRemoved[ri], ai)
+			matchesByAdded[ai] = append(matchesByAdded[ai], ri)
+		}
+	}
+	for _, m := range candidates {
+		if len(matchesByRemoved[m.ri]) == 1 && len(matchesByAdded[m.ai]) == 1 {
+			pair(m.ri, m.ai)
+		}
+	}
+}
+
 // renameKey returns a kind-scoped body fingerprint with the symbol's own
 // name blanked out, so `func Login(...)` and `func SignIn(...)` with the
 // same body collide on the same key.
@@ -153,8 +217,45 @@ func renameKey(s *core.SymbolRecord) (string, bool) {
 	if len(body) < minRenameBodyLen || s.Name == "" {
 		return "", false
 	}
-	normalized := strings.ReplaceAll(body, s.Name, "\x00")
+	normalized := replaceWholeIdent(body, s.Name)
 	return string(s.Kind) + "\x00" + normalized, true
+}
+
+// replaceWholeIdent blanks standalone identifier occurrences of name in
+// body — occurrences not flanked by identifier characters. A plain
+// ReplaceAll also mangles identifiers that merely contain the name ("Get"
+// inside "GetKeys"), which made normalization asymmetric between the
+// removed and the added body, so renames of common short names never
+// paired and fell back to removed+added.
+func replaceWholeIdent(body, name string) string {
+	var sb strings.Builder
+	sb.Grow(len(body))
+	for i := 0; i < len(body); {
+		j := strings.Index(body[i:], name)
+		if j < 0 {
+			sb.WriteString(body[i:])
+			break
+		}
+		j += i
+		end := j + len(name)
+		sb.WriteString(body[i:j])
+		leftOK := j == 0 || !isIdentChar(body[j-1])
+		rightOK := end == len(body) || !isIdentChar(body[end])
+		if leftOK && rightOK {
+			sb.WriteByte('\x00')
+		} else {
+			sb.WriteString(name)
+		}
+		i = end
+	}
+	return sb.String()
+}
+
+func isIdentChar(c byte) bool {
+	return c == '_' ||
+		('0' <= c && c <= '9') ||
+		('a' <= c && c <= 'z') ||
+		('A' <= c && c <= 'Z')
 }
 
 func isRenamedBefore(renamed []core.SymbolChange, before *core.SymbolRecord) bool {

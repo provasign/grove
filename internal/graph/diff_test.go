@@ -195,3 +195,73 @@ func TestDiffSymbolsEmptySnapshots(t *testing.T) {
 		t.Fatalf("fresh-index diff = %+v", added)
 	}
 }
+
+// A rename of a short, common name must still pair when the name also
+// appears as a substring of other identifiers in the body ("Get" inside
+// "GetKeys"). Plain substring normalization mangled those identifiers
+// asymmetrically and the pair was lost (found on the grafana corpus,
+// 2026-06-12).
+func TestDiffSymbolsRenameWithCommonNameSubstring(t *testing.T) {
+	bodyBefore := "func (kv *Store) Get(ctx context.Context) (string, error) {\n\tv, err := kv.GetKeys(ctx)\n\tif err != nil {\n\t\treturn \"\", err\n\t}\n\treturn decode(v)\n}"
+	bodyAfter := strings.Replace(bodyBefore, ") Get(", ") Fetch(", 1)
+	before := []core.SymbolRecord{
+		sym("sql.go", "Store.Get", "Get", core.KindMethod, 40, "func (kv *Store) Get(ctx context.Context) (string, error)", bodyBefore, true),
+	}
+	after := []core.SymbolRecord{
+		sym("sql.go", "Store.Fetch", "Fetch", core.KindMethod, 40, "func (kv *Store) Fetch(ctx context.Context) (string, error)", bodyAfter, true),
+	}
+	diff := DiffSymbols(before, after)
+	if len(diff.Added) != 0 || len(diff.Removed) != 0 {
+		t.Fatalf("common-name rename must pair: added=%+v removed=%+v", diff.Added, diff.Removed)
+	}
+	if len(diff.Renamed) != 1 || diff.Renamed[0].Before.Name != "Get" || diff.Renamed[0].After.Name != "Fetch" {
+		t.Fatalf("renamed = %+v", diff.Renamed)
+	}
+}
+
+func TestReplaceWholeIdent(t *testing.T) {
+	got := replaceWholeIdent("Get(kv.GetKeys, widGet, Get)", "Get")
+	want := "\x00(kv.GetKeys, widGet, \x00)"
+	if got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
+// A mechanical symbol rename that leaves the old name in the doc comment
+// ("// Get an item..." still preceding the renamed Fetch) must still pair:
+// both names are blanked on both sides in the pairwise pass. Found on the
+// grafana corpus, 2026-06-12.
+func TestDiffSymbolsRenameWithStaleDocComment(t *testing.T) {
+	bodyBefore := "// Get an item from the store\nfunc (kv *Store) Get(ctx context.Context) (string, error) {\n\tv, err := kv.GetKeys(ctx)\n\tif err != nil {\n\t\treturn \"\", err\n\t}\n\treturn decode(v)\n}"
+	bodyAfter := strings.Replace(bodyBefore, ") Get(", ") Fetch(", 1) // comment untouched
+	before := []core.SymbolRecord{
+		sym("sql.go", "Store.Get", "Get", core.KindMethod, 40, "func (kv *Store) Get(ctx context.Context) (string, error)", bodyBefore, true),
+	}
+	after := []core.SymbolRecord{
+		sym("sql.go", "Store.Fetch", "Fetch", core.KindMethod, 40, "func (kv *Store) Fetch(ctx context.Context) (string, error)", bodyAfter, true),
+	}
+	diff := DiffSymbols(before, after)
+	if len(diff.Renamed) != 1 || diff.Renamed[0].Before.Name != "Get" || diff.Renamed[0].After.Name != "Fetch" {
+		t.Fatalf("partial rename must pair, got renamed=%+v added=%+v removed=%+v", diff.Renamed, diff.Added, diff.Removed)
+	}
+	if len(diff.BreakingChanges) != 1 {
+		t.Fatalf("exported rename must be breaking: %+v", diff.BreakingChanges)
+	}
+}
+
+// The pairwise pass must stay 1:1 — two removed symbols with bodies that
+// both match one added symbol after dual blanking must not pair.
+func TestDiffSymbolsPartialRenameAmbiguityDoesNotPair(t *testing.T) {
+	body := "func NAME(x int) int {\n\treturn x + computeOffset(x)\n}"
+	before := []core.SymbolRecord{
+		sym("m.go", "AlphaOne", "AlphaOne", core.KindFunction, 1, "func AlphaOne(x int) int", strings.ReplaceAll(body, "NAME", "AlphaOne"), true),
+		sym("m.go", "AlphaTwo", "AlphaTwo", core.KindFunction, 10, "func AlphaTwo(x int) int", strings.ReplaceAll(body, "NAME", "AlphaTwo"), true),
+	}
+	after := []core.SymbolRecord{
+		sym("m.go", "Beta", "Beta", core.KindFunction, 1, "func Beta(x int) int", strings.ReplaceAll(body, "NAME", "Beta"), true),
+	}
+	diff := DiffSymbols(before, after)
+	if len(diff.Renamed) != 0 {
+		t.Fatalf("ambiguous partial rename must not pair: %+v", diff.Renamed)
+	}
+}
