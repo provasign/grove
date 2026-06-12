@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.6.2 - 2026-06-12
+
+Real-repo validation pass (prometheus / django / grafana) plus token
+discipline for the MCP surface.
+
+- **Scoped native analyzers:** only languages whose files changed re-run;
+  skipped analyzers' stored edges are carried forward. A one-file Go edit
+  on a 19k-file polyglot monorepo no longer re-runs the TypeScript
+  program check.
+- **O(import-depth) import resolution:** package-import matching used a
+  per-import scan over every directory (~0.5B string comparisons on
+  grafana); slash-suffix lookups produce a bit-identical graph.
+- **Diff-based edge persistence:** the edge table is synced by difference
+  (batched multi-row writes) instead of delete-everything-reinsert.
+- Net effect on grafana (18,979 files / 98.5k symbols / 1.16M edges):
+  one-file change 78.3s → 18.7s; cold index 87.4s → 56.6s. README
+  publishes the measured table.
+- **MCP token discipline:** symbol payloads no longer carry full bodies
+  (one grove_query response was ~10.7k tokens; now ~1.1k);
+  grove_impact caps at 50 minimal refs with an exact count; all
+  responses are compact JSON.
+
 ## v0.6.1 - 2026-06-11
 
 - Added `Engine.FileSymbols(ctx, relPath)`: the indexed symbols for one

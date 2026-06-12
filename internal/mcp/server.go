@@ -104,7 +104,9 @@ func (s *Server) handle(method string, params json.RawMessage) (any, *rpcError) 
 		if err != nil {
 			return nil, &rpcError{Code: -32000, Message: err.Error()}
 		}
-		encoded, _ := json.MarshalIndent(value, "", "  ")
+		// Compact JSON: results land in an agent's context window, and
+		// indentation is pure token overhead.
+		encoded, _ := json.Marshal(value)
 		return map[string]any{"content": []map[string]string{{"type": "text", "text": string(encoded)}}}, nil
 	default:
 		return nil, &rpcError{Code: -32601, Message: "method not found"}
@@ -127,14 +129,19 @@ func (s *Server) callTool(name string, args map[string]any) (any, error) {
 	case "grove_query":
 		return map[string]any{"results": semanticResults(s.currentGraph(), stringArg(args, "intent", ""), intArg(args, "limit", 50))}, nil
 	case "grove_symbols":
-		return map[string]any{"symbols": s.currentGraph().Search(stringArg(args, "query", ""), intArg(args, "limit", 50))}, nil
+		return map[string]any{"symbols": slimSymbols(s.currentGraph().Search(stringArg(args, "query", ""), intArg(args, "limit", 50)), 0)}, nil
 	case "grove_deps":
 		return map[string]any{"edges": s.currentGraph().Deps(stringArg(args, "file", ""))}, nil
 	case "grove_impact":
 		query := stringArg(args, "query", stringArg(args, "file", ""))
-		return map[string]any{"nodes": s.currentGraph().Impact(query, intArg(args, "maxDepth", 3))}, nil
+		nodes := s.currentGraph().Impact(query, intArg(args, "maxDepth", 3))
+		out := map[string]any{"count": len(nodes), "nodes": impactRefs(nodes, maxImpactNodes)}
+		if len(nodes) > maxImpactNodes {
+			out["note"] = fmt.Sprintf("showing %d of %d impacted symbols", maxImpactNodes, len(nodes))
+		}
+		return out, nil
 	case "grove_tests":
-		return map[string]any{"tests": s.currentGraph().TestsFor(stringArg(args, "query", stringArg(args, "file", "")))}, nil
+		return map[string]any{"tests": slimSymbols(s.currentGraph().TestsFor(stringArg(args, "query", stringArg(args, "file", ""))), 0)}, nil
 	case "grove_icr":
 		return s.currentGraph().ComputeICR(stringArg(args, "intent", "")), nil
 	case "grove_conflicts":
@@ -161,6 +168,87 @@ func (s *Server) callTool(name string, args map[string]any) (any, error) {
 	}
 }
 
+// maxImpactNodes caps blast-radius payloads: a hot symbol on a monorepo can
+// reach thousands of dependents (4,468 measured for "Dashboard" on grafana),
+// and dumping them all into an agent's context window helps no one. The
+// exact count is always reported.
+const maxImpactNodes = 50
+
+// SlimSymbol is the MCP wire shape for a symbol: everything an agent needs
+// to locate and reason about it, none of the bulk. Full bodies (RawText)
+// made a single grove_query response cost ~10k tokens; agents that want a
+// body should read the file (or use Prism, which compresses re-reads).
+type SlimSymbol struct {
+	ID            string `json:"id"`
+	FilePath      string `json:"filePath"`
+	Kind          string `json:"kind"`
+	Name          string `json:"name"`
+	QualifiedName string `json:"qualifiedName"`
+	Signature     string `json:"signature,omitempty"`
+	Docstring     string `json:"docstring,omitempty"`
+	SpanStart     int    `json:"spanStart"`
+	SpanEnd       int    `json:"spanEnd"`
+	Exported      bool   `json:"exported"`
+}
+
+func slimSymbol(s core.SymbolRecord) SlimSymbol {
+	doc := s.Docstring
+	if i := strings.IndexByte(doc, '\n'); i >= 0 {
+		doc = doc[:i] // first line carries the summary; bodies are bulk
+	}
+	return SlimSymbol{
+		ID:            s.ID,
+		FilePath:      s.FilePath,
+		Kind:          string(s.Kind),
+		Name:          s.Name,
+		QualifiedName: s.QualifiedName,
+		Signature:     s.Signature,
+		Docstring:     doc,
+		SpanStart:     s.Span.Start,
+		SpanEnd:       s.Span.End,
+		Exported:      s.Exports,
+	}
+}
+
+// ImpactRef is the minimal blast-radius entry: enough to locate the
+// dependent and look it up, nothing more. Impact lists run long (capped at
+// 50 of potentially thousands), so every field is paid 50×.
+type ImpactRef struct {
+	FilePath      string `json:"filePath"`
+	QualifiedName string `json:"qualifiedName"`
+	Kind          string `json:"kind"`
+	Line          int    `json:"line"`
+}
+
+func impactRefs(symbols []core.SymbolRecord, limit int) []ImpactRef {
+	if limit > 0 && len(symbols) > limit {
+		symbols = symbols[:limit]
+	}
+	out := make([]ImpactRef, 0, len(symbols))
+	for _, s := range symbols {
+		out = append(out, ImpactRef{
+			FilePath:      s.FilePath,
+			QualifiedName: s.QualifiedName,
+			Kind:          string(s.Kind),
+			Line:          s.Span.Start,
+		})
+	}
+	return out
+}
+
+// slimSymbols converts symbols to the wire shape, truncating to limit when
+// limit > 0.
+func slimSymbols(symbols []core.SymbolRecord, limit int) []SlimSymbol {
+	if limit > 0 && len(symbols) > limit {
+		symbols = symbols[:limit]
+	}
+	out := make([]SlimSymbol, 0, len(symbols))
+	for _, s := range symbols {
+		out = append(out, slimSymbol(s))
+	}
+	return out
+}
+
 func semanticResults(codeGraph *graph.CodeGraph, intent string, limit int) []map[string]any {
 	if limit <= 0 {
 		limit = 50
@@ -168,8 +256,11 @@ func semanticResults(codeGraph *graph.CodeGraph, intent string, limit int) []map
 	scored := codeGraph.SemanticSearch(intent, limit)
 	results := make([]map[string]any, 0, len(scored))
 	for _, s := range scored {
+		if s.Symbol == nil {
+			continue
+		}
 		results = append(results, map[string]any{
-			"symbol": s.Symbol,
+			"symbol": slimSymbol(*s.Symbol),
 			"score":  s.Score,
 		})
 	}
