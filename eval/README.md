@@ -98,10 +98,51 @@ The residual gin gap is mostly oracle-side flow precision (VTA proves which
 implementations actually reach a dispatch site; structure alone cannot) —
 acceptable territory for a blast-radius tool that says "may affect".
 
+## Python (dynamic oracle)
+
+`pytruth/gen_truth.py` runs a repo's own pytest suite under `sys.setprofile`
+and records every executed caller→callee pair between non-test, in-repo
+functions (closures attributed to their enclosing def; decorator line
+numbers normalized to the `def` line). The oracle is **exact but partial**:
+every asserted edge really executed, but untested paths are absent — so
+Grove's recall against it is meaningful while precision is a lower bound
+(a correct static edge on an untested path scores as a false positive).
+
+```sh
+/path/to/venv/bin/python eval/pytruth/gen_truth.py \
+  --repo /path/to/repo --commit <sha> --out truth.jsonl
+./grove-eval score --repo /path/to/repo --truth truth.jsonl --out-dir out/
+```
+
+### Baseline (2026-06-12, calls edges, Python)
+
+| Repo | Universe match | Precision* | Recall | F1 |
+|---|---|---|---|---|
+| requests (`6f66281a`) | 100% | 0.7653 | 0.5971 | 0.6708 |
+| flask (`36e4a824`) | 97.9% | 0.6693 | 0.3520 | 0.4614 |
+
+*lower bound — see the partial-oracle caveat above.
+
+The recall gap decomposes into three buckets (flask FN sample):
+
+1. **Property access** — `request.blueprints` executes `@property` code with
+   no call syntax, so no CallSite exists. Needs attribute-access modeling.
+2. **Decorator wrappers** — `@setupmethod`-style wrappers call the wrapped
+   function; Grove sees the decoration (in `Annotations`) but emits no
+   wrapper→wrapped edge yet.
+3. **Registry dispatch** — `dispatch_request` → view functions through
+   Flask's routing table. Fundamentally dynamic; a fair ceiling for static
+   structure.
+
+Class instantiation (`Flask(...)` → `Flask.__init__`, ~7% of flask's truth
+edges) is already handled: class-named calls route to the constructor.
+
 ## Roadmap
 
-- Python oracle (pyright or PyCG) over django/flask/requests corpus pins
+- decorator wrapper→wrapped call edges (flask bucket 2; `Annotations` has
+  the data already)
+- property-access edges (flask bucket 1; needs astkit attribute sites)
 - TS/JS oracle (TypeScript compiler API) over express/socket.io pins
-- `tests` edge scoring against runtime coverage
-  (`go test -coverprofile`, `coverage.py` dynamic contexts, nyc)
-- regression gate in CI against the last accepted baseline
+- `tests` edge scoring against runtime coverage — `gen_truth.py` is the
+  natural base: it already traces test→function execution
+- django pin once flask recall improves (same patterns, 100× the surface)

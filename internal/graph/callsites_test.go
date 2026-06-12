@@ -293,3 +293,29 @@ func TestBuildCalls_InRepoImportQualifierRestricts(t *testing.T) {
 		t.Fatal("package-qualified call must not reach same-package Open")
 	}
 }
+
+// Python: Cache() instantiation must produce a call edge to Cache.__init__.
+func TestBuildCalls_ClassCallRoutesToConstructor(t *testing.T) {
+	caller := core.SymbolRecord{
+		ID: "app.py::make@1", FilePath: "app.py", BlobSHA: "1",
+		Language: "python", Kind: core.KindFunction,
+		Name: "make", QualifiedName: "make",
+		CallSites: []core.CallSite{{Callee: "Cache", Line: 2}},
+	}
+	cls := core.SymbolRecord{
+		ID: "app.py::Cache@10", FilePath: "app.py", BlobSHA: "1",
+		Language: "python", Kind: core.KindClass,
+		Name: "Cache", QualifiedName: "Cache",
+	}
+	ctor := core.SymbolRecord{
+		ID: "app.py::Cache.__init__@11", FilePath: "app.py", BlobSHA: "1",
+		Language: "python", Kind: core.KindMethod,
+		Name: "__init__", QualifiedName: "Cache.__init__", ParentSymbol: "Cache",
+	}
+	for _, e := range BuildEdges([]core.SymbolRecord{caller, cls, ctor}) {
+		if e.Type == core.EdgeCalls && e.From == caller.ID && e.To == ctor.ID {
+			return
+		}
+	}
+	t.Fatal("expected instantiation edge make → Cache.__init__")
+}

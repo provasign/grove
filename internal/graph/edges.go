@@ -699,6 +699,15 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 				for _, cand := range narrowed {
 					addEdge(symbol.ID, cand.ID, 0.95)
 				}
+				// Class instantiation: "Flask(...)" executes Flask.__init__.
+				// Route class-named calls to the class's constructor method.
+				if len(narrowed) == 0 && !capped {
+					for _, ctor := range constructorTargets(idx, calleeName, scope) {
+						if ctor.ID != symbol.ID {
+							addEdge(symbol.ID, ctor.ID, 0.85)
+						}
+					}
+				}
 				// Fan-out the cap dropped is legitimate dynamic dispatch when an
 				// in-scope interface declares the method: emit edges to its
 				// implementations at reduced confidence.
@@ -802,6 +811,35 @@ func filterByParent(cands []*core.SymbolRecord, parent string) []*core.SymbolRec
 	for _, cand := range cands {
 		if cand.Kind == core.KindMethod && cand.ParentSymbol == parent {
 			out = append(out, cand)
+		}
+	}
+	return out
+}
+
+// constructorTargets resolves a class-named call ("Flask(...)") to the
+// class's constructor method (__init__, constructor, or any
+// KindConstructor child) so instantiation produces a call edge to the code
+// that actually runs.
+func constructorTargets(idx *edgeIndex, calleeName string, scope map[string]struct{}) []*core.SymbolRecord {
+	var out []*core.SymbolRecord
+	for _, cls := range idx.byName[strings.ToLower(calleeName)] {
+		if cls.Name != calleeName {
+			continue
+		}
+		if cls.Kind != core.KindClass && cls.Kind != core.KindStruct {
+			continue
+		}
+		if _, ok := scope[cls.FilePath]; !ok {
+			continue
+		}
+		for _, cand := range idx.byFile[cls.FilePath] {
+			if cand.ParentSymbol != cls.Name {
+				continue
+			}
+			if cand.Kind == core.KindConstructor ||
+				(cand.Kind == core.KindMethod && (cand.Name == "__init__" || cand.Name == "constructor")) {
+				out = append(out, cand)
+			}
 		}
 	}
 	return out
