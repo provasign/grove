@@ -72,11 +72,20 @@ func GoCallTruth(opts GoTruthOptions) (TruthFile, []TruthEdge, error) {
 		refs[fn] = ref
 		return ref, true
 	}
+	// Grove attributes calls made inside closures to the enclosing named
+	// declaration — the right model for blast radius. Mirror that here by
+	// resolving anonymous callers to their nearest named ancestor.
+	resolveCaller := func(fn *ssa.Function) (FuncRef, bool) {
+		for fn != nil && fn.Parent() != nil {
+			fn = fn.Parent()
+		}
+		return resolve(fn)
+	}
 
 	seen := map[string]bool{}
 	var edges []TruthEdge
 	for fn, node := range graph.Nodes {
-		caller, ok := resolve(fn)
+		caller, ok := resolveCaller(fn)
 		if !ok {
 			continue
 		}

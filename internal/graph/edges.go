@@ -654,16 +654,28 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
 
 		// ── High-confidence path: AST-extracted CallSites ───────────────────
 		if len(symbol.CallSites) > 0 {
+			selfVars := callerSelfQualifiers(&symbol)
 			for _, cs := range symbol.CallSites {
 				calleeName := cs.Callee
-				// Strip receiver prefix (e.g. "user.save" → "save", "self.do" → "do").
+				// Split receiver prefix (e.g. "user.save" → qualifier "user",
+				// name "save"); chains keep only the last segment ("a.b.Get" → "b").
+				qualifier := ""
 				if idx := strings.LastIndexByte(calleeName, '.'); idx >= 0 {
+					qualifier = calleeName[:idx]
 					calleeName = calleeName[idx+1:]
+				}
+				if j := strings.LastIndexByte(qualifier, '.'); j >= 0 {
+					qualifier = qualifier[j+1:]
 				}
 				if calleeName == "" {
 					continue
 				}
-				for _, cand := range resolveCallees(idx, &symbol, calleeName, scope, false) {
+				// AST-extracted names are exact by construction: case-insensitive
+				// matching here let "writeContentType" (free function) claim every
+				// type's "WriteContentType" method.
+				cands := resolveCallees(idx, &symbol, calleeName, scope, true)
+				cands = narrowByReceiver(cands, &symbol, qualifier, selfVars)
+				for _, cand := range cands {
 					addEdge(symbol.ID, cand.ID, 0.95)
 				}
 			}
@@ -692,6 +704,75 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
 		}
 	}
 	return edges
+}
+
+// callerSelfQualifiers returns the receiver spellings that mean "a method on
+// my own type" inside this symbol's body: self/this plus, for Go, the
+// receiver variable parsed from the method signature ("func (r JSON) ...").
+func callerSelfQualifiers(symbol *core.SymbolRecord) map[string]struct{} {
+	out := map[string]struct{}{"self": {}, "this": {}}
+	if symbol.Language == "go" && symbol.Kind == core.KindMethod {
+		if v := goReceiverVar(symbol.Signature); v != "" {
+			out[v] = struct{}{}
+		}
+	}
+	return out
+}
+
+// goReceiverVar extracts the receiver variable name from a Go method
+// signature like "func (r JSON) Render(w http.ResponseWriter) error".
+func goReceiverVar(signature string) string {
+	rest, ok := strings.CutPrefix(signature, "func (")
+	if !ok {
+		return ""
+	}
+	end := strings.IndexByte(rest, ')')
+	if end < 0 {
+		return ""
+	}
+	recv := strings.TrimSpace(rest[:end])
+	// "r JSON" / "r *JSON" → "r"; bare "*JSON" / "JSON" has no variable.
+	if i := strings.IndexByte(recv, ' '); i > 0 {
+		return recv[:i]
+	}
+	return ""
+}
+
+// narrowByReceiver tightens name-resolved callee candidates using the call
+// site's receiver qualifier. Two cases resolve without a type checker:
+//
+//   - the qualifier is the caller's own receiver (r./self./this.) → keep only
+//     methods on the caller's parent type
+//   - the qualifier names a type directly (JSON.WriteContentType) → keep only
+//     methods on that type
+//
+// When the qualifier matches neither pattern (an arbitrary local variable, an
+// external type, a package alias), candidates pass through unchanged: this
+// narrows known-wrong fanout, it never invents matches.
+func narrowByReceiver(cands []*core.SymbolRecord, caller *core.SymbolRecord, qualifier string, selfVars map[string]struct{}) []*core.SymbolRecord {
+	if qualifier == "" || len(cands) < 2 {
+		return cands
+	}
+	if _, isSelf := selfVars[qualifier]; isSelf && caller.ParentSymbol != "" {
+		if same := filterByParent(cands, caller.ParentSymbol); len(same) > 0 {
+			return same
+		}
+		return cands
+	}
+	if byType := filterByParent(cands, qualifier); len(byType) > 0 {
+		return byType
+	}
+	return cands
+}
+
+func filterByParent(cands []*core.SymbolRecord, parent string) []*core.SymbolRecord {
+	var out []*core.SymbolRecord
+	for _, cand := range cands {
+		if cand.Kind == core.KindMethod && cand.ParentSymbol == parent {
+			out = append(out, cand)
+		}
+	}
+	return out
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────

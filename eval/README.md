@@ -43,19 +43,32 @@ cd eval && go build -o grove-eval ./cmd/grove-eval
 Outputs `scorecard.json` and `scorecard.md` with precision/recall/F1 plus
 capped false-positive/false-negative examples for debugging.
 
-## Baseline (2026-06-12, calls edges, Go)
+## Baseline progression (calls edges, Go)
 
-| Repo | Universe match | Precision | Recall | F1 |
-|---|---|---|---|---|
-| prism (`ef4eea1`) | 100% | 0.9530 | 0.9935 | 0.9728 |
-| gin (`d75fcd4`) | 99.7% | 0.7282 | 0.8571 | 0.7874 |
+| Date | Change | gin P | gin R | gin F1 | prism F1 |
+|---|---|---|---|---|---|
+| 2026-06-12 | initial measurement | 0.7282 | 0.8571 | 0.7874 | 0.9728 |
+| 2026-06-12 | receiver-aware narrowing + closure-fair oracle | 0.7632 | 0.8657 | 0.8112 | 0.9876 |
+| 2026-06-12 | exact-case CallSite resolution | 0.8522 | 0.8657 | 0.8589 | 0.9907 |
 
-The gap between the two repos is the finding: gin's interface-heavy render/
-binding packages expose the two known weaknesses of name-based resolution —
-same-name methods on different types fan out into false positives, and
-interface-method calls don't reach concrete implementations (missing
-`overrides`-style resolution). Those are the next two accuracy investments,
-and this harness is how we'll know they worked.
+Day-one findings, all surfaced by the false-positive/negative examples:
+
+1. **Self-receiver fan-out** — `r.WriteContentType(w)` inside `JSON.Render`
+   matched every type's `WriteContentType` in the file. Fixed: calls through
+   the caller's own receiver (Go receiver var, `self`, `this`) resolve only
+   to methods on the caller's `ParentSymbol`.
+2. **Case-insensitive AST resolution** — the free function
+   `writeContentType` claimed every `WriteContentType` method. Fixed:
+   AST-extracted call sites resolve case-exactly (they're exact by
+   construction).
+3. **Closure attribution** — Grove attributes calls inside closures to the
+   enclosing declaration (right for blast radius); the oracle now mirrors
+   that instead of dropping anonymous functions.
+
+What remains is the hard tier: calls through unknown-typed local variables
+and interface dispatch not reaching concrete implementations. That's the
+`overrides` edge + interface modeling work — the next accuracy investment,
+and this harness is how we'll know it worked.
 
 ## Roadmap
 
