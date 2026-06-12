@@ -143,6 +143,14 @@ func buildInterfaceSatisfaction(idx *edgeIndex, symbols []core.SymbolRecord) (*i
 	return sat, edges
 }
 
+// implementorsFor returns the methods implementing calleeName for one
+// specific interface. Deliberately NOT scoped to the caller's imports:
+// dependency injection means implementations live in packages the interface
+// consumer never imports — that's the whole point of the interface.
+func (sat *interfaceSatisfaction) implementorsFor(iface *core.SymbolRecord, calleeName string) []*core.SymbolRecord {
+	return sat.implementors[iface.ID][strings.ToLower(calleeName)]
+}
+
 // dispatchTargets returns the implementing methods reachable when a call to
 // calleeName is interpreted as dynamic dispatch through an interface visible
 // from the caller: the interface's file must be in the caller's import scope,

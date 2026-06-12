@@ -1,8 +1,8 @@
 {
   "gin": {
     "commit": "d75fcd4",
-    "precision": 0.9034,
-    "recall": 0.9258,
+    "precision": 0.9259,
+    "recall": 0.9488,
     "tolerance": 0.005
   }
 }

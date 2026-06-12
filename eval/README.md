@@ -52,6 +52,7 @@ capped false-positive/false-negative examples for debugging.
 | 2026-06-12 | exact-case CallSite resolution | 0.8522 | 0.8657 | 0.8589 | 0.9907 |
 | 2026-06-12 | interface satisfaction → overrides edges + dispatch rescue | 0.8576 | 0.9258 | 0.8904 | 0.9907 |
 | 2026-06-12 | astkit v0.4.2 call-site qualifiers + import-qualified narrowing | 0.9034 | 0.9258 | 0.9145 | 0.9969 |
+| 2026-06-12 | local type inference (params, declarations, fields) | 0.9259 | 0.9488 | 0.9372 | 0.9984 |
 
 `eval/baseline.json` records the accepted floor; CI
 (`.github/workflows/eval.yml`) regenerates gin's ground truth at the corpus
@@ -85,10 +86,17 @@ Day-one findings, all surfaced by the false-positive/negative examples:
    files, case-exact so a `Session` field isn't confused with an
    `internal/session` package).
 
-What remains is the hard tier: calls through unknown-typed local variables
-(`ip.String()` matching a same-file method). That needs lightweight local
-type inference from declarations and field types — the next accuracy
-investment, and this harness is how we'll know it worked.
+6. **Unknown-typed locals** — `ip.String()` matched same-file methods.
+   Fixed with shallow local type inference (signature params, var/:=/
+   composite-literal declarations, New<Type> constructors resolved against
+   indexed types, receiver struct fields): a known type keeps only its own
+   methods, an interface type dispatches to implementors (unscoped — DI
+   implementations live where the consumer never imports), and a known type
+   with no matching candidate drops the edge.
+
+The residual gin gap is mostly oracle-side flow precision (VTA proves which
+implementations actually reach a dispatch site; structure alone cannot) —
+acceptable territory for a blast-radius tool that says "may affect".
 
 ## Roadmap
 

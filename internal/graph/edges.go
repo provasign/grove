@@ -657,6 +657,10 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 		// ── High-confidence path: AST-extracted CallSites ───────────────────
 		if len(symbol.CallSites) > 0 {
 			selfVars := callerSelfQualifiers(&symbol)
+			var localTypes map[string]string
+			if symbol.Language == "go" {
+				localTypes = goLocalTypes(idx, &symbol)
+			}
 			for _, cs := range symbol.CallSites {
 				calleeName := cs.Callee
 				// Split receiver prefix (e.g. "user.save" → qualifier "user",
@@ -678,9 +682,19 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 				cands, capped := resolveCallees(idx, &symbol, calleeName, scope, true)
 				narrowed := narrowByReceiver(cands, &symbol, qualifier, selfVars)
 				if len(narrowed) == len(cands) {
-					// Receiver narrowing didn't fire; a package-qualified call
-					// can still be pinned to (or excluded by) its import.
-					narrowed = narrowByImport(idx, &symbol, qualifier, cands)
+					// Receiver narrowing didn't fire; try the inferred type of
+					// the receiver variable, then import qualification.
+					kept, dispatch, decided := narrowByLocalType(idx, sat, localTypes, qualifier, calleeName, cands, scope)
+					if decided {
+						narrowed = kept
+						for _, m := range dispatch {
+							if m.ID != symbol.ID {
+								addEdge(symbol.ID, m.ID, 0.7)
+							}
+						}
+					} else {
+						narrowed = narrowByImport(idx, &symbol, qualifier, cands)
+					}
 				}
 				for _, cand := range narrowed {
 					addEdge(symbol.ID, cand.ID, 0.95)
