@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.6.1 - 2026-06-11
+
+- Added `Engine.FileSymbols(ctx, relPath)`: the indexed symbols for one
+  file, without paying for a whole-graph snapshot. Supports working-set
+  drift checks in Prism.
+
 ## v0.6.0 - 2026-06-11
 
 - **GraphDiff rename detection:** a removed symbol whose body matches an

@@ -206,6 +206,22 @@ func deepCopySymbol(s core.SymbolRecord) core.SymbolRecord {
 	return s
 }
 
+// FileSymbols returns deep copies of the symbols defined in filePath
+// (slash-separated, repo-relative), ordered by span. Cheap relative to
+// Snapshot: only the one file's symbols are copied.
+func (g *CodeGraph) FileSymbols(filePath string) []core.SymbolRecord {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	var out []core.SymbolRecord
+	for _, s := range g.symbols {
+		if s.FilePath == filePath {
+			out = append(out, deepCopySymbol(s))
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Span.Start < out[j].Span.Start })
+	return out
+}
+
 func (g *CodeGraph) Status() core.Status {
 	g.mu.RLock()
 	defer g.mu.RUnlock()

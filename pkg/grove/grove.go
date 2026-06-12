@@ -253,6 +253,13 @@ func (e *Engine) ICR(ctx context.Context, intent string) IsolatedChangeRegion {
 	return e.currentGraph().ComputeICR(intent)
 }
 
+// FileSymbols returns the symbols currently indexed for one repo-relative
+// file path, ordered by span. Use this instead of SnapshotSymbols when only
+// a handful of files matter (e.g. working-set drift checks).
+func (e *Engine) FileSymbols(ctx context.Context, relPath string) []Symbol {
+	return e.currentGraph().FileSymbols(relPath)
+}
+
 // SnapshotSymbols returns a deep copy of every symbol in the current graph.
 // Capture one before a merge/reindex and pass it to Diff afterwards to get
 // the structural delta.

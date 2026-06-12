@@ -7,6 +7,32 @@ import (
 	"testing"
 )
 
+func TestFileSymbols(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("package main\n\nfunc A() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "b.go"), []byte("package main\n\nfunc B() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := Open(ctx, Config{RepoRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	if _, err := eng.Index(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	syms := eng.FileSymbols(ctx, "a.go")
+	if len(syms) != 1 || syms[0].Name != "A" {
+		t.Fatalf("FileSymbols(a.go) = %+v", syms)
+	}
+	if got := eng.FileSymbols(ctx, "missing.go"); len(got) != 0 {
+		t.Fatalf("missing file returned %+v", got)
+	}
+}
+
 // TestDiffAgainstFileContent covers the merge-driver flow: the merged bytes
 // exist only in memory (git writes %A to the worktree after the driver
 // exits), so the drift must be computable without touching disk.
