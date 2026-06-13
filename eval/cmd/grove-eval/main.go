@@ -29,6 +29,8 @@ func main() {
 		err = cmdScore(os.Args[2:])
 	case "score-tests":
 		err = cmdScoreTests(os.Args[2:])
+	case "score-tests-closure":
+		err = cmdScoreTestsClosure(os.Args[2:])
 	case "score-impact":
 		err = cmdScoreImpact(os.Args[2:])
 	case "run":
@@ -136,6 +138,30 @@ func cmdScore(args []string) error {
 	}
 	if *baseline != "" {
 		return gate(card, *baseline)
+	}
+	return nil
+}
+
+func cmdScoreTestsClosure(args []string) error {
+	fs := flag.NewFlagSet("score-tests-closure", flag.ExitOnError)
+	repo := fs.String("repo", "", "repository root")
+	truth := fs.String("truth", "", "tests truth JSONL path")
+	_ = fs.Parse(args)
+	if *repo == "" || *truth == "" {
+		return fmt.Errorf("score-tests-closure: --repo and --truth are required")
+	}
+	header, edges, err := eval.ReadTruth(*truth)
+	if err != nil {
+		return err
+	}
+	card, err := eval.ScoreTestsClosure(context.Background(), *repo, header, edges)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("closure: %s — %d covered symbols\n", card.Repo, card.Targets)
+	for _, name := range []string{"tests", "diagnostic"} {
+		m := card.ByPolicy[name]
+		fmt.Printf("  %-11s P %.4f  R %.4f  (tp %d fp %d fn %d)\n", name, m.Precision, m.Recall, m.TP, m.FP, m.FN)
 	}
 	return nil
 }

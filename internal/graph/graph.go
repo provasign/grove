@@ -505,6 +505,59 @@ func (g *CodeGraph) TestsForWithStats(query string) ([]core.SymbolRecord, Policy
 	return g.testsForWithPolicy(query, PolicyTests)
 }
 
+// coveringTestsLocked walks the inbound dependency closure from the seed nodes
+// and returns the test symbols that reach any node in it. The caller holds the
+// read lock; edges the policy excludes are accumulated into skips.
+func (g *CodeGraph) coveringTestsLocked(seeds map[string]bool, policy TraversalPolicy, skips PolicySkips) map[string]core.SymbolRecord {
+	tests := make(map[string]core.SymbolRecord)
+	if len(seeds) == 0 {
+		return tests
+	}
+	visited := make(map[string]bool, len(seeds))
+	queue := make([]string, 0, len(seeds))
+	for id := range seeds {
+		visited[id] = true
+		queue = append(queue, id)
+	}
+	for len(queue) > 0 {
+		node := queue[0]
+		queue = queue[1:]
+		for _, ei := range g.inbound[node] {
+			edge := g.edges[ei]
+			switch edge.Type {
+			case core.EdgeTests:
+				if t, ok := g.symbols[edge.From]; ok {
+					tests[t.ID] = t
+				}
+			case core.EdgeCalls, core.EdgeContains, core.EdgeImplements, core.EdgeExtends, core.EdgeUsesType:
+				if !policy.Allows(edge) {
+					skips[edge.Reason]++
+					continue
+				}
+				if !visited[edge.From] {
+					visited[edge.From] = true
+					queue = append(queue, edge.From)
+				}
+			}
+		}
+	}
+	return tests
+}
+
+// TestsForSymbol returns the covering tests for one symbol ID under the given
+// policy — the ID-seeded form of TestsFor, used to benchmark the closure (and
+// to compare policies) without the name-matching phase.
+func (g *CodeGraph) TestsForSymbol(id string, policy TraversalPolicy) []core.SymbolRecord {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	tests := g.coveringTestsLocked(map[string]bool{id: true}, policy, PolicySkips{})
+	out := make([]core.SymbolRecord, 0, len(tests))
+	for _, t := range tests {
+		out = append(out, t)
+	}
+	return out
+}
+
 func (g *CodeGraph) testsForWithPolicy(query string, policy TraversalPolicy) ([]core.SymbolRecord, PolicySkips) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
@@ -531,37 +584,7 @@ func (g *CodeGraph) testsForWithPolicy(query string, policy TraversalPolicy) ([]
 	// edges (ambiguous bare-name call matches at 0.6, type-use guesses at
 	// 0.5) connect unrelated subsystems on large repos and made "tests for
 	// X" sweep in tests from across a monorepo.
-	tests := make(map[string]core.SymbolRecord)
-	if len(targets) > 0 {
-		visited := make(map[string]bool, len(targets))
-		queue := make([]string, 0, len(targets))
-		for id := range targets {
-			visited[id] = true
-			queue = append(queue, id)
-		}
-		for len(queue) > 0 {
-			node := queue[0]
-			queue = queue[1:]
-			for _, ei := range g.inbound[node] {
-				edge := g.edges[ei]
-				switch edge.Type {
-				case core.EdgeTests:
-					if t, ok := g.symbols[edge.From]; ok {
-						tests[t.ID] = t
-					}
-				case core.EdgeCalls, core.EdgeContains, core.EdgeImplements, core.EdgeExtends, core.EdgeUsesType:
-					if !policy.Allows(edge) {
-						skips[edge.Reason]++
-						continue
-					}
-					if !visited[edge.From] {
-						visited[edge.From] = true
-						queue = append(queue, edge.From)
-					}
-				}
-			}
-		}
-	}
+	tests := g.coveringTestsLocked(targets, policy, skips)
 
 	// Phase 3: substring fallback in test files.
 	if len(tests) == 0 {
