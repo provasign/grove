@@ -531,6 +531,7 @@ func buildDefinesAndImports(symbols []core.SymbolRecord) []core.Edge {
 			To:         symbol.ID,
 			Type:       core.EdgeDefines,
 			Confidence: 1.0,
+			Source:     core.EvidenceSourceASTKit,
 		})
 		if seenFiles[symbol.FilePath] {
 			continue
@@ -547,6 +548,7 @@ func buildDefinesAndImports(symbols []core.SymbolRecord) []core.Edge {
 				To:         "import:" + imp,
 				Type:       core.EdgeImports,
 				Confidence: 0.9,
+				Source:     core.EvidenceSourceASTKit,
 			})
 		}
 	}
@@ -573,6 +575,7 @@ func buildContains(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
 				To:         symbol.ID,
 				Type:       core.EdgeContains,
 				Confidence: 1.0,
+				Source:     core.EvidenceSourceASTKit,
 			})
 		}
 	}
@@ -688,6 +691,7 @@ func buildUsesType(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
 					To:         target.ID,
 					Type:       core.EdgeUsesType,
 					Confidence: 0.5,
+					Source:     core.EvidenceSourceHeuristic,
 				})
 			}
 		}
@@ -748,6 +752,7 @@ func buildTests(idx *edgeIndex, symbols []core.SymbolRecord, callEdges []core.Ed
 				To:         target.ID,
 				Type:       core.EdgeTests,
 				Confidence: confidence,
+				Source:     core.EvidenceSourceHeuristic,
 			})
 		}
 
@@ -889,7 +894,7 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 	var edges []core.Edge
 	seen := make(map[string]bool)
 
-	addEdge := func(fromID, toID string, confidence float64) {
+	addEdge := func(fromID, toID string, confidence float64, source core.EvidenceSource) {
 		key := fromID + "::calls::" + toID
 		if seen[key] {
 			return
@@ -897,7 +902,7 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 		seen[key] = true
 		edges = append(edges, core.Edge{
 			From: fromID, To: toID,
-			Type: core.EdgeCalls, Confidence: confidence,
+			Type: core.EdgeCalls, Confidence: confidence, Source: source,
 		})
 	}
 
@@ -935,7 +940,7 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 					}
 				}
 				for _, cand := range cands {
-					addEdge(symbol.ID, cand.ID, 0.7)
+					addEdge(symbol.ID, cand.ID, 0.7, core.EvidenceSourceASTKit)
 				}
 			}
 		}
@@ -949,7 +954,7 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 				localTypes = goLocalTypes(idx, &symbol)
 			case "python":
 				localTypes = pyLocalTypes(idx, &symbol)
-			case "typescript", "javascript":
+			case "typescript", "tsx", "javascript":
 				localTypes = tsLocalTypes(idx, &symbol)
 			case "java":
 				localTypes = javaLocalTypes(idx, &symbol)
@@ -1054,6 +1059,22 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 					// in-repo Drop impl by name.
 					continue
 				}
+				if symbol.Language == "php" && strings.HasSuffix(qualifier, "()") && len(cands) > 0 {
+					// Fluent-chain receiver ($builder->make()->addStmt()): resolve
+					// the call result's class and keep only its methods. An
+					// unresolvable/ambiguous result (self-returning builder method
+					// that exists on many classes) drops — mirrors Java/Rust — so
+					// the chain does not fan out to every same-named method.
+					if ret := phpCallResultType(idx, qualifier, scope); ret != "" {
+						if byType := filterByParent(cands, ret); len(byType) > 0 {
+							cands = byType
+						} else {
+							cands = nil
+						}
+					} else {
+						cands = nil
+					}
+				}
 				if (symbol.Language == "csharp" || symbol.Language == "php" ||
 					symbol.Language == "c" || symbol.Language == "cpp") &&
 					qualifier != "" && qualifier != "this" && qualifier != "base" &&
@@ -1143,7 +1164,7 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 				// base classes; bare super() invokes the base constructor.
 				if qualifier == "super()" || qualifier == "super" {
 					for _, cand := range narrowBySuper(idx, &symbol, cands) {
-						addEdge(symbol.ID, cand.ID, 0.85)
+						addEdge(symbol.ID, cand.ID, 0.85, core.EvidenceSourceHeuristic)
 					}
 					continue
 				}
@@ -1162,7 +1183,7 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 							}
 						}
 						for _, ctor := range targets {
-							addEdge(symbol.ID, ctor.ID, 0.85)
+							addEdge(symbol.ID, ctor.ID, 0.85, core.EvidenceSourceHeuristic)
 						}
 					}
 					continue
@@ -1174,7 +1195,7 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 						// reaches files import scope never sees.
 						if inherited := inheritedTargets(idx, &symbol, calleeName, false); len(inherited) > 0 {
 							for _, cand := range inherited {
-								addEdge(symbol.ID, cand.ID, 0.85)
+								addEdge(symbol.ID, cand.ID, 0.85, core.EvidenceSourceHeuristic)
 							}
 							continue
 						}
@@ -1188,7 +1209,7 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 						narrowed = kept
 						for _, m := range dispatch {
 							if m.ID != symbol.ID {
-								addEdge(symbol.ID, m.ID, 0.7)
+								addEdge(symbol.ID, m.ID, 0.7, core.EvidenceSourceHeuristic)
 							}
 						}
 					} else {
@@ -1204,7 +1225,7 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 					capped = false
 				}
 				for _, cand := range narrowed {
-					addEdge(symbol.ID, cand.ID, 0.95)
+					addEdge(symbol.ID, cand.ID, 0.95, core.EvidenceSourceASTKit)
 				}
 				// Class instantiation: "Flask(...)" executes Flask.__init__.
 				// Route class-named calls to the class's constructor method;
@@ -1230,7 +1251,7 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 					}
 					for _, ctor := range ctors {
 						if ctor.ID != symbol.ID {
-							addEdge(symbol.ID, ctor.ID, 0.85)
+							addEdge(symbol.ID, ctor.ID, 0.85, core.EvidenceSourceHeuristic)
 						}
 					}
 				}
@@ -1240,7 +1261,7 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 				if capped && sat != nil {
 					for _, m := range sat.dispatchTargets(calleeName, scope) {
 						if m.ID != symbol.ID {
-							addEdge(symbol.ID, m.ID, 0.7)
+							addEdge(symbol.ID, m.ID, 0.7, core.EvidenceSourceHeuristic)
 						}
 					}
 				}
@@ -1280,7 +1301,7 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 				if cand.FilePath == symbol.FilePath {
 					confidence = 0.85
 				}
-				addEdge(symbol.ID, cand.ID, confidence)
+				addEdge(symbol.ID, cand.ID, confidence, core.EvidenceSourceRegex)
 			}
 		}
 	}
@@ -1292,7 +1313,7 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 // never runs.
 var astCallSiteLanguages = map[string]bool{
 	"go": true, "python": true, "javascript": true, "typescript": true,
-	"java": true, "rust": true, "csharp": true, "php": true,
+	"tsx": true, "java": true, "rust": true, "csharp": true, "php": true,
 	"c": true, "cpp": true,
 }
 
@@ -1731,6 +1752,7 @@ func resolveTypeEdges(idx *edgeIndex, symbol core.SymbolRecord, targetName strin
 			To:         target.ID,
 			Type:       edgeType,
 			Confidence: confidence,
+			Source:     core.EvidenceSourceHeuristic,
 		})
 	}
 	return out

@@ -50,8 +50,8 @@
   },
   "php-parser": {
     "commit": "8eea230",
-    "precision": 0.5279,
-    "recall": 0.5638,
+    "precision": 0.7701,
+    "recall": 0.5357,
     "tolerance": 0.005,
     "minUniverse": 0.99
   },

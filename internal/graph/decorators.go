@@ -38,7 +38,7 @@ func buildDecoratorEdges(idx *edgeIndex, symbols []core.SymbolRecord, callEdges 
 			return
 		}
 		seen[key] = true
-		edges = append(edges, core.Edge{From: from, To: to, Type: core.EdgeCalls, Confidence: 0.7})
+		edges = append(edges, core.Edge{From: from, To: to, Type: core.EdgeCalls, Confidence: 0.7, Source: core.EvidenceSourceHeuristic})
 	}
 
 	wrappersOf := map[string][]string{} // wrapped symbol ID → wrapper symbol IDs

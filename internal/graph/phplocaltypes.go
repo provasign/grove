@@ -20,6 +20,10 @@ var (
 	phpNewLocalRe = regexp.MustCompile(`\$(\w+)\s*=\s*new\s+\\?([A-Za-z_][\w\\]*)`)
 	// property: [modifiers] Type $name ;|=  (Type is class-like, ?nullable)
 	phpPropertyRe = regexp.MustCompile(`(?m)(?:public|private|protected|readonly|static)\s+(?:(?:public|private|protected|readonly|static)\s+)*\??([A-Za-z_][\w\\]*)\s+\$(\w+)`)
+	// return new Foo(  /  return new \Ns\Foo(
+	phpReturnNewRe = regexp.MustCompile(`return\s+new\s+\\?([A-Za-z_][\w\\]*)`)
+	// return $this; (fluent builder)
+	phpReturnThisRe = regexp.MustCompile(`return\s+\$this\b`)
 )
 
 // phpLocalTypes infers identifier → bare class name for one PHP callable.
@@ -77,6 +81,63 @@ func phpLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string 
 	}
 	delete(out, "this")
 	return out
+}
+
+// phpCallResultType resolves the class produced by a call-result receiver in a
+// fluent chain ("createInterfaceBuilder()" → Interface_) by inferring the
+// return type of the named method/function in scope. Mirrors javaCallResultType:
+// returns "" when no candidate resolves or candidates disagree, so an ambiguous
+// fluent self-return (many "addStmt(): $this" across builder classes) drops
+// rather than fanning out to every same-named downstream method.
+func phpCallResultType(idx *edgeIndex, qualifier string, scope map[string]struct{}) string {
+	name := strings.TrimSuffix(qualifier, "()")
+	ret := ""
+	for _, cand := range idx.byName[strings.ToLower(name)] {
+		if cand.Name != name {
+			continue
+		}
+		if cand.Kind != core.KindFunction && cand.Kind != core.KindMethod {
+			continue
+		}
+		if _, ok := scope[cand.FilePath]; !ok {
+			continue
+		}
+		r := phpReturnType(cand)
+		if r == "" {
+			return ""
+		}
+		if ret == "" {
+			ret = r
+		} else if ret != r {
+			return ""
+		}
+	}
+	return ret
+}
+
+// phpReturnType infers a callable's return class: a declared `: \Ns\Type`, else
+// `return new X`, else `return $this` (fluent → the method's own class).
+func phpReturnType(s *core.SymbolRecord) string {
+	if i := strings.LastIndexByte(s.Signature, ')'); i >= 0 {
+		tail := s.Signature[i+1:]
+		if c := strings.IndexByte(tail, ':'); c >= 0 {
+			if t := phpBareType(strings.TrimSpace(tail[c+1:])); t != "" {
+				return t
+			}
+			// `: self`/`: static` reduce to "" in phpBareType → fall through to
+			// the body, where `return $this` pins the concrete class.
+		}
+	}
+	body := stripCommentsAndStrings(s.RawText)
+	if m := phpReturnNewRe.FindStringSubmatch(body); m != nil {
+		if t := phpBareType(m[1]); t != "" {
+			return t
+		}
+	}
+	if s.ParentSymbol != "" && phpReturnThisRe.MatchString(body) {
+		return s.ParentSymbol
+	}
+	return ""
 }
 
 // phpParamTypes parses "function f(Foo $a, ?Bar $b, private Repo $c)" into
