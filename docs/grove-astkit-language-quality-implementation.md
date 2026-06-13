@@ -297,6 +297,28 @@ Invariant from the sweep: **tighten scope/precision before adding recall**, and
 raise baseline only on a reproducible gain → gate). Never reintroduce native
 text-matched call edges or regex fallback for `astCallSiteLanguages`.
 
+#### Wave 0 measured FP attribution (2026-06-13)
+
+The scorecard now attributes every false positive to its resolver reason
+(`FPByReason`). Measured on the pinned repos:
+
+| Pin (lang) | P / R | FPs | Dominant FP reason |
+|---|---|---|---|
+| commons-lang (Java) | .68/.84 | 1555 | **ast-narrowed 95%** (inheritance 3%, dispatch 1%) |
+| Newtonsoft.Json (C#) | .66/.70 | 4471 | **ast-narrowed 94%** (dispatch 5%) |
+| ripgrep (Rust) | .85/.60 | 490 | **ast-narrowed 99%** |
+| jansson (C/C++) | .88/.56 | 73 | **ast-narrowed 100%** (precision already high; gap is recall) |
+| PHP-Parser (PHP) | .77/.54 | 585 | **constructor 79%**, ast-narrowed 20% |
+
+Routing conclusion: the precision leak across Java/C#/Rust/C/C++ is overwhelmingly
+the **ast-narrowed** bucket — the AST call site resolves to a candidate set that
+still contains the wrong same-name/overload target. That is the single
+cross-cutting precision lever (tighter receiver/overload narrowing — Waves 1, 3,
+4), not dispatch or fallback. **PHP is the exception**: its leak is constructor
+edges (`new X()` the dynamic xdebug oracle under-records in unexecuted
+reduce-callback tables) — a distinct, smaller lever, partly an oracle artifact
+(hence the static-oracle item below).
+
 ### Wave 0 — Guardrails & identity infra (do first; de-risks all later waves)
 
 - **Structured imports + qualified identity** (Sweep #1): Grove-side `ImportRecord`
