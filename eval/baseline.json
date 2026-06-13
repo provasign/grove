@@ -40,5 +40,12 @@
     "recall": 0.5967,
     "tolerance": 0.005,
     "minUniverse": 0.98
+  },
+  "newtonsoft": {
+    "commit": "0a2e291",
+    "precision": 0.6031,
+    "recall": 0.7021,
+    "tolerance": 0.005,
+    "minUniverse": 0.99
   }
 }

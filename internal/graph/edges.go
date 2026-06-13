@@ -170,6 +170,20 @@ func (idx *edgeIndex) importedFiles(fromFile string) map[string]struct{} {
 	}
 	out := map[string]struct{}{fromFile: {}}
 
+	// C#: `using` imports a namespace, not a file, and namespaces don't map
+	// to directories — so file-level import resolution can't see the target.
+	// Within one assembly every type is mutually visible, so scope is the
+	// whole repo; precision is held by type narrowing (qualified calls must
+	// resolve to a known type or an inferable local — see the csharp static
+	// block in buildCalls), not by scope.
+	if fileLanguage(idx, fromFile) == "csharp" {
+		for f := range idx.byFile {
+			out[f] = struct{}{}
+		}
+		idx.importedFilesCache[fromFile] = out
+		return out
+	}
+
 	// Same-package scope (Go only): a Go file does not import its own package,
 	// yet calls between files in the same directory are extremely common
 	// (compressor.go ↔ compressor_test.go, split implementation files). In Go a
@@ -937,6 +951,8 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 				localTypes = javaLocalTypes(idx, &symbol)
 			case "rust":
 				localTypes = rustLocalTypes(idx, &symbol)
+			case "csharp":
+				localTypes = csharpLocalTypes(idx, &symbol)
 			}
 			var javaArgTypeCache map[string]string
 			for _, cs := range symbol.CallSites {
@@ -971,6 +987,17 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 					// still applies); anything Rust's narrowing fails to
 					// pin back down is re-capped after narrowing.
 					cands = nil
+				}
+				if symbol.Language == "csharp" {
+					// Overload disambiguation by arity: JsonConvert has five
+					// DeserializeObject overloads; Roslyn picks one by args,
+					// so a call resolving to all five is four false edges.
+					// filterByArgc keeps params-array and default-friendly
+					// candidates and never zeroes the set. (Same-arity
+					// overloads remain the structural ceiling, as in Java —
+					// arg-type narrowing needs type info C# call sites here
+					// don't carry.)
+					cands = filterByArgc(cands, cs.Argc)
 				}
 				if symbol.Language == "java" {
 					// Overload disambiguation: arity first, then exact
@@ -1018,6 +1045,27 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 					// Prelude mem::drop: a bare drop(x) never targets an
 					// in-repo Drop impl by name.
 					continue
+				}
+				if symbol.Language == "csharp" && qualifier != "" && qualifier != "this" &&
+					qualifier != "base" && !strings.HasSuffix(qualifier, "()") && len(cands) > 0 {
+					// Static typing, C# edition of the Java/Rust rule. A
+					// qualifier names a type directly (JsonConvert.ToString)
+					// or a typed variable (reader.Read). If the qualifier is
+					// neither a known indexed type nor an inferable local,
+					// the receiver is a BCL/third-party object (sb.Append,
+					// list.Add) — its method isn't ours, so a same-name match
+					// is noise: drop. A resolvable type narrows by parent.
+					if held, ok := localTypes[qualifier]; ok {
+						if byType := filterByParent(cands, held); len(byType) > 0 {
+							cands = byType
+						} else {
+							cands = nil
+						}
+					} else if filterByParent(cands, qualifier) != nil && len(filterByParent(cands, qualifier)) > 0 {
+						cands = filterByParent(cands, qualifier)
+					} else if !typeSymbolExists(idx, qualifier) {
+						cands = nil
+					}
 				}
 				if symbol.Language == "rust" && qualifier != "" && len(cands) > 0 {
 					// Static typing, Rust edition of the Java rule. An
@@ -1233,13 +1281,13 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 // never runs.
 var astCallSiteLanguages = map[string]bool{
 	"go": true, "python": true, "javascript": true, "typescript": true,
-	"java": true, "rust": true,
+	"java": true, "rust": true, "csharp": true,
 }
 
 // classLanguage reports whether the language has class inheritance our
 // base-class parsers understand.
 func classLanguage(lang string) bool {
-	return lang == "python" || lang == "typescript" || lang == "javascript" || lang == "java"
+	return lang == "python" || lang == "typescript" || lang == "javascript" || lang == "java" || lang == "csharp"
 }
 
 // callerSelfQualifiers returns the receiver spellings that mean "a method on

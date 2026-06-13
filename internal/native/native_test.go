@@ -1104,10 +1104,14 @@ func TestCSharpSemanticEdgesResolveClassAwareBindings(t *testing.T) {
 	edges := csharpSemanticEdges(symbols)
 	assertNativeEdge(t, edges, "src/App.cs::Controller@1", "src/App.cs::BaseController@1", core.EdgeExtends)
 	assertNativeEdge(t, edges, "src/App.cs::Controller@1", "src/App.cs::IRunnable@1", core.EdgeImplements)
-	assertNativeEdge(t, edges, "src/App.cs::Handle@1", "src/App.cs::Helper@1", core.EdgeCalls)
-	assertNativeEdge(t, edges, "src/App.cs::Handle@1", "src/App.cs::Save@1", core.EdgeCalls)
-	assertNativeEdge(t, edges, "src/App.cs::Handle@1", "src/App.cs::Repo_ctor@1", core.EdgeCalls)
 	assertNativeEdge(t, edges, "src/App.cs::Handle@1", "src/App.cs::Repo@1", core.EdgeUsesType)
+	// Call edges are owned by the graph layer; the native pass must not
+	// emit them (text matching exploded on overloads — Newtonsoft P 0.20).
+	for _, edge := range edges {
+		if edge.Type == core.EdgeCalls {
+			t.Fatalf("native csharp must not emit call edges, got %#v", edge)
+		}
+	}
 }
 
 func assertNativeEdge(t *testing.T, edges []core.Edge, from, to string, edgeType core.EdgeType) {

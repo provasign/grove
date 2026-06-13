@@ -94,6 +94,9 @@ func cmdTruth(args []string) error {
 	case "rust":
 		header, edges, err = eval.RustCallTruth(*repo)
 		header.Commit = *commit
+	case "csharp":
+		header, edges, err = eval.CSharpCallTruth(*repo)
+		header.Commit = *commit
 	default:
 		header, edges, err = generateTruth(*repo, *commit, *includeTests)
 	}

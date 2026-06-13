@@ -320,6 +320,73 @@ bindings, iterator element types, `dyn Trait` lookups through collections
 The same registry-dispatch territory as Python's ceiling, to revisit with
 measured variants rather than hope.
 
+## C# (Roslyn semantic-model oracle)
+
+`grove-eval truth --lang csharp` shells a small dotnet program (`eval/cstruth`,
+built with `dotnet build -c Release -o bin`) that builds one Roslyn
+compilation from every `.cs` file under the repo — framework references only,
+so in-repo symbol resolution is exact regardless of unresolved third-party
+types, the same altitude as the TypeScript oracle — and resolves every
+invocation and object-creation to its symbol. Edges between two in-repo
+declarations are the truth; lambda calls attribute to the enclosing method.
+The dotnet SDK is only needed to *generate* the snapshot; CI scores against
+the committed snapshot with tree-sitter alone (no dotnet).
+
+Pin: Newtonsoft.Json (the canonical C# library — overload-heavy, and a
+multi-target `#if`-laden codebase that stress-tests conditional compilation).
+
+### Baseline (2026-06-12, calls edges)
+
+| Repo | Universe match | Precision | Recall | F1 |
+|---|---|---|---|---|
+| Newtonsoft.Json (`0a2e291`) | 99.6% | 0.6031 | 0.7021 | 0.6488 |
+
+Day-one progression (0.2632 → 0.6488), each step measured:
+
+| Fix | F1 |
+|---|---|
+| baseline (native text-match calls + regex fallback, universe 79%) | 0.2948* |
+| astkit: descend `#if`/`#elif`/`#else` preprocessor blocks (universe 79% → 99.6%) | 0.2632 |
+| retire native C# call edges (text matching) + astkit C# call sites | 0.3339 |
+| csharpLocalTypes + static-typing unknown-receiver drop | 0.3790 |
+| repo-wide scope (one assembly, types mutually visible) | 0.4800 |
+| overload disambiguation by arity (filterByArgc) | **0.6488** |
+
+*the 0.2948 predates the universe fix and overstates quality (a fifth of the
+oracle's declarations — every file wrapped in `#if` — were invisible).
+
+Day-one findings, all fixed same day:
+
+1. **Whole files vanished inside `#if`** — Newtonsoft wraps every file in
+   `#if !(PORTABLE || ...)`; tree-sitter nests the declarations inside a
+   `preproc_if` node and astkit's C# walker didn't descend it (859 of 5373
+   oracle declarations invisible). The C# analog of Rust's `mod_item`
+   descent; all branches are walked so a symbol guarded by any target is
+   found.
+2. **Native text-matched call edges** (`internal/native/csharp.go`) fired on
+   every `.csproj` repo (no toolchain gate) and edged every same-named
+   overload — retired, keeping implements + uses-type, exactly as the Java
+   and Rust native passes were.
+3. **No call-site narrowing** — C# had no astkit call-site extractor, so the
+   graph layer fell back to broad regex. Added `csCallSites` (member-access
+   receiver qualifiers, object-creation → constructor) and enrolled C# in
+   the AST path with `csharpLocalTypes` and the static-typing drop (an
+   uninferable receiver is a BCL/third-party object — `sb.Append`,
+   `list.Add` — whose method isn't ours).
+4. **C# scope is the assembly, not the file** — `using` imports a namespace,
+   which doesn't map to a directory, so file-level import resolution missed
+   cross-file targets (recall 0.36). Within one assembly every type is
+   mutually visible, so C# scope is repo-wide; precision is held by type
+   narrowing, not scope. This took recall 0.36 → 0.70.
+5. **Overload fan-out** — `JsonConvert` has five `DeserializeObject`
+   overloads; Roslyn picks one by args. Arity narrowing (`filterByArgc`,
+   shared with Java) split them, P 0.36 → 0.60.
+
+Residual gap: same-arity overload sets (`SerializeObject(o, Formatting)` vs
+`(o, JsonSerializerSettings)`) and LINQ extension methods resolving to
+Newtonsoft's `LinqBridge` polyfill — the structural ceiling without full
+type binding, the same territory as Java's residual.
+
 ## Tests edges (runtime coverage oracle)
 
 `gen_truth.py --tests-out` also records which in-repo functions each test

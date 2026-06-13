@@ -34,3 +34,7 @@ vendor/
 # OS
 .DS_Store
 node_modules
+
+# C# oracle build output
+eval/cstruth/bin/
+eval/cstruth/obj/

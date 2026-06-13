@@ -169,26 +169,15 @@ func csharpSemanticEdges(symbols []core.SymbolRecord) []core.Edge {
 		if !callableKind(symbol.Kind) || symbol.RawText == "" {
 			continue
 		}
-		for _, method := range idx.methodsByCls[symbol.ParentSymbol] {
-			if method.ID != symbol.ID && containsCall(symbol.RawText, method.Name) {
-				add(symbolEdge(symbol, method, core.EdgeCalls, 0.95))
-			}
-		}
-		for _, call := range csharpQualifiedCalls(symbol.RawText) {
-			for _, method := range idx.methods[call.Qualifier+"."+call.Method] {
-				if method.ID != symbol.ID {
-					add(symbolEdge(symbol, method, core.EdgeCalls, 0.96))
-				}
-			}
-		}
+		// Call edges intentionally NOT emitted here (same lesson as the Java
+		// and Rust native passes): text matching edged every same-named
+		// method/overload it saw, exploding precision on overload-heavy
+		// libraries (Newtonsoft: P 0.20). The graph layer's call-site
+		// resolution owns calls; this pass keeps only the type-usage
+		// evidence text matching is still reliable for.
 		for _, className := range csharpConstructedTypes(symbol.RawText) {
 			if target, ok := csharpBestType(idx, className, symbol.FilePath); ok && target.ID != symbol.ID {
 				add(symbolEdge(symbol, target, core.EdgeUsesType, 0.95))
-			}
-			for _, ctor := range idx.ctors[className] {
-				if ctor.ID != symbol.ID {
-					add(symbolEdge(symbol, ctor, core.EdgeCalls, 0.96))
-				}
 			}
 		}
 		for name := range idx.typesByName {
@@ -237,24 +226,6 @@ func splitCSharpTypeList(text string) []string {
 		}
 		if part != "" {
 			out = append(out, part)
-		}
-	}
-	return out
-}
-
-type csharpQualifiedCall struct {
-	Qualifier string
-	Method    string
-}
-
-var csharpQualifiedCallPattern = regexp.MustCompile(`\b([A-Z][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*\(`)
-
-func csharpQualifiedCalls(rawText string) []csharpQualifiedCall {
-	matches := csharpQualifiedCallPattern.FindAllStringSubmatch(stripQuotedText(rawText), -1)
-	out := make([]csharpQualifiedCall, 0, len(matches))
-	for _, match := range matches {
-		if len(match) == 3 {
-			out = append(out, csharpQualifiedCall{Qualifier: match[1], Method: match[2]})
 		}
 	}
 	return out
