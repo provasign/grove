@@ -339,9 +339,9 @@ multi-target `#if`-laden codebase that stress-tests conditional compilation).
 
 | Repo | Universe match | Precision | Recall | F1 |
 |---|---|---|---|---|
-| Newtonsoft.Json (`0a2e291`) | 99.6% | 0.6031 | 0.7021 | 0.6488 |
+| Newtonsoft.Json (`0a2e291`) | 99.6% | 0.6579 | 0.7021 | 0.6793 |
 
-Day-one progression (0.2632 → 0.6488), each step measured:
+Day-one progression (0.2632 → 0.6793), each step measured:
 
 | Fix | F1 |
 |---|---|
@@ -350,7 +350,8 @@ Day-one progression (0.2632 → 0.6488), each step measured:
 | retire native C# call edges (text matching) + astkit C# call sites | 0.3339 |
 | csharpLocalTypes + static-typing unknown-receiver drop | 0.3790 |
 | repo-wide scope (one assembly, types mutually visible) | 0.4800 |
-| overload disambiguation by arity (filterByArgc) | **0.6488** |
+| overload disambiguation by arity (filterByArgc) | 0.6488 |
+| generic-overload split (astkit v0.4.15 `CallSite.Generic`; `DeserializeObject<T>` vs `DeserializeObject`) — precision 0.60 → 0.66, recall unchanged | **0.6793** |
 
 *the 0.2948 predates the universe fix and overstates quality (a fifth of the
 oracle's declarations — every file wrapped in `#if` — were invisible).
@@ -409,16 +410,17 @@ suite for broad dynamic coverage).
 
 | Repo | Universe match | Precision* | Recall | F1 |
 |---|---|---|---|---|
-| PHP-Parser (`8eea230`) | 100% | 0.5279 | 0.5638 | 0.5453 |
+| PHP-Parser (`8eea230`) | 100% | 0.7701 | 0.5357 | 0.6319 |
 
 *lower bound — see the partial-oracle caveat above.
 
-Day-one progression (0.2028 → 0.5453), each step measured:
+Day-one progression (0.2028 → 0.6319), each step measured:
 
 | Fix | F1 |
 |---|---|
 | baseline (regex fallback only, native calls retired) | 0.2028 |
-| astkit PHP call sites + AST path + phpLocalTypes + static drop + repo-wide scope + arity | **0.5453** |
+| astkit PHP call sites + AST path + phpLocalTypes + static drop + repo-wide scope + arity | 0.5453 |
+| fluent-chain call-result receiver resolution (`$b->make()->addStmt()`; resolve result type or drop ambiguous) — precision 0.53 → 0.77 | **0.6319** |
 
 The first measurement already had 100% universe and P 0.96 / R 0.11: the
 regex fallback resolved a handful of calls precisely but saw almost nothing.

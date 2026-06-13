@@ -116,8 +116,8 @@ the full progression history). Calls-edge accuracy across **ten languages**,
 | flask | Python | dynamic (pytest runtime trace) | 0.85 | 0.61 | **0.71** |
 | ripgrep | Rust | rust-analyzer SCIP index | 0.85 | 0.60 | **0.70** |
 | jansson | C / C++ | scip-clang SCIP index | 0.88 | 0.56 | **0.69** |
-| Newtonsoft.Json | C# | Roslyn semantic model | 0.60 | 0.70 | **0.65** |
-| PHP-Parser | PHP | dynamic (xdebug runtime trace) | 0.53 | 0.56 | **0.55** |
+| Newtonsoft.Json | C# | Roslyn semantic model | 0.66 | 0.70 | **0.68** |
+| PHP-Parser | PHP | dynamic (xdebug runtime trace) | 0.77 | 0.54 | **0.63** |
 
 Notes on reading these honestly:
 
