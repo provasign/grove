@@ -445,6 +445,58 @@ Findings:
    untested rules' closures are real call edges absent from the trace, so
    they score as false positives.
 
+## C / C++ (scip-clang SCIP oracle)
+
+`grove-eval truth --lang cfamily` runs scip-clang over the project's
+`compile_commands.json` (cmake generates it) and reads the SCIP index.
+scip-clang type-checks every translation unit, so each reference is a
+resolved use. Unlike rust-analyzer it emits neither enclosing ranges nor
+symbol kinds, so a function/method is recognized from its SCIP descriptor
+(ends in `().`) and each reference is attributed to the nearest preceding
+function definition in the same file — exact for C (functions don't nest), a
+close approximation for C++. Generated headers under `build/` and all header
+files are excluded as caller sources (their macro/prototype/inline content
+mis-attributes); call-edge truth lives in `.c`/`.cc` bodies. The toolchain
+(cmake + scip-clang) is only needed to generate the snapshot; CI scores it
+with tree-sitter alone. `$GROVE_EVAL_CFAMILY_SCIP` points at a prebuilt
+index.
+
+Pin: jansson (zero-dependency C, CMake — `cmake -B build
+-DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_POLICY_VERSION_MINIMUM=3.5`).
+
+### Baseline (2026-06-13, calls edges)
+
+| Repo | Universe match | Precision | Recall | F1 |
+|---|---|---|---|---|
+| jansson (`684e18c`) | 97.2% | 0.8793 | 0.5642 | 0.6874 |
+
+Day-one progression (0.3911 → 0.6874), each step measured:
+
+| Fix | F1 |
+|---|---|
+| baseline (native calls retired, regex fallback only) | 0.3911 |
+| astkit C/C++ call sites + AST path + cFamilyLocalTypes + repo-wide scope + arity | 0.6552 |
+| oracle: exclude header files as caller sources (macro/prototype mis-attribution) | 0.6874 |
+
+Findings:
+
+1. **Native text-matched call edges** (`internal/native/cfamily.go`, no
+   toolchain gate) — retired, keeping uses-type, as the Java/Rust/C#/PHP
+   passes were.
+2. **No call-site narrowing** — C/C++ had no astkit call-site extractor, so
+   the graph layer fell back to broad regex (R 0.24). Added `cCallSites`
+   (member/scoped/template calls, `new`) and enrolled C/C++ in the AST path
+   with `cFamilyLocalTypes` and repo-wide scope (a C/C++ binary's symbols
+   are mutually visible after include/link), which took recall to 0.56.
+3. **scip-clang has no enclosing ranges** — references are attributed by file
+   position. This is exact for C; header files (macros, prototypes, inline
+   functions) break the partition and are excluded from the truth.
+
+Residual gap: the C preprocessor. `json_array_append` and friends are
+function-like macros expanding to `*_new` calls; Grove has no symbol for a
+macro, so calls through them are absent — the structural ceiling for a
+source-level graph of C.
+
 ## Tests edges (runtime coverage oracle)
 
 `gen_truth.py --tests-out` also records which in-repo functions each test

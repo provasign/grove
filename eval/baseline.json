@@ -54,5 +54,12 @@
     "recall": 0.5638,
     "tolerance": 0.005,
     "minUniverse": 0.99
+  },
+  "jansson": {
+    "commit": "684e18c",
+    "precision": 0.8793,
+    "recall": 0.5642,
+    "tolerance": 0.005,
+    "minUniverse": 0.96
   }
 }

@@ -207,6 +207,36 @@ jobs:
           name: php-scorecard
           path: /tmp/eval-out/
 
+  cfamily-accuracy:
+    name: calls edges vs scip-clang (jansson)
+    runs-on: ubuntu-latest
+    env:
+      JANSSON_COMMIT: 684e18c
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            eval/go.sum
+      - name: Clone jansson at corpus pin
+        run: |
+          git clone --quiet https://github.com/akheron/jansson.git /tmp/jansson
+          git -C /tmp/jansson checkout --quiet "$JANSSON_COMMIT"
+      - name: Build grove-eval
+        working-directory: eval
+        run: go build -o /tmp/grove-eval ./cmd/grove-eval
+      - name: Score against snapshot baseline
+        run: /tmp/grove-eval score --repo /tmp/jansson --truth eval/testdata/jansson@$JANSSON_COMMIT/calls-truth.jsonl.gz --out-dir /tmp/eval-out --baseline eval/baseline.json
+      - name: Upload scorecard
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cfamily-scorecard
+          path: /tmp/eval-out/
+
   java-accuracy:
     name: calls edges vs javac-javap (commons-lang)
     runs-on: ubuntu-latest

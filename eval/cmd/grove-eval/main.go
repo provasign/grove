@@ -100,6 +100,9 @@ func cmdTruth(args []string) error {
 	case "php":
 		header, edges, err = eval.PHPCallTruth(*repo)
 		header.Commit = *commit
+	case "cfamily", "c", "cpp":
+		header, edges, err = eval.CFamilyCallTruth(*repo)
+		header.Commit = *commit
 	default:
 		header, edges, err = generateTruth(*repo, *commit, *includeTests)
 	}

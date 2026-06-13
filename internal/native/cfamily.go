@@ -212,35 +212,25 @@ func cFamilySemanticEdges(symbols []core.SymbolRecord, includeTargets map[string
 		if (caller.Language != "c" && caller.Language != "cpp") || caller.RawText == "" || !callableKind(caller.Kind) {
 			continue
 		}
+		// Call edges intentionally NOT emitted here (same lesson as the Java,
+		// Rust, C#, and PHP native passes): text matching edged every
+		// same-named callable it saw. The graph layer's call-site resolution
+		// owns calls; this pass keeps only the type-usage evidence text
+		// matching is still reliable for.
 		scopeFiles := cFamilyScopeFiles(caller.FilePath, includeTargets)
 		for _, file := range scopeFiles {
 			for _, target := range idx.byFile[file] {
 				if target.ID == caller.ID {
 					continue
 				}
-				if callableKind(target.Kind) && cFamilyContainsCallable(caller.RawText, target, file != caller.FilePath) {
-					add(symbolEdge(caller, target, core.EdgeCalls, 0.93))
-				}
 				if typeKind(target.Kind) && cFamilyContainsType(caller.RawText, target, file != caller.FilePath) {
 					add(symbolEdge(caller, target, core.EdgeUsesType, 0.91))
-				}
-			}
-		}
-		for _, call := range cFamilyQualifiedCalls(caller.RawText) {
-			for _, method := range idx.methods[call.Qualifier+"::"+call.Method] {
-				if method.ID != caller.ID {
-					add(symbolEdge(caller, method, core.EdgeCalls, 0.95))
 				}
 			}
 		}
 		for _, typeName := range cFamilyConstructedTypes(caller.RawText) {
 			if target, ok := cFamilyBestType(idx, typeName, caller.FilePath); ok && target.ID != caller.ID {
 				add(symbolEdge(caller, target, core.EdgeUsesType, 0.93))
-			}
-			for _, ctor := range idx.ctors[typeName] {
-				if ctor.ID != caller.ID {
-					add(symbolEdge(caller, ctor, core.EdgeCalls, 0.95))
-				}
 			}
 		}
 	}

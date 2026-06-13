@@ -843,8 +843,14 @@ func TestCFamilySemanticEdgesUseIncludedHeaderScope(t *testing.T) {
 		},
 	}
 	edges := cFamilySemanticEdges(symbols, map[string][]string{"src/main.c": {"include/auth.h"}})
-	assertNativeEdge(t, edges, "src/main.c::run@1", "include/auth.h::save@1", core.EdgeCalls)
 	assertNativeEdge(t, edges, "src/main.c::run@1", "include/auth.h::User@1", core.EdgeUsesType)
+	// Call edges are owned by the graph layer; the native pass must not emit
+	// them (text matching exploded on same-named callables).
+	for _, edge := range edges {
+		if edge.Type == core.EdgeCalls {
+			t.Fatalf("native c/c++ must not emit call edges, got %#v", edge)
+		}
+	}
 }
 
 func TestCFamilySemanticEdgesResolveCppQualifiedCallsAndConstructors(t *testing.T) {
@@ -868,9 +874,12 @@ func TestCFamilySemanticEdgesResolveCppQualifiedCallsAndConstructors(t *testing.
 		},
 	}
 	edges := cFamilySemanticEdges(symbols, map[string][]string{"src/main.cpp": {"include/repo.hpp"}})
-	assertNativeEdge(t, edges, "src/main.cpp::run@1", "include/repo.hpp::Save@1", core.EdgeCalls)
-	assertNativeEdge(t, edges, "src/main.cpp::run@1", "include/repo.hpp::Repo_ctor@1", core.EdgeCalls)
 	assertNativeEdge(t, edges, "src/main.cpp::run@1", "include/repo.hpp::Repo@1", core.EdgeUsesType)
+	for _, edge := range edges {
+		if edge.Type == core.EdgeCalls {
+			t.Fatalf("native c/c++ must not emit call edges, got %#v", edge)
+		}
+	}
 }
 
 func TestResolveCIncludeUsesFileDirAndIncludeDirs(t *testing.T) {

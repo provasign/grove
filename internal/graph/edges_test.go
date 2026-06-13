@@ -99,23 +99,23 @@ func TestCallsRespectsCommentAndStringStripping(t *testing.T) {
 	// those. For AST languages an empty CallSites list is authoritative.
 	g := New()
 	g.Replace([]core.SymbolRecord{
-		{ID: "a.c::Caller@sha", FilePath: "a.c", Language: "c", Kind: core.KindFunction, Name: "Caller", QualifiedName: "Caller",
+		{ID: "a.rb::Caller@sha", FilePath: "a.rb", Language: "ruby", Kind: core.KindFunction, Name: "Caller", QualifiedName: "Caller",
 			RawText: "void Caller() {\n\t// Real() should be ignored in comments\n\t/* Real(1,2) */\n\tchar *s = \"Real(literal)\";\n}"},
-		{ID: "a.c::Real@sha", FilePath: "a.c", Language: "c", Kind: core.KindFunction, Name: "Real", QualifiedName: "Real",
+		{ID: "a.rb::Real@sha", FilePath: "a.rb", Language: "ruby", Kind: core.KindFunction, Name: "Real", QualifiedName: "Real",
 			RawText: "void Real() {}"},
 	}, 1)
-	if hasEdge(g, core.EdgeCalls, "a.c::Caller@sha", "a.c::Real@sha") {
+	if hasEdge(g, core.EdgeCalls, "a.rb::Caller@sha", "a.rb::Real@sha") {
 		t.Fatalf("calls edge should not be emitted from comments or strings")
 	}
 
 	// Sanity: a real call must still produce the edge (fallback language).
 	g.Replace([]core.SymbolRecord{
-		{ID: "a.c::Caller@sha", FilePath: "a.c", Language: "c", Kind: core.KindFunction, Name: "Caller", QualifiedName: "Caller",
+		{ID: "a.rb::Caller@sha", FilePath: "a.rb", Language: "ruby", Kind: core.KindFunction, Name: "Caller", QualifiedName: "Caller",
 			RawText: "void Caller() { Real(); }"},
-		{ID: "a.c::Real@sha", FilePath: "a.c", Language: "c", Kind: core.KindFunction, Name: "Real", QualifiedName: "Real",
+		{ID: "a.rb::Real@sha", FilePath: "a.rb", Language: "ruby", Kind: core.KindFunction, Name: "Real", QualifiedName: "Real",
 			RawText: "void Real() {}"},
 	}, 1)
-	if !hasEdge(g, core.EdgeCalls, "a.c::Caller@sha", "a.c::Real@sha") {
+	if !hasEdge(g, core.EdgeCalls, "a.rb::Caller@sha", "a.rb::Real@sha") {
 		t.Fatalf("expected calls edge for genuine call")
 	}
 

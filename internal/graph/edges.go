@@ -176,7 +176,7 @@ func (idx *edgeIndex) importedFiles(fromFile string) map[string]struct{} {
 	// whole repo; precision is held by type narrowing (qualified calls must
 	// resolve to a known type or an inferable local — see the csharp static
 	// block in buildCalls), not by scope.
-	if lang := fileLanguage(idx, fromFile); lang == "csharp" || lang == "php" {
+	if lang := fileLanguage(idx, fromFile); lang == "csharp" || lang == "php" || lang == "c" || lang == "cpp" {
 		// C#/PHP resolve types through namespace imports (`using`/`use`),
 		// which don't map to directories; within one library every type is
 		// mutually visible, so scope is the whole repo and precision is held
@@ -959,6 +959,8 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 				localTypes = csharpLocalTypes(idx, &symbol)
 			case "php":
 				localTypes = phpLocalTypes(idx, &symbol)
+			case "c", "cpp":
+				localTypes = cFamilyLocalTypes(idx, &symbol)
 			}
 			var javaArgTypeCache map[string]string
 			for _, cs := range symbol.CallSites {
@@ -994,7 +996,8 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 					// pin back down is re-capped after narrowing.
 					cands = nil
 				}
-				if symbol.Language == "csharp" || symbol.Language == "php" {
+				if symbol.Language == "csharp" || symbol.Language == "php" ||
+					symbol.Language == "c" || symbol.Language == "cpp" {
 					// Overload disambiguation by arity. C#: JsonConvert has
 					// five DeserializeObject overloads, Roslyn picks one by
 					// args. PHP has no overloads but default/variadic params
@@ -1051,7 +1054,8 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 					// in-repo Drop impl by name.
 					continue
 				}
-				if (symbol.Language == "csharp" || symbol.Language == "php") &&
+				if (symbol.Language == "csharp" || symbol.Language == "php" ||
+					symbol.Language == "c" || symbol.Language == "cpp") &&
 					qualifier != "" && qualifier != "this" && qualifier != "base" &&
 					qualifier != "self" && qualifier != "parent" && qualifier != "static" &&
 					!strings.HasSuffix(qualifier, "()") && len(cands) > 0 {
@@ -1289,12 +1293,13 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 var astCallSiteLanguages = map[string]bool{
 	"go": true, "python": true, "javascript": true, "typescript": true,
 	"java": true, "rust": true, "csharp": true, "php": true,
+	"c": true, "cpp": true,
 }
 
 // classLanguage reports whether the language has class inheritance our
 // base-class parsers understand.
 func classLanguage(lang string) bool {
-	return lang == "python" || lang == "typescript" || lang == "javascript" || lang == "java" || lang == "csharp" || lang == "php"
+	return lang == "python" || lang == "typescript" || lang == "javascript" || lang == "java" || lang == "csharp" || lang == "php" || lang == "cpp"
 }
 
 // callerSelfQualifiers returns the receiver spellings that mean "a method on
