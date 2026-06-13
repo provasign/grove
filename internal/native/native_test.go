@@ -753,15 +753,21 @@ func TestRustSemanticEdgesResolveModuleQualifiedSymbols(t *testing.T) {
 	edges := rustSemanticEdges(symbols, []string{"src/lib.rs", "src/auth.rs"})
 	var foundCall, foundType bool
 	for _, edge := range edges {
-		if edge.From == "src/lib.rs::run@1" && edge.To == "src/auth.rs::save@1" && edge.Type == core.EdgeCalls {
+		if edge.Type == core.EdgeCalls {
 			foundCall = true
 		}
 		if edge.From == "src/lib.rs::run@1" && edge.To == "src/auth.rs::User@1" && edge.Type == core.EdgeUsesType {
 			foundType = true
 		}
 	}
-	if !foundCall || !foundType {
-		t.Fatalf("expected module call and type edges, got %#v", edges)
+	// Native rust no longer emits call edges (the graph layer's narrowed
+	// call-site resolution owns calls); text matching only contributes
+	// type-usage and implements evidence.
+	if foundCall {
+		t.Fatalf("native rust must not emit call edges, got %#v", edges)
+	}
+	if !foundType {
+		t.Fatalf("expected module type edge, got %#v", edges)
 	}
 }
 
@@ -793,9 +799,15 @@ func TestRustSemanticEdgesResolveImplReceiverAndSignatureTypes(t *testing.T) {
 	}
 	edges := rustSemanticEdges(symbols, []string{"src/lib.rs"})
 	assertNativeEdge(t, edges, "src/lib.rs::Service@1", "src/lib.rs::AuthProvider@1", core.EdgeImplements)
-	assertNativeEdge(t, edges, "src/lib.rs::run@1", "src/lib.rs::authenticate@1", core.EdgeCalls)
 	assertNativeEdge(t, edges, "src/lib.rs::run@1", "src/lib.rs::Service@1", core.EdgeUsesType)
 	assertNativeEdge(t, edges, "src/lib.rs::run@1", "src/lib.rs::User@1", core.EdgeUsesType)
+	// Call edges are owned by the graph layer; the native pass must not
+	// emit them (text matching exploded on same-named trait methods).
+	for _, edge := range edges {
+		if edge.Type == core.EdgeCalls {
+			t.Fatalf("native rust must not emit call edges, got %#v", edge)
+		}
+	}
 }
 
 func TestCIncludes(t *testing.T) {

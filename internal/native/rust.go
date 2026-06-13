@@ -190,29 +190,23 @@ func rustSemanticEdges(symbols []core.SymbolRecord, files []string) []core.Edge 
 		if caller.Language != "rust" || caller.RawText == "" || !callableKind(caller.Kind) {
 			continue
 		}
-		varTypes := rustVariableTypes(caller.RawText)
-		scopeFiles := append([]string{caller.FilePath}, rustModuleScopeFiles(caller.FilePath, caller.RawText, moduleFiles)...)
-		for _, file := range scopeFiles {
+		// Call edges intentionally NOT emitted here (same lesson as the Java
+		// native pass): the text-matching approach edged every same-named
+		// function/method it saw, a multi-x edge explosion on a crate with
+		// 100+ same-named trait methods (ripgrep's flag `update`s: P 0.19).
+		// astkit emits qualified call sites for Rust, so the graph layer's
+		// type-narrowed resolution is authoritative. This pass keeps only
+		// what text matching is still reliable for: type-usage evidence.
+		// (This analyzer only runs when `cargo` is on PATH — CI runners and
+		// dev machines with rustup — so the explosion was invisible wherever
+		// cargo was absent.)
+		for _, file := range append([]string{caller.FilePath}, rustModuleScopeFiles(caller.FilePath, caller.RawText, moduleFiles)...) {
 			for _, target := range byFile[file] {
 				if target.ID == caller.ID {
 					continue
 				}
-				if callableKind(target.Kind) && rustContainsCall(caller.RawText, target, file != caller.FilePath) {
-					add(symbolEdge(caller, target, core.EdgeCalls, 0.95))
-				}
 				if typeKind(target.Kind) && rustContainsType(caller.RawText, target, file != caller.FilePath) {
 					add(symbolEdge(caller, target, core.EdgeUsesType, 0.93))
-				}
-			}
-		}
-		for _, receiverCall := range rustReceiverCalls(caller.RawText) {
-			typeName := varTypes[receiverCall.Receiver]
-			if typeName == "" {
-				continue
-			}
-			for _, method := range methodsByType[typeName] {
-				if method.Name == receiverCall.Method && method.ID != caller.ID {
-					add(symbolEdge(caller, method, core.EdgeCalls, 0.96))
 				}
 			}
 		}
@@ -238,37 +232,6 @@ func rustImplRefs(rawText string) []rustImplRef {
 	for _, match := range matches {
 		if len(match) == 3 {
 			out = append(out, rustImplRef{TraitName: rustLastPathSegment(match[1]), TypeName: rustLastPathSegment(match[2])})
-		}
-	}
-	return out
-}
-
-var rustLetTypePattern = regexp.MustCompile(`\blet\s+(?:mut\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*:\s*&?(?:mut\s+)?([A-Za-z_][A-Za-z0-9_:]*)`)
-
-func rustVariableTypes(rawText string) map[string]string {
-	matches := rustLetTypePattern.FindAllStringSubmatch(rawText, -1)
-	out := map[string]string{}
-	for _, match := range matches {
-		if len(match) == 3 {
-			out[match[1]] = rustLastPathSegment(match[2])
-		}
-	}
-	return out
-}
-
-type rustReceiverCall struct {
-	Receiver string
-	Method   string
-}
-
-var rustReceiverCallPattern = regexp.MustCompile(`\b([a-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*\(`)
-
-func rustReceiverCalls(rawText string) []rustReceiverCall {
-	matches := rustReceiverCallPattern.FindAllStringSubmatch(stripQuotedText(rawText), -1)
-	out := make([]rustReceiverCall, 0, len(matches))
-	for _, match := range matches {
-		if len(match) == 3 {
-			out = append(out, rustReceiverCall{Receiver: match[1], Method: match[2]})
 		}
 	}
 	return out
@@ -362,15 +325,6 @@ func rustPathPrefixes(rawText string) []string {
 		}
 	}
 	return out
-}
-
-func rustContainsCall(rawText string, target core.SymbolRecord, qualified bool) bool {
-	if !qualified {
-		return containsCall(rawText, target.Name)
-	}
-	module := rustModuleName(target.FilePath)
-	pattern := regexp.MustCompile(`\b` + regexp.QuoteMeta(module) + `::` + regexp.QuoteMeta(target.Name) + `\s*\(`)
-	return pattern.MatchString(stripQuotedText(rawText))
 }
 
 func rustContainsType(rawText string, target core.SymbolRecord, qualified bool) bool {
