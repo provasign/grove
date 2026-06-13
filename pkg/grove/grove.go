@@ -248,6 +248,18 @@ func (e *Engine) Tests(ctx context.Context, query string) ([]Symbol, error) {
 	return e.currentGraph().TestsFor(query), nil
 }
 
+// TestsWithEvidence returns the covering tests plus the per-reason counts of
+// edges the traversal policy excluded — the weak evidence Grove chose not to
+// trust. Lets a consumer report "related tests" alongside what was withheld.
+func (e *Engine) TestsWithEvidence(ctx context.Context, query string) ([]Symbol, map[string]int, error) {
+	tests, skips := e.currentGraph().TestsForWithStats(query)
+	out := make(map[string]int, len(skips))
+	for reason, n := range skips {
+		out[string(reason)] = n
+	}
+	return tests, out, nil
+}
+
 // ICR computes the Isolated Change Region for a given intent.
 func (e *Engine) ICR(ctx context.Context, intent string) IsolatedChangeRegion {
 	return e.currentGraph().ComputeICR(intent)

@@ -340,6 +340,17 @@ func (g *CodeGraph) Deps(filePath string) []core.Edge {
 // "Inbound" means: things that call, test, or contain the seed symbol —
 // i.e., the blast radius if the seed changes.
 func (g *CodeGraph) Impact(query string, maxDepth int) []core.SymbolRecord {
+	// Default stays PolicyDiagnostic: blast radius is recall-first, and an
+	// earlier measured experiment found confidence-pruning impact net-negative
+	// (gin depth-2 F1 0.878 without pruning). Callers wanting a tighter,
+	// guarantee-grade radius pass a stricter policy via ImpactWithPolicy.
+	return g.ImpactWithPolicy(query, maxDepth, PolicyDiagnostic)
+}
+
+// ImpactWithPolicy is Impact with an explicit traversal policy — e.g.
+// PolicyCertification for a blast radius that only follows guarantee-grade
+// edges.
+func (g *CodeGraph) ImpactWithPolicy(query string, maxDepth int, policy TraversalPolicy) []core.SymbolRecord {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
@@ -395,6 +406,9 @@ func (g *CodeGraph) Impact(query string, maxDepth int) []core.SymbolRecord {
 				edge.Type != core.EdgeExtends && edge.Type != core.EdgeUsesType {
 				continue
 			}
+			if !policy.Allows(edge) {
+				continue
+			}
 			if _, ok := visited[edge.From]; ok {
 				continue
 			}
@@ -429,10 +443,73 @@ func (g *CodeGraph) Impact(query string, maxDepth int) []core.SymbolRecord {
 // (ambiguous name-matched calls 0.6, type-use 0.5) sit below the cut.
 const minTestTraversalConfidence = 0.7
 
+// TraversalPolicy decides which edges a consumer closure may walk, by
+// confidence floor and resolver reason. Profiles let tests / impact /
+// certification / diagnostic consumers opt into different strictness instead of
+// one hard-coded threshold, and make the choice explainable (every excluded
+// edge has a reason). See roadmap Wave 4 / Sweep #4.
+type TraversalPolicy struct {
+	Name          string
+	MinConfidence float64
+	ExcludeReason map[core.EdgeReason]bool
+}
+
+// Allows reports whether an edge passes the policy.
+func (p TraversalPolicy) Allows(e core.Edge) bool {
+	if e.Confidence < p.MinConfidence {
+		return false
+	}
+	if p.ExcludeReason[e.Reason] {
+		return false
+	}
+	return true
+}
+
+var (
+	// PolicyDiagnostic walks every edge — debugging / full blast radius.
+	PolicyDiagnostic = TraversalPolicy{Name: "diagnostic"}
+	// PolicyTests: evidence-backed edges only. The 0.7 floor drops type-use
+	// (0.5) and ambiguous name-matched calls (0.6); the reason exclusion drops
+	// the regex body-scan fallback even at same-file confidence (0.85).
+	PolicyTests = TraversalPolicy{Name: "tests", MinConfidence: minTestTraversalConfidence,
+		ExcludeReason: map[core.EdgeReason]bool{core.ReasonRegexFallbck: true}}
+	// PolicyImpact: blast radius keeps dynamic dispatch (real edges) but drops
+	// the regex fallback and the weakest type-use guesses (0.5).
+	PolicyImpact = TraversalPolicy{Name: "impact", MinConfidence: 0.6,
+		ExcludeReason: map[core.EdgeReason]bool{core.ReasonRegexFallbck: true}}
+	// PolicyCertification backs guarantees: only AST-exact / structural /
+	// native edges (≥0.9). The 0.9 floor already drops heuristic dispatch
+	// (0.7) and constructor/inheritance guesses (0.85); the reason exclusions
+	// state the intent.
+	PolicyCertification = TraversalPolicy{Name: "certification", MinConfidence: 0.9,
+		ExcludeReason: map[core.EdgeReason]bool{
+			core.ReasonDispatch: true, core.ReasonRegexFallbck: true,
+			core.ReasonInheritance: true, core.ReasonConstructor: true,
+		}}
+)
+
+// PolicySkips counts, per resolver reason, the edges a policy excluded during a
+// traversal — so consumers (certification) can cite the evidence they did not
+// trust.
+type PolicySkips map[core.EdgeReason]int
+
 func (g *CodeGraph) TestsFor(query string) []core.SymbolRecord {
+	tests, _ := g.testsForWithPolicy(query, PolicyTests)
+	return tests
+}
+
+// TestsForWithStats is TestsFor plus the per-reason counts of edges the policy
+// excluded from the closure — the evidence Grove chose not to trust, for
+// certification-style "included vs excluded" reporting.
+func (g *CodeGraph) TestsForWithStats(query string) ([]core.SymbolRecord, PolicySkips) {
+	return g.testsForWithPolicy(query, PolicyTests)
+}
+
+func (g *CodeGraph) testsForWithPolicy(query string, policy TraversalPolicy) ([]core.SymbolRecord, PolicySkips) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
+	skips := PolicySkips{}
 	needle := strings.ToLower(strings.TrimSpace(query))
 
 	// Phase 1: locate target symbols by exact or substring match.
@@ -473,7 +550,8 @@ func (g *CodeGraph) TestsFor(query string) []core.SymbolRecord {
 						tests[t.ID] = t
 					}
 				case core.EdgeCalls, core.EdgeContains, core.EdgeImplements, core.EdgeExtends, core.EdgeUsesType:
-					if edge.Confidence < minTestTraversalConfidence {
+					if !policy.Allows(edge) {
+						skips[edge.Reason]++
 						continue
 					}
 					if !visited[edge.From] {
@@ -508,7 +586,7 @@ func (g *CodeGraph) TestsFor(query string) []core.SymbolRecord {
 		}
 		return out[i].FilePath < out[j].FilePath
 	})
-	return out
+	return out, skips
 }
 
 // ComputeICR computes an Isolated Change Region for the given intent string.
