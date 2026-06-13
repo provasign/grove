@@ -213,9 +213,9 @@ same-arity `isEmpty`/`indexOf`/`add` variants per name).
 
 | Repo | Universe | Precision | Recall | F1 |
 |---|---|---|---|---|
-| commons-lang (`44298fe`) | 96.7% | 0.6798 | 0.8413 | 0.7520 |
+| commons-lang (`44298fe`) | 96.7% | 0.6935 | 0.8387 | 0.7592 |
 
-Second-day progression (0.553 → 0.752), each step measured:
+Second-day progression (0.553 → 0.759), each step measured:
 
 | Fix | F1 |
 |---|---|
@@ -224,6 +224,7 @@ Second-day progression (0.553 → 0.752), each step measured:
 | maven-layout import suffix inversion; implicit-JDK qualifier drop | 0.6747 |
 | AST-empty CallSites authoritative (regex fallback gated to non-AST langs) | 0.7169 |
 | unknown-typed receivers drop (static typing: unknown = external); call-result receivers resolve via return type | 0.7520 |
+| implicit-self narrowing (bare Foo() binds caller's own class, not every same-named method) — precision 0.680 → 0.694 | **0.7592** |
 
 The fallback gating and import fixes lifted every language: gin 0.9372 →
 0.9413, flask 0.700 → 0.708 (tests P 0.681 → 0.742, hit 31.5% → 36.3%),
@@ -339,9 +340,9 @@ multi-target `#if`-laden codebase that stress-tests conditional compilation).
 
 | Repo | Universe match | Precision | Recall | F1 |
 |---|---|---|---|---|
-| Newtonsoft.Json (`0a2e291`) | 99.6% | 0.6579 | 0.7021 | 0.6793 |
+| Newtonsoft.Json (`0a2e291`) | 99.6% | 0.6617 | 0.7021 | 0.6813 |
 
-Day-one progression (0.2632 → 0.6793), each step measured:
+Day-one progression (0.2632 → 0.6813), each step measured:
 
 | Fix | F1 |
 |---|---|
@@ -351,7 +352,8 @@ Day-one progression (0.2632 → 0.6793), each step measured:
 | csharpLocalTypes + static-typing unknown-receiver drop | 0.3790 |
 | repo-wide scope (one assembly, types mutually visible) | 0.4800 |
 | overload disambiguation by arity (filterByArgc) | 0.6488 |
-| generic-overload split (astkit v0.4.15 `CallSite.Generic`; `DeserializeObject<T>` vs `DeserializeObject`) — precision 0.60 → 0.66, recall unchanged | **0.6793** |
+| generic-overload split (astkit v0.4.15 `CallSite.Generic`; `DeserializeObject<T>` vs `DeserializeObject`) — precision 0.60 → 0.66, recall unchanged | 0.6793 |
+| implicit-self narrowing (bare Method() binds caller's own class) | **0.6813** |
 
 *the 0.2948 predates the universe fix and overstates quality (a fifth of the
 oracle's declarations — every file wrapped in `#if` — were invisible).

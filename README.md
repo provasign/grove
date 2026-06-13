@@ -111,7 +111,7 @@ the full progression history). Calls-edge accuracy across **ten languages**,
 |---|---|---|---|---|---|
 | gin | Go | go/ssa + VTA callgraph | 0.93 | 0.95 | **0.94** |
 | socket.io | TypeScript | TypeScript compiler API | 0.85 | 0.96 | **0.90** |
-| commons-lang | Java | javac + javap bytecode | 0.68 | 0.84 | **0.75** |
+| commons-lang | Java | javac + javap bytecode | 0.69 | 0.84 | **0.76** |
 | express | JavaScript (CJS) | TypeScript compiler API (checkJs) | 0.75 | 0.71 | **0.73** |
 | flask | Python | dynamic (pytest runtime trace) | 0.85 | 0.61 | **0.71** |
 | ripgrep | Rust | rust-analyzer SCIP index | 0.85 | 0.60 | **0.70** |
