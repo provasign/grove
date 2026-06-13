@@ -47,5 +47,12 @@
     "recall": 0.7021,
     "tolerance": 0.005,
     "minUniverse": 0.99
+  },
+  "php-parser": {
+    "commit": "8eea230",
+    "precision": 0.5279,
+    "recall": 0.5638,
+    "tolerance": 0.005,
+    "minUniverse": 0.99
   }
 }

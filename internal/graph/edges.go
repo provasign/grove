@@ -176,7 +176,11 @@ func (idx *edgeIndex) importedFiles(fromFile string) map[string]struct{} {
 	// whole repo; precision is held by type narrowing (qualified calls must
 	// resolve to a known type or an inferable local — see the csharp static
 	// block in buildCalls), not by scope.
-	if fileLanguage(idx, fromFile) == "csharp" {
+	if lang := fileLanguage(idx, fromFile); lang == "csharp" || lang == "php" {
+		// C#/PHP resolve types through namespace imports (`using`/`use`),
+		// which don't map to directories; within one library every type is
+		// mutually visible, so scope is the whole repo and precision is held
+		// by type narrowing (the static block in buildCalls), not by scope.
 		for f := range idx.byFile {
 			out[f] = struct{}{}
 		}
@@ -953,6 +957,8 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 				localTypes = rustLocalTypes(idx, &symbol)
 			case "csharp":
 				localTypes = csharpLocalTypes(idx, &symbol)
+			case "php":
+				localTypes = phpLocalTypes(idx, &symbol)
 			}
 			var javaArgTypeCache map[string]string
 			for _, cs := range symbol.CallSites {
@@ -988,15 +994,14 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 					// pin back down is re-capped after narrowing.
 					cands = nil
 				}
-				if symbol.Language == "csharp" {
-					// Overload disambiguation by arity: JsonConvert has five
-					// DeserializeObject overloads; Roslyn picks one by args,
-					// so a call resolving to all five is four false edges.
-					// filterByArgc keeps params-array and default-friendly
-					// candidates and never zeroes the set. (Same-arity
-					// overloads remain the structural ceiling, as in Java —
-					// arg-type narrowing needs type info C# call sites here
-					// don't carry.)
+				if symbol.Language == "csharp" || symbol.Language == "php" {
+					// Overload disambiguation by arity. C#: JsonConvert has
+					// five DeserializeObject overloads, Roslyn picks one by
+					// args. PHP has no overloads but default/variadic params
+					// mean a same-named method on an unrelated class with a
+					// different arity is still a wrong candidate. filterByArgc
+					// keeps variadic/default-friendly candidates and never
+					// zeroes the set.
 					cands = filterByArgc(cands, cs.Argc)
 				}
 				if symbol.Language == "java" {
@@ -1046,23 +1051,25 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 					// in-repo Drop impl by name.
 					continue
 				}
-				if symbol.Language == "csharp" && qualifier != "" && qualifier != "this" &&
-					qualifier != "base" && !strings.HasSuffix(qualifier, "()") && len(cands) > 0 {
-					// Static typing, C# edition of the Java/Rust rule. A
-					// qualifier names a type directly (JsonConvert.ToString)
-					// or a typed variable (reader.Read). If the qualifier is
-					// neither a known indexed type nor an inferable local,
-					// the receiver is a BCL/third-party object (sb.Append,
-					// list.Add) — its method isn't ours, so a same-name match
-					// is noise: drop. A resolvable type narrows by parent.
+				if (symbol.Language == "csharp" || symbol.Language == "php") &&
+					qualifier != "" && qualifier != "this" && qualifier != "base" &&
+					qualifier != "self" && qualifier != "parent" && qualifier != "static" &&
+					!strings.HasSuffix(qualifier, "()") && len(cands) > 0 {
+					// Static typing, C#/PHP edition of the Java/Rust rule. A
+					// qualifier names a type directly (JsonConvert.ToString,
+					// Foo::bar) or a typed variable (reader.Read, $repo->save).
+					// If it's neither a known indexed type nor an inferable
+					// local, the receiver is a library object (sb.Append,
+					// $logger->info) whose method isn't ours — a same-name
+					// match is noise: drop. A resolvable type narrows by parent.
 					if held, ok := localTypes[qualifier]; ok {
 						if byType := filterByParent(cands, held); len(byType) > 0 {
 							cands = byType
 						} else {
 							cands = nil
 						}
-					} else if filterByParent(cands, qualifier) != nil && len(filterByParent(cands, qualifier)) > 0 {
-						cands = filterByParent(cands, qualifier)
+					} else if byQual := filterByParent(cands, qualifier); len(byQual) > 0 {
+						cands = byQual
 					} else if !typeSymbolExists(idx, qualifier) {
 						cands = nil
 					}
@@ -1281,13 +1288,13 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 // never runs.
 var astCallSiteLanguages = map[string]bool{
 	"go": true, "python": true, "javascript": true, "typescript": true,
-	"java": true, "rust": true, "csharp": true,
+	"java": true, "rust": true, "csharp": true, "php": true,
 }
 
 // classLanguage reports whether the language has class inheritance our
 // base-class parsers understand.
 func classLanguage(lang string) bool {
-	return lang == "python" || lang == "typescript" || lang == "javascript" || lang == "java" || lang == "csharp"
+	return lang == "python" || lang == "typescript" || lang == "javascript" || lang == "java" || lang == "csharp" || lang == "php"
 }
 
 // callerSelfQualifiers returns the receiver spellings that mean "a method on

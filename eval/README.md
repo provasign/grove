@@ -387,6 +387,64 @@ Residual gap: same-arity overload sets (`SerializeObject(o, Formatting)` vs
 Newtonsoft's `LinqBridge` polyfill — the structural ceiling without full
 type binding, the same territory as Java's residual.
 
+## PHP (Xdebug dynamic-trace oracle)
+
+`grove-eval truth --lang php` runs the repo's own phpunit under
+`xdebug.mode=trace` with `eval/phptruth/boot.php` prepended; boot.php dumps a
+reflection map of in-repo declaration locations at shutdown, and the Go side
+reconstructs caller→callee edges from the trace's call-stack levels. This is
+a dynamic, exact-but-partial oracle — the same design as Python's pytruth:
+every asserted edge really executed, untested paths are absent, so **recall
+is the headline and precision a lower bound** (a correct static edge on an
+untested path scores as a false positive). In-repo closures collapse to their
+enclosing function, mirroring Grove; vendored dependencies are excluded.
+
+Generating the snapshot needs php with xdebug and the repo's dev
+dependencies (`composer install`); CI scores the committed snapshot with
+tree-sitter alone (no PHP toolchain). Pin: nikic/PHP-Parser (zero runtime
+deps, a dense recursive-descent + visitor call graph, and a comprehensive
+suite for broad dynamic coverage).
+
+### Baseline (2026-06-13, calls edges)
+
+| Repo | Universe match | Precision* | Recall | F1 |
+|---|---|---|---|---|
+| PHP-Parser (`8eea230`) | 100% | 0.5279 | 0.5638 | 0.5453 |
+
+*lower bound — see the partial-oracle caveat above.
+
+Day-one progression (0.2028 → 0.5453), each step measured:
+
+| Fix | F1 |
+|---|---|
+| baseline (regex fallback only, native calls retired) | 0.2028 |
+| astkit PHP call sites + AST path + phpLocalTypes + static drop + repo-wide scope + arity | **0.5453** |
+
+The first measurement already had 100% universe and P 0.96 / R 0.11: the
+regex fallback resolved a handful of calls precisely but saw almost nothing.
+Enrolling PHP in the call-site path (astkit v0.4.13 emits qualified
+function/member/static/new call sites), with `phpLocalTypes` (typed params,
+typed and constructor-promoted properties, `new` locals), the static-typing
+unknown-receiver drop, repo-wide scope (PHP `use` imports a namespace, not a
+file; one library's classes are mutually visible), and arity narrowing, took
+recall to 0.56 while precision settled at 0.53.
+
+Findings:
+
+1. **Native text-matched call edges** (`internal/native/php.go`, no toolchain
+   gate) — retired, keeping implements + uses-type, as the Java/Rust/C#
+   passes were.
+2. **Polymorphic dispatch is the ceiling** — `$node->getSubNodeNames()` where
+   `$node: Node` (an interface) executes a concrete subclass's method; the
+   static graph can only see the interface or fan out to ~100 implementors.
+   The dynamic oracle records the one concrete target, so these are
+   irreducible without per-call-site type flow — the same registry/dynamic
+   territory as Python's ~0.6 recall ceiling.
+3. **Precision is a lower bound** — PHP-Parser's generated parser
+   (`initReduceCallbacks`) defines a reduce closure per grammar rule;
+   untested rules' closures are real call edges absent from the trace, so
+   they score as false positives.
+
 ## Tests edges (runtime coverage oracle)
 
 `gen_truth.py --tests-out` also records which in-repo functions each test

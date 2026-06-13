@@ -97,6 +97,9 @@ func cmdTruth(args []string) error {
 	case "csharp":
 		header, edges, err = eval.CSharpCallTruth(*repo)
 		header.Commit = *commit
+	case "php":
+		header, edges, err = eval.PHPCallTruth(*repo)
+		header.Commit = *commit
 	default:
 		header, edges, err = generateTruth(*repo, *commit, *includeTests)
 	}

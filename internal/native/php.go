@@ -203,28 +203,15 @@ func phpSemanticEdges(symbols []core.SymbolRecord, psr4 map[string][]string, fil
 		if !callableKind(symbol.Kind) || symbol.RawText == "" {
 			continue
 		}
-		for _, method := range idx.methodsByCls[symbol.ParentSymbol] {
-			if method.ID != symbol.ID && containsCall(symbol.RawText, method.Name) {
-				add(symbolEdge(symbol, method, core.EdgeCalls, 0.93))
-			}
-		}
-		for _, call := range phpStaticCalls(symbol.RawText) {
-			className := phpResolveAlias(call.Class, aliases[symbol.FilePath])
-			for _, method := range idx.methods[lastDottedName(className)+"::"+call.Method] {
-				if method.ID != symbol.ID {
-					add(symbolEdge(symbol, method, core.EdgeCalls, 0.95))
-				}
-			}
-		}
+		// Call edges intentionally NOT emitted here (same lesson as the Java,
+		// Rust, and C# native passes): text matching edged every same-named
+		// method it saw. The graph layer's call-site resolution owns calls;
+		// this pass keeps only the type-usage evidence text matching is still
+		// reliable for.
 		for _, className := range phpConstructedTypes(symbol.RawText) {
 			className = phpResolveAlias(className, aliases[symbol.FilePath])
 			if target, ok := phpBestType(idx, className, symbol.FilePath, psr4, fileScope); ok && target.ID != symbol.ID {
 				add(symbolEdge(symbol, target, core.EdgeUsesType, 0.94))
-			}
-			for _, ctor := range idx.ctors[lastDottedName(className)] {
-				if ctor.ID != symbol.ID {
-					add(symbolEdge(symbol, ctor, core.EdgeCalls, 0.95))
-				}
 			}
 		}
 		for name := range idx.typesByName {

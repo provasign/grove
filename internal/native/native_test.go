@@ -977,9 +977,14 @@ func TestPHPSemanticEdgesResolveClassAwareBindings(t *testing.T) {
 	assertNativeEdge(t, edges, "src/Service/AuthService.php::AuthService@1", "src/Service/BaseService.php::BaseService@1", core.EdgeExtends)
 	assertNativeEdge(t, edges, "src/Service/AuthService.php::AuthService@1", "src/Contract/Loginable.php::Loginable@1", core.EdgeImplements)
 	assertNativeEdge(t, edges, "src/Service/AuthService.php::AuthService@1", "src/Support/Loggable.php::Loggable@1", core.EdgeImplements)
-	assertNativeEdge(t, edges, "src/Service/AuthService.php::login@1", "src/Repo/UserRepo.php::create@1", core.EdgeCalls)
-	assertNativeEdge(t, edges, "src/Service/AuthService.php::login@1", "src/Repo/UserRepo.php::__construct@1", core.EdgeCalls)
 	assertNativeEdge(t, edges, "src/Service/AuthService.php::login@1", "src/Repo/UserRepo.php::UserRepo@1", core.EdgeUsesType)
+	// Call edges are owned by the graph layer; the native pass must not emit
+	// them (text matching exploded on same-named methods).
+	for _, edge := range edges {
+		if edge.Type == core.EdgeCalls {
+			t.Fatalf("native php must not emit call edges, got %#v", edge)
+		}
+	}
 }
 
 func TestLexicalSemanticEdgesResolveSameFileCallsAndTypes(t *testing.T) {
