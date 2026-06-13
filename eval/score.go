@@ -52,7 +52,7 @@ func ScoreCalls(ctx context.Context, repoRoot string, header TruthFile, truth []
 	}
 
 	// Grove calls-edge set over the matched universe.
-	groveSet := map[[2]string]bool{}
+	groveSet := map[[2]string]core.Edge{}
 	for _, e := range edges {
 		if e.Type != core.EdgeCalls {
 			continue
@@ -62,20 +62,36 @@ func ScoreCalls(ctx context.Context, repoRoot string, header TruthFile, truth []
 		if !okFrom || !okTo || fromKey == toKey {
 			continue
 		}
-		groveSet[[2]string{fromKey, toKey}] = true
+		groveSet[[2]string{fromKey, toKey}] = e
 	}
 
 	tp := 0
 	var falsePos, falseNeg []EdgeExample
-	for pair := range groveSet {
+	fpBySource := map[string]int{}
+	fpByReason := map[string]int{}
+	for pair, e := range groveSet {
 		if _, ok := truthSet[pair]; ok {
 			tp++
-		} else if len(falsePos) < maxExamples {
+			continue
+		}
+		// False positive: attribute it to the evidence source + resolver
+		// reason so scorecards show which mechanism leaks precision.
+		src := string(e.Source)
+		if src == "" {
+			src = "unknown"
+		}
+		reason := string(e.Reason)
+		if reason == "" {
+			reason = "unset"
+		}
+		fpBySource[src]++
+		fpByReason[reason]++
+		if len(falsePos) < maxExamples {
 			falsePos = append(falsePos, exampleFromKeys(pair, truthFuncs))
 		}
 	}
 	for pair, e := range truthSet {
-		if !groveSet[pair] {
+		if _, ok := groveSet[pair]; !ok {
 			if len(falseNeg) < maxExamples {
 				falseNeg = append(falseNeg, EdgeExample{Caller: e.Caller.String(), Callee: e.Callee.String()})
 			}
@@ -97,6 +113,8 @@ func ScoreCalls(ctx context.Context, repoRoot string, header TruthFile, truth []
 		TruePositives:   tp,
 		FalsePositives:  falsePos,
 		FalseNegatives:  falseNeg,
+		FPBySource:      fpBySource,
+		FPByReason:      fpByReason,
 	}
 	if len(truthFuncs) > 0 {
 		card.SymbolMatchRate = ratio(len(keyToGroveID), len(truthFuncs))
@@ -153,9 +171,39 @@ func (c Scorecard) Markdown() string {
 		fmt.Fprintf(&b, "| …with ≥1 true related test | %d |\n", c.FunctionsHit)
 		fmt.Fprintf(&b, "| **Function hit rate** | **%.4f** |\n", c.FunctionHitRate)
 	}
+	writeFPAttribution(&b, "False positives by resolver reason", c.FPByReason)
+	writeFPAttribution(&b, "False positives by evidence source", c.FPBySource)
 	writeExamples(&b, "False positives (Grove edge, oracle disagrees)", c.FalsePositives)
 	writeExamples(&b, "False negatives (oracle edge Grove missed)", c.FalseNegatives)
 	return b.String()
+}
+
+// writeFPAttribution renders an FP breakdown, highest count first, so the
+// dominant precision leak is obvious at a glance.
+func writeFPAttribution(b *strings.Builder, title string, counts map[string]int) {
+	if len(counts) == 0 {
+		return
+	}
+	type kv struct {
+		k string
+		n int
+	}
+	rows := make([]kv, 0, len(counts))
+	total := 0
+	for k, n := range counts {
+		rows = append(rows, kv{k, n})
+		total += n
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].n != rows[j].n {
+			return rows[i].n > rows[j].n
+		}
+		return rows[i].k < rows[j].k
+	})
+	fmt.Fprintf(b, "\n## %s\n\n| Bucket | FP count | Share |\n|---|---|---|\n", title)
+	for _, r := range rows {
+		fmt.Fprintf(b, "| %s | %d | %.1f%% |\n", r.k, r.n, 100*float64(r.n)/float64(total))
+	}
 }
 
 func writeExamples(b *strings.Builder, title string, ex []EdgeExample) {

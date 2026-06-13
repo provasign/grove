@@ -51,6 +51,13 @@ type Scorecard struct {
 	FalsePositives  []EdgeExample `json:"falsePositives,omitempty"`
 	FalseNegatives  []EdgeExample `json:"falseNegatives,omitempty"`
 
+	// False-positive attribution over ALL false positives (not just the
+	// sampled examples): how many FP calls edges came from each evidence
+	// source and resolver reason. Surfaces which mechanism (dispatch rescue,
+	// ast-narrowed overload, regex fallback, …) is leaking precision.
+	FPBySource map[string]int `json:"fpBySource,omitempty"`
+	FPByReason map[string]int `json:"fpByReason,omitempty"`
+
 	// Tests-edge scoring only: function-level coverage signal quality.
 	FunctionsCovered int     `json:"functionsCovered,omitempty"`
 	FunctionsHit     int     `json:"functionsHit,omitempty"`

@@ -75,6 +75,7 @@ func (s *Store) runAlterMigrations(ctx context.Context) error {
 		`ALTER TABLE symbols ADD COLUMN annotations     TEXT NOT NULL DEFAULT '[]'`,
 		`ALTER TABLE symbols ADD COLUMN call_sites      TEXT NOT NULL DEFAULT '[]'`,
 		`ALTER TABLE edges ADD COLUMN source            TEXT NOT NULL DEFAULT 'unknown'`,
+		`ALTER TABLE edges ADD COLUMN reason            TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE symbols ADD COLUMN attr_sites      TEXT NOT NULL DEFAULT '[]'`,
 		// The FTS5 mirror was never queried by any retrieval path (search
 		// runs in-memory over the graph), yet its sync triggers doubled the
@@ -216,20 +217,21 @@ func (s *Store) ReplaceEdges(ctx context.Context, edges []core.Edge) error {
 	type edgeMeta struct {
 		confidence float64
 		source     string
+		reason     string
 	}
 	stored := map[string]edgeMeta{}
-	rows, err := s.db.QueryContext(ctx, `SELECT id, confidence, source FROM edges`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, confidence, source, COALESCE(reason, '') FROM edges`)
 	if err != nil {
 		return err
 	}
 	for rows.Next() {
-		var id, source string
+		var id, source, reason string
 		var conf float64
-		if err := rows.Scan(&id, &conf, &source); err != nil {
+		if err := rows.Scan(&id, &conf, &source, &reason); err != nil {
 			rows.Close()
 			return err
 		}
-		stored[id] = edgeMeta{confidence: conf, source: source}
+		stored[id] = edgeMeta{confidence: conf, source: source, reason: reason}
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
@@ -245,7 +247,7 @@ func (s *Store) ReplaceEdges(ctx context.Context, edges []core.Edge) error {
 			continue // duplicate (from, type, to); first one wins
 		}
 		wantIDs[id] = true
-		if meta, ok := stored[id]; ok && meta.confidence == edge.Confidence && meta.source == string(edge.Source) {
+		if meta, ok := stored[id]; ok && meta.confidence == edge.Confidence && meta.source == string(edge.Source) && meta.reason == string(edge.Reason) {
 			continue
 		}
 		upserts = append(upserts, edge)
@@ -284,7 +286,7 @@ func (s *Store) ReplaceEdges(ctx context.Context, edges []core.Edge) error {
 		}
 	}
 
-	const insertChunk = 400 // 6 columns × 400 = 2400 parameters per statement
+	const insertChunk = 342 // 7 columns × 342 = 2394 parameters per statement
 	for start := 0; start < len(upserts); start += insertChunk {
 		end := start + insertChunk
 		if end > len(upserts) {
@@ -292,16 +294,16 @@ func (s *Store) ReplaceEdges(ctx context.Context, edges []core.Edge) error {
 		}
 		chunk := upserts[start:end]
 		var sb strings.Builder
-		sb.WriteString(`INSERT INTO edges (id, from_node, to_node, edge_type, confidence, source) VALUES `)
-		args := make([]any, 0, len(chunk)*6)
+		sb.WriteString(`INSERT INTO edges (id, from_node, to_node, edge_type, confidence, source, reason) VALUES `)
+		args := make([]any, 0, len(chunk)*7)
 		for i, edge := range chunk {
 			if i > 0 {
 				sb.WriteString(",")
 			}
-			sb.WriteString("(?,?,?,?,?,?)")
-			args = append(args, upsertIDs[start+i], edge.From, edge.To, string(edge.Type), edge.Confidence, string(edge.Source))
+			sb.WriteString("(?,?,?,?,?,?,?)")
+			args = append(args, upsertIDs[start+i], edge.From, edge.To, string(edge.Type), edge.Confidence, string(edge.Source), string(edge.Reason))
 		}
-		sb.WriteString(` ON CONFLICT(id) DO UPDATE SET confidence = excluded.confidence, source = excluded.source`)
+		sb.WriteString(` ON CONFLICT(id) DO UPDATE SET confidence = excluded.confidence, source = excluded.source, reason = excluded.reason`)
 		if _, err := tx.ExecContext(ctx, sb.String(), args...); err != nil {
 			return err
 		}
@@ -414,7 +416,7 @@ func (s *Store) AllSymbols(ctx context.Context) ([]core.SymbolRecord, error) {
 
 func (s *Store) AllEdges(ctx context.Context) ([]core.Edge, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT from_node, to_node, edge_type, confidence, COALESCE(source, 'unknown')
+		SELECT from_node, to_node, edge_type, confidence, COALESCE(source, 'unknown'), COALESCE(reason, '')
 		FROM edges
 		ORDER BY from_node, edge_type, to_node
 	`)
@@ -425,12 +427,13 @@ func (s *Store) AllEdges(ctx context.Context) ([]core.Edge, error) {
 	var edges []core.Edge
 	for rows.Next() {
 		var edge core.Edge
-		var typ, source string
-		if err := rows.Scan(&edge.From, &edge.To, &typ, &edge.Confidence, &source); err != nil {
+		var typ, source, reason string
+		if err := rows.Scan(&edge.From, &edge.To, &typ, &edge.Confidence, &source, &reason); err != nil {
 			return nil, err
 		}
 		edge.Type = core.EdgeType(typ)
 		edge.Source = core.EvidenceSource(source)
+		edge.Reason = core.EdgeReason(reason)
 		edges = append(edges, edge)
 	}
 	return edges, rows.Err()
