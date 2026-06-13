@@ -16,7 +16,7 @@ This is intentionally an implementation checklist, not a product roadmap.
 ## Current Review Status
 
 Reviewed against the current Grove workspace and `github.com/provasign/astkit`
-`v0.4.14` on 2026-06-13.
+`v0.4.15` on 2026-06-13.
 
 This document is still the right quality agenda, but it must be read with these
 current-state corrections:
@@ -31,11 +31,14 @@ current-state corrections:
 - Rust, C#, PHP, C, and C++ have moved forward. astkit now emits call sites for
   normal Rust, C#, PHP, and C-family calls, and Grove treats those languages as
   AST call-site languages. Items below for those languages are now hardening
-  work, not "add call-site extraction from zero."
-- TSX needs a Grove-side follow-up: the parser supports `tsx`, but
-  `astCallSiteLanguages` and the TS/JS local-type branch in `buildCalls` do not
-  currently include `"tsx"`, so TSX can still fall through to regex fallback
-  behavior when a symbol has no call sites and misses TS local-type narrowing.
+  work, not "add call-site extraction from zero." C# call sites also carry
+  generic-call evidence that Grove can use during overload narrowing.
+- The TSX follow-up from the previous review is fixed. The parser supports
+  `tsx`, `astCallSiteLanguages` includes it, and the TS/JS local-type branch in
+  `buildCalls` handles it. `internal/graph/tsx_test.go` pins both no-regex
+  fallback for empty TSX call-site lists and TSX receiver local-type narrowing.
+  Remaining TSX work is JSX component evidence, path alias coverage, and
+  native-symbol mapping policy.
 - Grove now has local type inference files for Go, Python, JS/TS, Java, Rust,
   C#, PHP, and C/C++. The remaining work is to improve inference quality,
   language-specific scope, and receiver-resolution policy, not to create those
@@ -59,6 +62,333 @@ current-state corrections:
   is a safety net guarded by `TestBuildEdges_EverySourceTagged`. The remaining
   open piece is consumer-side confidence policy (test/cert traversal opting out
   of weak edges).
+
+## Fresh Accuracy Sweep: Highest-Leverage Next Work
+
+The current architecture is in a better place than the original checklist:
+calls for supported languages are AST-first, native text-matched call edges are
+retired outside real compiler analyzers, and source tagging is present. The next
+accuracy gains should therefore come from sharper identity, scope, and policy
+rather than from more broad matching.
+
+### Accuracy invariants to preserve
+
+- Do not reintroduce text-matched native call edges for Java, Rust, C#, PHP, or
+  C/C++. Those analyzers should contribute project structure, import/include
+  reachability, type-use, inheritance, and implementation evidence until they
+  can resolve calls with a compiler-grade API.
+- Do not run regex fallback for languages in `astCallSiteLanguages`. Empty
+  `CallSites` is currently authoritative for `go`, `python`, `javascript`,
+  `typescript`, `tsx`, `java`, `rust`, `csharp`, `php`, `c`, and `cpp`.
+- Keep receiver/type narrowing before broad name matching. A qualifier that is
+  a known local, `this`/`self`, a known type, or a call result must get the
+  first chance to reduce candidates.
+- Treat broad candidate sets as a precision failure unless there is explicit
+  dispatch evidence. Interface/trait rescue should stay reduced-confidence and
+  capped.
+- Keep weak edges out of consumer closure by default. `TestsFor`, impact, and
+  certification should traverse only edges whose source/confidence is allowed
+  by policy.
+
+### 1. Preserve structured import and namespace identity in Grove
+
+The biggest remaining precision leak is that Grove still projects astkit import
+records to `[]string` on `SymbolRecord.Imports`. That loses alias, static,
+wildcard, grouped-use, require/include kind, and namespace metadata before
+`importedFiles`, `narrowByImport`, and local type narrowing can use it.
+
+Implementation targets:
+
+- Add a Grove-side `ImportRecord` or equivalent parser projection that preserves
+  astkit `Raw`, `Path`, `Alias`, `Group`, `Line`, plus Grove-normalized fields:
+  `Kind`, `Owner`, `Member`, `Wildcard`, `Static`, `RelativeLevel`, and
+  `ResolvedFiles`.
+- Keep `SymbolRecord.Imports []string` temporarily for API compatibility, but
+  build `edgeIndex.fileImports` from structured records where available.
+- Carry namespace/package identity on symbols for languages where short names
+  collide routinely:
+  - Java package
+  - C# namespace and project
+  - PHP namespace and Composer prefix
+  - C++ namespace
+  - Python module path
+  - Rust crate/module path
+- Use qualified identity during matching before falling back to
+  `ParentSymbol + Name` or bare `Name`.
+
+Acceptance:
+
+- Java static/wildcard imports, Rust grouped uses, PHP grouped/function/const
+  uses, C# alias/static/global usings, and Python aliases all have fixtures
+  proving that unrelated same short names do not enter scope.
+- Two classes named `Service` in different PHP/C# namespaces do not collide
+  when a call/import names only one namespace.
+
+### 2. Replace repo-wide scopes with project-aware scopes
+
+`importedFiles` still deliberately makes C#, PHP, C, and C++ repo-wide because
+string imports do not map cleanly to files. That keeps recall acceptable, but it
+is now the largest cross-language false-positive surface. The native analyzers
+already collect enough project structure to become scope providers.
+
+Implementation targets:
+
+- C#: build a project graph from `.csproj` files and scope calls to the caller's
+  project plus referenced projects. Respect SDK-style default includes,
+  explicit `Compile Include/Remove`, linked files, and project references.
+- PHP: use Composer PSR-4, `autoload-dev`, classmap, and `autoload.files` as
+  the primary cross-file scope. Repo-wide PHP scope should become a fallback
+  only when no Composer mapping is available.
+- C/C++: use `compile_commands.json` and resolved `#include` edges as call/type
+  scope. Calls from a `.c/.cc/.cpp` file should see same file, directly
+  included headers, unique implementation/header twins, and explicitly linked
+  translation-unit evidence if available.
+- Java: replace raw dot-path strings with package/import records. Same-package
+  scope should stay, but wildcard/static imports need metadata so they do not
+  behave like broad basename matches.
+- Rust: expand grouped/glob `use` records and preserve crate/module path
+  identity. Crate-wide scope is reasonable, but `pub use` re-export expansion
+  should be explicit and fixture-backed.
+- Python and JS/TS/TSX: keep exact relative resolution, add path alias/package
+  export handling, and avoid generic basename fallback when an exact resolver
+  has evidence.
+
+Acceptance:
+
+- Negative same-name fixtures exist for every repo-wide language before and
+  after the scope change: C#, PHP, C, C++, Java, Rust, Python, JS/TS/TSX, and
+  Go.
+- A language-aware resolver can explain why each cross-file candidate is in
+  scope: same package, import, project reference, include edge, PSR-4 mapping,
+  crate/module path, or native compiler evidence.
+
+### 3. Make receiver resolution a single explainable pipeline
+
+`buildCalls` now contains the right ideas, but the logic is still distributed
+across language-specific branches. That makes regressions likely when one
+language gets a new narrowing rule.
+
+Implementation targets:
+
+- Introduce a common `CallResolution` flow with ordered stages:
+  1. parse qualifier/callee/call-result receiver
+  2. resolve self/this/base/super/parent/static
+  3. resolve type-qualified calls
+  4. resolve inferred local variable type
+  5. resolve call-result return type
+  6. resolve import/package/module qualifier
+  7. apply overload/arity/argument/generic filters
+  8. apply dynamic dispatch rescue
+  9. only then apply bounded bare-name fallback
+- Return a reason code with each edge, such as `receiver-self`,
+  `local-type`, `call-result`, `import-qualified`, `overload-argc`,
+  `generic-overload`, `constructor`, `dispatch`, or `regex-fallback`.
+- Keep the existing language-specific local-type providers, but expose them
+  through one interface and require a negative fixture for every new provider
+  feature.
+
+Acceptance:
+
+- `TestBuildEdges_EverySourceTagged` is extended to require a non-empty
+  reason/policy tag for every graph-built edge once the edge model supports it.
+- The same resolver-order tests run across at least Java, TSX, Rust, C#, PHP,
+  and C++ with identical expectations for known receiver, unknown receiver,
+  call-result receiver, and imported qualifier behavior.
+
+### 4. Use confidence as policy, not just metadata
+
+Edges now carry confidence and source, and `TestsFor` has a minimum traversal
+threshold. The next accuracy step is to make policy explicit for all consumers
+instead of hard-coding one threshold in one traversal.
+
+Implementation targets:
+
+- Define policy profiles for `tests`, `impact`, `certification`, and
+  `diagnostic` traversal.
+- Traverse native/compiler and AST/type-narrowed edges by default; require an
+  opt-in for regex, broad dynamic dispatch, and name-derived test edges.
+- Expose skipped-edge counts and reasons in certification reports so users can
+  see when Grove avoided weak evidence.
+- Calibrate confidence bands from eval data per language/source instead of
+  treating current constants as permanent truth.
+
+Acceptance:
+
+- `TestsFor`, impact, and certification have fixtures where a weak regex or
+  ambiguous dispatch edge exists but is not traversed under strict policy.
+- Certification output can cite both included and excluded evidence with source,
+  confidence, and reason.
+
+### 5. Add targeted recall only after scope is tight
+
+Some recall gaps are still important, but adding call forms before fixing scope
+would also add false positives. The order matters.
+
+Highest-value recall additions after scope tightening:
+
+- Java: explicit constructor invocations, method references, static imports,
+  lambda/method-reference argument tokens, `null` and varargs compatibility,
+  and richer assignment/control-flow local type inference.
+- TS/TSX: JSX component usage evidence, path aliases, package exports, overload
+  implementation selection, and namespace/import-equals forms.
+- Python: relative imports, package `__init__.py` exports, dataclass/attrs/
+  pydantic field types, classmethod/staticmethod receiver policy, and fixture
+  helper traversal.
+- Rust: grouped/glob uses, `<Type as Trait>::method`, more builder/call-result
+  returns, and trait default method dispatch fixtures.
+- C/C++: include-scoped free functions, C++ namespaces, constructors,
+  `ptr->method`, operators where recoverable, and function-pointer calls only
+  as weak evidence.
+- C#: namespace/project scope, alias/static/global usings, extension methods,
+  nullable/generic type erasure, and Roslyn-backed calls when available.
+- PHP: namespace-qualified identity, grouped/function/const uses, classmap/
+  `autoload.files`, traits, callable arrays, and Pest coverage.
+
+### 6. Build a false-positive corpus, not only recall fixtures
+
+The existing eval baselines are useful, but the next regressions will likely be
+specific false positives from broad scope or ambiguous same-name matching.
+
+Implementation targets:
+
+- Add strict negative fixtures for each language with:
+  - same short class/function/method name in unrelated package/namespace/module
+  - external dependency qualifier that matches an in-repo name
+  - ambiguous call-result chain
+  - overload set with one valid target
+  - test helper with same name outside the test's scope
+- Track fanout metrics per call site: number of initial candidates, candidates
+  after each narrowing stage, final edges emitted, and cap/drop reason.
+- Gate eval on false-positive count and fanout distribution, not only precision
+  and recall averages.
+
+Acceptance:
+
+- A change that increases average precision but adds any strict false-positive
+  fixture fails CI.
+- Large real-repo scorecards report the top false-positive sources by language,
+  source, confidence band, and resolver reason.
+
+## Execution Roadmap (sequenced waves)
+
+This is the authoritative execution order for accuracy work. It combines the
+Fresh Accuracy Sweep workstreams (1–6 above) with the per-call-site narrowing
+levers proven this cycle (PHP fluent-chain resolution F1 .55→.63; C#
+generic-overload split F1 .65→.68). It supersedes the older "Implementation
+Order" section for accuracy work; that section remains the broader correctness
+checklist.
+
+### Routing principle: fix what the board says each language needs
+
+Do not apply one prescription to all languages. Route by the precision/recall
+split on the current board, because the levers differ and can fight each other
+(tightening scope can cost recall — verified on C/C++ where definitions live in
+non-`#include`d `.c` files).
+
+| Bucket | Languages (P / R) | Dominant lever |
+|---|---|---|
+| Precision-bound (low P) | Java (.68/.84) | structured imports + namespace identity + overload arg-type binding |
+| Recall-bound (high P, low R) | C/C++ (.88/.56), Rust (.85/.60), PHP (.77/.54), Python (.85/.61) | dispatch rescue + targeted recall; scope-tighten only where it does NOT cost recall |
+| Balanced | C# (.66/.70) | arg-type overload narrowing (precision) + dispatch rescue (recall) |
+| Strong, maintain | Go (.94), TS (.90), JS (.73) | regression-guard only |
+
+Invariant from the sweep: **tighten scope/precision before adding recall**, and
+**measure every step** (`universe` → implement → score F1 delta on the pin →
+raise baseline only on a reproducible gain → gate). Never reintroduce native
+text-matched call edges or regex fallback for `astCallSiteLanguages`.
+
+### Wave 0 — Guardrails & identity infra (do first; de-risks all later waves)
+
+- **Structured imports + qualified identity** (Sweep #1): Grove-side `ImportRecord`
+  projection preserving astkit `Raw/Path/Alias/Group` + normalized
+  `Kind/Owner/Member/Wildcard/Static/RelativeLevel/ResolvedFiles`; carry
+  namespace/package/crate/module identity on symbols and use it in matching
+  before `ParentSymbol+Name`. Foundational for Waves 1–3.
+- **False-positive corpus + fanout metrics** (Sweep #6): strict negative
+  same-name fixtures per language; per-call-site fanout tracking (candidates in →
+  after each stage → edges out → cap/drop reason); gate eval on FP count and
+  fanout distribution, not just average P/R. This is the safety net the riskier
+  waves require.
+- **Edge reason codes** (Sweep #3, start): tag every graph-built edge with a
+  resolver reason; extend `TestBuildEdges_EverySourceTagged` to require it.
+- **Honest recall measurement** (new): add a static second oracle for the
+  dynamic-oracle languages (Python pytest-trace, PHP xdebug-trace) so we separate
+  Grove-fault recall from oracle-coverage gaps before chasing their recall.
+
+### Wave 1 — Ready precision levers (cheap; pattern already proven)
+
+- **C# arg-type overload narrowing** — astkit v0.4.15 already emits C# arg tokens;
+  wire `narrowOverloadsByArgTypes` for C# to split same-arity *different-type*
+  overloads (`SerializeObject(value, Formatting)` vs `(value, settings)`) the
+  generic split didn't catch.
+- **PHP chain-root propagation** — recover the TPs dropped by the
+  ambiguous-fluent-chain rule (`addStmt().getNode`) by threading the chain's root
+  type through `return $this` links; lifts PHP recall back up without ceding the
+  precision gain.
+- **C/C++ hygiene** — exclude generated `build/` dirs from indexing (kills the
+  duplicate-header `json_decref` problem) and prefer the `.c` definition over the
+  header prototype as call target.
+
+### Wave 2 — Cross-cutting recall: bounded dispatch rescue
+
+Generalize Go's interface-satisfaction dispatch rescue to **PHP, C#, Java, Rust**:
+when a receiver resolves to an interface/abstract/trait that declares the method,
+emit reduced-confidence, capped edges to in-scope implementations (Sweep #5 +
+the "interface/trait rescue stays reduced-confidence and capped" invariant). This
+is the single highest-aggregate-F1 lever — it recovers the polymorphic-dispatch
+FNs that dominate four languages (PHP `getType`/`getSubNodeNames`, C# virtual
+dispatch, Rust trait methods, Java interface dispatch) — and is evidence-gated so
+it does not inflate precision loss.
+
+### Wave 3 — Project-aware scope (precision; the big structural one)
+
+Replace repo-wide scope with project-aware scope (Sweep #2), **routed**: apply
+where it nets positive, keep repo-wide as fallback where tightening would cost
+recall.
+
+- **Java**: package/import records; wildcard/static imports carry metadata so they
+  stop behaving like broad basename matches (directly attacks the precision floor).
+- **C#**: `.csproj` project graph — scope to caller's project + referenced
+  projects.
+- **PHP**: Composer PSR-4/`autoload-dev`/classmap as primary scope; repo-wide as
+  fallback.
+- **C/C++**: `compile_commands.json` + resolved `#include` edges as scope — but
+  only after confirming on jansson it does not regress recall (the high-P/low-R
+  trap); keep unique header/impl-twin and linked-TU evidence.
+- **Rust**: expand grouped/glob `use` + `pub use` re-exports; preserve crate/module
+  identity (crate-wide scope stays).
+
+Each change gated on Wave 0's FP corpus + fanout metrics.
+
+### Wave 4 — Consolidation & policy
+
+- **Single explainable `CallResolution` pipeline** (Sweep #3): ordered stages
+  (self/this → type → local-type → call-result → import/module → overload/arity/
+  generic → dispatch rescue → bounded bare-name), each emitting a reason code.
+  Worth doing now — Wave 0's reason-tags + FP corpus give it a measurable payoff
+  and a regression net it lacked before. Consolidates the per-language branches.
+- **Confidence as policy** (Sweep #4): policy profiles for `tests`/`impact`/
+  `certification`/`diagnostic`; default-traverse native/AST-narrowed edges,
+  opt-in for regex/broad-dispatch/name-derived; report excluded evidence. Feeds
+  RFC #5 (the tests-edge "related ≥0.8 / possibly-related <0.8" tiers).
+
+### Wave 5 — Targeted recall tail
+
+Only after scope is tight (Sweep #5): Java constructors/method-refs/static
+imports; TS/TSX JSX usage + path aliases + overload-impl selection; Python
+relative imports + dataclass/attrs/pydantic field types + classmethod policy;
+Rust `<Type as Trait>::method` + trait-default dispatch; C/C++ include-scoped free
+functions + C++ namespaces/constructors/`ptr->method`; PHP traits + callable
+arrays + Pest.
+
+### Expected trajectory
+
+Wave 1 nudges C# and PHP a few points each (precision/recall recovery). Wave 2 is
+the broad recall lift across PHP/C#/Rust/Java. Wave 3 is the precision lift,
+concentrated on Java (the lowest-precision language) and cross-project C#. Waves
+4–5 are consolidation and the long tail. Floors to watch: PHP and C# (just
+moved), then Rust and C/C++ (recall-bound, partly astkit/macro-limited), with
+Java precision as the standing structural target.
 
 ## Supported Languages
 
@@ -175,11 +505,10 @@ Acceptance:
 Current status:
 
 - Partially implemented at the language level. `astCallSiteLanguages` now
-  includes `go`, `python`, `javascript`, `typescript`, `java`, `rust`,
+  includes `go`, `python`, `javascript`, `typescript`, `tsx`, `java`, `rust`,
   `csharp`, `php`, `c`, and `cpp`, so an empty `CallSites` list skips regex
   fallback for those languages.
-- `tsx` is still missing from this allowlist even though parser detection and
-  astkit extraction support TSX.
+- TSX coverage is explicitly pinned by `internal/graph/tsx_test.go`.
 - Still open at the symbol level. Grove cannot currently distinguish "body
   visited and no calls" from "strategy supported the language but missed a node
   form inside this symbol." Partial parses can merge regex symbols, but there
@@ -324,6 +653,13 @@ Grove targets:
 Implementation:
 
 - Keep and extend the existing per-language eval baselines.
+- Add a per-edge explanation payload to eval output:
+  - source (`native`, `astkit`, `heuristic`, `regex`)
+  - confidence
+  - resolver reason
+  - initial candidate count
+  - final candidate count
+  - scope reason
 - Add strict feature fixtures per language with expected edges:
   - imports
   - calls
@@ -332,20 +668,24 @@ Implementation:
   - extends/implements
   - tests edges
   - negative same-name non-scope cases
-- Report precision, recall, and false-positive count per language.
+- Report precision, recall, false-positive count, and fanout distribution per
+  language and per evidence source.
 - Add "coverage" as feature coverage, not only score coverage:
   - symbol categories covered
   - call forms covered
   - import forms covered
   - test detection covered
-- CI should continue to fail on precision/recall regression against baselines
-  and should also fail on any new false-positive in strict fixtures.
+- CI should continue to fail on precision/recall regression against baselines,
+  any new false-positive in strict fixtures, or a fanout increase that crosses a
+  configured language/source budget.
 
 Acceptance:
 
 - Every production language has a reproducible quality score and strict feature
   fixture.
 - A change to one language cannot silently regress another.
+- Scorecards identify the top false-positive sources by language, resolver
+  reason, confidence band, and scope reason.
 
 ## Java
 
@@ -353,7 +693,7 @@ Acceptance:
 
 Current status:
 
-- Partially implemented in astkit `v0.4.14`. Java call-site extraction covers
+- Partially implemented in astkit `v0.4.15`. Java call-site extraction covers
   `method_invocation` and `object_creation_expression`, generic constructor
   names are reduced to the bare type, and call sites carry `Argc` plus simple
   literal/identifier argument tokens.
@@ -690,7 +1030,7 @@ Acceptance:
 
 Current status:
 
-- Partially implemented in astkit `v0.4.14`. JS/TS extraction now covers JSX
+- Partially implemented in astkit `v0.4.15`. JS/TS extraction now covers JSX
   syntax through the JS grammar, CommonJS-style assignment functions
   (`exports.x =`, `app.listen =`, `X.prototype.y =`), class fields, super call
   sites, and receiver-qualified call sites.
@@ -785,7 +1125,7 @@ Acceptance:
 
 Current status:
 
-- Partially implemented in astkit `v0.4.14`. TS/TSX extraction handles TSX via
+- Partially implemented in astkit `v0.4.15`. TS/TSX extraction handles TSX via
   the TSX grammar, abstract classes/method signatures, assignment-style
   functions, class fields, super call sites, and receiver-qualified call sites.
 - Remaining TS/TSX work is import/export metadata, path aliases, overload
@@ -825,10 +1165,11 @@ Current status:
   calls, and type references when a project config and `typescript` package are
   available. Grove also has TS/JS local type inference for annotations,
   constructor parameter properties, class fields, and simple `new` assignments.
+- TSX is now included wherever Grove treats `typescript` and `javascript` as
+  AST/typed-local call languages; `internal/graph/tsx_test.go` pins empty
+  call-site fallback suppression and receiver local-type narrowing.
 - Still open: path aliases/exports need fuller coverage, native symbol mapping
-  is still by file plus bare name, JSX evidence needs explicit policy, and
-  `buildCalls` should include `tsx` anywhere it treats `typescript` and
-  `javascript` as AST/typed-local languages.
+  is still by file plus bare name, and JSX evidence needs explicit policy.
 
 Targets:
 
@@ -876,7 +1217,7 @@ Acceptance:
 
 Current status:
 
-- Partially implemented in astkit `v0.4.14`. Rust call-site extraction now
+- Partially implemented in astkit `v0.4.15`. Rust call-site extraction now
   covers normal call expressions, macro invocations, generic-function
   turbofish forms, scoped identifiers, field-expression receiver calls, and
   macro token-tree calls.
@@ -983,7 +1324,7 @@ Acceptance:
 
 Current status:
 
-- Partially implemented in astkit `v0.4.14`. C/C++ function symbols now carry
+- Partially implemented in astkit `v0.4.15`. C/C++ function symbols now carry
   `cCallSites` for plain calls, member calls, scoped calls, template calls, and
   `new` expressions where the grammar exposes them.
 - Remaining C astkit work is symbol/import metadata hardening: prototypes vs
@@ -1065,7 +1406,7 @@ Acceptance:
 
 Current status:
 
-- Partially implemented in astkit `v0.4.14`. C++ shares `cCallSites` with C and
+- Partially implemented in astkit `v0.4.15`. C++ shares `cCallSites` with C and
   covers several ordinary function/member/scoped/template call forms. Symbol
   extraction has improved enough for eval, but C++ remains less semantically
   complete than Go/TS/Java/Rust.
@@ -1146,9 +1487,10 @@ Acceptance:
 
 Current status:
 
-- Partially implemented in astkit `v0.4.14`. C# call-site extraction now covers
+- Partially implemented in astkit `v0.4.15`. C# call-site extraction now covers
   `invocation_expression` and `object_creation_expression`, including member
-  access receivers and generic names.
+  access receivers, generic names, and a `CallSite.Generic` flag for explicit
+  generic method/object-creation syntax.
 - The remaining C# work is import metadata, richer symbol forms, property/field
   evidence, extension-method policy, and project/namespace-aware graph scope.
 
@@ -1187,11 +1529,13 @@ Current status:
 
 - Partially implemented. Grove treats C# call sites as authoritative, uses
   repo-wide assembly-style scope, has `csharplocaltypes.go`, filters overloads
-  by arity, and keeps native C# call text-matching retired. The Newtonsoft.Json
-  eval baseline is gated in CI.
+  by arity and generic-call shape, and keeps native C# call text-matching
+  retired. `internal/graph/csharp_generic_test.go` pins generic vs
+  non-generic same-arity overload narrowing, and the Newtonsoft.Json eval
+  baseline is gated in CI.
 - Still open: true namespace/project-reference scoping, alias/static/global
-  `using` metadata, extension methods, same-arity overloads, and Roslyn-backed
-  native resolution.
+  `using` metadata, extension methods, non-generic same-arity overloads with
+  identical argument shape, and Roslyn-backed native resolution.
 
 Targets:
 
@@ -1242,7 +1586,7 @@ Acceptance:
 
 Current status:
 
-- Partially implemented in astkit `v0.4.14`. PHP call-site extraction now
+- Partially implemented in astkit `v0.4.15`. PHP call-site extraction now
   covers free function calls, member calls, nullsafe member calls, scoped calls,
   and object creation.
 - The remaining PHP work is namespace/use normalization, alias metadata,
@@ -1287,8 +1631,9 @@ Current status:
 
 - Partially implemented. Grove treats PHP call sites as authoritative, has
   `phplocaltypes.go`, uses repo-wide library scope, reads Composer PSR-4 plus
-  `autoload-dev` in the native analyzer, and keeps native PHP call text-matching
-  retired. PHP-Parser is gated in CI.
+  `autoload-dev` in the native analyzer, handles simple fluent call-result
+  receiver narrowing through `phpCallResultType`, and keeps native PHP call
+  text-matching retired. PHP-Parser is gated in CI.
 - Still open: namespace-qualified symbol identity, grouped/function/const use
   metadata, PSR-4/classmap precision beyond the current native hints, trait
   resolution, and callable-array/Pest coverage.
@@ -1420,9 +1765,10 @@ Current status:
   Python, TS/JS, Java, Rust, C#, PHP, and C/C++, but it remains distributed
   across language-specific branches in `buildCalls` plus separate local type
   files.
-- Edge de-duplication preserves the higher-confidence duplicate and native
-  sources are tagged, but graph-built edges still need explicit source tagging
-  and policy metadata.
+- Edge de-duplication preserves the higher-confidence duplicate, native sources
+  are tagged, and graph-built edges now set explicit `astkit`, `heuristic`, or
+  `regex` sources. The remaining gap is policy metadata and consumer-side
+  confidence handling, not basic source tagging.
 
 Targets:
 
@@ -1536,22 +1882,27 @@ Keep:
 
 ## Implementation Order
 
-1. astkit and Grove import normalization, especially Java wildcard/static,
-   Rust grouped uses, PHP grouped/typed uses, and C#/Python aliases.
-2. Java correctness fixes: missing call-site forms, multi-field declarations,
+1. Preserve structured import/namespace metadata through Grove projection:
+   Java wildcard/static, Rust grouped/glob uses, PHP grouped/function/const
+   uses, C# alias/static/global usings, Python aliases/relative imports, and
+   JS/TS/TSX path aliases/exports.
+2. Replace repo-wide scopes with project-aware scopes: C/C++ include graph,
+   PHP Composer PSR-4/classmap/files, C# project/reference namespace scope, and
+   Java package/import scope.
+3. Add strict false-positive fixtures and fanout budgets before adding broad
+   recall. Include negative same-name cases for every supported language.
+4. Consolidate receiver/type/call-result/import resolution into one ordered,
+   explainable pipeline with language-specific providers behind a common
+   interface.
+5. Wire confidence/source/reason policy into `TestsFor`, impact, and
+   certification so strict consumers skip weak edges by default.
+6. Java correctness fixes: missing call-site forms, multi-field declarations,
    local type inference, overload narrowing, and unknown-receiver policy.
-3. Grove language-aware `importedFiles` and namespace/package/module scope so
-   basename matching is a bounded fallback; prioritize C/C++ include scoping,
-   PHP namespace/PSR-4 scoping, C# project/namespace scoping, and Java imports.
-4. C/C++ scoped graph resolution and C++ hardening on top of existing AST
-   call-site extraction, keeping native C-family text matching limited to
-   include/type-use evidence.
-5. Rust/C#/PHP hardening on top of existing AST call-site extraction and local
-   type providers.
-6. Common receiver/type narrowing interface and edge source/confidence policy.
-7. Test-edge precision and framework-specific coverage.
-8. Strict feature fixtures, false-positive fixture gates, broader tests-edge
-   gates, and impact gates on top of existing per-language eval baselines.
+7. TS/TSX, Python, Rust, C#/PHP, and C/C++ recall hardening on top of scoped
+   resolution, keeping native text matching limited to include/type-use/project
+   evidence.
+8. Broader tests-edge gates, impact gates, and per-language scorecard
+   regression gates on top of existing eval baselines.
 
 ## Minimum Quality Gates
 
@@ -1566,13 +1917,18 @@ Each language should have:
 
 - exact symbol fixture
 - exact import fixture
+- exact structured import/namespace fixture
 - exact call fixture
 - exact constructor fixture when applicable
 - exact type-use fixture
 - exact inheritance fixture when applicable
 - exact tests fixture
 - at least one negative same-name fixture
+- external dependency qualifier fixture where applicable
+- ambiguous receiver/call-result fixture where applicable
+- overload/generic fixture where applicable
 - precision/recall/false-positive score in CI
+- fanout budget and top false-positive source report in CI
 
 No language should be marked production-confident until its strict fixture
 false-positive count is zero and its measured recall gaps are documented with
