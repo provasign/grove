@@ -71,7 +71,7 @@ Source files
 
 **Delta indexing by content hash.** Grove hashes each file before parsing. If the stored hash matches, the file is skipped entirely. Indexing a 5000-file repo after a one-line change touches one file, not 5000.
 
-**AST-first with native enrichment.** Tree-sitter produces a complete AST even for files with syntax errors, but marks broken subtrees as `ERROR` nodes. When `root.HasError()` is true, Grove runs both the AST extractor and the regex fallback, then merges the results with AST taking precedence. On top of that, language-native analyzers add higher-confidence call, type-use, inheritance, import, and constructor edges when the local toolchain is available. Files that are actively being edited mid-keystroke are still indexed usefully, and the graph gets richer when the repository can be resolved with native tooling.
+**AST-first with native enrichment.** Tree-sitter produces a complete AST even for files with syntax errors, but marks broken subtrees as `ERROR` nodes. When `root.HasError()` is true, Grove runs both the AST extractor and the regex fallback, then merges the results with AST taking precedence. On top of that, language-native analyzers add type-use, inheritance, and import edges when the local toolchain is available. (Call edges are owned by the call-site resolver in `internal/graph/`, which narrows by inferred receiver type — text-matching call edges in the native pass exploded fan-out on overload- and same-name-heavy code, so they were retired in favor of the narrowed graph-layer resolution.) Files that are actively being edited mid-keystroke are still indexed usefully, and the graph gets richer when the repository can be resolved with native tooling.
 
 **Scoped edges prevent false positives.** `calls` and `uses-type` edges are only created between symbols in the same file or in files connected by an `imports` edge. Without this constraint, a function named `parse` in one package would appear to call a `parse` function in an unrelated package, producing roughly 5× the false-positive edges.
 
@@ -104,7 +104,8 @@ Non-code files (`.md`, `.yaml`, `.json`, `.xml`, `.sh`, `.toml`, `.proto`, `.sql
 Grove's edges are scored against typed-toolchain ground truth on pinned
 real-world repos, and CI fails any change that regresses below the recorded
 floors (see [eval/README.md](eval/README.md) for methodology, oracles, and
-the full progression history). Calls-edge accuracy, 2026-06-12:
+the full progression history). Calls-edge accuracy across **ten languages**,
+2026-06-13:
 
 | Repo (pin) | Language | Oracle | Precision | Recall | F1 |
 |---|---|---|---|---|---|
@@ -113,13 +114,23 @@ the full progression history). Calls-edge accuracy, 2026-06-12:
 | commons-lang | Java | javac + javap bytecode | 0.68 | 0.84 | **0.75** |
 | express | JavaScript (CJS) | TypeScript compiler API (checkJs) | 0.75 | 0.71 | **0.73** |
 | flask | Python | dynamic (pytest runtime trace) | 0.85 | 0.61 | **0.71** |
+| ripgrep | Rust | rust-analyzer SCIP index | 0.85 | 0.60 | **0.70** |
+| jansson | C / C++ | scip-clang SCIP index | 0.88 | 0.56 | **0.69** |
+| Newtonsoft.Json | C# | Roslyn semantic model | 0.60 | 0.70 | **0.65** |
+| PHP-Parser | PHP | dynamic (xdebug runtime trace) | 0.53 | 0.56 | **0.55** |
 
 Notes on reading these honestly:
 
-- The Python oracle is **runtime execution**, so it records edges no static
-  tool can see (registry dispatch, dunder protocols, proxies); Python
-  recall against it is a conservative lower bound, and precision is the
-  lever that matters.
+- Oracles match each ecosystem: typed static analysis where the language has
+  it (Go SSA/VTA, the TypeScript checker, Roslyn, rust-analyzer and
+  scip-clang SCIP, Java bytecode), and **runtime execution** for the
+  dynamically-dispatched languages (Python and PHP test-suite traces).
+- A runtime oracle records edges no static tool can see (registry dispatch,
+  dunder/magic protocols, proxies, virtual dispatch), so for Python and PHP
+  recall against it is a conservative lower bound and precision is the lever
+  that matters. The static-oracle languages are the inverse — precision is
+  the lower bound where a true edge runs through an untested or dynamically
+  dispatched path the structural graph can't pin to one target.
 - Test-relatedness edges are scored against per-test runtime coverage:
   flask edge precision 0.74, with a truly-covering test suggested for 36%
   of covered functions. Blast radius (depth-2 reverse reachability on gin)
