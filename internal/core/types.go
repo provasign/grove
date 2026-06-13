@@ -32,10 +32,11 @@ type LineRange struct {
 // AST-extracted call sites enable high-confidence calls edges that do not
 // rely on regex/string-stripping heuristics.
 type CallSite struct {
-	Callee string   `json:"callee"` // bare name; receiver-qualified uses "Receiver.callee"
-	Line   int      `json:"line"`
-	Argc   int      `json:"argc,omitempty"` // argument count; advisory (0 = none or unknown)
-	Args   []string `json:"args,omitempty"` // bare-identifier argument names ("" for complex exprs)
+	Callee  string   `json:"callee"` // bare name; receiver-qualified uses "Receiver.callee"
+	Line    int      `json:"line"`
+	Argc    int      `json:"argc,omitempty"`    // argument count; advisory (0 = none or unknown)
+	Args    []string `json:"args,omitempty"`    // bare-identifier argument names ("" for complex exprs)
+	Generic bool     `json:"generic,omitempty"` // call supplies explicit type args (Foo<T>()); splits generic vs non-generic overloads
 }
 
 type SymbolRecord struct {

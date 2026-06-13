@@ -1012,6 +1012,16 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 					// zeroes the set.
 					cands = filterByArgc(cands, cs.Argc)
 				}
+				if symbol.Language == "csharp" && len(cands) > 1 {
+					// Generic split: DeserializeObject<T>(string) and
+					// DeserializeObject(string) collide on name + arity + value
+					// arg type (both take a string). The call's explicit type
+					// args (cs.Generic) are the only signal — a generic call
+					// binds a generic overload, a non-generic call a
+					// non-generic one. Roslyn's 5-overload JsonConvert fanout
+					// was the dominant C# false-positive source.
+					cands = filterByGeneric(cands, cs.Generic)
+				}
 				if symbol.Language == "java" {
 					// Overload disambiguation: arity first, then exact
 					// argument-type evidence (positive matches only — see
@@ -1453,6 +1463,36 @@ func filterByArgc(cands []*core.SymbolRecord, argc int) []*core.SymbolRecord {
 		return cands
 	}
 	return out
+}
+
+// filterByGeneric keeps the overloads whose generic-ness matches the call's:
+// a call with explicit type arguments (Foo<T>()) binds a generic overload, a
+// plain call binds a non-generic one. Never zeroes the set — if no candidate
+// matches (e.g. signatures didn't parse), all pass through so a real edge is
+// not lost to a parse gap.
+func filterByGeneric(cands []*core.SymbolRecord, wantGeneric bool) []*core.SymbolRecord {
+	var out []*core.SymbolRecord
+	for _, cand := range cands {
+		if csIsGenericMethod(cand) == wantGeneric {
+			out = append(out, cand)
+		}
+	}
+	if len(out) == 0 {
+		return cands
+	}
+	return out
+}
+
+// csIsGenericMethod reports whether a C# overload declares type parameters,
+// detected as the method name immediately followed by "<" in the signature
+// head ("DeserializeObject<T>(...)"). A generic return type ("List<int> Foo()")
+// does not count: the "<" there does not follow the method name.
+func csIsGenericMethod(s *core.SymbolRecord) bool {
+	head := s.Signature
+	if i := strings.IndexByte(head, '('); i >= 0 {
+		head = head[:i]
+	}
+	return strings.Contains(head, s.Name+"<")
 }
 
 // declParamCount counts declared parameters from a callable's first

@@ -43,7 +43,7 @@
   },
   "newtonsoft": {
     "commit": "0a2e291",
-    "precision": 0.6031,
+    "precision": 0.6579,
     "recall": 0.7021,
     "tolerance": 0.005,
     "minUniverse": 0.99
