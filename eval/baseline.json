@@ -33,5 +33,12 @@
     "recall": 0.8413,
     "minUniverse": 0.96,
     "tolerance": 0.005
+  },
+  "ripgrep": {
+    "commit": "82313cf",
+    "precision": 0.8514,
+    "recall": 0.5967,
+    "tolerance": 0.005,
+    "minUniverse": 0.98
   }
 }

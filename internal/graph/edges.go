@@ -42,6 +42,15 @@ type edgeIndex struct {
 
 	// importedFilesCache memoizes the result of importedFiles() per file.
 	importedFilesCache map[string]map[string]struct{}
+
+	// Rust crate topology: visibility in Rust is crate-wide (any item is
+	// reachable through crate:: paths without a per-file use), so scope is
+	// the enclosing crate plus used workspace crates. A crate root is a
+	// directory holding lib.rs or main.rs; files attach to the nearest
+	// root above them.
+	rustCrateOfFile map[string]string   // .rs file → crate root dir
+	rustCrateFiles  map[string][]string // crate root dir → files under it
+	rustCrateByName map[string]string   // normalized crate name → root dir
 }
 
 func newEdgeIndex(symbols []core.SymbolRecord) *edgeIndex {
@@ -81,7 +90,74 @@ func newEdgeIndex(symbols []core.SymbolRecord) *edgeIndex {
 		idx.importPathToFiles[strings.ToLower(trimExt(f))] = append(idx.importPathToFiles[strings.ToLower(trimExt(f))], f)
 		idx.baseToFiles[strings.ToLower(baseNameNoExt(f))] = append(idx.baseToFiles[strings.ToLower(baseNameNoExt(f))], f)
 	}
+	idx.buildRustCrates()
 	return idx
+}
+
+// buildRustCrates derives the crate topology from file layout alone: every
+// directory containing lib.rs or main.rs roots a crate; each .rs file
+// belongs to the nearest root above it (its own directory when no root
+// exists, e.g. integration-test targets). The crate's referenceable name is
+// the root's directory name — or its parent's for src/ layouts — registered
+// with hyphens normalized to underscores plus its last underscore token,
+// because package names commonly prefix the directory name (grep-searcher
+// lives in crates/searcher).
+func (idx *edgeIndex) buildRustCrates() {
+	roots := map[string]bool{}
+	for f := range idx.byFile {
+		if !strings.HasSuffix(f, ".rs") {
+			continue
+		}
+		if base := baseNameNoExt(f); base == "lib" || base == "main" {
+			roots[dirOf(f)] = true
+		}
+	}
+	if len(roots) == 0 {
+		return
+	}
+	idx.rustCrateOfFile = map[string]string{}
+	idx.rustCrateFiles = map[string][]string{}
+	idx.rustCrateByName = map[string]string{}
+	for f := range idx.byFile {
+		if !strings.HasSuffix(f, ".rs") {
+			continue
+		}
+		root := dirOf(f)
+		for d := root; ; {
+			if roots[d] {
+				root = d
+				break
+			}
+			parent := dirOf(d)
+			if parent == d || parent == "." || parent == "" {
+				break
+			}
+			d = parent
+		}
+		idx.rustCrateOfFile[f] = root
+		idx.rustCrateFiles[root] = append(idx.rustCrateFiles[root], f)
+	}
+	crateName := func(root string) string {
+		name := baseOf(root)
+		if name == "src" {
+			name = baseOf(dirOf(root))
+		}
+		return strings.ToLower(strings.ReplaceAll(name, "-", "_"))
+	}
+	for root := range roots {
+		if name := crateName(root); name != "" && name != "." {
+			idx.rustCrateByName[name] = root
+		}
+	}
+	// Token aliases never displace an exact crate name.
+	for root := range roots {
+		name := crateName(root)
+		if i := strings.LastIndexByte(name, '_'); i >= 0 && i+1 < len(name) {
+			if tok := name[i+1:]; idx.rustCrateByName[tok] == "" {
+				idx.rustCrateByName[tok] = root
+			}
+		}
+	}
 }
 
 // importedFiles returns the set of file paths that are reachable through
@@ -101,7 +177,8 @@ func (idx *edgeIndex) importedFiles(fromFile string) map[string]struct{} {
 	// scope. This is NOT true for TS/JS/Java/Python, where imports are always
 	// explicit per file regardless of directory — so we gate on language to
 	// avoid linking unrelated same-folder modules there.
-	if lang := fileLanguage(idx, fromFile); lang == "go" || lang == "java" {
+	lang := fileLanguage(idx, fromFile)
+	if lang == "go" || lang == "java" {
 		// Go: a directory IS a package. Java: a directory is a package too —
 		// same-package classes need no import.
 		fromDir := dirOf(fromFile)
@@ -110,6 +187,69 @@ func (idx *edgeIndex) importedFiles(fromFile string) map[string]struct{} {
 				out[f] = struct{}{}
 			}
 		}
+	}
+	if lang == "rust" && idx.rustCrateOfFile != nil {
+		// Rust visibility is crate-wide: crate::/super:: paths reach any
+		// sibling module with no per-file use declaration. Scope is the
+		// whole enclosing crate plus used workspace crates — transitively,
+		// because facade crates re-export their dependencies (ripgrep's
+		// core uses grep::printer::..., where crates/grep is a shim over
+		// grep-printer) and paths through a re-export reach the underlying
+		// crate's items directly.
+		ownRoot := idx.rustCrateOfFile[fromFile]
+		visited := map[string]bool{}
+		queue := []string{ownRoot}
+		for len(queue) > 0 {
+			root := queue[0]
+			queue = queue[1:]
+			if visited[root] {
+				continue
+			}
+			visited[root] = true
+			for _, f := range idx.rustCrateFiles[root] {
+				if f != fromFile {
+					out[f] = struct{}{}
+				}
+				for imp := range idx.fileImports[f] {
+					if root != ownRoot && !strings.HasPrefix(imp, "pub ") {
+						// Any own-crate import is dependency evidence (the
+						// extern prelude names deps crate-wide), but other
+						// crates extend reachability only through pub use
+						// re-export chains.
+						continue
+					}
+					seg := strings.TrimPrefix(imp, "pub ")
+					seg = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(seg), "use "))
+					if i := strings.Index(seg, "::"); i >= 0 {
+						seg = seg[:i]
+					}
+					// "pub use grep_printer as printer" — the crate name
+					// ends at the first space.
+					if i := strings.IndexByte(seg, ' '); i >= 0 {
+						seg = seg[:i]
+					}
+					seg = strings.ToLower(strings.TrimSpace(seg))
+					switch seg {
+					case "", "crate", "super", "self", "std", "core", "alloc":
+						continue
+					}
+					crateRoot, ok := idx.rustCrateByName[seg]
+					if !ok {
+						// Package names commonly prefix the directory name
+						// (use grep_searcher → crates/searcher): retry on
+						// the path's last underscore token.
+						if i := strings.LastIndexByte(seg, '_'); i >= 0 && i+1 < len(seg) {
+							crateRoot, ok = idx.rustCrateByName[seg[i+1:]]
+						}
+					}
+					if ok && !visited[crateRoot] {
+						queue = append(queue, crateRoot)
+					}
+				}
+			}
+		}
+		idx.importedFilesCache[fromFile] = out
+		return out
 	}
 
 	imports, ok := idx.fileImports[fromFile]
@@ -795,6 +935,8 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 				localTypes = tsLocalTypes(idx, &symbol)
 			case "java":
 				localTypes = javaLocalTypes(idx, &symbol)
+			case "rust":
+				localTypes = rustLocalTypes(idx, &symbol)
 			}
 			var javaArgTypeCache map[string]string
 			for _, cs := range symbol.CallSites {
@@ -819,11 +961,15 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 				// matching here let "writeContentType" (free function) claim every
 				// type's "WriteContentType" method.
 				cands, capped := resolveCallees(idx, &symbol, calleeName, scope, true)
-				if capped && symbol.Language != "java" {
-					// Only Java's narrowing has the evidence (arity, arg
-					// types) to pin down very large same-name sets; for other
-					// languages an over-cap set stays dropped (dispatch
-					// rescue below still applies).
+				if capped && symbol.Language != "java" && symbol.Language != "rust" {
+					// Only narrowing with real evidence may keep very large
+					// same-name sets: Java (arity, arg types) and Rust
+					// (typed receivers/qualifiers — crate-wide scope makes
+					// "new" or "update" routinely exceed the cap before the
+					// type evidence has had its chance). For the rest an
+					// over-cap set stays dropped (dispatch rescue below
+					// still applies); anything Rust's narrowing fails to
+					// pin back down is re-capped after narrowing.
 					cands = nil
 				}
 				if symbol.Language == "java" {
@@ -864,6 +1010,72 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 								}
 							} else if qualifier[0] >= 'a' && qualifier[0] <= 'z' {
 								cands = nil
+							}
+						}
+					}
+				}
+				if symbol.Language == "rust" && qualifier == "" && calleeName == "drop" {
+					// Prelude mem::drop: a bare drop(x) never targets an
+					// in-repo Drop impl by name.
+					continue
+				}
+				if symbol.Language == "rust" && qualifier != "" && len(cands) > 0 {
+					// Static typing, Rust edition of the Java rule. An
+					// uppercase qualifier is a type path (PathBuf::from,
+					// Regex::new): if no candidate belongs to that type and
+					// no local resolves it, the callee lives outside the
+					// repo — drop. A lowercase qualifier with no local type
+					// is a module path or an uninferable variable: keep
+					// only candidates declared in a matching module file
+					// (parse::parse_low_raw → flags/parse.rs), else drop.
+					_, isSelf := selfVars[qualifier]
+					_, typed := localTypes[qualifier]
+					if strings.HasSuffix(qualifier, "()") {
+						// Call-result receiver: builder chains live here
+						// (.line_number(true).build() narrows build by
+						// line_number's return type). Unknown results are
+						// external (.unwrap().x, .iter().y) — drop.
+						if rets := rustCallResultTypes(idx, qualifier, &symbol, scope); len(rets) > 0 {
+							var byType []*core.SymbolRecord
+							for _, cand := range cands {
+								if (cand.Kind == core.KindMethod || cand.Kind == core.KindConstructor) && rets[cand.ParentSymbol] {
+									byType = append(byType, cand)
+								}
+							}
+							cands = byType
+						} else {
+							cands = nil
+						}
+					} else if isSelf && symbol.ParentSymbol != "" && len(filterByParent(cands, symbol.ParentSymbol)) == 0 {
+						// Default trait methods: self.is_match() inside
+						// impl Matcher for X, where X declares no
+						// is_match, executes the trait's declaration.
+						if trait := rustImplTrait(&symbol); trait != "" {
+							if byTrait := filterByParent(cands, trait); len(byTrait) > 0 {
+								cands = byTrait
+							}
+						}
+					} else if !isSelf && !typed && len(filterByParent(cands, qualifier)) == 0 {
+						if qualifier[0] >= 'A' && qualifier[0] <= 'Z' {
+							cands = nil
+						} else {
+							// Module-named files win; a single same-file
+							// candidate stays for inline modules (mod
+							// convert { fn str... } inside defs.rs), but a
+							// same-named set in one file is receiver
+							// ambiguity, not module scoping — drop it.
+							var inModule, sameFile []*core.SymbolRecord
+							for _, cand := range cands {
+								base := baseNameNoExt(cand.FilePath)
+								if base == qualifier || (base == "mod" && baseOf(dirOf(cand.FilePath)) == qualifier) {
+									inModule = append(inModule, cand)
+								} else if cand.FilePath == symbol.FilePath {
+									sameFile = append(sameFile, cand)
+								}
+							}
+							cands = inModule
+							if len(cands) == 0 && len(sameFile) == 1 {
+								cands = sameFile
 							}
 						}
 					}
@@ -1092,7 +1304,9 @@ func narrowByReceiver(cands []*core.SymbolRecord, caller *core.SymbolRecord, qua
 func filterByParent(cands []*core.SymbolRecord, parent string) []*core.SymbolRecord {
 	var out []*core.SymbolRecord
 	for _, cand := range cands {
-		if cand.Kind == core.KindMethod && cand.ParentSymbol == parent {
+		// Constructors count: Rust's Type::new is a constructor-kind
+		// method and must narrow by its parent like any other.
+		if (cand.Kind == core.KindMethod || cand.Kind == core.KindConstructor) && cand.ParentSymbol == parent {
 			out = append(out, cand)
 		}
 	}

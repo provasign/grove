@@ -245,6 +245,81 @@ Day-one findings, fixed same day:
 Residual gap: same-arity same-type-shape overload sets and erasure-vs-
 source attribution — Java's structural ceiling without full type binding.
 
+## Rust (rust-analyzer SCIP oracle)
+
+`grove-eval truth --lang rust` runs `rust-analyzer scip` over the cargo
+workspace and reads the index: function-kind definition occurrences (each
+carries its body span as `enclosing_range`) form the declaration universe,
+and every reference occurrence to an in-repo function inside another
+function's body becomes a caller→callee edge — calls, inferred method
+dispatch, and function-as-value references alike, the same "may affect"
+altitude as the Go VTA oracle. Macro-generated declarations (`rgtest!`-style
+test functions with no `fn` syntax at the definition site) are skipped like
+javap's synthetics. Symbol strings are NOT unique across targets of one
+package (the build-script crate's `main()` collides with the bin's), so
+caller identity always comes from the definition in the referencing file and
+multi-definition callees resolve same-file first or drop as ambiguous.
+
+Pin: ripgrep (multi-crate workspace with a facade crate, trait-generic
+searcher/matcher/printer pipeline, builder-convention APIs — and unit tests
+that live inside `#[cfg(test)] mod tests` blocks per Rust idiom).
+
+### Baseline (2026-06-12, calls edges)
+
+| Repo | Universe match | Precision | Recall | F1 |
+|---|---|---|---|---|
+| ripgrep (`82313cf`) | 99.4% | 0.8514 | 0.5967 | 0.7017 |
+
+Day-one progression (0.4422 → 0.7017), each step measured:
+
+| Fix | F1 |
+|---|---|
+| baseline (regex-era symbols, file-local scope) | 0.4422* |
+| astkit: descend inline `mod` blocks (universe 64.5% → 99.4%) + trait bodies | 0.2329 |
+| rustLocalTypes (params, lets, fields, generic bounds) + scoped-path qualifiers + Type::new constructor narrowing | 0.4790 |
+| crate-wide scope + workspace-crate `use` resolution + unknown-receiver drops | 0.5874 |
+| fan-out cap exemption (type evidence first) + builder-chain types + module-file narrowing | 0.6273 |
+| call-result receiver types (union, body-mention filtered) + impl_trait default-method routing | 0.6487 |
+| macro token-tree call recovery (assert!/write! bodies) + chain qualifiers through path calls | 0.7017 |
+
+*the 0.4422 number predates the universe fix: a third of the oracle's
+declarations (every unit test) were invisible, so it overstates quality.
+
+Day-one findings, all fixed same day:
+
+1. **Inline modules were invisible** — astkit never descended `mod_item`,
+   hiding every `#[cfg(test)] mod tests` function (592 of 2304 oracle
+   declarations on ripgrep). The same fix surfaced trait-body method
+   signatures, Rust's dispatch points.
+2. **Path-call qualifiers were dropped** — `Searcher::new` arrived as bare
+   `new` (the astkit v0.4.2 lesson, third edition). Constructor-kind
+   symbols also had to count in parent narrowing — Rust spells
+   constructors `Type::new`, and filterByParent only admitted methods.
+3. **Scope was file-local** — Rust visibility is crate-wide and `use`
+   paths cross crates; ripgrep's core reaches the printer only through a
+   facade crate's `pub use`, so crate scope closes transitively over
+   re-exports, with package-name → directory matching on the last
+   underscore token (grep_searcher lives in crates/searcher).
+4. **Macro arguments are token trees** — calls inside `assert_eq!`/
+   `write!` are not call-expression nodes, and idiomatic Rust tests make
+   most of their calls there. Recovered by scanning the token tree text
+   with string literals stripped.
+5. **Static typing makes unknowns meaningful** (the Java lesson, Rust
+   edition): an uppercase qualifier whose type owns no candidate is an
+   external type (`PathBuf::from`); a lowercase one with no inferred type
+   is a module path or an uninferable receiver — keep module-file matches
+   and single same-file candidates, drop the rest. Builder chains resolve
+   through return types: `.line_number(true).build()` narrows `build` by
+   `line_number`'s declared return, with candidates filtered to types the
+   caller's body actually mentions (word-boundary exact — `Searcher` must
+   not claim a body that only names `SearcherTester`).
+
+Residual gap: untyped flow the annotation surface can't see — match/loop
+bindings, iterator element types, `dyn Trait` lookups through collections
+(`flag.update()` via ripgrep's flag registry), and `?`-chained results.
+The same registry-dispatch territory as Python's ceiling, to revisit with
+measured variants rather than hope.
+
 ## Tests edges (runtime coverage oracle)
 
 `gen_truth.py --tests-out` also records which in-repo functions each test

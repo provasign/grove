@@ -33,6 +33,8 @@ func main() {
 		err = cmdScoreImpact(os.Args[2:])
 	case "run":
 		err = cmdRun(os.Args[2:])
+	case "universe":
+		err = cmdUniverse(os.Args[2:])
 	default:
 		usage()
 	}
@@ -50,6 +52,21 @@ func usage() {
 	os.Exit(2)
 }
 
+func cmdUniverse(args []string) error {
+	fs := flag.NewFlagSet("universe", flag.ExitOnError)
+	repo := fs.String("repo", "", "repository root")
+	truth := fs.String("truth", "", "truth JSONL path")
+	_ = fs.Parse(args)
+	if *repo == "" || *truth == "" {
+		return fmt.Errorf("universe: --repo and --truth are required")
+	}
+	_, edges, err := eval.ReadTruth(*truth)
+	if err != nil {
+		return err
+	}
+	return eval.UniverseReport(context.Background(), *repo, edges)
+}
+
 func truthEnv() []string {
 	// GOWORK=off keeps go.work files in parent directories from changing
 	// what the oracle type-checks.
@@ -61,7 +78,7 @@ func cmdTruth(args []string) error {
 	repo := fs.String("repo", "", "repository root")
 	out := fs.String("out", "", "output truth JSONL path")
 	commit := fs.String("commit", "", "commit SHA recorded in the header")
-	lang := fs.String("lang", "go", "oracle language: go (ssa+vta) or java (javac+javap)")
+	lang := fs.String("lang", "go", "oracle language: go (ssa+vta), java (javac+javap), or rust (rust-analyzer scip)")
 	includeTests := fs.Bool("include-tests", false, "include _test.go packages")
 	_ = fs.Parse(args)
 	if *repo == "" || *out == "" {
@@ -70,10 +87,14 @@ func cmdTruth(args []string) error {
 	var header eval.TruthFile
 	var edges []eval.TruthEdge
 	var err error
-	if *lang == "java" {
+	switch *lang {
+	case "java":
 		header, edges, err = eval.JavaCallTruth(*repo)
 		header.Commit = *commit
-	} else {
+	case "rust":
+		header, edges, err = eval.RustCallTruth(*repo)
+		header.Commit = *commit
+	default:
 		header, edges, err = generateTruth(*repo, *commit, *includeTests)
 	}
 	if err != nil {

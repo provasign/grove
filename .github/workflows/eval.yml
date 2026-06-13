@@ -117,6 +117,36 @@ jobs:
           name: ts-scorecards
           path: /tmp/eval-out/
 
+  rust-accuracy:
+    name: calls edges vs rust-analyzer-scip (ripgrep)
+    runs-on: ubuntu-latest
+    env:
+      RIPGREP_COMMIT: 82313cf
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            eval/go.sum
+      - name: Clone ripgrep at corpus pin
+        run: |
+          git clone --quiet https://github.com/BurntSushi/ripgrep.git /tmp/ripgrep
+          git -C /tmp/ripgrep checkout --quiet "$RIPGREP_COMMIT"
+      - name: Build grove-eval
+        working-directory: eval
+        run: go build -o /tmp/grove-eval ./cmd/grove-eval
+      - name: Score against snapshot baseline
+        run: /tmp/grove-eval score --repo /tmp/ripgrep --truth eval/testdata/ripgrep@$RIPGREP_COMMIT/calls-truth.jsonl.gz --out-dir /tmp/eval-out --baseline eval/baseline.json
+      - name: Upload scorecard
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-scorecard
+          path: /tmp/eval-out/
+
   java-accuracy:
     name: calls edges vs javac-javap (commons-lang)
     runs-on: ubuntu-latest
