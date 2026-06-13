@@ -1204,7 +1204,22 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 					continue
 				}
 				narrowed := narrowByReceiver(cands, &symbol, qualifier, selfVars)
-				if _, isSelf := selfVars[qualifier]; isSelf && classLanguage(symbol.Language) {
+				_, isSelf := selfVars[qualifier]
+				// Bare unqualified call in Java/C#/C++ is implicit this.method():
+				// member lookup binds it to the caller's own class first, so it
+				// must not fan out to every same-named method across unrelated
+				// classes. Narrow to own-class candidates when the own class
+				// declares the method; otherwise fall through to the inherited
+				// lookup below (ancestor) or, if neither, leave it (free function).
+				implicitSelf := qualifier == "" && symbol.ParentSymbol != "" &&
+					(symbol.Kind == core.KindMethod || symbol.Kind == core.KindConstructor) &&
+					implicitSelfLanguage(symbol.Language)
+				if implicitSelf {
+					if own := filterByParent(cands, symbol.ParentSymbol); len(own) > 0 {
+						narrowed = own
+					}
+				}
+				if (isSelf || implicitSelf) && classLanguage(symbol.Language) {
 					if len(filterByParent(narrowed, symbol.ParentSymbol)) == 0 {
 						// Not a method on the caller's own class: inheritance
 						// reaches files import scope never sees.
@@ -1336,6 +1351,15 @@ var astCallSiteLanguages = map[string]bool{
 // base-class parsers understand.
 func classLanguage(lang string) bool {
 	return lang == "python" || lang == "typescript" || lang == "javascript" || lang == "java" || lang == "csharp" || lang == "php" || lang == "cpp"
+}
+
+// implicitSelfLanguage reports whether a bare, unqualified call inside a method
+// is an implicit this.method() — member lookup binds it to the caller's own
+// class (or an ancestor) before any other scope. True for Java, C#, and C++.
+// Excludes PHP/Python/JS/TS, where a bare call() is a free function or local,
+// not self.method(), so narrowing it to the caller's class would be wrong.
+func implicitSelfLanguage(lang string) bool {
+	return lang == "java" || lang == "csharp" || lang == "cpp"
 }
 
 // callerSelfQualifiers returns the receiver spellings that mean "a method on

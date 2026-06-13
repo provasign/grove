@@ -29,8 +29,8 @@
   },
   "commons-lang": {
     "commit": "44298fe",
-    "precision": 0.6798,
-    "recall": 0.8413,
+    "precision": 0.6935,
+    "recall": 0.8387,
     "minUniverse": 0.96,
     "tolerance": 0.005
   },
@@ -43,7 +43,7 @@
   },
   "newtonsoft": {
     "commit": "0a2e291",
-    "precision": 0.6579,
+    "precision": 0.6617,
     "recall": 0.7021,
     "tolerance": 0.005,
     "minUniverse": 0.99
