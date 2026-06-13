@@ -93,7 +93,7 @@ func buildInterfaceSatisfaction(idx *edgeIndex, symbols []core.SymbolRecord) (*i
 			return
 		}
 		seen[key] = true
-		edges = append(edges, core.Edge{From: from, To: to, Type: t, Confidence: 0.75, Source: core.EvidenceSourceHeuristic})
+		edges = append(edges, core.Edge{From: from, To: to, Type: t, Confidence: 0.75, Source: core.EvidenceSourceHeuristic, Reason: core.ReasonMethodSet})
 	}
 
 	for i := range symbols {

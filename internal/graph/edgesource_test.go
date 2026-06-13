@@ -47,6 +47,9 @@ func TestBuildEdges_EverySourceTagged(t *testing.T) {
 		if e.Source == "" || e.Source == core.EvidenceSourceUnknown {
 			t.Errorf("edge %s %s→%s has unusable source %q", e.Type, e.From, e.To, e.Source)
 		}
+		if e.Reason == "" {
+			t.Errorf("edge %s %s→%s has no resolver reason", e.Type, e.From, e.To)
+		}
 	}
 	// Sanity: the fixture must actually exercise the main builders, otherwise
 	// the guard could pass vacuously.

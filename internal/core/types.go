@@ -85,6 +85,13 @@ type Edge struct {
 	Type       EdgeType       `json:"type"`
 	Confidence float64        `json:"confidence"`
 	Source     EvidenceSource `json:"source,omitempty"`
+	// Reason is the resolver mechanism that produced the edge — the "why".
+	// Source names the extraction layer (astkit/heuristic/regex/native);
+	// Reason names how the candidate set was resolved. Coarse today; the
+	// single-pipeline refactor (roadmap Wave 4) will split the ast-narrowed
+	// bucket into receiver-self / local-type / call-result / import-qualified /
+	// overload sub-reasons.
+	Reason EdgeReason `json:"reason,omitempty"`
 }
 
 type Status struct {
@@ -181,6 +188,26 @@ const (
 	EvidenceSourceHeuristic  EvidenceSource = "heuristic"
 	EvidenceSourceRegex      EvidenceSource = "regex"
 	EvidenceSourceUnknown    EvidenceSource = "unknown"
+)
+
+// EdgeReason names the resolver mechanism that produced an edge — the "why"
+// behind it, complementary to EvidenceSource (the extraction layer). Used by
+// false-positive scorecards (roadmap Sweep #6) to attribute FPs to a mechanism,
+// and by the future resolution pipeline (Wave 4) to explain each edge.
+type EdgeReason string
+
+const (
+	ReasonASTNarrowed  EdgeReason = "ast-narrowed"   // AST call site resolved by receiver/type/import narrowing
+	ReasonDispatch     EdgeReason = "dispatch"       // interface/dynamic dispatch rescue (reduced confidence)
+	ReasonConstructor  EdgeReason = "constructor"    // class-instantiation / super()/this() constructor edge
+	ReasonInheritance  EdgeReason = "inheritance"    // super.method()/inherited method on a base class
+	ReasonProperty     EdgeReason = "property"       // attribute/property read (AttrSite)
+	ReasonRegexFallbck EdgeReason = "regex-fallback" // body-scan fallback (non-AST-callsite languages)
+	ReasonStructural   EdgeReason = "structural"     // defines/contains/imports — structural projection
+	ReasonTypeRef      EdgeReason = "type-ref"       // uses-type / extends / implements by name resolution
+	ReasonTestEvidence EdgeReason = "test-evidence"  // tests edge (annotation/name/call-derived)
+	ReasonMethodSet    EdgeReason = "method-set"     // overrides/implements by method-set inclusion
+	ReasonDecorator    EdgeReason = "decorator"      // decorator/wrapper call edge
 )
 
 type EvidenceRef struct {
