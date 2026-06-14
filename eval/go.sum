@@ -20,6 +20,8 @@ github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 h1:Jamvg5psRI
 github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/provasign/astkit v0.4.15 h1:8Ah09W6vSoX3XAU0xB8IrHppPzZ9MleN7KWRYXb665U=
 github.com/provasign/astkit v0.4.15/go.mod h1:uSQxIxw3dVpK/6KmHvqIE8+DK/nhxDuPklKv7g96Jr4=
+github.com/provasign/astkit v0.4.16 h1:4LRzOXtiBgxSCvkA0FLwKisl/+biZurOAAxN5qiQ7bw=
+github.com/provasign/astkit v0.4.16/go.mod h1:uSQxIxw3dVpK/6KmHvqIE8+DK/nhxDuPklKv7g96Jr4=
 github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec h1:W09IVJc94icq4NjY3clb7Lk8O1qJ8BdBEF8z0ibU0rE=
 github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec/go.mod h1:qqbHyh8v60DhA7CoWK5oRCqLrMHRGoxYCSS9EjAz6Eo=
 github.com/scip-code/scip/bindings/go/scip v0.8.1 h1:ZkyT9RDgkbd6ffvMbi9nYdwh7+gLoz8Z9ftFMxgUiVs=

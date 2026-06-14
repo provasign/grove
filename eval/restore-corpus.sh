@@ -23,6 +23,7 @@ ripgrep|https://github.com/BurntSushi/ripgrep.git|82313cf
 newtonsoft|https://github.com/JamesNK/Newtonsoft.Json.git|0a2e291
 php-parser|https://github.com/nikic/PHP-Parser.git|8eea230
 jansson|https://github.com/akheron/jansson.git|684e18c
+commons-lang|https://github.com/apache/commons-lang.git|44298fe
 "
 
 while IFS='|' read -r name url pin; do

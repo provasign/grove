@@ -30,7 +30,7 @@
   "commons-lang": {
     "commit": "44298fe",
     "precision": 0.6935,
-    "recall": 0.8387,
+    "recall": 0.8479,
     "minUniverse": 0.96,
     "tolerance": 0.005
   },
