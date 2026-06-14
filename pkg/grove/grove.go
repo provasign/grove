@@ -26,6 +26,8 @@ import (
 // mirroring shapes.
 type (
 	Symbol               = core.SymbolRecord
+	Reference            = parser.Reference
+	ReferenceResult      = parser.ReferenceResult
 	Edge                 = core.Edge
 	EdgeType             = core.EdgeType
 	IndexResult          = core.IndexResult
@@ -246,6 +248,18 @@ func (e *Engine) Impact(ctx context.Context, query string, maxDepth int) ([]Symb
 // Tests returns the test symbols that cover the given symbol/file query.
 func (e *Engine) Tests(ctx context.Context, query string) ([]Symbol, error) {
 	return e.currentGraph().TestsFor(query), nil
+}
+
+// References answers "where is NAME used?" by scanning code occurrences of the
+// name (comments/strings excluded), each attributed to its enclosing symbol.
+// Unlike Impact (which walks the resolved call graph), this is the resolution-
+// free reference layer: near-complete for types/classes/constants that calls
+// edges never capture. ReferenceResult.Ambiguous reports whether several
+// definitions share the name. Catches syntactic references only — reflection /
+// dynamic usage is invisible, so "no references" is best-effort, not proof of
+// dead code.
+func (e *Engine) References(ctx context.Context, name string) (ReferenceResult, error) {
+	return parser.NewEngine().References(e.Root(), name)
 }
 
 // TestsWithEvidence returns the covering tests plus the per-reason counts of
