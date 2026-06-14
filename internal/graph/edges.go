@@ -1204,6 +1204,12 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 					continue
 				}
 				narrowed := narrowByReceiver(cands, &symbol, qualifier, selfVars)
+				// resolvedByType records that the receiver's type was known and
+				// used to pin (or precisely drop) the targets — in which case the
+				// blanket dispatch rescue below must NOT also fire, or it floods a
+				// precisely-resolved interface call (x.Get on a SecretsKVStore)
+				// with every same-named method across the repo.
+				resolvedByType := false
 				_, isSelf := selfVars[qualifier]
 				// Bare unqualified call in Java/C#/C++ is implicit this.method():
 				// member lookup binds it to the caller's own class first, so it
@@ -1236,6 +1242,10 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 					// the receiver variable, then import qualification.
 					kept, dispatch, decided := narrowByLocalType(idx, sat, localTypes, qualifier, calleeName, cands, scope)
 					if decided {
+						// The receiver type was known: this call site is resolved
+						// (to kept, to dispatch implementors, or to nothing). Mark
+						// it so the blanket dispatch rescue below stays out.
+						resolvedByType = true
 						narrowed = kept
 						for _, m := range dispatch {
 							if m.ID != symbol.ID {
@@ -1288,7 +1298,7 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 				// Fan-out the cap dropped is legitimate dynamic dispatch when an
 				// in-scope interface declares the method: emit edges to its
 				// implementations at reduced confidence.
-				if capped && sat != nil {
+				if capped && !resolvedByType && sat != nil {
 					for _, m := range sat.dispatchTargets(calleeName, scope) {
 						if m.ID != symbol.ID {
 							addEdge(symbol.ID, m.ID, 0.7, core.EvidenceSourceHeuristic, core.ReasonDispatch)

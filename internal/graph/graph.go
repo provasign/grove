@@ -335,6 +335,79 @@ func (g *CodeGraph) Deps(filePath string) []core.Edge {
 	return deps
 }
 
+// Neighbor is a symbol reached from a seed by exactly one typed edge.
+type Neighbor struct {
+	Symbol     core.SymbolRecord
+	EdgeType   core.EdgeType
+	Direction  string // "out" = seed→symbol (callee, uses-type); "in" = symbol→seed (caller, test)
+	Confidence float64
+}
+
+// Neighbors returns the seed symbol's direct typed neighbors — one graph hop,
+// edge types preserved (unlike Impact, which flattens the blast radius). This is
+// what lets a caller ask precisely for "what does X call" (direction "out",
+// kind calls), "who calls X" (direction "in", kind calls), or "what tests X"
+// (direction "in", kind tests) instead of a relevance-ranked blob.
+//
+// direction is "out", "in", or "both"/"". kinds filters by edge type; an empty
+// set returns every kind. Seeds are matched by exact name / qualified name / ID.
+func (g *CodeGraph) Neighbors(query, direction string, kinds map[core.EdgeType]bool) []Neighbor {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	if strings.TrimSpace(query) == "" {
+		return nil
+	}
+	seeds := make(map[string]bool)
+	for id, s := range g.symbols {
+		if strings.EqualFold(s.Name, query) ||
+			strings.EqualFold(s.QualifiedName, query) ||
+			strings.EqualFold(s.ID, query) {
+			seeds[id] = true
+		}
+	}
+	if len(seeds) == 0 {
+		return nil
+	}
+	wantKind := func(t core.EdgeType) bool { return len(kinds) == 0 || kinds[t] }
+	if direction == "" {
+		direction = "both"
+	}
+
+	var out []Neighbor
+	seen := make(map[string]bool)
+	add := func(neighborID string, t core.EdgeType, dir string, conf float64) {
+		sym, ok := g.symbols[neighborID]
+		if !ok { // skip file: nodes and unresolved targets
+			return
+		}
+		key := neighborID + "|" + string(t) + "|" + dir
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		out = append(out, Neighbor{Symbol: sym, EdgeType: t, Direction: dir, Confidence: conf})
+	}
+
+	if direction == "out" || direction == "both" {
+		for _, e := range g.edges {
+			if seeds[e.From] && wantKind(e.Type) {
+				add(e.To, e.Type, "out", e.Confidence)
+			}
+		}
+	}
+	if direction == "in" || direction == "both" {
+		for seedID := range seeds {
+			for _, idx := range g.inbound[seedID] {
+				if e := g.edges[idx]; wantKind(e.Type) {
+					add(e.From, e.Type, "in", e.Confidence)
+				}
+			}
+		}
+	}
+	return out
+}
+
 // Impact returns all symbols reachable from the seed (identified by query)
 // by traversing inbound edges up to maxDepth.
 // "Inbound" means: things that call, test, or contain the seed symbol —

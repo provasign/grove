@@ -47,6 +47,20 @@ type (
 	}
 )
 
+// Edge-type constants re-exported so consumers can filter Neighbors() without
+// importing internal/core.
+const (
+	EdgeDefines    = core.EdgeDefines
+	EdgeImports    = core.EdgeImports
+	EdgeCalls      = core.EdgeCalls
+	EdgeExtends    = core.EdgeExtends
+	EdgeImplements = core.EdgeImplements
+	EdgeUsesType   = core.EdgeUsesType
+	EdgeTests      = core.EdgeTests
+	EdgeContains   = core.EdgeContains
+	EdgeOverrides  = core.EdgeOverrides
+)
+
 // Config controls how Engine opens a repository's Grove index.
 type Config struct {
 	// RepoRoot is the absolute path to the repository whose .grove/ directory
@@ -243,6 +257,36 @@ func (e *Engine) Deps(ctx context.Context, filePath string) ([]Edge, error) {
 // Impact returns the blast radius for a symbol/file query.
 func (e *Engine) Impact(ctx context.Context, query string, maxDepth int) ([]Symbol, error) {
 	return e.currentGraph().Impact(query, maxDepth), nil
+}
+
+// Neighbor is a symbol reached from a seed by one typed edge.
+type Neighbor struct {
+	Symbol     Symbol
+	EdgeType   EdgeType
+	Direction  string // "out" = seed→symbol; "in" = symbol→seed
+	Confidence float64
+}
+
+// Neighbors returns a symbol's direct typed neighbors with edge types preserved
+// — the precise "what does X call / who calls X / what tests X" answer, as
+// opposed to Impact's flattened, type-erased blast radius. direction is "out",
+// "in", or "both"; kinds filters by edge type (empty = all).
+func (e *Engine) Neighbors(ctx context.Context, query, direction string, kinds ...EdgeType) ([]Neighbor, error) {
+	kindSet := make(map[core.EdgeType]bool, len(kinds))
+	for _, k := range kinds {
+		kindSet[k] = true
+	}
+	raw := e.currentGraph().Neighbors(query, direction, kindSet)
+	out := make([]Neighbor, 0, len(raw))
+	for _, n := range raw {
+		out = append(out, Neighbor{
+			Symbol:     n.Symbol,
+			EdgeType:   n.EdgeType,
+			Direction:  n.Direction,
+			Confidence: n.Confidence,
+		})
+	}
+	return out, nil
 }
 
 // Tests returns the test symbols that cover the given symbol/file query.
