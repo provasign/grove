@@ -1,10 +1,13 @@
 package parser
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 
 	"github.com/provasign/astkit"
 	"github.com/provasign/grove/internal/core"
@@ -44,48 +47,117 @@ var referenceNodeTypes = map[string]bool{
 // excluded, unlike textual grep) and attributes each occurrence to its nearest
 // enclosing symbol. It deliberately does NOT resolve which overload/definition
 // a reference binds to — it reports completeness with an ambiguity flag.
+//
+// `name` may be a bare name ("ValidateToken") or a qualified one
+// ("auth.Service.ValidateToken", "pkg::Type::method") — references position is
+// always the bare leaf identifier, so the qualifier is stripped to the last
+// segment before matching. A byte-level substring pre-filter skips files that
+// cannot contain the name without parsing them, which is what keeps the query
+// fast on large trees (only the handful of files mentioning the name are
+// parsed, not the whole repo).
 func (e *Engine) References(root, name string) (ReferenceResult, error) {
 	res := ReferenceResult{Name: name}
-	eng := astkit.NewEngine()
+	leaf := leafName(name)
+	leafBytes := []byte(leaf)
+
+	// Phase 1 (serial walk): collect candidate files, skipping dependency/
+	// cache/VCS dirs so references report the user's code, not vendored or
+	// downloaded sources (matches the indexer's ignore policy).
+	type task struct {
+		abs, rel string
+		lang     astkit.LanguageKey
+	}
+	var tasks []task
 	err := filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil
 		}
 		if info.IsDir() {
-			// Skip dependency/cache/VCS dirs so references report the user's
-			// code, not vendored or downloaded sources (matches the indexer's
-			// ignore policy). Without this a Go-module cache or node_modules
-			// would dominate both the result set and the query time.
 			if p != root && refSkipDir(info.Name()) {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		lang, ok := detectRefLang(p)
-		if !ok {
-			return nil
+		if lang, ok := detectRefLang(p); ok {
+			tasks = append(tasks, task{abs: p, rel: relPath(root, p), lang: lang})
 		}
-		src, rerr := os.ReadFile(p)
-		if rerr != nil {
-			return nil
-		}
-		// Definitions in this file named `name`, and symbol spans for enclosing.
-		syms, _ := e.ExtractFile(p, root)
-		for i := range syms {
-			if syms[i].Name == name {
-				res.DefCount++
-			}
-		}
-		tree, perr := eng.Parse(context.Background(), lang, src)
-		if perr != nil || tree == nil {
-			return nil
-		}
-		rel := relPath(root, p)
-		walkRefs(tree.RootNode(), src, name, rel, syms, &res.Refs)
 		return nil
 	})
+
+	// Phase 2 (parallel): read + parse the candidate files. Most files don't
+	// mention the name, so a byte-level substring pre-filter skips parsing them
+	// entirely; the remainder are parsed concurrently (astkit engines are safe
+	// for concurrent use, as the indexer relies on). Outcomes land by index so
+	// the merge below stays in deterministic walk order.
+	type outcome struct {
+		refs []Reference
+		defs int
+	}
+	outcomes := make([]outcome, len(tasks))
+	if len(tasks) > 0 {
+		workers := runtime.GOMAXPROCS(0)
+		if workers > 8 {
+			workers = 8
+		}
+		if workers > len(tasks) {
+			workers = len(tasks)
+		}
+		taskCh := make(chan int)
+		var wg sync.WaitGroup
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				eng := astkit.NewEngine()
+				for idx := range taskCh {
+					t := tasks[idx]
+					src, rerr := os.ReadFile(t.abs)
+					if rerr != nil || !bytes.Contains(src, leafBytes) {
+						continue
+					}
+					// Definitions named `leaf` here, and spans for enclosing.
+					syms, _ := e.ExtractFile(t.abs, root)
+					defs := 0
+					for i := range syms {
+						if syms[i].Name == leaf {
+							defs++
+						}
+					}
+					tree, perr := eng.Parse(context.Background(), t.lang, src)
+					if perr != nil || tree == nil {
+						outcomes[idx] = outcome{defs: defs}
+						continue
+					}
+					var refs []Reference
+					walkRefs(tree.RootNode(), src, leaf, t.rel, syms, &refs)
+					outcomes[idx] = outcome{refs: refs, defs: defs}
+				}
+			}()
+		}
+		for idx := range tasks {
+			taskCh <- idx
+		}
+		close(taskCh)
+		wg.Wait()
+	}
+
+	for _, o := range outcomes {
+		res.DefCount += o.defs
+		res.Refs = append(res.Refs, o.refs...)
+	}
 	res.Ambiguous = res.DefCount > 1
 	return res, err
+}
+
+// leafName strips a qualifier to the bare identifier that appears in reference
+// position: "auth.Service.ValidateToken" -> "ValidateToken",
+// "pkg::Type::method" -> "method". A trailing separator or an already-bare name
+// is returned unchanged.
+func leafName(name string) string {
+	if i := strings.LastIndexAny(name, ".:#\\/"); i >= 0 && i+1 < len(name) {
+		return name[i+1:]
+	}
+	return name
 }
 
 func walkRefs(n *sitter.Node, src []byte, name, file string, syms []core.SymbolRecord, out *[]Reference) {

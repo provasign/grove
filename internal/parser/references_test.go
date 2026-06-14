@@ -75,6 +75,29 @@ func TestReferences_SkipsVendorAndCacheDirs(t *testing.T) {
 	}
 }
 
+func TestReferences_QualifiedNameMatchesLeaf(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "svc.go"), []byte(
+		"package p\n\ntype Service struct{}\n\nfunc (Service) ValidateToken(s string) bool { return s != \"\" }\n\nfunc use(s Service) { _ = s.ValidateToken(\"x\"); _ = s.ValidateToken(\"y\") }\n"),
+		0o644)
+
+	bare, err := NewEngine().References(dir, "ValidateToken")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A qualified input must resolve to the same bare-leaf references, not zero.
+	qual, err := NewEngine().References(dir, "auth.Service.ValidateToken")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(qual.Refs) == 0 {
+		t.Fatalf("qualified name returned 0 references (regression: qualifier not stripped)")
+	}
+	if len(qual.Refs) != len(bare.Refs) {
+		t.Fatalf("qualified (%d) and bare (%d) reference counts differ", len(qual.Refs), len(bare.Refs))
+	}
+}
+
 func TestReferences_ExcludesCommentsAndStrings(t *testing.T) {
 	dir := t.TempDir()
 	// "Nowhere" appears only in a comment and a string — zero code references.
