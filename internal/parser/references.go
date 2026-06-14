@@ -48,7 +48,17 @@ func (e *Engine) References(root, name string) (ReferenceResult, error) {
 	res := ReferenceResult{Name: name}
 	eng := astkit.NewEngine()
 	err := filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() {
+		if err != nil {
+			return nil
+		}
+		if info.IsDir() {
+			// Skip dependency/cache/VCS dirs so references report the user's
+			// code, not vendored or downloaded sources (matches the indexer's
+			// ignore policy). Without this a Go-module cache or node_modules
+			// would dominate both the result set and the query time.
+			if p != root && refSkipDir(info.Name()) {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		lang, ok := detectRefLang(p)
@@ -104,6 +114,21 @@ func enclosingSymbol(syms []core.SymbolRecord, line int) string {
 		}
 	}
 	return best
+}
+
+// refSkipDir mirrors the indexer's shouldSkipDirName policy (internal/index/
+// ignore.go) so References walks the same file set the index does. Kept as a
+// local copy rather than an import to avoid an internal/index ↔ internal/parser
+// dependency.
+func refSkipDir(name string) bool {
+	switch name {
+	case ".git", ".grove", ".cache", ".venv", ".tox", ".next", ".idea",
+		"node_modules", "vendor", "dist", "bin", "__pycache__", "target",
+		"coverage", ".pytest_cache", ".mypy_cache", ".ruff_cache":
+		return true
+	default:
+		return false
+	}
 }
 
 func detectRefLang(path string) (astkit.LanguageKey, bool) {

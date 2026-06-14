@@ -43,6 +43,38 @@ func TestReferences_FindsTypeUsesAcrossFiles(t *testing.T) {
 	}
 }
 
+func TestReferences_SkipsVendorAndCacheDirs(t *testing.T) {
+	dir := t.TempDir()
+	mk := func(rel, content string) {
+		p := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// One real use in the user's code; the rest are in dirs the indexer ignores
+	// and must NOT be reported (they'd be vendored/downloaded noise).
+	mk("app.go", "package p\n\nfunc run() { var x Widget; _ = x }\n")
+	mk("vendor/lib.go", "package lib\n\ntype Widget struct{}\n")
+	mk("node_modules/pkg/m.go", "package m\n\nvar Widget = 1\n")
+	mk(".cache/home/go/pkg/mod/dep/d.go", "package d\n\ntype Widget struct{}\n")
+
+	res, err := NewEngine().References(dir, "Widget")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range res.Refs {
+		if r.File != "app.go" {
+			t.Errorf("reference from ignored dir leaked into results: %s:%d", r.File, r.Line)
+		}
+	}
+	if len(res.Refs) != 1 {
+		t.Fatalf("expected exactly 1 reference (app.go), got %d (%+v)", len(res.Refs), res.Refs)
+	}
+}
+
 func TestReferences_ExcludesCommentsAndStrings(t *testing.T) {
 	dir := t.TempDir()
 	// "Nowhere" appears only in a comment and a string — zero code references.
