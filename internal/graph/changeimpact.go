@@ -94,7 +94,7 @@ func (g *CodeGraph) ChangeImpact(query string) (*ChangeImpactResult, error) {
 	// 2. Declaration(s): methods named methodName contained in the named type,
 	// filtered by the query's parameter list when one was given.
 	decls := g.containedMethods(typeIDs, methodName)
-	if len(queryParams) > 0 {
+	if len(queryParams) > 0 && len(decls) > 0 {
 		if byParams := filterByParamTypes(decls, queryParams); len(byParams) > 0 {
 			decls = byParams
 		} else {
@@ -102,15 +102,21 @@ func (g *CodeGraph) ChangeImpact(query string) (*ChangeImpactResult, error) {
 				typeName, methodName, strings.Join(queryParams, ", "))
 		}
 	}
-	if len(decls) == 0 {
-		return nil, fmt.Errorf("change-impact: type %q declares no method %q", typeName, methodName)
-	}
+	// decls may be empty even though the type is indexed: TS and Go interface
+	// member signatures are not parsed as symbols. Proceed — the subtype
+	// closure below still yields the implementation family, which roots the
+	// change-set (validated after the closure walk).
 
 	// The declaration's signature anchors family compatibility. Type
 	// parameters of the declaring type (and single-letter placeholders) are
-	// wildcards: an override binds them to concrete types.
-	declParams := paramTypesOf(&decls[0])
-	wildcards := typeParamWildcards(g.symbols, &decls[0])
+	// wildcards: an override binds them to concrete types. With no indexed
+	// declaration, the query's own parameter list (possibly nil) anchors.
+	declParams := queryParams
+	wildcards := map[string]bool{}
+	if len(decls) > 0 {
+		declParams = paramTypesOf(&decls[0])
+		wildcards = typeParamWildcards(g.symbols, &decls[0])
+	}
 
 	// 3. Subtype closure (downward): inbound extends/implements edges.
 	closure := make(map[string]bool, len(typeIDs))
@@ -151,6 +157,9 @@ func (g *CodeGraph) ChangeImpact(query string) (*ChangeImpactResult, error) {
 		if signatureCompatible(declParams, paramTypesOf(&m), wildcards) {
 			family = append(family, m)
 		}
+	}
+	if len(decls) == 0 && len(family) == 0 {
+		return nil, fmt.Errorf("change-impact: type %q declares no method %q and no subtype implements it", typeName, methodName)
 	}
 
 	// 5. Supers (upward, informational): same-signature declarations on
