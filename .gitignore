@@ -39,3 +39,4 @@ node_modules
 eval/cstruth/bin/
 eval/cstruth/obj/
 /.cache/
+/eval/grove-eval
