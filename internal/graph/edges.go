@@ -1,6 +1,7 @@
 package graph
 
 import (
+	"path"
 	"regexp"
 	"strings"
 
@@ -585,7 +586,14 @@ func buildContains(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
 		}
 		for _, parent := range idx.byName[strings.ToLower(symbol.ParentSymbol)] {
 			if parent.FilePath != symbol.FilePath {
-				continue
+				// Go receiver methods attach to their type across files:
+				// `func (s *T) M()` may live in any file of T's package.
+				// Same directory ≈ same package (Go enforces one package
+				// per directory).
+				if symbol.Language != "go" || parent.Language != "go" ||
+					path.Dir(parent.FilePath) != path.Dir(symbol.FilePath) {
+					continue
+				}
 			}
 			if parent.Kind != core.KindStruct && parent.Kind != core.KindClass &&
 				parent.Kind != core.KindInterface && parent.Kind != core.KindTrait {

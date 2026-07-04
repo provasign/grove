@@ -144,3 +144,29 @@ func symNames(ss []core.SymbolRecord) []string {
 	}
 	return out
 }
+
+// Go receiver methods live in any file of the type's package — the contains
+// edge must resolve cross-file within the same directory.
+func TestGoCrossFileMethodContains(t *testing.T) {
+	g := New()
+	g.Replace([]core.SymbolRecord{
+		{ID: "pkg/store/store.go::SQLStore@sha", FilePath: "pkg/store/store.go", Language: "go", Kind: core.KindStruct,
+			Name: "SQLStore", QualifiedName: "SQLStore", RawText: "type SQLStore struct { db *DB }"},
+		{ID: "pkg/store/tx.go::SQLStore.WithTx@sha", FilePath: "pkg/store/tx.go", Language: "go", Kind: core.KindMethod,
+			Name: "WithTx", QualifiedName: "SQLStore.WithTx", ParentSymbol: "SQLStore",
+			Signature: "func (ss *SQLStore) WithTx(ctx context.Context) error"},
+		// Same-named type in a DIFFERENT package must not capture the method.
+		{ID: "pkg/other/store.go::SQLStore@sha", FilePath: "pkg/other/store.go", Language: "go", Kind: core.KindStruct,
+			Name: "SQLStore", QualifiedName: "SQLStore", RawText: "type SQLStore struct{}"},
+	}, 3)
+	r, err := g.ChangeImpact("SQLStore.WithTx")
+	if err != nil {
+		t.Fatalf("cross-file Go method not resolved: %v", err)
+	}
+	if len(r.Declarations) != 1 || r.Declarations[0].FilePath != "pkg/store/tx.go" {
+		t.Fatalf("declarations = %v", symNames(r.Declarations))
+	}
+	if hasEdge(g, core.EdgeContains, "pkg/other/store.go::SQLStore@sha", "pkg/store/tx.go::SQLStore.WithTx@sha") {
+		t.Fatalf("cross-package contains edge must not exist")
+	}
+}
