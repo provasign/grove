@@ -49,6 +49,8 @@ func Run(args []string) int {
 		return deps(engine, codeGraph, args[1:])
 	case "impact":
 		return impact(engine, codeGraph, args[1:])
+	case "change-impact":
+		return changeImpact(engine, codeGraph, args[1:])
 	case "tests":
 		return tests(engine, codeGraph, args[1:])
 	case "icr":
@@ -262,6 +264,33 @@ func impact(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) in
 		return 1
 	}
 	return printJSON(map[string]any{"nodes": codeGraph.Impact(query, 3)})
+}
+
+// changeImpact prints the type-resolved change-set for a method signature
+// change: declaration, override/implementation family, super-declarations,
+// and resolved callers — the task-shaped alternative to name-seeded impact.
+func changeImpact(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int {
+	args, refresh := stripRefresh(args)
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: grove change-impact 'Type.method' | 'Type.method(ParamType, ...)' [dir] [--refresh]")
+		return 2
+	}
+	query := args[0]
+	cfg, err := config.Resolve(argOrDefault(args, 1, "."))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	if err := prepareReadGraph(engine, codeGraph, cfg.Root, refresh); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	result, err := codeGraph.ChangeImpact(query)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	return printJSON(result)
 }
 
 func tests(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int {
@@ -581,6 +610,7 @@ Usage:
   grove query <intent> [dir] [--refresh]         semantic search (Model2Vec embeddings)
   grove deps <file> [dir] [--refresh]
   grove impact <symbol-or-file-query> [dir] [--refresh]
+  grove change-impact <Type.method(Params)> [dir]   type-resolved change-set: declaration + override family + callers
   grove tests <file> [dir] [--refresh]
   grove icr <intent> [dir] [--refresh]
   grove certify <diff-file-or-> [dir]

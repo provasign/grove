@@ -31,6 +31,25 @@ func TestImplementsEdgeJava(t *testing.T) {
 	}
 }
 
+// Generic bounds must not emit bogus extends edges, and generic arguments in
+// the extends clause must still resolve to the base class (jackson style:
+// `class ValueSer<T extends Number> extends JsonSerializer<T>`).
+func TestExtendsEdgeJavaGenerics(t *testing.T) {
+	g := New()
+	g.Replace([]core.SymbolRecord{
+		{ID: "a.java::JsonSerializer@sha", FilePath: "a.java", Language: "java", Kind: core.KindClass, Name: "JsonSerializer", QualifiedName: "JsonSerializer"},
+		{ID: "a.java::Number@sha", FilePath: "a.java", Language: "java", Kind: core.KindClass, Name: "Number", QualifiedName: "Number"},
+		{ID: "a.java::ValueSer@sha", FilePath: "a.java", Language: "java", Kind: core.KindClass, Name: "ValueSer", QualifiedName: "ValueSer",
+			Signature: "public class ValueSer<T extends Number> extends JsonSerializer<T>"},
+	}, 1)
+	if !hasEdge(g, core.EdgeExtends, "a.java::ValueSer@sha", "a.java::JsonSerializer@sha") {
+		t.Fatalf("missing extends edge ValueSer→JsonSerializer through generics")
+	}
+	if hasEdge(g, core.EdgeExtends, "a.java::ValueSer@sha", "a.java::Number@sha") {
+		t.Fatalf("generic bound `T extends Number` must not emit an extends edge")
+	}
+}
+
 func TestPythonClassBaseExtends(t *testing.T) {
 	g := New()
 	g.Replace([]core.SymbolRecord{

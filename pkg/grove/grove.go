@@ -259,6 +259,52 @@ func (e *Engine) Impact(ctx context.Context, query string, maxDepth int) ([]Symb
 	return e.currentGraph().Impact(query, maxDepth), nil
 }
 
+// ChangeImpactResult is the deterministic change-set for a method signature
+// change: declaration(s), the override/implementation family in the subtype
+// closure, super-declarations up the hierarchy, and every method with a
+// resolved call edge into the set. Computed in the engine so no agent has to
+// orchestrate references → overrides → callers over primitives.
+type ChangeImpactResult struct {
+	Query        string
+	Declarations []Symbol
+	Supers       []Symbol
+	Family       []Symbol
+	Callers      []Symbol
+}
+
+// Sites returns the full change-set (declarations ∪ family ∪ callers) as one
+// deduplicated, file-ordered list.
+func (r ChangeImpactResult) Sites() []Symbol {
+	seen := make(map[string]bool)
+	var out []Symbol
+	for _, group := range [][]Symbol{r.Declarations, r.Family, r.Callers} {
+		for _, s := range group {
+			if !seen[s.ID] {
+				seen[s.ID] = true
+				out = append(out, s)
+			}
+		}
+	}
+	return out
+}
+
+// ChangeImpact resolves a "Type.method" or "Type.method(ParamType, ...)"
+// query to the exact change-set for that method's signature — type-resolved
+// seeding, not name-substring seeding (contrast Impact).
+func (e *Engine) ChangeImpact(ctx context.Context, query string) (ChangeImpactResult, error) {
+	raw, err := e.currentGraph().ChangeImpact(query)
+	if err != nil {
+		return ChangeImpactResult{}, err
+	}
+	return ChangeImpactResult{
+		Query:        raw.Query,
+		Declarations: raw.Declarations,
+		Supers:       raw.Supers,
+		Family:       raw.Family,
+		Callers:      raw.Callers,
+	}, nil
+}
+
 // Neighbor is a symbol reached from a seed by one typed edge.
 type Neighbor struct {
 	Symbol     Symbol

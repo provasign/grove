@@ -302,6 +302,25 @@ func (idx *edgeIndex) importedFiles(fromFile string) map[string]struct{} {
 		impNorm = strings.TrimSuffix(impNorm, ".java")
 		impNorm = strings.TrimSuffix(impNorm, ".rs")
 
+		// Java wildcard import: `import com.example.util.*;` names a package,
+		// not a class. The package path is a *suffix* of the repo-relative
+		// source dir (src/main/java/com/example/util), so the equality-keyed
+		// suffix loop below can never match it — resolve by reverse suffix
+		// lookup instead: candidate dirs sharing the package's last segment,
+		// kept when the dir ends with the full package path. Without this the
+		// import resolves to nothing (its last segment is "*") and every
+		// cross-package callee behind it is silently out of scope.
+		if lang == "java" && strings.HasSuffix(impNorm, ".*") {
+			pkgPath := strings.ReplaceAll(strings.TrimSuffix(impNorm, ".*"), ".", "/")
+			for _, f := range idx.dirFilesByBase[baseOf(pkgPath)] {
+				d := strings.ToLower(dirOf(f))
+				if (d == pkgPath || strings.HasSuffix(d, "/"+pkgPath)) && f != fromFile {
+					out[f] = struct{}{}
+				}
+			}
+			continue
+		}
+
 		// Last path segment of the import (e.g., "lodash/fp" → "fp",
 		// "./auth" → "auth", "fmt" → "fmt", "com.example.Auth" → "Auth").
 		seg := lastImportSegment(imp)
@@ -595,6 +614,31 @@ var (
 	usesTypeIdent   = regexp.MustCompile(`\b([A-Z][A-Za-z0-9_]+)\b`)
 )
 
+// stripAngleBrackets removes balanced `<...>` sections (including nested
+// generics like `Map<String, List<T>>`) so type arguments and bounds do not
+// leak into name-list parsing.
+func stripAngleBrackets(s string) string {
+	var b strings.Builder
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '<':
+			depth++
+		case '>':
+			if depth > 0 {
+				depth--
+			} else {
+				b.WriteByte(s[i])
+			}
+		default:
+			if depth == 0 {
+				b.WriteByte(s[i])
+			}
+		}
+	}
+	return b.String()
+}
+
 // buildExtendsImplements emits inheritance edges. It reads the symbol's
 // Signature (and RawText for Python/Rust where the signature is sparse) to
 // detect parent classes, implemented interfaces, and trait impls.
@@ -610,6 +654,10 @@ func buildExtendsImplements(idx *edgeIndex, symbols []core.SymbolRecord) []core.
 			if text == "" {
 				text = firstLine(symbol.RawText)
 			}
+			// Drop balanced <...> sections so generic arguments and bounds
+			// (`class Foo<T extends Bar> extends Baz<Qux>`) neither confuse
+			// the extends regex nor emit bogus edges to type parameters.
+			text = stripAngleBrackets(text)
 			for _, name := range matchNameList(extendsRe, text) {
 				edges = append(edges, resolveTypeEdges(idx, symbol, name, core.EdgeExtends, 0.85)...)
 			}
@@ -852,10 +900,15 @@ var callIdentRe = regexp.MustCompile(`([A-Za-z_$][A-Za-z0-9_$]*)\s*\(`)
 const maxCalleeFanout = 16
 
 // resolveCallees resolves a bare callee name within symbol's import scope.
-// A same-file match wins outright: in every supported language a local
-// definition shadows imported ones. Cross-file matches are returned only
-// when unambiguous enough to be meaningful.
-func resolveCallees(idx *edgeIndex, symbol *core.SymbolRecord, calleeName string, scope map[string]struct{}, exactCase bool) ([]*core.SymbolRecord, bool) {
+// A same-file match wins outright (unless sameFileWins is false): in every
+// supported language a local definition shadows imported ones for BARE calls.
+// For a call through an explicit typed receiver that shadowing is wrong —
+// `serializer.serialize(...)` inside IndexedListSerializer.java must reach
+// JsonSerializer.serialize even though the file declares its own serialize
+// override — so callers pass sameFileWins=false when a non-self qualifier is
+// present and type narrowing will pin the target. Cross-file matches are
+// returned only when unambiguous enough to be meaningful.
+func resolveCallees(idx *edgeIndex, symbol *core.SymbolRecord, calleeName string, scope map[string]struct{}, exactCase bool, sameFileWins bool) ([]*core.SymbolRecord, bool) {
 	var sameFile, crossFile []*core.SymbolRecord
 	for _, cand := range idx.byName[strings.ToLower(calleeName)] {
 		if cand.ID == symbol.ID {
@@ -876,9 +929,10 @@ func resolveCallees(idx *edgeIndex, symbol *core.SymbolRecord, calleeName string
 			crossFile = append(crossFile, cand)
 		}
 	}
-	if len(sameFile) > 0 {
+	if len(sameFile) > 0 && sameFileWins {
 		return sameFile, false
 	}
+	crossFile = append(crossFile, sameFile...)
 	if len(crossFile) > maxCalleeFanout {
 		// Over the fan-out cap — but narrowing may still pin these down, so
 		// return them with the flag; the caller caps AFTER narrowing.
@@ -994,7 +1048,20 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 				// AST-extracted names are exact by construction: case-insensitive
 				// matching here let "writeContentType" (free function) claim every
 				// type's "WriteContentType" method.
-				cands, capped := resolveCallees(idx, &symbol, calleeName, scope, true)
+				//
+				// Same-file shadowing applies to bare calls only. A Java call
+				// through an explicit non-self receiver binds by the receiver's
+				// type, not the enclosing file — a file that overrides serialize
+				// still calls OTHER types' serialize through typed receivers,
+				// and the typed-receiver narrowing below pins (or precisely
+				// drops) the widened candidate set.
+				sameFileWins := true
+				if symbol.Language == "java" && qualifier != "" && qualifier != "this" && qualifier != "super" {
+					if _, isSelf := selfVars[qualifier]; !isSelf {
+						sameFileWins = false
+					}
+				}
+				cands, capped := resolveCallees(idx, &symbol, calleeName, scope, true, sameFileWins)
 				if capped && symbol.Language != "java" && symbol.Language != "rust" {
 					// Only narrowing with real evidence may keep very large
 					// same-name sets: Java (arity, arg types) and Rust
@@ -1331,7 +1398,7 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 				continue
 			}
 			seenCallee[calleeName] = true
-			cands, fbCapped := resolveCallees(idx, &symbol, calleeName, scope, true)
+			cands, fbCapped := resolveCallees(idx, &symbol, calleeName, scope, true, true)
 			if fbCapped {
 				// The fallback has no narrowing evidence; over-cap stays dropped.
 				continue

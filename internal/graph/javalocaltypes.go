@@ -13,13 +13,16 @@ import (
 
 var (
 	// Type x = ... (typed local; also matches enhanced-for "for (Type x :")
-	javaLocalDeclRe = regexp.MustCompile(`\b([A-Z]\w*)(?:<[^<>]*>)?(?:\[\])?\s+(\w+)\s*[=:)]`)
+	// The generic group tolerates one nesting level (JsonDeserializer<Enum<?>>,
+	// Map<String, List<T>>) — regexes can't balance arbitrarily, one level
+	// covers real declarations.
+	javaLocalDeclRe = regexp.MustCompile(`\b([A-Z]\w*)(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?(?:\[\])?\s+(\w+)\s*[=:)]`)
 	// typed local including primitives and arrays, for overload matching:
 	// anchored to statement starts so "return x =" / cast fragments can't
 	// masquerade as declarations
 	javaTypedLocalRe = regexp.MustCompile(`(?m)(?:^|[;{)]\s*)\s*(?:final\s+)?((?:boolean|byte|char|short|int|long|float|double|[A-Z][\w.]*)(?:<[^<>]*>)?(?:\[\])?)\s+(\w+)\s*=`)
 	// field declaration line in a class body
-	javaFieldRe = regexp.MustCompile(`(?m)^\s+(?:(?:public|private|protected|static|final|transient|volatile)\s+)*([A-Z]\w*)(?:<[^<>]*>)?(?:\[\])?\s+(\w+)\s*[;=]`)
+	javaFieldRe = regexp.MustCompile(`(?m)^\s+(?:(?:public|private|protected|static|final|transient|volatile)\s+)*([A-Z]\w*)(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?(?:\[\])?\s+(\w+)\s*[;=]`)
 )
 
 // javaArgTypes infers identifier → raw type token (primitives and arrays

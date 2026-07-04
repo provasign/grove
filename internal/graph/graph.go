@@ -40,8 +40,11 @@ type CodeGraph struct {
 
 	// inbound maps node ID → indices into edges whose To is that node, so
 	// BFS traversals (Impact, TestsFor) are O(V+E) instead of scanning the
-	// whole edge list once per visited node.
-	inbound map[string][]int
+	// whole edge list once per visited node. outbound is the mirror index
+	// (node ID → indices whose From is that node) for downward walks
+	// (ChangeImpact's contains/supertype traversals).
+	inbound  map[string][]int
+	outbound map[string][]int
 
 	// Lazily-built semantic-search engine. Invalidated on every Replace().
 	// semVecCache survives invalidation: vectors are keyed by symbol ID
@@ -89,8 +92,10 @@ func (g *CodeGraph) install(symbols []core.SymbolRecord, edges []core.Edge, file
 	g.edges = edges
 	g.filesIndexed = filesIndexed
 	g.inbound = make(map[string][]int, len(g.edges))
+	g.outbound = make(map[string][]int, len(g.edges))
 	for i, e := range g.edges {
 		g.inbound[e.To] = append(g.inbound[e.To], i)
+		g.outbound[e.From] = append(g.outbound[e.From], i)
 	}
 
 	g.semMu.Lock()
