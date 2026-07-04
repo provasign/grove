@@ -26,6 +26,13 @@ type interfaceSatisfaction struct {
 // match; comment lines are stripped before matching.
 var goIfaceMethodRe = regexp.MustCompile(`(?m)^\s*([A-Za-z_]\w*)\s*\(`)
 
+// tsIfaceMethodRe matches a TS/JS interface method signature line
+// ("escape(name: string): string", optionally generic or optional:
+// "clone?<T>(x: T): T"). Property members ("driver: Driver") and
+// function-typed properties ("handler: (x) => void") have ':' before any
+// '(' and don't match.
+var tsIfaceMethodRe = regexp.MustCompile(`(?m)^\s*([A-Za-z_$][\w$]*)\??\s*(?:<[^>\n]*>)?\s*\(`)
+
 // interfaceMethodNames extracts the method names an interface declares.
 // Child method symbols (parent set to the interface) win when present —
 // some languages' parsers emit them; Go's does not, so Go falls back to
@@ -40,7 +47,18 @@ func interfaceMethodNames(iface *core.SymbolRecord, idx *edgeIndex) []string {
 	if len(names) > 0 {
 		return names
 	}
-	if iface.Language != "go" || iface.RawText == "" {
+	if iface.RawText == "" {
+		return nil
+	}
+	// Body-text fallback for languages whose parsers do not emit interface
+	// members as symbols: Go (method specs) and TS/JS (method signatures).
+	var re *regexp.Regexp
+	switch iface.Language {
+	case "go":
+		re = goIfaceMethodRe
+	case "typescript", "tsx", "javascript":
+		re = tsIfaceMethodRe
+	default:
 		return nil
 	}
 	body := stripCommentsAndStrings(iface.RawText)
@@ -49,10 +67,27 @@ func interfaceMethodNames(iface *core.SymbolRecord, idx *edgeIndex) []string {
 	if i := strings.IndexByte(body, '{'); i >= 0 {
 		body = body[i+1:]
 	}
-	for _, m := range goIfaceMethodRe.FindAllStringSubmatch(body, -1) {
-		names = append(names, m[1])
+	seen := map[string]bool{}
+	for _, m := range re.FindAllStringSubmatch(body, -1) {
+		if !seen[m[1]] {
+			seen[m[1]] = true
+			names = append(names, m[1])
+		}
 	}
 	return names
+}
+
+// nominalInterfaceLang reports whether a language declares interface
+// implementation explicitly (implements/extends clauses, or Python base
+// classes), so structural method-set matching must not synthesize satisfaction
+// edges for it. Go (and languages without explicit clauses here) stay
+// structural.
+func nominalInterfaceLang(language string) bool {
+	switch language {
+	case "java", "typescript", "tsx", "javascript", "python":
+		return true
+	}
+	return false
 }
 
 // buildInterfaceSatisfaction computes satisfaction and returns the derived
@@ -127,12 +162,23 @@ func buildInterfaceSatisfaction(idx *edgeIndex, symbols []core.SymbolRecord) (*i
 			if sat.implementors[iface.ID] == nil {
 				sat.implementors[iface.ID] = map[string][]*core.SymbolRecord{}
 			}
+			// Structural satisfaction over-approximates for NOMINAL languages
+			// (Java/TS/JS/Python): any class with a same-named method would
+			// otherwise "implement" the interface, polluting the subtype
+			// closure (e.g. a QueryBuilder.escape wrapper landing in the
+			// Driver.escape family). Those languages declare implements/extends
+			// explicitly, and buildExtendsImplements emits the real edges — so
+			// here we skip structural EDGE emission for them and keep the
+			// structural index only for call-dispatch over-approximation.
+			nominal := nominalInterfaceLang(iface.Language)
 			for _, n := range lower {
 				m := methods[n]
 				sat.implementors[iface.ID][n] = append(sat.implementors[iface.ID][n], m)
-				addEdge(m.ID, iface.ID, core.EdgeOverrides)
+				if !nominal {
+					addEdge(m.ID, iface.ID, core.EdgeOverrides)
+				}
 			}
-			if t, ok := typeSymbols[key]; ok {
+			if t, ok := typeSymbols[key]; ok && !nominal {
 				addEdge(t.ID, iface.ID, core.EdgeImplements)
 			}
 		}

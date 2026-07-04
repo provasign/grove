@@ -2,6 +2,7 @@ package graph
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/provasign/grove/internal/core"
@@ -160,6 +161,28 @@ func (g *CodeGraph) ChangeImpact(query string) (*ChangeImpactResult, error) {
 	}
 	if len(decls) == 0 && len(family) == 0 {
 		return nil, fmt.Errorf("change-impact: type %q declares no method %q and no subtype implements it", typeName, methodName)
+	}
+	if len(decls) == 0 {
+		// The member exists in source but not as a symbol (TS interface
+		// members, Go interface specs). When the seed type's body declares
+		// it, synthesize the declaration record: the declaring file is part
+		// of the change-set.
+		for _, tid := range typeIDs {
+			t, ok := g.symbols[tid]
+			if !ok || !typeDeclaresMember(&t, methodName) {
+				continue
+			}
+			decls = append(decls, core.SymbolRecord{
+				ID:            t.ID + "#" + methodName,
+				FilePath:      t.FilePath,
+				Language:      t.Language,
+				Kind:          core.KindMethod,
+				Name:          methodName,
+				QualifiedName: t.Name + "." + methodName,
+				ParentSymbol:  t.Name,
+				Span:          t.Span,
+			})
+		}
 	}
 
 	// 5. Supers (upward, informational): same-signature declarations on
@@ -493,6 +516,34 @@ func set(names ...string) map[string]bool {
 		m[n] = true
 	}
 	return m
+}
+
+// typeDeclaresMember reports whether a type's body text declares a member
+// method of the given name — for languages whose parsers do not emit those
+// members as symbols (TS/JS interfaces, Go interface specs).
+func typeDeclaresMember(t *core.SymbolRecord, method string) bool {
+	if t.RawText == "" {
+		return false
+	}
+	var re *regexp.Regexp
+	switch t.Language {
+	case "go":
+		re = goIfaceMethodRe
+	case "typescript", "tsx", "javascript":
+		re = tsIfaceMethodRe
+	default:
+		return false
+	}
+	body := stripCommentsAndStrings(t.RawText)
+	if i := strings.IndexByte(body, '{'); i >= 0 {
+		body = body[i+1:]
+	}
+	for _, m := range re.FindAllStringSubmatch(body, -1) {
+		if m[1] == method {
+			return true
+		}
+	}
+	return false
 }
 
 // containedMethods returns methods/functions named methodName reached from

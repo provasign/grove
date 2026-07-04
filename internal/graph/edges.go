@@ -1040,12 +1040,24 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 				// Split receiver prefix (e.g. "user.save" → qualifier "user",
 				// name "save"); chains keep only the last segment ("a.b.Get" → "b").
 				qualifier := ""
+				fullChain := "" // full receiver chain, e.g. "this.connection.driver"
 				if idx := strings.LastIndexByte(calleeName, '.'); idx >= 0 {
 					qualifier = calleeName[:idx]
 					calleeName = calleeName[idx+1:]
 				}
+				fullChain = qualifier
 				if j := strings.LastIndexByte(qualifier, '.'); j >= 0 {
 					qualifier = qualifier[j+1:]
+				}
+				// astkit collapses a member-chain receiver to its last segment
+				// (`this.connection.driver.escape` → callee "driver.escape"), so
+				// fullChain lost the intermediate hops. For TS/JS recover the
+				// full chain from the caller's own source line to enable
+				// multi-hop field-type resolution below.
+				if tsFamilyLang(symbol.Language) && qualifier != "" && cs.Line > 0 {
+					if chain := tsReceiverChainAt(symbol.RawText, cs.Line-symbol.Span.Start, calleeName); chain != "" {
+						fullChain = chain
+					}
 				}
 				if calleeName == "" || calleeName == "constructor" || calleeName == "super" {
 					// "new X" and "super(...)" are invocation forms, not names:
@@ -1316,6 +1328,14 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 					// Receiver narrowing didn't fire; try the inferred type of
 					// the receiver variable, then import qualification.
 					kept, dispatch, decided := narrowByLocalType(idx, sat, localTypes, qualifier, calleeName, cands, scope)
+					if !decided && tsFamilyLang(symbol.Language) && strings.Contains(fullChain, ".") {
+						// Multi-hop receiver (`this.connection.driver.escape`):
+						// walk the field-type chain and dispatch to the resolved
+						// type's implementors. The single-segment lookup above
+						// cannot see `driver` because it is a field of the chain's
+						// intermediate type, not of the enclosing class.
+						kept, dispatch, decided = narrowByChainType(idx, sat, localTypes, &symbol, fullChain, calleeName, cands)
+					}
 					if decided {
 						// The receiver type was known: this call site is resolved
 						// (to kept, to dispatch implementors, or to nothing). Mark

@@ -170,3 +170,34 @@ func TestGoCrossFileMethodContains(t *testing.T) {
 		t.Fatalf("cross-package contains edge must not exist")
 	}
 }
+
+// TS class-body fields (astkit emits no KindField for TS) must be scanned from
+// class source so `this.driver.escape()` resolves through the Driver family.
+func TestTsClassBodyFieldTypes(t *testing.T) {
+	raw := `class Repo extends Base {
+  protected driver: Driver
+  private readonly conn: Connection;
+  count: number = 0
+  handler: Handler = () => {}
+  constructor(x: Foo) { this.x = x }
+  query(sql: string): Result { return this.driver.escape(sql) }
+  get size(): number { return 0 }
+}`
+	got := map[string]string{}
+	tsClassBodyFieldTypes(raw, func(n, ty string) {
+		if ty != "" {
+			got[n] = ty
+		}
+	})
+	want := map[string]string{"driver": "Driver", "conn": "Connection", "handler": "Handler"}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("field %s: got %q want %q (all=%v)", k, got[k], v, got)
+		}
+	}
+	for _, bad := range []string{"query", "size", "count"} {
+		if _, ok := got[bad]; ok {
+			t.Errorf("%q must not be a field: %v", bad, got)
+		}
+	}
+}
