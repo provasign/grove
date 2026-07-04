@@ -270,6 +270,18 @@ type ChangeImpactResult struct {
 	Supers       []Symbol
 	Family       []Symbol
 	Callers      []Symbol
+
+	// ExternalSupers: supertype names declared in the hierarchy that resolve
+	// to no indexed type (JDK / dependency types). Informational.
+	ExternalSupers []string
+	// OverridesExternal: "Type#method" entries when the queried method is a
+	// member of an external supertype's contract — changing its signature
+	// breaks a contract the project does not own, and the change-set is the
+	// project-local closure only.
+	OverridesExternal []string
+	// Completeness: "closed" (family fully rooted in indexed types) or
+	// "project-local" (bounded by an external contract).
+	Completeness string
 }
 
 // Sites returns the full change-set (declarations ∪ family ∪ callers) as one
@@ -297,11 +309,14 @@ func (e *Engine) ChangeImpact(ctx context.Context, query string) (ChangeImpactRe
 		return ChangeImpactResult{}, err
 	}
 	return ChangeImpactResult{
-		Query:        raw.Query,
-		Declarations: raw.Declarations,
-		Supers:       raw.Supers,
-		Family:       raw.Family,
-		Callers:      raw.Callers,
+		Query:             raw.Query,
+		Declarations:      raw.Declarations,
+		Supers:            raw.Supers,
+		Family:            raw.Family,
+		Callers:           raw.Callers,
+		ExternalSupers:    raw.ExternalSupers,
+		OverridesExternal: raw.OverridesExternal,
+		Completeness:      raw.Completeness,
 	}, nil
 }
 

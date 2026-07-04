@@ -19,6 +19,23 @@ type ChangeImpactResult struct {
 	Supers       []core.SymbolRecord // same-signature declarations up the hierarchy (informational: changing a mid-hierarchy override usually forces these too)
 	Family       []core.SymbolRecord // overrides/implementations in the subtype closure (excluding Declarations)
 	Callers      []core.SymbolRecord // methods with call edges into Declarations or Family (excluding both)
+
+	// ExternalSupers lists supertype names declared in the hierarchy's
+	// extends/implements clauses that resolve to no indexed type (JDK or
+	// dependency types). Informational: the clause is in project source even
+	// when the type is not.
+	ExternalSupers []string
+	// OverridesExternal is non-empty when the queried method is a member of
+	// an external supertype's contract ("java.util.Iterator#next"): changing
+	// its signature breaks that contract, and the change-set below is the
+	// project-local dispatch closure, not a complete must-change set (calls
+	// through receivers typed as the external supertype are not indexed).
+	OverridesExternal []string
+	// Completeness is "closed" when the override family is fully rooted in
+	// indexed types, "project-local" when it is bounded by an external
+	// contract (OverridesExternal non-empty, or the query named an external
+	// type directly).
+	Completeness string
 }
 
 // Sites returns every symbol in the change-set (declarations, family,
@@ -67,7 +84,11 @@ func (g *CodeGraph) ChangeImpact(query string) (*ChangeImpactResult, error) {
 		}
 	}
 	if len(typeIDs) == 0 {
-		return nil, fmt.Errorf("change-impact: no type named %q in the graph", typeName)
+		// External-rooted query: the named type is not in the index (a JDK or
+		// dependency type, e.g. "java.util.Iterator.next"). The well-posed
+		// project question is the implementation closure: every indexed type
+		// whose declared extends/implements clause names it, transitively.
+		return g.externalRootedImpact(query, typeName, methodName, queryParams)
 	}
 
 	// 2. Declaration(s): methods named methodName contained in the named type,
@@ -195,17 +216,274 @@ func (g *CodeGraph) ChangeImpact(query string) (*ChangeImpactResult, error) {
 		}
 	}
 
+	// 7. Contract boundary: supertype names declared anywhere in the upward
+	// closure (seed types + indexed supertypes) that resolve to no indexed
+	// type are external. If the queried method is a member of a well-known
+	// external contract, the result is the project-local closure of a
+	// contract the project does not own — flag it.
+	hierarchyIDs := make([]string, 0, len(typeIDs)+len(superTypes))
+	hierarchyIDs = append(hierarchyIDs, typeIDs...)
+	for id := range superTypes {
+		hierarchyIDs = append(hierarchyIDs, id)
+	}
+	externalSupers, overridesExternal := g.externalContract(hierarchyIDs, methodName)
+	completeness := "closed"
+	if len(overridesExternal) > 0 {
+		completeness = "project-local"
+	}
+
 	sortSymbols(decls)
 	sortSymbols(family)
 	sortSymbols(supers)
 	sortSymbols(callers)
 	return &ChangeImpactResult{
-		Query:        query,
-		Declarations: decls,
-		Supers:       supers,
-		Family:       family,
-		Callers:      callers,
+		Query:             query,
+		Declarations:      decls,
+		Supers:            supers,
+		Family:            family,
+		Callers:           callers,
+		ExternalSupers:    externalSupers,
+		OverridesExternal: overridesExternal,
+		Completeness:      completeness,
 	}, nil
+}
+
+// externalContract inspects the extends/implements clauses of the given type
+// symbols: names that resolve to no indexed type are external supertypes, and
+// when methodName is a member of a well-known external contract (jdkContract)
+// the override is flagged as "Type#method". Caller must hold g.mu.
+func (g *CodeGraph) externalContract(typeIDs []string, methodName string) (externalSupers, overridesExternal []string) {
+	seenSuper := make(map[string]bool)
+	seenOverride := make(map[string]bool)
+	for _, tid := range typeIDs {
+		t, ok := g.symbols[tid]
+		if !ok {
+			continue
+		}
+		for _, name := range declaredSuperNames(&t) {
+			simple := name
+			if j := strings.LastIndexByte(simple, '.'); j >= 0 {
+				simple = simple[j+1:]
+			}
+			if g.hasIndexedType(simple) {
+				continue
+			}
+			if !seenSuper[name] {
+				seenSuper[name] = true
+				externalSupers = append(externalSupers, name)
+			}
+			if members, known := jdkContract[simple]; known && members[methodName] {
+				key := name + "#" + methodName
+				if !seenOverride[key] {
+					seenOverride[key] = true
+					overridesExternal = append(overridesExternal, key)
+				}
+			}
+		}
+	}
+	return externalSupers, overridesExternal
+}
+
+// externalRootedImpact answers a change-impact query whose type is not in the
+// index: the project-local implementation closure of an external member —
+// every indexed type declaring the external name in its extends/implements
+// clause, its subtype closure, their matching methods, and their callers.
+// This is the deprecation/migration question ("what implements Iterator
+// here?"); a signature change to the external member itself is out of the
+// project's hands, so Completeness is always "project-local". Caller must
+// hold g.mu.
+func (g *CodeGraph) externalRootedImpact(query, typeName, methodName string, queryParams []string) (*ChangeImpactResult, error) {
+	var seedIDs []string
+	for id, s := range g.symbols {
+		switch s.Kind {
+		case core.KindClass, core.KindInterface, core.KindType, core.KindStruct, core.KindTrait, core.KindEnum:
+		default:
+			continue
+		}
+		for _, name := range declaredSuperNames(&s) {
+			simple := name
+			if j := strings.LastIndexByte(simple, '.'); j >= 0 {
+				simple = simple[j+1:]
+			}
+			if simple == typeName {
+				seedIDs = append(seedIDs, id)
+				break
+			}
+		}
+	}
+	if len(seedIDs) == 0 {
+		return nil, fmt.Errorf("change-impact: no type named %q in the graph and no indexed type declares it as a supertype", typeName)
+	}
+
+	// Subtype closure below the seeds (the seeds themselves implement the
+	// external contract, so they are family roots, not declarations).
+	closure := make(map[string]bool, len(seedIDs))
+	frontier := append([]string(nil), seedIDs...)
+	for _, id := range seedIDs {
+		closure[id] = true
+	}
+	for len(frontier) > 0 {
+		node := frontier[0]
+		frontier = frontier[1:]
+		for _, ei := range g.inbound[node] {
+			edge := g.edges[ei]
+			if edge.Type != core.EdgeExtends && edge.Type != core.EdgeImplements {
+				continue
+			}
+			if !closure[edge.From] {
+				closure[edge.From] = true
+				frontier = append(frontier, edge.From)
+			}
+		}
+	}
+	closureIDs := make([]string, 0, len(closure))
+	for id := range closure {
+		closureIDs = append(closureIDs, id)
+	}
+
+	family := g.containedMethods(closureIDs, methodName)
+	if len(queryParams) > 0 {
+		if byParams := filterByParamTypes(family, queryParams); len(byParams) > 0 {
+			family = byParams
+		}
+	}
+	if len(family) == 0 {
+		return nil, fmt.Errorf("change-impact: no indexed implementation of %s.%s (external type; %d project types declare it as a supertype)",
+			typeName, methodName, len(seedIDs))
+	}
+
+	memberIDs := make(map[string]bool, len(family))
+	for _, m := range family {
+		memberIDs[m.ID] = true
+	}
+	callerSeen := make(map[string]bool)
+	var callers []core.SymbolRecord
+	for id := range memberIDs {
+		for _, ei := range g.inbound[id] {
+			edge := g.edges[ei]
+			if edge.Type != core.EdgeCalls {
+				continue
+			}
+			if memberIDs[edge.From] || callerSeen[edge.From] {
+				continue
+			}
+			callerSeen[edge.From] = true
+			if s, ok := g.symbols[edge.From]; ok {
+				callers = append(callers, s)
+			}
+		}
+	}
+
+	sortSymbols(family)
+	sortSymbols(callers)
+	return &ChangeImpactResult{
+		Query:             query,
+		Family:            family,
+		Callers:           callers,
+		ExternalSupers:    []string{typeName},
+		OverridesExternal: []string{typeName + "#" + methodName},
+		Completeness:      "project-local",
+	}, nil
+}
+
+// declaredSuperNames extracts the supertype names written in a type's
+// declaration clause — the same sources buildExtendsImplements reads — so
+// external names (which produce no edges) are still visible for boundary
+// reporting.
+func declaredSuperNames(s *core.SymbolRecord) []string {
+	switch s.Language {
+	case "typescript", "tsx", "javascript", "java":
+		if s.Kind != core.KindClass && s.Kind != core.KindInterface {
+			return nil
+		}
+		text := s.Signature
+		if text == "" {
+			text = firstLine(s.RawText)
+		}
+		text = stripAngleBrackets(text)
+		names := matchNameList(extendsRe, text)
+		return append(names, matchNameList(implementsRe, text)...)
+	case "python":
+		if s.Kind != core.KindClass {
+			return nil
+		}
+		m := pythonClassBase.FindStringSubmatch(firstLine(s.RawText))
+		if len(m) < 2 {
+			return nil
+		}
+		var out []string
+		for _, base := range splitTrim(m[1], ',') {
+			if base = stripPythonBase(base); base != "" {
+				out = append(out, base)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+// hasIndexedType reports whether any indexed symbol of a type kind has the
+// given simple name. Caller must hold g.mu.
+func (g *CodeGraph) hasIndexedType(name string) bool {
+	for _, s := range g.symbols {
+		if s.Name != name {
+			continue
+		}
+		switch s.Kind {
+		case core.KindClass, core.KindInterface, core.KindType, core.KindStruct, core.KindTrait, core.KindEnum:
+			return true
+		}
+	}
+	return false
+}
+
+// jdkContract maps well-known java.lang / java.util / java.util.function /
+// java.io interface simple names to their member methods, so an override of
+// an external contract can be flagged definitively rather than guessed. The
+// table is deliberately small: absence here only means "not flagged", never
+// "not external" (ExternalSupers still reports the name).
+var jdkContract = map[string]map[string]bool{
+	"Iterator":      set("hasNext", "next", "remove", "forEachRemaining"),
+	"ListIterator":  set("hasNext", "next", "remove", "forEachRemaining", "hasPrevious", "previous", "nextIndex", "previousIndex", "set", "add"),
+	"Iterable":      set("iterator", "forEach", "spliterator"),
+	"Enumeration":   set("hasMoreElements", "nextElement", "asIterator"),
+	"Collection":    set("size", "isEmpty", "contains", "iterator", "toArray", "add", "remove", "containsAll", "addAll", "removeAll", "retainAll", "clear", "removeIf", "spliterator", "stream", "parallelStream", "forEach"),
+	"List":          set("size", "isEmpty", "contains", "iterator", "toArray", "add", "remove", "containsAll", "addAll", "removeAll", "retainAll", "clear", "get", "set", "indexOf", "lastIndexOf", "listIterator", "subList", "replaceAll", "sort"),
+	"Set":           set("size", "isEmpty", "contains", "iterator", "toArray", "add", "remove", "containsAll", "addAll", "removeAll", "retainAll", "clear"),
+	"Queue":         set("add", "offer", "remove", "poll", "element", "peek"),
+	"Deque":         set("addFirst", "addLast", "offerFirst", "offerLast", "removeFirst", "removeLast", "pollFirst", "pollLast", "getFirst", "getLast", "peekFirst", "peekLast", "push", "pop", "descendingIterator"),
+	"Map":           set("size", "isEmpty", "containsKey", "containsValue", "get", "put", "remove", "putAll", "clear", "keySet", "values", "entrySet", "getOrDefault", "forEach", "replaceAll", "putIfAbsent", "replace", "computeIfAbsent", "computeIfPresent", "compute", "merge"),
+	"SortedMap":     set("comparator", "subMap", "headMap", "tailMap", "firstKey", "lastKey"),
+	"NavigableMap":  set("lowerEntry", "lowerKey", "floorEntry", "floorKey", "ceilingEntry", "ceilingKey", "higherEntry", "higherKey", "firstEntry", "lastEntry", "pollFirstEntry", "pollLastEntry", "descendingMap", "navigableKeySet", "descendingKeySet"),
+	"SortedSet":     set("comparator", "subSet", "headSet", "tailSet", "first", "last"),
+	"NavigableSet":  set("lower", "floor", "ceiling", "higher", "pollFirst", "pollLast", "descendingSet", "descendingIterator"),
+	"Entry":         set("getKey", "getValue", "setValue"),
+	"Comparable":    set("compareTo"),
+	"Comparator":    set("compare", "reversed", "thenComparing"),
+	"Runnable":      set("run"),
+	"Callable":      set("call"),
+	"AutoCloseable": set("close"),
+	"Closeable":     set("close"),
+	"Flushable":     set("flush"),
+	"CharSequence":  set("length", "charAt", "subSequence", "chars", "codePoints"),
+	"Appendable":    set("append"),
+	"Function":      set("apply", "compose", "andThen"),
+	"BiFunction":    set("apply", "andThen"),
+	"Supplier":      set("get"),
+	"Consumer":      set("accept", "andThen"),
+	"BiConsumer":    set("accept", "andThen"),
+	"Predicate":     set("test", "and", "or", "negate"),
+	"BiPredicate":   set("test", "and", "or", "negate"),
+	"UnaryOperator": set("apply"),
+	"Spliterator":   set("tryAdvance", "forEachRemaining", "trySplit", "estimateSize", "characteristics", "getComparator"),
+}
+
+func set(names ...string) map[string]bool {
+	m := make(map[string]bool, len(names))
+	for _, n := range names {
+		m[n] = true
+	}
+	return m
 }
 
 // containedMethods returns methods/functions named methodName reached from

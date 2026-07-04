@@ -1,0 +1,14 @@
+# Auto-Intent Capture artifact. The user's prompt that produced this code.
+# See docs/architecture.md. Do not hand-edit unless you know what you're doing.
+schema: relay.intent/v2
+id: INT-2026-06-07-fix-native-analyzer-symlink-root-mismatch-commit-codex-pendi
+status: committed
+title: Fix native analyzer symlink root mismatch + commit Codex pending changes
+description: Take over Codex's work on the native-analyzers-priority branch. Commit staged/unstaged changes (go.go goAnalyzerEnv+callsite edges, python.go confidence bumps, engine.go C++ class member extraction, native_test.go + engine_test.go new tests). Also fix a regression in the C-family native analyzer where include edge resolution fails on macOS because filepath.Abs does not resolve the /tmp -> /private/tmp symlink, causing relFile to fail when compile_commands.json directory uses the real /private/tmp path.
+originated_from:
+    agent: claude-code
+    model: claude-sonnet-4-6
+    prompt_hash: 8009c1bef16d8969f7f1f7d32088bf7797961beaa450b5f0fa34c15438ac1362
+created_at: 2026-06-07T04:02:40.940266Z
+committed_at: 2026-06-07T13:11:53.809103Z
+committed_by_agent: claude-sonnet-4-6
