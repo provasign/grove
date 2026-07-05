@@ -16,6 +16,9 @@ import (
 	"strings"
 
 	"github.com/provasign/grove/internal/core"
+	"runtime"
+	"sort"
+	"sync"
 )
 
 type goAnalyzer struct{}
@@ -91,21 +94,116 @@ func (goAnalyzer) Analyze(ctx context.Context, req Request) Result {
 			}
 		}
 	}
-	semanticEdges, semanticDiagnostics := goSemanticEdges(req.Root, req.Files, req.Symbols, pkgs)
+	// Scope the expensive passes (per-package type-check, symbol sweeps) to
+	// the packages containing changed files plus their transitive reverse
+	// importers — an exported-signature change propagates to everything that
+	// type-checks against it. The cheap go-list import edges above stay
+	// whole-repo. Partial reports the analyzed dirs so the indexer carries
+	// the stored native edges of every other package.
+	semFiles, semSymbols := req.Files, req.Symbols
+	var partial map[string][]string
+	var scopeDiag []string
+	if len(req.ChangedFiles) > 0 {
+		affected := goAffectedDirs(req.Root, req.ChangedFiles, pkgs)
+		if len(affected) > 0 {
+			semFiles = filterByDirs(req.Files, affected)
+			semSymbols = filterSymbolsByDirs(req.Symbols, affected)
+			dirs := make([]string, 0, len(affected))
+			for d := range affected {
+				dirs = append(dirs, d)
+			}
+			sort.Strings(dirs)
+			partial = map[string][]string{"go": dirs}
+			scopeDiag = []string{"scoped to " + itoa(len(dirs)) + " affected package dir(s); other packages' native edges carried forward"}
+		}
+	}
+	semanticEdges, semanticDiagnostics := goSemanticEdges(req.Root, semFiles, req.Symbols, pkgs)
 	edges = append(edges, semanticEdges...)
-	callSiteEdges := goCallSiteEdges(req.Symbols)
+	callSiteEdges := goCallSiteEdges(semSymbols, req.Symbols)
 	edges = append(edges, callSiteEdges...)
-	typeUseEdges := goTypeUseEdges(ctx, req.Symbols)
+	typeUseEdges := goTypeUseEdges(ctx, semSymbols, req.Symbols)
 	edges = append(edges, typeUseEdges...)
 
 	return Result{
-		Edges: edges,
-		Diagnostics: append([]string{
+		Edges:   edges,
+		Partial: partial,
+		Diagnostics: append(append([]string{
 			"go list resolved " + itoa(len(pkgs)) + " package(s)",
 			"resolved " + itoa(countEdgesOfType(callSiteEdges, core.EdgeCalls)) + " native call-site edge(s)",
 			"resolved " + itoa(countEdgesOfType(typeUseEdges, core.EdgeUsesType)) + " native lexical type-use edge(s)",
-		}, semanticDiagnostics...),
+		}, scopeDiag...), semanticDiagnostics...),
 	}
+}
+
+// goAffectedDirs returns the package dirs of the changed go files plus every
+// dir that transitively imports one of them (repo-relative, slash paths).
+func goAffectedDirs(root string, changedFiles []string, pkgs []goListPackage) map[string]bool {
+	changedDirs := map[string]bool{}
+	for _, f := range changedFiles {
+		if strings.HasSuffix(f, ".go") {
+			changedDirs[packageDir(f)] = true
+		}
+	}
+	if len(changedDirs) == 0 {
+		return nil
+	}
+	// dir -> import path, and reverse import graph over repo packages
+	dirToImport := map[string]string{}
+	importers := map[string][]string{} // import path -> dirs importing it
+	for _, pkg := range pkgs {
+		rel, ok := relFile(root, pkg.Dir)
+		if !ok {
+			continue
+		}
+		dirToImport[rel] = pkg.ImportPath
+		for _, imp := range pkg.Imports {
+			importers[imp] = append(importers[imp], rel)
+		}
+	}
+	affected := map[string]bool{}
+	queue := make([]string, 0, len(changedDirs))
+	for d := range changedDirs {
+		affected[d] = true
+		queue = append(queue, d)
+	}
+	sort.Strings(queue)
+	for len(queue) > 0 {
+		dir := queue[0]
+		queue = queue[1:]
+		imp, ok := dirToImport[dir]
+		if !ok {
+			continue
+		}
+		deps := append([]string(nil), importers[imp]...)
+		sort.Strings(deps)
+		for _, d := range deps {
+			if !affected[d] {
+				affected[d] = true
+				queue = append(queue, d)
+			}
+		}
+	}
+	return affected
+}
+
+func filterByDirs(files []string, dirs map[string]bool) []string {
+	var out []string
+	for _, f := range files {
+		if dirs[packageDir(f)] {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+func filterSymbolsByDirs(symbols []core.SymbolRecord, dirs map[string]bool) []core.SymbolRecord {
+	var out []core.SymbolRecord
+	for _, s := range symbols {
+		if dirs[packageDir(s.FilePath)] {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // goAnalyzerEnv preserves the user environment. Earlier versions redirected
@@ -206,13 +304,49 @@ func goSemanticEdges(root string, files []string, symbols []core.SymbolRecord, p
 
 	var edges []core.Edge
 	var diagnostics []string
-	for dir, dirFiles := range filesByDir {
-		pkgEdges, err := goSemanticPackageEdges(root, dir, dirFiles, symbolIdx, pkgDirsByImport)
-		if err != nil {
-			diagnostics = append(diagnostics, "semantic package "+dir+" skipped: "+err.Error())
+	dirs := make([]string, 0, len(filesByDir))
+	for d := range filesByDir {
+		dirs = append(dirs, d)
+	}
+	sort.Strings(dirs)
+	// Per-package type-checks are independent and symbolIdx/pkgDirsByImport
+	// are read-only here; results land by index so output order (and thus
+	// the built graph) is identical to the sequential loop.
+	type dirOutcome struct {
+		edges []core.Edge
+		err   error
+	}
+	outcomes := make([]dirOutcome, len(dirs))
+	workers := runtime.GOMAXPROCS(0)
+	if workers > 8 {
+		workers = 8
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	dirCh := make(chan int)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for di := range dirCh {
+				e, err := goSemanticPackageEdges(root, dirs[di], filesByDir[dirs[di]], symbolIdx, pkgDirsByImport)
+				outcomes[di] = dirOutcome{edges: e, err: err}
+			}
+		}()
+	}
+	for di := range dirs {
+		dirCh <- di
+	}
+	close(dirCh)
+	wg.Wait()
+	for di, o := range outcomes {
+		if o.err != nil {
+			diagnostics = append(diagnostics, "semantic package "+dirs[di]+" skipped: "+o.err.Error())
 			continue
 		}
-		edges = append(edges, pkgEdges...)
+		edges = append(edges, o.edges...)
 	}
 	diagnostics = append(diagnostics, "resolved "+itoa(countEdgesOfType(edges, core.EdgeCalls))+" native call edge(s)")
 	diagnostics = append(diagnostics, "resolved "+itoa(countEdgesOfType(edges, core.EdgeUsesType))+" native type-use edge(s)")
@@ -298,14 +432,21 @@ func goCallerSymbol(fset *token.FileSet, fn *ast.FuncDecl, symbolIdx goSymbolInd
 	file := filepath.ToSlash(pos.Filename)
 	if i := strings.LastIndex(file, "/"); i >= 0 {
 		// fset stores absolute paths; SymbolRecord uses repo-relative paths.
+		// Deterministic winner on multiple matches (vendored copies can
+		// share a path suffix): smallest key wins, never map order.
+		bestKey := ""
+		var best core.SymbolRecord
 		for key, symbol := range symbolIdx.byFileFunc {
 			if strings.HasSuffix(file, symbol.FilePath) && strings.Contains(key, "\x00") {
 				recv := goReceiverName(fn)
 				wantKey := goCallableKey(packageDir(symbol.FilePath), recv, fn.Name.Name)
-				if key == symbol.FilePath+"\x00"+wantKey {
-					return symbol, true
+				if key == symbol.FilePath+"\x00"+wantKey && (bestKey == "" || key < bestKey) {
+					bestKey, best = key, symbol
 				}
 			}
+		}
+		if bestKey != "" {
+			return best, true
 		}
 	}
 	return core.SymbolRecord{}, false
@@ -470,11 +611,13 @@ func lastPathSegment(path string) string {
 	return path
 }
 
-func goCallSiteEdges(symbols []core.SymbolRecord) []core.Edge {
-	idx := newGoNativeIndex(symbols)
+// goCallSiteEdges resolves call sites for callers against the FULL symbol
+// index — callers may be scoped to changed packages, targets live anywhere.
+func goCallSiteEdges(callers, all []core.SymbolRecord) []core.Edge {
+	idx := newGoNativeIndex(all)
 	var edges []core.Edge
 	seen := map[string]bool{}
-	for _, caller := range symbols {
+	for _, caller := range callers {
 		if caller.Language != "go" || !callableKind(caller.Kind) {
 			continue
 		}
@@ -581,17 +724,17 @@ var goIdentRe = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]*`)
 // the previous implementation compiled a fresh regex and re-stripped the
 // body for every (caller, type-name) pair, unbounded by the analyzer
 // timeout. ctx is checked so a timeout still ends the pass promptly.
-func goTypeUseEdges(ctx context.Context, symbols []core.SymbolRecord) []core.Edge {
-	idx := newGoNativeIndex(symbols)
+// goTypeUseEdges resolves type references for callers against the FULL
+// symbol index — callers may be scoped to changed packages, but their
+// targets live anywhere in the repo.
+func goTypeUseEdges(ctx context.Context, callers, all []core.SymbolRecord) []core.Edge {
+	idx := newGoNativeIndex(all)
 	if len(idx.typesByName) == 0 {
 		return nil
 	}
 	var edges []core.Edge
 	seen := map[string]bool{}
-	for i, caller := range symbols {
-		if i%256 == 0 && ctx.Err() != nil {
-			break
-		}
+	for _, caller := range callers {
 		if caller.Language != "go" || !callableKind(caller.Kind) || caller.RawText == "" {
 			continue
 		}

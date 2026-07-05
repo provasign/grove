@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/provasign/grove/internal/core"
+	"sort"
 )
 
 // interfaceSatisfaction records which concrete types satisfy which
@@ -120,6 +121,20 @@ func buildInterfaceSatisfaction(idx *edgeIndex, symbols []core.SymbolRecord) (*i
 		}
 	}
 
+	// Deterministic iteration order: implementor slices feed first-match
+	// type inference and dispatch fan-out downstream, so their order must
+	// not depend on map iteration.
+	sortedTypeKeys := make([]typeKey, 0, len(methodsByType))
+	for k := range methodsByType {
+		sortedTypeKeys = append(sortedTypeKeys, k)
+	}
+	sort.Slice(sortedTypeKeys, func(i, j int) bool {
+		if sortedTypeKeys[i].dir != sortedTypeKeys[j].dir {
+			return sortedTypeKeys[i].dir < sortedTypeKeys[j].dir
+		}
+		return sortedTypeKeys[i].name < sortedTypeKeys[j].name
+	})
+
 	var edges []core.Edge
 	seen := map[string]bool{}
 	addEdge := func(from, to string, t core.EdgeType) {
@@ -144,7 +159,8 @@ func buildInterfaceSatisfaction(idx *edgeIndex, symbols []core.SymbolRecord) (*i
 		for j, n := range names {
 			lower[j] = strings.ToLower(n)
 		}
-		for key, methods := range methodsByType {
+		for _, key := range sortedTypeKeys {
+			methods := methodsByType[key]
 			// The interface's own methods would trivially "satisfy" it.
 			if key.name == iface.Name && key.dir == dirOf(iface.FilePath) {
 				continue

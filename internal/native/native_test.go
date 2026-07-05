@@ -682,9 +682,9 @@ func TestGoCallSiteEdgesResolveImportedCalls(t *testing.T) {
 		ID: "auth/auth.go::User@1", FilePath: "auth/auth.go",
 		Language: "go", Kind: core.KindStruct, Name: "User",
 	}
-	edges := goCallSiteEdges([]core.SymbolRecord{caller, callee, user})
+	edges := goCallSiteEdges([]core.SymbolRecord{caller, callee, user}, []core.SymbolRecord{caller, callee, user})
 	assertNativeEdge(t, edges, caller.ID, callee.ID, core.EdgeCalls)
-	typeEdges := goTypeUseEdges(context.Background(), []core.SymbolRecord{caller, callee, user})
+	typeEdges := goTypeUseEdges(context.Background(), []core.SymbolRecord{caller, callee, user}, []core.SymbolRecord{caller, callee, user})
 	assertNativeEdge(t, typeEdges, caller.ID, user.ID, core.EdgeUsesType)
 }
 
@@ -703,7 +703,7 @@ func TestGoCallSiteEdgesPreferExactImportedPackage(t *testing.T) {
 		ID: "other/auth.go::Login@1", FilePath: "other/auth.go",
 		Language: "go", Kind: core.KindFunction, Name: "Login",
 	}
-	edges := goCallSiteEdges([]core.SymbolRecord{caller, authLogin, otherLogin})
+	edges := goCallSiteEdges([]core.SymbolRecord{caller, authLogin, otherLogin}, []core.SymbolRecord{caller, authLogin, otherLogin})
 	if len(edges) != 1 {
 		t.Fatalf("expected one edge, got %#v", edges)
 	}

@@ -247,7 +247,14 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 	if opts.Force || result.FilesUpdated == result.FilesSeen {
 		scope = nil
 	}
-	nativeResult := native.AnalyzeChanged(ctx, root, symbols, i.nativeConfig, scope)
+	var changedRel []string
+	if scope != nil {
+		for _, task := range tasks {
+			changedRel = append(changedRel, task.relPath)
+		}
+		changedRel = append(changedRel, prunedFiles...)
+	}
+	nativeResult := native.AnalyzeChangedFiles(ctx, root, symbols, i.nativeConfig, scope, changedRel)
 	result.Native = append(result.Native, nativeResult.Diagnostics...)
 	tick("native-analyzers")
 
@@ -256,6 +263,16 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 	// would otherwise drop them.
 	if len(nativeResult.SkippedLanguages) > 0 {
 		carried, err := i.carriedNativeEdges(ctx, symbols, nativeResult.SkippedLanguages)
+		if err != nil {
+			return nil, result, err
+		}
+		nativeResult.Edges = append(nativeResult.Edges, carried...)
+	}
+	// Partially-analyzed languages: carry the stored native edges whose
+	// source file lives outside the analyzed package dirs — those packages'
+	// facts did not change and were not recomputed.
+	if len(nativeResult.Partial) > 0 {
+		carried, err := i.carriedPartialEdges(ctx, symbols, nativeResult.Partial)
 		if err != nil {
 			return nil, result, err
 		}
@@ -319,6 +336,70 @@ func (i *Indexer) carriedNativeEdges(ctx context.Context, symbols []core.SymbolR
 			continue
 		}
 		if _, ok := nodeLang(e.To); !ok {
+			continue // endpoint no longer exists; drop the stale edge
+		}
+		out = append(out, e)
+	}
+	return out, nil
+}
+
+// carriedPartialEdges returns stored native edges of partially-analyzed
+// languages whose SOURCE file is outside the analyzed package dirs (fresh
+// facts exist for files inside them). Endpoints must still resolve — edge
+// IDs embed blob SHAs, so edges into changed files drop out naturally.
+func (i *Indexer) carriedPartialEdges(ctx context.Context, symbols []core.SymbolRecord, partial map[string][]string) ([]core.Edge, error) {
+	stored, err := i.store.AllEdges(ctx)
+	if err != nil {
+		return nil, err
+	}
+	analyzed := map[string]map[string]bool{} // lang -> dir set
+	for lang, dirs := range partial {
+		set := map[string]bool{}
+		for _, d := range dirs {
+			set[d] = true
+		}
+		analyzed[lang] = set
+	}
+	symInfo := make(map[string]*core.SymbolRecord, len(symbols))
+	fileLang := map[string]string{}
+	for idx := range symbols {
+		s := &symbols[idx]
+		symInfo[s.ID] = s
+		if _, ok := fileLang[s.FilePath]; !ok {
+			fileLang[s.FilePath] = s.Language
+		}
+	}
+	nodeInfo := func(node string) (lang, file string, ok bool) {
+		if s, found := symInfo[node]; found {
+			return s.Language, s.FilePath, true
+		}
+		if rest, found := strings.CutPrefix(node, "file:"); found {
+			if l, ok2 := fileLang[rest]; ok2 {
+				return l, rest, true
+			}
+		}
+		return "", "", false
+	}
+	dirOf := func(f string) string {
+		if i := strings.LastIndexByte(f, '/'); i >= 0 {
+			return f[:i]
+		}
+		return "."
+	}
+	var out []core.Edge
+	for _, e := range stored {
+		if e.Source != core.EvidenceSourceNative {
+			continue
+		}
+		lang, file, ok := nodeInfo(e.From)
+		if !ok {
+			continue
+		}
+		dirs, isPartial := analyzed[lang]
+		if !isPartial || dirs[dirOf(file)] {
+			continue // fully analyzed language, or a freshly analyzed dir
+		}
+		if _, _, ok := nodeInfo(e.To); !ok {
 			continue // endpoint no longer exists; drop the stale edge
 		}
 		out = append(out, e)

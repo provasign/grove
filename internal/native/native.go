@@ -15,6 +15,9 @@ import (
 
 const defaultTimeout = 5 * time.Second
 
+// maxScaledTimeout caps the size-scaled analyzer budget.
+const maxScaledTimeout = 60 * time.Second
+
 type Config struct {
 	Enabled           bool
 	Languages         map[string]bool
@@ -68,6 +71,12 @@ type Request struct {
 	Root    string
 	Symbols []core.SymbolRecord
 	Files   []string
+	// ChangedFiles, when non-empty, allows the analyzer to scope expensive
+	// per-package work to the packages containing these files (plus their
+	// reverse importers). An analyzer that scopes MUST report the analyzed
+	// package dirs in Result.Partial so the indexer carries the stored
+	// native edges of every other package forward.
+	ChangedFiles []string
 }
 
 type Result struct {
@@ -77,6 +86,10 @@ type Result struct {
 	// no files of theirs changed; the indexer carries their stored native
 	// edges forward instead of dropping them.
 	SkippedLanguages []string
+	// Partial maps a language to the package dirs its analyzer actually
+	// re-analyzed this run. The indexer carries stored native edges of that
+	// language whose source file lives OUTSIDE those dirs.
+	Partial map[string][]string
 }
 
 func PriorityAnalyzers() []Analyzer {
@@ -107,6 +120,12 @@ func AnalyzeWithConfig(ctx context.Context, root string, symbols []core.SymbolRe
 // On a polyglot monorepo this is the difference between a one-file Go edit
 // re-running the whole TypeScript program check and not.
 func AnalyzeChanged(ctx context.Context, root string, symbols []core.SymbolRecord, cfg Config, changedLanguages map[string]bool) Result {
+	return AnalyzeChangedFiles(ctx, root, symbols, cfg, changedLanguages, nil)
+}
+
+// AnalyzeChangedFiles additionally passes the changed file list so analyzers
+// can scope per-package work (see Request.ChangedFiles).
+func AnalyzeChangedFiles(ctx context.Context, root string, symbols []core.SymbolRecord, cfg Config, changedLanguages map[string]bool, changedFiles []string) Result {
 	if !cfg.Enabled {
 		return Result{Diagnostics: []string{"native analyzers disabled"}}
 	}
@@ -131,16 +150,58 @@ func AnalyzeChanged(ctx context.Context, root string, symbols []core.SymbolRecor
 		}
 		avail := analyzer.Available(ctx, root)
 		if !avail.Available {
-			combined.Diagnostics = append(combined.Diagnostics, analyzer.Name()+": skipped: "+avail.Reason)
+			// Availability flaps with PATH/toolchain env; carrying the
+			// stored edges keeps the graph stable across such flaps.
+			combined.Diagnostics = append(combined.Diagnostics,
+				analyzer.Name()+": skipped: "+avail.Reason+" (previous native edges carried forward)")
+			combined.SkippedLanguages = append(combined.SkippedLanguages, analyzer.Languages()...)
 			continue
 		}
-		runCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
-		result := analyzer.Analyze(runCtx, Request{Root: root, Symbols: symbols, Files: reqFiles})
+		// Budget scales with input size unless the user pinned a timeout:
+		// the 5s default starves real monorepos (go list alone needs ~3s on
+		// 19k files) and a starved analyzer used to land PARTIAL results —
+		// half a million edges flapping run to run.
+		timeout := cfg.Timeout
+		if cfg.Timeout == defaultTimeout {
+			if scaled := time.Duration(len(reqFiles)) * 4 * time.Millisecond; scaled > timeout {
+				timeout = scaled
+			}
+			if timeout > maxScaledTimeout {
+				timeout = maxScaledTimeout
+			}
+		}
+		runCtx, cancel := context.WithTimeout(ctx, timeout)
+		result := analyzer.Analyze(runCtx, Request{Root: root, Symbols: symbols, Files: reqFiles, ChangedFiles: changedFiles})
+		timedOut := runCtx.Err() != nil
 		cancel()
 		for _, diag := range result.Diagnostics {
 			combined.Diagnostics = append(combined.Diagnostics, analyzer.Name()+": "+diag)
 		}
+		// All-or-nothing: analyzers produce their full edge set or nothing
+		// (one subprocess, decoded at the end), so an empty result means the
+		// analyzer failed or was killed. Report its languages as skipped and
+		// the indexer carries the previously stored native edges forward —
+		// stale-proof, because edge endpoints embed blob SHAs and carried
+		// edges whose endpoint files changed no longer resolve and drop.
+		// A result WITH edges is complete even if the deadline expired at
+		// the boundary — never discard computed facts.
+		if len(result.Edges) == 0 {
+			reason := "no edges produced"
+			if timedOut {
+				reason = "timed out after " + timeout.String()
+			}
+			combined.Diagnostics = append(combined.Diagnostics,
+				analyzer.Name()+": "+reason+" — previous native edges carried forward")
+			combined.SkippedLanguages = append(combined.SkippedLanguages, analyzer.Languages()...)
+			continue
+		}
 		combined.Edges = append(combined.Edges, result.Edges...)
+		for lang, dirs := range result.Partial {
+			if combined.Partial == nil {
+				combined.Partial = map[string][]string{}
+			}
+			combined.Partial[lang] = append(combined.Partial[lang], dirs...)
+		}
 	}
 	return combined
 }

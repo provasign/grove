@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/provasign/grove/internal/core"
+	"sort"
 )
 
 // edgeIndex holds per-build symbol indexes used by the edge constructors.
@@ -83,7 +84,10 @@ func newEdgeIndex(symbols []core.SymbolRecord) *edgeIndex {
 	}
 	// Build dirToFiles after byFile is populated so each directory maps to
 	// all its files in one pass (O(n) total, vs O(n) per-file scan later).
-	for f := range idx.byFile {
+	// Iterate file paths SORTED: these derived slices feed first-match and
+	// capped resolution downstream, so their order must not depend on map
+	// iteration (which made ~12 of 859k edges flap run-to-run on grafana).
+	for _, f := range sortedFileKeys(idx.byFile) {
 		d := dirOf(f)
 		idx.dirToFiles[d] = append(idx.dirToFiles[d], f)
 		if dLower := strings.ToLower(d); dLower != "" && dLower != "." {
@@ -97,6 +101,29 @@ func newEdgeIndex(symbols []core.SymbolRecord) *edgeIndex {
 	return idx
 }
 
+// sortedKeys returns a set-map's keys in lexicographic order — any loop
+// whose RESULT can depend on processing order (first-match, len()==0
+// fallbacks) must iterate deterministically.
+func sortedKeys(m map[string]struct{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// sortedFileKeys returns the map's keys in lexicographic order, so every
+// slice derived from file iteration is deterministic.
+func sortedFileKeys(m map[string][]*core.SymbolRecord) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
 // buildRustCrates derives the crate topology from file layout alone: every
 // directory containing lib.rs or main.rs roots a crate; each .rs file
 // belongs to the nearest root above it (its own directory when no root
@@ -107,7 +134,7 @@ func newEdgeIndex(symbols []core.SymbolRecord) *edgeIndex {
 // lives in crates/searcher).
 func (idx *edgeIndex) buildRustCrates() {
 	roots := map[string]bool{}
-	for f := range idx.byFile {
+	for _, f := range sortedFileKeys(idx.byFile) {
 		if !strings.HasSuffix(f, ".rs") {
 			continue
 		}
@@ -121,7 +148,7 @@ func (idx *edgeIndex) buildRustCrates() {
 	idx.rustCrateOfFile = map[string]string{}
 	idx.rustCrateFiles = map[string][]string{}
 	idx.rustCrateByName = map[string]string{}
-	for f := range idx.byFile {
+	for _, f := range sortedFileKeys(idx.byFile) {
 		if !strings.HasSuffix(f, ".rs") {
 			continue
 		}
@@ -278,7 +305,7 @@ func (idx *edgeIndex) importedFiles(fromFile string) map[string]struct{} {
 		idx.importedFilesCache[fromFile] = out
 		return out
 	}
-	for imp := range imports {
+	for _, imp := range sortedKeys(imports) {
 		raw := strings.Trim(imp, "\"' ;")
 		// Relative imports name one specific file or directory: resolve them
 		// against the importing file's location and skip fuzzy matching —
@@ -1823,7 +1850,7 @@ func (idx *edgeIndex) importFilesForQualifier(fromFile, qualifier string) (map[s
 	}
 	found := false
 	out := map[string]struct{}{}
-	for imp := range imports {
+	for _, imp := range sortedKeys(imports) {
 		if lastImportSegment(imp) != qualifier {
 			continue
 		}

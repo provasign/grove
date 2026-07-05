@@ -378,7 +378,7 @@ func (s *Store) AllSymbols(ctx context.Context) ([]core.SymbolRecord, error) {
 		       modifiers, type_parameters, annotations, call_sites,
 		       COALESCE(attr_sites, '[]')
 		FROM symbols
-		ORDER BY file_path, span_start
+		ORDER BY file_path, span_start, id
 	`)
 	if err != nil {
 		return nil, err
