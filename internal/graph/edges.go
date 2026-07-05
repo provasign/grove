@@ -3,7 +3,9 @@ package graph
 import (
 	"path"
 	"regexp"
+	"runtime"
 	"strings"
+	"sync"
 
 	"github.com/provasign/grove/internal/core"
 )
@@ -957,7 +959,51 @@ func resolveCallees(idx *edgeIndex, symbol *core.SymbolRecord, calleeName string
 // implementation matched a per-callable compiled regex against every other
 // callable's body — O(callables²) regex scans, which on a 10K-symbol
 // single-package corpus took ~40s.
+// buildCalls resolves every function/method's call and property-read sites.
+// Per-symbol resolution is independent (dedup keys embed the caller ID, and
+// idx/sat are read-only here), so symbols resolve in parallel; results
+// concatenate in symbol order, keeping output byte-identical to the previous
+// sequential build.
 func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatisfaction) []core.Edge {
+	// Pre-warm the importedFiles memo for every file serially: it is the
+	// only lazily-written edgeIndex state, and warming it here makes the
+	// index strictly read-only for the parallel workers below.
+	for f := range idx.byFile {
+		idx.importedFiles(f)
+	}
+	results := make([][]core.Edge, len(symbols))
+	workers := runtime.GOMAXPROCS(0)
+	if workers > 8 {
+		workers = 8
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	taskCh := make(chan int)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range taskCh {
+				results[i] = resolveCallEdges(idx, symbols[i], sat)
+			}
+		}()
+	}
+	for i := range symbols {
+		taskCh <- i
+	}
+	close(taskCh)
+	wg.Wait()
+	var edges []core.Edge
+	for _, r := range results {
+		edges = append(edges, r...)
+	}
+	return edges
+}
+
+// resolveCallEdges resolves one caller's outgoing call/property edges.
+func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSatisfaction) []core.Edge {
 	var edges []core.Edge
 	seen := make(map[string]bool)
 
@@ -973,471 +1019,469 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 		})
 	}
 
-	for _, symbol := range symbols {
-		if symbol.Kind != core.KindFunction && symbol.Kind != core.KindMethod && symbol.Kind != core.KindConstructor {
-			continue
-		}
-		scope := idx.importedFiles(symbol.FilePath)
+	if symbol.Kind != core.KindFunction && symbol.Kind != core.KindMethod && symbol.Kind != core.KindConstructor {
+		return nil
+	}
+	scope := idx.importedFiles(symbol.FilePath)
 
-		// ── Property reads (AST-extracted AttrSites) ────────────────────────
-		// An attribute access ("request.blueprints") executes @property code
-		// with no call syntax. Resolve strictly against property-annotated
-		// methods so plain field reads never produce edges. Independent of
-		// CallSites: a function may only read properties.
-		if len(symbol.AttrSites) > 0 {
-			attrSelfVars := callerSelfQualifiers(&symbol)
-			for _, as := range symbol.AttrSites {
-				name := as.Callee
-				qualifier := ""
-				if idx := strings.LastIndexByte(name, '.'); idx >= 0 {
-					qualifier = name[:idx]
-					name = name[idx+1:]
-				}
-				if j := strings.LastIndexByte(qualifier, '.'); j >= 0 {
-					qualifier = qualifier[j+1:]
-				}
-				if name == "" {
-					continue
-				}
-				cands := resolvePropertyTargets(idx, &symbol, name, scope)
-				cands = narrowByReceiver(cands, &symbol, qualifier, attrSelfVars)
-				if _, isSelf := attrSelfVars[qualifier]; isSelf && classLanguage(symbol.Language) && len(filterByParent(cands, symbol.ParentSymbol)) == 0 {
-					if inherited := inheritedTargets(idx, &symbol, name, true); len(inherited) > 0 {
-						cands = inherited
-					}
-				}
-				for _, cand := range cands {
-					addEdge(symbol.ID, cand.ID, 0.7, core.EvidenceSourceASTKit, core.ReasonProperty)
+	// ── Property reads (AST-extracted AttrSites) ────────────────────────
+	// An attribute access ("request.blueprints") executes @property code
+	// with no call syntax. Resolve strictly against property-annotated
+	// methods so plain field reads never produce edges. Independent of
+	// CallSites: a function may only read properties.
+	if len(symbol.AttrSites) > 0 {
+		attrSelfVars := callerSelfQualifiers(&symbol)
+		for _, as := range symbol.AttrSites {
+			name := as.Callee
+			qualifier := ""
+			if idx := strings.LastIndexByte(name, '.'); idx >= 0 {
+				qualifier = name[:idx]
+				name = name[idx+1:]
+			}
+			if j := strings.LastIndexByte(qualifier, '.'); j >= 0 {
+				qualifier = qualifier[j+1:]
+			}
+			if name == "" {
+				continue
+			}
+			cands := resolvePropertyTargets(idx, &symbol, name, scope)
+			cands = narrowByReceiver(cands, &symbol, qualifier, attrSelfVars)
+			if _, isSelf := attrSelfVars[qualifier]; isSelf && classLanguage(symbol.Language) && len(filterByParent(cands, symbol.ParentSymbol)) == 0 {
+				if inherited := inheritedTargets(idx, &symbol, name, true); len(inherited) > 0 {
+					cands = inherited
 				}
 			}
-		}
-
-		// ── High-confidence path: AST-extracted CallSites ───────────────────
-		if len(symbol.CallSites) > 0 {
-			selfVars := callerSelfQualifiers(&symbol)
-			var localTypes map[string]string
-			switch symbol.Language {
-			case "go":
-				localTypes = goLocalTypes(idx, &symbol)
-			case "python":
-				localTypes = pyLocalTypes(idx, &symbol)
-			case "typescript", "tsx", "javascript":
-				localTypes = tsLocalTypes(idx, &symbol)
-			case "java":
-				localTypes = javaLocalTypes(idx, &symbol)
-			case "rust":
-				localTypes = rustLocalTypes(idx, &symbol)
-			case "csharp":
-				localTypes = csharpLocalTypes(idx, &symbol)
-			case "php":
-				localTypes = phpLocalTypes(idx, &symbol)
-			case "c", "cpp":
-				localTypes = cFamilyLocalTypes(idx, &symbol)
+			for _, cand := range cands {
+				addEdge(symbol.ID, cand.ID, 0.7, core.EvidenceSourceASTKit, core.ReasonProperty)
 			}
-			var javaArgTypeCache map[string]string
-			for _, cs := range symbol.CallSites {
-				calleeName := cs.Callee
-				// Split receiver prefix (e.g. "user.save" → qualifier "user",
-				// name "save"); chains keep only the last segment ("a.b.Get" → "b").
-				qualifier := ""
-				fullChain := "" // full receiver chain, e.g. "this.connection.driver"
-				if idx := strings.LastIndexByte(calleeName, '.'); idx >= 0 {
-					qualifier = calleeName[:idx]
-					calleeName = calleeName[idx+1:]
+		}
+	}
+
+	// ── High-confidence path: AST-extracted CallSites ───────────────────
+	if len(symbol.CallSites) > 0 {
+		selfVars := callerSelfQualifiers(&symbol)
+		var localTypes map[string]string
+		switch symbol.Language {
+		case "go":
+			localTypes = goLocalTypes(idx, &symbol)
+		case "python":
+			localTypes = pyLocalTypes(idx, &symbol)
+		case "typescript", "tsx", "javascript":
+			localTypes = tsLocalTypes(idx, &symbol)
+		case "java":
+			localTypes = javaLocalTypes(idx, &symbol)
+		case "rust":
+			localTypes = rustLocalTypes(idx, &symbol)
+		case "csharp":
+			localTypes = csharpLocalTypes(idx, &symbol)
+		case "php":
+			localTypes = phpLocalTypes(idx, &symbol)
+		case "c", "cpp":
+			localTypes = cFamilyLocalTypes(idx, &symbol)
+		}
+		var javaArgTypeCache map[string]string
+		for _, cs := range symbol.CallSites {
+			calleeName := cs.Callee
+			// Split receiver prefix (e.g. "user.save" → qualifier "user",
+			// name "save"); chains keep only the last segment ("a.b.Get" → "b").
+			qualifier := ""
+			fullChain := "" // full receiver chain, e.g. "this.connection.driver"
+			if idx := strings.LastIndexByte(calleeName, '.'); idx >= 0 {
+				qualifier = calleeName[:idx]
+				calleeName = calleeName[idx+1:]
+			}
+			fullChain = qualifier
+			if j := strings.LastIndexByte(qualifier, '.'); j >= 0 {
+				qualifier = qualifier[j+1:]
+			}
+			// astkit collapses a member-chain receiver to its last segment
+			// (`this.connection.driver.escape` → callee "driver.escape"), so
+			// fullChain lost the intermediate hops. For TS/JS recover the
+			// full chain from the caller's own source line to enable
+			// multi-hop field-type resolution below.
+			if tsFamilyLang(symbol.Language) && qualifier != "" && cs.Line > 0 {
+				if chain := tsReceiverChainAt(symbol.RawText, cs.Line-symbol.Span.Start, calleeName); chain != "" {
+					fullChain = chain
 				}
-				fullChain = qualifier
-				if j := strings.LastIndexByte(qualifier, '.'); j >= 0 {
-					qualifier = qualifier[j+1:]
+			}
+			if calleeName == "" || calleeName == "constructor" || calleeName == "super" {
+				// "new X" and "super(...)" are invocation forms, not names:
+				// a bare "constructor" callee would match every class's
+				// constructor in scope.
+				continue
+			}
+			// AST-extracted names are exact by construction: case-insensitive
+			// matching here let "writeContentType" (free function) claim every
+			// type's "WriteContentType" method.
+			//
+			// Same-file shadowing applies to bare calls only. A Java call
+			// through an explicit non-self receiver binds by the receiver's
+			// type, not the enclosing file — a file that overrides serialize
+			// still calls OTHER types' serialize through typed receivers,
+			// and the typed-receiver narrowing below pins (or precisely
+			// drops) the widened candidate set.
+			sameFileWins := true
+			if symbol.Language == "java" && qualifier != "" && qualifier != "this" && qualifier != "super" {
+				if _, isSelf := selfVars[qualifier]; !isSelf {
+					sameFileWins = false
 				}
-				// astkit collapses a member-chain receiver to its last segment
-				// (`this.connection.driver.escape` → callee "driver.escape"), so
-				// fullChain lost the intermediate hops. For TS/JS recover the
-				// full chain from the caller's own source line to enable
-				// multi-hop field-type resolution below.
-				if tsFamilyLang(symbol.Language) && qualifier != "" && cs.Line > 0 {
-					if chain := tsReceiverChainAt(symbol.RawText, cs.Line-symbol.Span.Start, calleeName); chain != "" {
-						fullChain = chain
+			}
+			cands, capped := resolveCallees(idx, &symbol, calleeName, scope, true, sameFileWins)
+			if capped && symbol.Language != "java" && symbol.Language != "rust" {
+				// Only narrowing with real evidence may keep very large
+				// same-name sets: Java (arity, arg types) and Rust
+				// (typed receivers/qualifiers — crate-wide scope makes
+				// "new" or "update" routinely exceed the cap before the
+				// type evidence has had its chance). For the rest an
+				// over-cap set stays dropped (dispatch rescue below
+				// still applies); anything Rust's narrowing fails to
+				// pin back down is re-capped after narrowing.
+				cands = nil
+			}
+			if symbol.Language == "csharp" || symbol.Language == "php" ||
+				symbol.Language == "c" || symbol.Language == "cpp" {
+				// Overload disambiguation by arity. C#: JsonConvert has
+				// five DeserializeObject overloads, Roslyn picks one by
+				// args. PHP has no overloads but default/variadic params
+				// mean a same-named method on an unrelated class with a
+				// different arity is still a wrong candidate. filterByArgc
+				// keeps variadic/default-friendly candidates and never
+				// zeroes the set.
+				cands = filterByArgc(cands, cs.Argc)
+			}
+			if symbol.Language == "csharp" && len(cands) > 1 {
+				// Generic split: DeserializeObject<T>(string) and
+				// DeserializeObject(string) collide on name + arity + value
+				// arg type (both take a string). The call's explicit type
+				// args (cs.Generic) are the only signal — a generic call
+				// binds a generic overload, a non-generic call a
+				// non-generic one. Roslyn's 5-overload JsonConvert fanout
+				// was the dominant C# false-positive source.
+				cands = filterByGeneric(cands, cs.Generic)
+			}
+			if symbol.Language == "java" {
+				// Overload disambiguation: arity first, then exact
+				// argument-type evidence (positive matches only — see
+				// narrowOverloadsByArgTypes).
+				cands = filterByArgc(cands, cs.Argc)
+				if len(cands) > 1 && len(cs.Args) > 0 {
+					if javaArgTypeCache == nil {
+						javaArgTypeCache = javaArgTypes(&symbol)
 					}
+					javaResolveCallReturnTypes(idx, cs.Args, scope, javaArgTypeCache)
+					cands = narrowOverloadsByArgTypes(cands, cs.Args, javaArgTypeCache)
 				}
-				if calleeName == "" || calleeName == "constructor" || calleeName == "super" {
-					// "new X" and "super(...)" are invocation forms, not names:
-					// a bare "constructor" callee would match every class's
-					// constructor in scope.
-					continue
-				}
-				// AST-extracted names are exact by construction: case-insensitive
-				// matching here let "writeContentType" (free function) claim every
-				// type's "WriteContentType" method.
-				//
-				// Same-file shadowing applies to bare calls only. A Java call
-				// through an explicit non-self receiver binds by the receiver's
-				// type, not the enclosing file — a file that overrides serialize
-				// still calls OTHER types' serialize through typed receivers,
-				// and the typed-receiver narrowing below pins (or precisely
-				// drops) the widened candidate set.
-				sameFileWins := true
-				if symbol.Language == "java" && qualifier != "" && qualifier != "this" && qualifier != "super" {
-					if _, isSelf := selfVars[qualifier]; !isSelf {
-						sameFileWins = false
+				// Static typing makes unknowns meaningful: a lowercase
+				// receiver with no inferable type is almost always a JDK
+				// or library object (map.isEmpty, list.forEach) — its
+				// methods aren't in our index, so name collisions are
+				// noise. Call-result receivers resolve through the inner
+				// call's return type (append().append keeps builder
+				// chains); unresolvable ones drop too.
+				if qualifier != "" && qualifier != "super" {
+					if localTypes == nil {
+						localTypes = javaLocalTypes(idx, &symbol)
 					}
-				}
-				cands, capped := resolveCallees(idx, &symbol, calleeName, scope, true, sameFileWins)
-				if capped && symbol.Language != "java" && symbol.Language != "rust" {
-					// Only narrowing with real evidence may keep very large
-					// same-name sets: Java (arity, arg types) and Rust
-					// (typed receivers/qualifiers — crate-wide scope makes
-					// "new" or "update" routinely exceed the cap before the
-					// type evidence has had its chance). For the rest an
-					// over-cap set stays dropped (dispatch rescue below
-					// still applies); anything Rust's narrowing fails to
-					// pin back down is re-capped after narrowing.
-					cands = nil
-				}
-				if symbol.Language == "csharp" || symbol.Language == "php" ||
-					symbol.Language == "c" || symbol.Language == "cpp" {
-					// Overload disambiguation by arity. C#: JsonConvert has
-					// five DeserializeObject overloads, Roslyn picks one by
-					// args. PHP has no overloads but default/variadic params
-					// mean a same-named method on an unrelated class with a
-					// different arity is still a wrong candidate. filterByArgc
-					// keeps variadic/default-friendly candidates and never
-					// zeroes the set.
-					cands = filterByArgc(cands, cs.Argc)
-				}
-				if symbol.Language == "csharp" && len(cands) > 1 {
-					// Generic split: DeserializeObject<T>(string) and
-					// DeserializeObject(string) collide on name + arity + value
-					// arg type (both take a string). The call's explicit type
-					// args (cs.Generic) are the only signal — a generic call
-					// binds a generic overload, a non-generic call a
-					// non-generic one. Roslyn's 5-overload JsonConvert fanout
-					// was the dominant C# false-positive source.
-					cands = filterByGeneric(cands, cs.Generic)
-				}
-				if symbol.Language == "java" {
-					// Overload disambiguation: arity first, then exact
-					// argument-type evidence (positive matches only — see
-					// narrowOverloadsByArgTypes).
-					cands = filterByArgc(cands, cs.Argc)
-					if len(cands) > 1 && len(cs.Args) > 0 {
-						if javaArgTypeCache == nil {
-							javaArgTypeCache = javaArgTypes(&symbol)
-						}
-						javaResolveCallReturnTypes(idx, cs.Args, scope, javaArgTypeCache)
-						cands = narrowOverloadsByArgTypes(cands, cs.Args, javaArgTypeCache)
-					}
-					// Static typing makes unknowns meaningful: a lowercase
-					// receiver with no inferable type is almost always a JDK
-					// or library object (map.isEmpty, list.forEach) — its
-					// methods aren't in our index, so name collisions are
-					// noise. Call-result receivers resolve through the inner
-					// call's return type (append().append keeps builder
-					// chains); unresolvable ones drop too.
-					if qualifier != "" && qualifier != "super" {
-						if localTypes == nil {
-							localTypes = javaLocalTypes(idx, &symbol)
-						}
-						_, isSelf := selfVars[qualifier]
-						_, typed := localTypes[qualifier]
-						if !isSelf && !typed && !typeSymbolExists(idx, qualifier) {
-							if strings.HasSuffix(qualifier, "()") {
-								if ret := javaCallResultType(idx, qualifier, scope); ret != "" {
-									if byType := filterByParent(cands, ret); len(byType) > 0 {
-										cands = byType
-									} else {
-										cands = nil
-									}
+					_, isSelf := selfVars[qualifier]
+					_, typed := localTypes[qualifier]
+					if !isSelf && !typed && !typeSymbolExists(idx, qualifier) {
+						if strings.HasSuffix(qualifier, "()") {
+							if ret := javaCallResultType(idx, qualifier, scope); ret != "" {
+								if byType := filterByParent(cands, ret); len(byType) > 0 {
+									cands = byType
 								} else {
 									cands = nil
 								}
-							} else if qualifier[0] >= 'a' && qualifier[0] <= 'z' {
+							} else {
 								cands = nil
 							}
+						} else if qualifier[0] >= 'a' && qualifier[0] <= 'z' {
+							cands = nil
 						}
 					}
 				}
-				if symbol.Language == "rust" && qualifier == "" && calleeName == "drop" {
-					// Prelude mem::drop: a bare drop(x) never targets an
-					// in-repo Drop impl by name.
-					continue
-				}
-				if symbol.Language == "php" && strings.HasSuffix(qualifier, "()") && len(cands) > 0 {
-					// Fluent-chain receiver ($builder->make()->addStmt()): resolve
-					// the call result's class and keep only its methods. An
-					// unresolvable/ambiguous result (self-returning builder method
-					// that exists on many classes) drops — mirrors Java/Rust — so
-					// the chain does not fan out to every same-named method.
-					if ret := phpCallResultType(idx, qualifier, scope); ret != "" {
-						if byType := filterByParent(cands, ret); len(byType) > 0 {
-							cands = byType
-						} else {
-							cands = nil
-						}
+			}
+			if symbol.Language == "rust" && qualifier == "" && calleeName == "drop" {
+				// Prelude mem::drop: a bare drop(x) never targets an
+				// in-repo Drop impl by name.
+				continue
+			}
+			if symbol.Language == "php" && strings.HasSuffix(qualifier, "()") && len(cands) > 0 {
+				// Fluent-chain receiver ($builder->make()->addStmt()): resolve
+				// the call result's class and keep only its methods. An
+				// unresolvable/ambiguous result (self-returning builder method
+				// that exists on many classes) drops — mirrors Java/Rust — so
+				// the chain does not fan out to every same-named method.
+				if ret := phpCallResultType(idx, qualifier, scope); ret != "" {
+					if byType := filterByParent(cands, ret); len(byType) > 0 {
+						cands = byType
 					} else {
 						cands = nil
 					}
+				} else {
+					cands = nil
 				}
-				if (symbol.Language == "csharp" || symbol.Language == "php" ||
-					symbol.Language == "c" || symbol.Language == "cpp") &&
-					qualifier != "" && qualifier != "this" && qualifier != "base" &&
-					qualifier != "self" && qualifier != "parent" && qualifier != "static" &&
-					!strings.HasSuffix(qualifier, "()") && len(cands) > 0 {
-					// Static typing, C#/PHP edition of the Java/Rust rule. A
-					// qualifier names a type directly (JsonConvert.ToString,
-					// Foo::bar) or a typed variable (reader.Read, $repo->save).
-					// If it's neither a known indexed type nor an inferable
-					// local, the receiver is a library object (sb.Append,
-					// $logger->info) whose method isn't ours — a same-name
-					// match is noise: drop. A resolvable type narrows by parent.
-					if held, ok := localTypes[qualifier]; ok {
-						if byType := filterByParent(cands, held); len(byType) > 0 {
-							cands = byType
-						} else {
-							cands = nil
-						}
-					} else if byQual := filterByParent(cands, qualifier); len(byQual) > 0 {
-						cands = byQual
-					} else if !typeSymbolExists(idx, qualifier) {
+			}
+			if (symbol.Language == "csharp" || symbol.Language == "php" ||
+				symbol.Language == "c" || symbol.Language == "cpp") &&
+				qualifier != "" && qualifier != "this" && qualifier != "base" &&
+				qualifier != "self" && qualifier != "parent" && qualifier != "static" &&
+				!strings.HasSuffix(qualifier, "()") && len(cands) > 0 {
+				// Static typing, C#/PHP edition of the Java/Rust rule. A
+				// qualifier names a type directly (JsonConvert.ToString,
+				// Foo::bar) or a typed variable (reader.Read, $repo->save).
+				// If it's neither a known indexed type nor an inferable
+				// local, the receiver is a library object (sb.Append,
+				// $logger->info) whose method isn't ours — a same-name
+				// match is noise: drop. A resolvable type narrows by parent.
+				if held, ok := localTypes[qualifier]; ok {
+					if byType := filterByParent(cands, held); len(byType) > 0 {
+						cands = byType
+					} else {
 						cands = nil
 					}
+				} else if byQual := filterByParent(cands, qualifier); len(byQual) > 0 {
+					cands = byQual
+				} else if !typeSymbolExists(idx, qualifier) {
+					cands = nil
 				}
-				if symbol.Language == "rust" && qualifier != "" && len(cands) > 0 {
-					// Static typing, Rust edition of the Java rule. An
-					// uppercase qualifier is a type path (PathBuf::from,
-					// Regex::new): if no candidate belongs to that type and
-					// no local resolves it, the callee lives outside the
-					// repo — drop. A lowercase qualifier with no local type
-					// is a module path or an uninferable variable: keep
-					// only candidates declared in a matching module file
-					// (parse::parse_low_raw → flags/parse.rs), else drop.
-					_, isSelf := selfVars[qualifier]
-					_, typed := localTypes[qualifier]
-					if strings.HasSuffix(qualifier, "()") {
-						// Call-result receiver: builder chains live here
-						// (.line_number(true).build() narrows build by
-						// line_number's return type). Unknown results are
-						// external (.unwrap().x, .iter().y) — drop.
-						if rets := rustCallResultTypes(idx, qualifier, &symbol, scope); len(rets) > 0 {
-							var byType []*core.SymbolRecord
-							for _, cand := range cands {
-								if (cand.Kind == core.KindMethod || cand.Kind == core.KindConstructor) && rets[cand.ParentSymbol] {
-									byType = append(byType, cand)
-								}
-							}
-							cands = byType
-						} else {
-							cands = nil
-						}
-					} else if isSelf && symbol.ParentSymbol != "" && len(filterByParent(cands, symbol.ParentSymbol)) == 0 {
-						// Default trait methods: self.is_match() inside
-						// impl Matcher for X, where X declares no
-						// is_match, executes the trait's declaration.
-						if trait := rustImplTrait(&symbol); trait != "" {
-							if byTrait := filterByParent(cands, trait); len(byTrait) > 0 {
-								cands = byTrait
-							}
-						}
-					} else if !isSelf && !typed && len(filterByParent(cands, qualifier)) == 0 {
-						if qualifier[0] >= 'A' && qualifier[0] <= 'Z' {
-							cands = nil
-						} else {
-							// Module-named files win; a single same-file
-							// candidate stays for inline modules (mod
-							// convert { fn str... } inside defs.rs), but a
-							// same-named set in one file is receiver
-							// ambiguity, not module scoping — drop it.
-							var inModule, sameFile []*core.SymbolRecord
-							for _, cand := range cands {
-								base := baseNameNoExt(cand.FilePath)
-								if base == qualifier || (base == "mod" && baseOf(dirOf(cand.FilePath)) == qualifier) {
-									inModule = append(inModule, cand)
-								} else if cand.FilePath == symbol.FilePath {
-									sameFile = append(sameFile, cand)
-								}
-							}
-							cands = inModule
-							if len(cands) == 0 && len(sameFile) == 1 {
-								cands = sameFile
-							}
-						}
-					}
-				}
-				// super().method() / super.method() resolves on the caller's
-				// base classes; bare super() invokes the base constructor.
-				if qualifier == "super()" || qualifier == "super" {
-					for _, cand := range narrowBySuper(idx, &symbol, cands) {
-						addEdge(symbol.ID, cand.ID, 0.85, core.EvidenceSourceHeuristic, core.ReasonInheritance)
-					}
-					continue
-				}
-				if calleeName == "super()" && symbol.ParentSymbol != "" {
-					for _, base := range baseClassesFor(idx, symbol.Language, symbol.ParentSymbol, dirOf(symbol.FilePath)) {
-						targets := constructorTargets(idx, base, scope)
-						if len(targets) == 0 {
-							// Inheritance crosses imports — but prefer the twin
-							// in the caller's own package over same-named
-							// classes elsewhere in a monorepo.
-							for _, cand := range idx.byName["constructor"] {
-								if cand.ParentSymbol == base && cand.Kind == core.KindConstructor &&
-									samePackageRoot(cand.FilePath, symbol.FilePath) {
-									targets = append(targets, cand)
-								}
-							}
-						}
-						for _, ctor := range targets {
-							addEdge(symbol.ID, ctor.ID, 0.85, core.EvidenceSourceHeuristic, core.ReasonConstructor)
-						}
-					}
-					continue
-				}
-				narrowed := narrowByReceiver(cands, &symbol, qualifier, selfVars)
-				// resolvedByType records that the receiver's type was known and
-				// used to pin (or precisely drop) the targets — in which case the
-				// blanket dispatch rescue below must NOT also fire, or it floods a
-				// precisely-resolved interface call (x.Get on a SecretsKVStore)
-				// with every same-named method across the repo.
-				resolvedByType := false
+			}
+			if symbol.Language == "rust" && qualifier != "" && len(cands) > 0 {
+				// Static typing, Rust edition of the Java rule. An
+				// uppercase qualifier is a type path (PathBuf::from,
+				// Regex::new): if no candidate belongs to that type and
+				// no local resolves it, the callee lives outside the
+				// repo — drop. A lowercase qualifier with no local type
+				// is a module path or an uninferable variable: keep
+				// only candidates declared in a matching module file
+				// (parse::parse_low_raw → flags/parse.rs), else drop.
 				_, isSelf := selfVars[qualifier]
-				// Bare unqualified call in Java/C#/C++ is implicit this.method():
-				// member lookup binds it to the caller's own class first, so it
-				// must not fan out to every same-named method across unrelated
-				// classes. Narrow to own-class candidates when the own class
-				// declares the method; otherwise fall through to the inherited
-				// lookup below (ancestor) or, if neither, leave it (free function).
-				implicitSelf := qualifier == "" && symbol.ParentSymbol != "" &&
-					(symbol.Kind == core.KindMethod || symbol.Kind == core.KindConstructor) &&
-					implicitSelfLanguage(symbol.Language)
-				if implicitSelf {
-					if own := filterByParent(cands, symbol.ParentSymbol); len(own) > 0 {
-						narrowed = own
-					}
-				}
-				if (isSelf || implicitSelf) && classLanguage(symbol.Language) {
-					if len(filterByParent(narrowed, symbol.ParentSymbol)) == 0 {
-						// Not a method on the caller's own class: inheritance
-						// reaches files import scope never sees.
-						if inherited := inheritedTargets(idx, &symbol, calleeName, false); len(inherited) > 0 {
-							for _, cand := range inherited {
-								addEdge(symbol.ID, cand.ID, 0.85, core.EvidenceSourceHeuristic, core.ReasonInheritance)
-							}
-							continue
-						}
-					}
-				}
-				if len(narrowed) == len(cands) {
-					// Receiver narrowing didn't fire; try the inferred type of
-					// the receiver variable, then import qualification.
-					kept, dispatch, decided := narrowByLocalType(idx, sat, localTypes, qualifier, calleeName, cands, scope)
-					if !decided && tsFamilyLang(symbol.Language) && strings.Contains(fullChain, ".") {
-						// Multi-hop receiver (`this.connection.driver.escape`):
-						// walk the field-type chain and dispatch to the resolved
-						// type's implementors. The single-segment lookup above
-						// cannot see `driver` because it is a field of the chain's
-						// intermediate type, not of the enclosing class.
-						kept, dispatch, decided = narrowByChainType(idx, sat, localTypes, &symbol, fullChain, calleeName, cands)
-					}
-					if decided {
-						// The receiver type was known: this call site is resolved
-						// (to kept, to dispatch implementors, or to nothing). Mark
-						// it so the blanket dispatch rescue below stays out.
-						resolvedByType = true
-						narrowed = kept
-						for _, m := range dispatch {
-							if m.ID != symbol.ID {
-								addEdge(symbol.ID, m.ID, 0.7, core.EvidenceSourceHeuristic, core.ReasonDispatch)
+				_, typed := localTypes[qualifier]
+				if strings.HasSuffix(qualifier, "()") {
+					// Call-result receiver: builder chains live here
+					// (.line_number(true).build() narrows build by
+					// line_number's return type). Unknown results are
+					// external (.unwrap().x, .iter().y) — drop.
+					if rets := rustCallResultTypes(idx, qualifier, &symbol, scope); len(rets) > 0 {
+						var byType []*core.SymbolRecord
+						for _, cand := range cands {
+							if (cand.Kind == core.KindMethod || cand.Kind == core.KindConstructor) && rets[cand.ParentSymbol] {
+								byType = append(byType, cand)
 							}
 						}
+						cands = byType
 					} else {
-						narrowed = narrowByImport(idx, &symbol, qualifier, cands)
+						cands = nil
 					}
-				}
-				if len(narrowed) > maxCalleeFanout {
-					// Still unresolvably broad after every narrowing pass:
-					// drop (the dispatch rescue below may still apply).
-					narrowed = nil
-					capped = true
-				} else if len(narrowed) > 0 {
-					capped = false
-				}
-				for _, cand := range narrowed {
-					addEdge(symbol.ID, cand.ID, 0.95, core.EvidenceSourceASTKit, core.ReasonASTNarrowed)
-				}
-				// Class instantiation: "Flask(...)" executes Flask.__init__.
-				// Route class-named calls to the class's constructor method;
-				// "cls(...)" constructs the caller's own class, and a variable
-				// holding a class (null_session_class = NullSession) constructs
-				// the held class.
-				if len(narrowed) == 0 && !capped {
-					ctorName := calleeName
-					if calleeName == "cls" && symbol.ParentSymbol != "" {
-						ctorName = symbol.ParentSymbol
-					} else if held, ok := localTypes[calleeName]; ok && strings.HasPrefix(held, "class:") {
-						ctorName = strings.TrimPrefix(held, "class:")
+				} else if isSelf && symbol.ParentSymbol != "" && len(filterByParent(cands, symbol.ParentSymbol)) == 0 {
+					// Default trait methods: self.is_match() inside
+					// impl Matcher for X, where X declares no
+					// is_match, executes the trait's declaration.
+					if trait := rustImplTrait(&symbol); trait != "" {
+						if byTrait := filterByParent(cands, trait); len(byTrait) > 0 {
+							cands = byTrait
+						}
 					}
-					ctors := constructorTargets(idx, ctorName, scope)
-					if symbol.Language == "java" {
-						ctors = filterByArgc(ctors, cs.Argc)
-						if len(ctors) > 1 && len(cs.Args) > 0 {
-							if javaArgTypeCache == nil {
-								javaArgTypeCache = javaArgTypes(&symbol)
+				} else if !isSelf && !typed && len(filterByParent(cands, qualifier)) == 0 {
+					if qualifier[0] >= 'A' && qualifier[0] <= 'Z' {
+						cands = nil
+					} else {
+						// Module-named files win; a single same-file
+						// candidate stays for inline modules (mod
+						// convert { fn str... } inside defs.rs), but a
+						// same-named set in one file is receiver
+						// ambiguity, not module scoping — drop it.
+						var inModule, sameFile []*core.SymbolRecord
+						for _, cand := range cands {
+							base := baseNameNoExt(cand.FilePath)
+							if base == qualifier || (base == "mod" && baseOf(dirOf(cand.FilePath)) == qualifier) {
+								inModule = append(inModule, cand)
+							} else if cand.FilePath == symbol.FilePath {
+								sameFile = append(sameFile, cand)
 							}
-							ctors = narrowOverloadsByArgTypes(ctors, cs.Args, javaArgTypeCache)
 						}
-					}
-					for _, ctor := range ctors {
-						if ctor.ID != symbol.ID {
-							addEdge(symbol.ID, ctor.ID, 0.85, core.EvidenceSourceHeuristic, core.ReasonConstructor)
+						cands = inModule
+						if len(cands) == 0 && len(sameFile) == 1 {
+							cands = sameFile
 						}
 					}
 				}
-				// Fan-out the cap dropped is legitimate dynamic dispatch when an
-				// in-scope interface declares the method: emit edges to its
-				// implementations at reduced confidence.
-				if capped && !resolvedByType && sat != nil {
-					for _, m := range sat.dispatchTargets(calleeName, scope) {
+			}
+			// super().method() / super.method() resolves on the caller's
+			// base classes; bare super() invokes the base constructor.
+			if qualifier == "super()" || qualifier == "super" {
+				for _, cand := range narrowBySuper(idx, &symbol, cands) {
+					addEdge(symbol.ID, cand.ID, 0.85, core.EvidenceSourceHeuristic, core.ReasonInheritance)
+				}
+				continue
+			}
+			if calleeName == "super()" && symbol.ParentSymbol != "" {
+				for _, base := range baseClassesFor(idx, symbol.Language, symbol.ParentSymbol, dirOf(symbol.FilePath)) {
+					targets := constructorTargets(idx, base, scope)
+					if len(targets) == 0 {
+						// Inheritance crosses imports — but prefer the twin
+						// in the caller's own package over same-named
+						// classes elsewhere in a monorepo.
+						for _, cand := range idx.byName["constructor"] {
+							if cand.ParentSymbol == base && cand.Kind == core.KindConstructor &&
+								samePackageRoot(cand.FilePath, symbol.FilePath) {
+								targets = append(targets, cand)
+							}
+						}
+					}
+					for _, ctor := range targets {
+						addEdge(symbol.ID, ctor.ID, 0.85, core.EvidenceSourceHeuristic, core.ReasonConstructor)
+					}
+				}
+				continue
+			}
+			narrowed := narrowByReceiver(cands, &symbol, qualifier, selfVars)
+			// resolvedByType records that the receiver's type was known and
+			// used to pin (or precisely drop) the targets — in which case the
+			// blanket dispatch rescue below must NOT also fire, or it floods a
+			// precisely-resolved interface call (x.Get on a SecretsKVStore)
+			// with every same-named method across the repo.
+			resolvedByType := false
+			_, isSelf := selfVars[qualifier]
+			// Bare unqualified call in Java/C#/C++ is implicit this.method():
+			// member lookup binds it to the caller's own class first, so it
+			// must not fan out to every same-named method across unrelated
+			// classes. Narrow to own-class candidates when the own class
+			// declares the method; otherwise fall through to the inherited
+			// lookup below (ancestor) or, if neither, leave it (free function).
+			implicitSelf := qualifier == "" && symbol.ParentSymbol != "" &&
+				(symbol.Kind == core.KindMethod || symbol.Kind == core.KindConstructor) &&
+				implicitSelfLanguage(symbol.Language)
+			if implicitSelf {
+				if own := filterByParent(cands, symbol.ParentSymbol); len(own) > 0 {
+					narrowed = own
+				}
+			}
+			if (isSelf || implicitSelf) && classLanguage(symbol.Language) {
+				if len(filterByParent(narrowed, symbol.ParentSymbol)) == 0 {
+					// Not a method on the caller's own class: inheritance
+					// reaches files import scope never sees.
+					if inherited := inheritedTargets(idx, &symbol, calleeName, false); len(inherited) > 0 {
+						for _, cand := range inherited {
+							addEdge(symbol.ID, cand.ID, 0.85, core.EvidenceSourceHeuristic, core.ReasonInheritance)
+						}
+						continue
+					}
+				}
+			}
+			if len(narrowed) == len(cands) {
+				// Receiver narrowing didn't fire; try the inferred type of
+				// the receiver variable, then import qualification.
+				kept, dispatch, decided := narrowByLocalType(idx, sat, localTypes, qualifier, calleeName, cands, scope)
+				if !decided && tsFamilyLang(symbol.Language) && strings.Contains(fullChain, ".") {
+					// Multi-hop receiver (`this.connection.driver.escape`):
+					// walk the field-type chain and dispatch to the resolved
+					// type's implementors. The single-segment lookup above
+					// cannot see `driver` because it is a field of the chain's
+					// intermediate type, not of the enclosing class.
+					kept, dispatch, decided = narrowByChainType(idx, sat, localTypes, &symbol, fullChain, calleeName, cands)
+				}
+				if decided {
+					// The receiver type was known: this call site is resolved
+					// (to kept, to dispatch implementors, or to nothing). Mark
+					// it so the blanket dispatch rescue below stays out.
+					resolvedByType = true
+					narrowed = kept
+					for _, m := range dispatch {
 						if m.ID != symbol.ID {
 							addEdge(symbol.ID, m.ID, 0.7, core.EvidenceSourceHeuristic, core.ReasonDispatch)
 						}
 					}
+				} else {
+					narrowed = narrowByImport(idx, &symbol, qualifier, cands)
 				}
 			}
-			continue // CallSites authoritative; skip regex fallback for this symbol
+			if len(narrowed) > maxCalleeFanout {
+				// Still unresolvably broad after every narrowing pass:
+				// drop (the dispatch rescue below may still apply).
+				narrowed = nil
+				capped = true
+			} else if len(narrowed) > 0 {
+				capped = false
+			}
+			for _, cand := range narrowed {
+				addEdge(symbol.ID, cand.ID, 0.95, core.EvidenceSourceASTKit, core.ReasonASTNarrowed)
+			}
+			// Class instantiation: "Flask(...)" executes Flask.__init__.
+			// Route class-named calls to the class's constructor method;
+			// "cls(...)" constructs the caller's own class, and a variable
+			// holding a class (null_session_class = NullSession) constructs
+			// the held class.
+			if len(narrowed) == 0 && !capped {
+				ctorName := calleeName
+				if calleeName == "cls" && symbol.ParentSymbol != "" {
+					ctorName = symbol.ParentSymbol
+				} else if held, ok := localTypes[calleeName]; ok && strings.HasPrefix(held, "class:") {
+					ctorName = strings.TrimPrefix(held, "class:")
+				}
+				ctors := constructorTargets(idx, ctorName, scope)
+				if symbol.Language == "java" {
+					ctors = filterByArgc(ctors, cs.Argc)
+					if len(ctors) > 1 && len(cs.Args) > 0 {
+						if javaArgTypeCache == nil {
+							javaArgTypeCache = javaArgTypes(&symbol)
+						}
+						ctors = narrowOverloadsByArgTypes(ctors, cs.Args, javaArgTypeCache)
+					}
+				}
+				for _, ctor := range ctors {
+					if ctor.ID != symbol.ID {
+						addEdge(symbol.ID, ctor.ID, 0.85, core.EvidenceSourceHeuristic, core.ReasonConstructor)
+					}
+				}
+			}
+			// Fan-out the cap dropped is legitimate dynamic dispatch when an
+			// in-scope interface declares the method: emit edges to its
+			// implementations at reduced confidence.
+			if capped && !resolvedByType && sat != nil {
+				for _, m := range sat.dispatchTargets(calleeName, scope) {
+					if m.ID != symbol.ID {
+						addEdge(symbol.ID, m.ID, 0.7, core.EvidenceSourceHeuristic, core.ReasonDispatch)
+					}
+				}
+			}
 		}
+		return edges // CallSites authoritative; skip regex fallback for this symbol
+	}
 
-		// ── Fallback: one identifier-extraction pass over the stripped body ──
-		// Only for languages without AST call-site extraction: where the
-		// extractor ran, an empty CallSites list is authoritative — a method
-		// with zero calls would otherwise regex-match its own signature
-		// ("append(final int value)" edging every sibling overload).
-		if astCallSiteLanguages[symbol.Language] {
+	// ── Fallback: one identifier-extraction pass over the stripped body ──
+	// Only for languages without AST call-site extraction: where the
+	// extractor ran, an empty CallSites list is authoritative — a method
+	// with zero calls would otherwise regex-match its own signature
+	// ("append(final int value)" edging every sibling overload).
+	if astCallSiteLanguages[symbol.Language] {
+		return edges
+	}
+	if symbol.RawText == "" {
+		return edges
+	}
+	stripped := stripCommentsAndStrings(symbol.RawText)
+	seenCallee := make(map[string]bool)
+	for _, m := range callIdentRe.FindAllStringSubmatch(stripped, -1) {
+		calleeName := m[1]
+		if seenCallee[calleeName] {
 			continue
 		}
-		if symbol.RawText == "" {
+		if calleeName == "constructor" || calleeName == "super" {
 			continue
 		}
-		stripped := stripCommentsAndStrings(symbol.RawText)
-		seenCallee := make(map[string]bool)
-		for _, m := range callIdentRe.FindAllStringSubmatch(stripped, -1) {
-			calleeName := m[1]
-			if seenCallee[calleeName] {
-				continue
+		seenCallee[calleeName] = true
+		cands, fbCapped := resolveCallees(idx, &symbol, calleeName, scope, true, true)
+		if fbCapped {
+			// The fallback has no narrowing evidence; over-cap stays dropped.
+			continue
+		}
+		for _, cand := range cands {
+			confidence := 0.6
+			if cand.FilePath == symbol.FilePath {
+				confidence = 0.85
 			}
-			if calleeName == "constructor" || calleeName == "super" {
-				continue
-			}
-			seenCallee[calleeName] = true
-			cands, fbCapped := resolveCallees(idx, &symbol, calleeName, scope, true, true)
-			if fbCapped {
-				// The fallback has no narrowing evidence; over-cap stays dropped.
-				continue
-			}
-			for _, cand := range cands {
-				confidence := 0.6
-				if cand.FilePath == symbol.FilePath {
-					confidence = 0.85
-				}
-				addEdge(symbol.ID, cand.ID, confidence, core.EvidenceSourceRegex, core.ReasonRegexFallbck)
-			}
+			addEdge(symbol.ID, cand.ID, confidence, core.EvidenceSourceRegex, core.ReasonRegexFallbck)
 		}
 	}
 	return edges

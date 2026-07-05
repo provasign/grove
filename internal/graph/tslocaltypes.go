@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/provasign/grove/internal/core"
+	"sync"
 )
 
 // TS/JS local type inference: typed class fields (already indexed as field
@@ -243,14 +244,14 @@ func tsClassFieldTypes(idx *edgeIndex, className string, out map[string]string) 
 // tsReceiverChainRe captures a dotted receiver chain immediately before a
 // `.<method>(` call, e.g. "this.connection.driver" in
 // "this.connection.driver.escape(".
-var tsReceiverChainReCache = map[string]*regexp.Regexp{}
+var tsReceiverChainReCache sync.Map // method → *regexp.Regexp; concurrent-safe: buildCalls resolves callers in parallel
 
 func tsReceiverChainRe(method string) *regexp.Regexp {
-	if re, ok := tsReceiverChainReCache[method]; ok {
-		return re
+	if re, ok := tsReceiverChainReCache.Load(method); ok {
+		return re.(*regexp.Regexp)
 	}
 	re := regexp.MustCompile(`([A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)\s*\.\s*` + regexp.QuoteMeta(method) + `\s*\(`)
-	tsReceiverChainReCache[method] = re
+	tsReceiverChainReCache.Store(method, re)
 	return re
 }
 

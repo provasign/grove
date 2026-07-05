@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/provasign/grove/internal/core"
 	"github.com/provasign/grove/internal/graph"
@@ -42,6 +43,20 @@ type Options struct {
 	Force bool
 }
 
+// phaseTimer prints per-phase durations to stderr when GROVE_TIMING=1 —
+// the profiling surface for index/delta performance work.
+func phaseTimer() func(string) {
+	if os.Getenv("GROVE_TIMING") == "" {
+		return func(string) {}
+	}
+	last := time.Now()
+	return func(phase string) {
+		now := time.Now()
+		fmt.Fprintf(os.Stderr, "[timing] %-28s %8.2fs\n", phase, now.Sub(last).Seconds())
+		last = now
+	}
+}
+
 func (i *Indexer) Index(ctx context.Context, root string) (*graph.CodeGraph, core.IndexResult, error) {
 	return i.IndexWithOptions(ctx, root, Options{})
 }
@@ -61,6 +76,7 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 	}
 	root = absRoot
 	result.Root = root
+	tick := phaseTimer()
 	// Remove per-repo Go caches left behind by earlier Grove versions
 	// before walking, so they are neither indexed nor left to grow.
 	native.CleanupLegacyCaches(root)
@@ -128,6 +144,7 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 	if err != nil {
 		return nil, result, err
 	}
+	tick("walk+sha-scan")
 
 	// Phase 2 (parallel): parse changed files. Tree-sitter parsing is the
 	// dominant cold-index cost and astkit engines are safe for concurrent
@@ -165,6 +182,7 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 		close(taskCh)
 		wg.Wait()
 	}
+	tick("parse-changed")
 
 	// Phase 3 (serial): persist. SQLite has one writer; ordered writes keep
 	// the run reproducible.
@@ -197,10 +215,12 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 	}
 	result.FilesPruned = filesPruned
 
+	tick("persist-changed")
 	symbols, err := i.store.AllSymbols(ctx)
 	if err != nil {
 		return nil, result, err
 	}
+	tick("load-all-symbols")
 
 	// No file changed: the persisted edges are still exactly what a rebuild
 	// would produce, so reuse them instead of re-running native analyzers
@@ -229,6 +249,7 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 	}
 	nativeResult := native.AnalyzeChanged(ctx, root, symbols, i.nativeConfig, scope)
 	result.Native = append(result.Native, nativeResult.Diagnostics...)
+	tick("native-analyzers")
 
 	// Carry forward stored native edges for the skipped analyzers' languages:
 	// their facts didn't change, and rebuilding edges from scratch below
@@ -243,10 +264,12 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 
 	codeGraph := graph.New()
 	codeGraph.ReplaceWithEdges(symbols, nativeResult.Edges, result.FilesSeen)
+	tick("edge-construction")
 	_, edges := codeGraph.Snapshot()
 	if err := i.store.ReplaceEdges(ctx, edges); err != nil {
 		return nil, result, err
 	}
+	tick("edge-store-write")
 
 	result.SymbolCount = len(symbols)
 	result.EdgeCount = len(edges)

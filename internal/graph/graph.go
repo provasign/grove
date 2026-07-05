@@ -3,10 +3,12 @@ package graph
 import (
 	"crypto/sha1"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/provasign/grove/internal/core"
 	"github.com/provasign/grove/internal/embeddings"
@@ -157,21 +159,44 @@ func mergeEdges(base, enriched []core.Edge) []core.Edge {
 // "calls" and "uses-type" are scoped to same-file + imported-file symbols
 // per the non-negotiable accuracy rule in the plan.
 func BuildEdges(symbols []core.SymbolRecord) []core.Edge {
+	tick := edgeTimer()
 	idx := newEdgeIndex(symbols)
+	tick("edge-index")
 
 	edges := make([]core.Edge, 0, len(symbols)*4)
 	edges = append(edges, buildDefinesAndImports(symbols)...)
+	tick("defines+imports")
 	edges = append(edges, buildContains(idx, symbols)...)
+	tick("contains")
 	edges = append(edges, buildExtendsImplements(idx, symbols)...)
+	tick("extends+implements")
 	edges = append(edges, buildUsesType(idx, symbols)...)
+	tick("uses-type")
 	sat, satEdges := buildInterfaceSatisfaction(idx, symbols)
 	edges = append(edges, satEdges...)
+	tick("interface-satisfaction")
 	callEdges := buildCalls(idx, symbols, sat)
 	edges = append(edges, callEdges...)
+	tick("calls")
 	decoEdges := buildDecoratorEdges(idx, symbols, callEdges)
 	edges = append(edges, decoEdges...)
+	tick("decorators")
 	edges = append(edges, buildTests(idx, symbols, append(callEdges, decoEdges...))...)
+	tick("tests")
 	return edges
+}
+
+// edgeTimer prints per-builder durations to stderr when GROVE_TIMING=1.
+func edgeTimer() func(string) {
+	if os.Getenv("GROVE_TIMING") == "" {
+		return func(string) {}
+	}
+	last := time.Now()
+	return func(phase string) {
+		now := time.Now()
+		fmt.Fprintf(os.Stderr, "[timing]   edge/%-22s %8.2fs\n", phase, now.Sub(last).Seconds())
+		last = now
+	}
 }
 
 func (g *CodeGraph) Snapshot() ([]core.SymbolRecord, []core.Edge) {
@@ -516,6 +541,7 @@ func (g *CodeGraph) ImpactWithPolicy(query string, maxDepth int, policy Traversa
 //     dependency closure (calls/contains/implements/extends/uses-type/tests)
 //     and gather every test symbol that reaches any node in that closure.
 //  2. Fallback: substring search in test files (for free-text queries).
+//
 // minTestTraversalConfidence bounds which edges the TestsFor closure walks.
 // Resolved call edges carry 0.85–0.95, containment 1.0; the fallback tiers
 // (ambiguous name-matched calls 0.6, type-use 0.5) sit below the cut.
