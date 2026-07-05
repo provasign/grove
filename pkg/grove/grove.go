@@ -341,6 +341,9 @@ type RenamePlanResult struct {
 
 	Edits     []RenameEdit
 	Ambiguous []RenameEdit
+	// Unresolved lists change-set sites for which no line edit could be
+	// derived — the agent must handle these manually.
+	Unresolved []string
 
 	SitesTotal        int
 	ExternalSupers    []string
@@ -358,6 +361,7 @@ func (e *Engine) RenamePlan(ctx context.Context, query, newName string) (RenameP
 	res := RenamePlanResult{
 		Query:             raw.Query,
 		NewName:           raw.NewName,
+		Unresolved:        raw.Unresolved,
 		SitesTotal:        raw.SitesTotal,
 		ExternalSupers:    raw.ExternalSupers,
 		OverridesExternal: raw.OverridesExternal,

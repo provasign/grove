@@ -31,6 +31,10 @@ type RenamePlanResult struct {
 
 	Edits     []RenameEdit // confirmed: apply as-is
 	Ambiguous []RenameEdit // same-named non-family callee also in scope: verify receiver type first
+	// Unresolved lists change-set sites for which no line edit could be
+	// derived (empty indexed text, or the name not found in call position
+	// on the recorded lines) — the agent must handle these manually.
+	Unresolved []string
 
 	SitesTotal        int // sites in the underlying change-impact set
 	ExternalSupers    []string
@@ -75,6 +79,9 @@ func (g *CodeGraph) RenamePlan(query, newName string) (*RenamePlanResult, error)
 
 	// identifier in call/declaration position
 	pat := regexp.MustCompile(`\b` + regexp.QuoteMeta(methodName) + `\b(\s*\()`)
+	// ReplaceAllString treats $ in the replacement as a template variable —
+	// escape it so a $-bearing newName substitutes literally.
+	replacement := strings.ReplaceAll(newName, "$", "$$") + "$1"
 	editLine := func(s core.SymbolRecord, line int, confirmed bool) {
 		if s.RawText == "" || line < s.Span.Start {
 			return
@@ -85,7 +92,7 @@ func (g *CodeGraph) RenamePlan(query, newName string) (*RenamePlanResult, error)
 			return
 		}
 		before := lines[idx]
-		after := pat.ReplaceAllString(before, newName+"$1")
+		after := pat.ReplaceAllString(before, replacement)
 		if after == before {
 			return // name not on this line in call position
 		}
@@ -147,6 +154,19 @@ func (g *CodeGraph) RenamePlan(query, newName string) (*RenamePlanResult, error)
 
 	sortEdits(res.Edits)
 	sortEdits(res.Ambiguous)
+	editedSites := map[string]bool{}
+	for _, e := range res.Edits {
+		editedSites[e.SiteID] = true
+	}
+	for _, e := range res.Ambiguous {
+		editedSites[e.SiteID] = true
+	}
+	for _, s := range sites {
+		if !editedSites[s.ID] {
+			res.Unresolved = append(res.Unresolved, s.FilePath+":"+s.Name)
+		}
+	}
+	sort.Strings(res.Unresolved)
 	return res, nil
 }
 
