@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/provasign/grove/internal/core"
+	"sort"
 )
 
 type phpAnalyzer struct{}
@@ -214,8 +215,15 @@ func phpSemanticEdges(symbols []core.SymbolRecord, psr4 map[string][]string, fil
 				add(symbolEdge(symbol, target, core.EdgeUsesType, 0.94))
 			}
 		}
-		for name := range idx.typesByName {
-			if target, ok := phpBestType(idx, name, symbol.FilePath, psr4, fileScope); ok && target.ID != symbol.ID && containsTypeToken(symbol.RawText, name) {
+		names := make([]string, 0, 8)
+		for t := range typeTokensIn(symbol.RawText) {
+			if _, ok := idx.typesByName[t]; ok {
+				names = append(names, t)
+			}
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			if target, ok := phpBestType(idx, name, symbol.FilePath, psr4, fileScope); ok && target.ID != symbol.ID {
 				add(symbolEdge(symbol, target, core.EdgeUsesType, 0.9))
 			}
 		}

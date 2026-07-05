@@ -101,6 +101,22 @@ func containsCall(text, name string) bool {
 	return pattern.MatchString(stripQuotedText(text))
 }
 
+// identTokenRe extracts identifier-shaped tokens for typeTokensIn.
+var identTokenRe = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]*`)
+
+// typeTokensIn returns the distinct identifier tokens of text with quoted
+// text stripped. Type-use passes scan the body ONCE and look tokens up,
+// replacing the per-(symbol, type-name) regex scans that made the java/
+// csharp/php analyzers quadratic (285s on a 1.2k-file repo — never noticed
+// while the 5s timeout killed them before completion).
+func typeTokensIn(text string) map[string]bool {
+	tokens := map[string]bool{}
+	for _, t := range identTokenRe.FindAllString(stripQuotedText(text), -1) {
+		tokens[t] = true
+	}
+	return tokens
+}
+
 func containsTypeToken(text, name string) bool {
 	if name == "" {
 		return false
