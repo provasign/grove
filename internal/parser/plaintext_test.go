@@ -14,51 +14,51 @@ import (
 func TestDetectLanguagePlaintext(t *testing.T) {
 	cases := map[string]string{
 		// Markdown
-		"README.md":        "plaintext",
-		"CHANGELOG.mdx":    "plaintext",
-		"notes.markdown":   "plaintext",
+		"README.md":      "plaintext",
+		"CHANGELOG.mdx":  "plaintext",
+		"notes.markdown": "plaintext",
 		// YAML
-		"config.yaml":      "plaintext",
-		"policy.yml":       "plaintext",
+		"config.yaml": "plaintext",
+		"policy.yml":  "plaintext",
 		// JSON
-		"package.json":     "plaintext",
-		"mcp.json":         "plaintext",
+		"package.json": "plaintext",
+		"mcp.json":     "plaintext",
 		// XML
-		"rules.xml":        "plaintext",
-		"pom.xml":          "plaintext",
+		"rules.xml": "plaintext",
+		"pom.xml":   "plaintext",
 		// Shell
-		"deploy.sh":        "plaintext",
-		"setup.bash":       "plaintext",
-		"rc.zsh":           "plaintext",
+		"deploy.sh":  "plaintext",
+		"setup.bash": "plaintext",
+		"rc.zsh":     "plaintext",
 		// TOML
-		"Cargo.toml":       "plaintext",
-		"pyproject.toml":   "plaintext",
+		"Cargo.toml":     "plaintext",
+		"pyproject.toml": "plaintext",
 		// Config
-		"app.ini":          "plaintext",
-		"server.cfg":       "plaintext",
-		"nginx.conf":       "plaintext",
+		"app.ini":    "plaintext",
+		"server.cfg": "plaintext",
+		"nginx.conf": "plaintext",
 		// Text
-		"notes.txt":        "plaintext",
+		"notes.txt": "plaintext",
 		// Proto / SQL / GraphQL
-		"api.proto":        "plaintext",
-		"schema.sql":       "plaintext",
-		"query.graphql":    "plaintext",
-		"query.gql":        "plaintext",
+		"api.proto":     "plaintext",
+		"schema.sql":    "plaintext",
+		"query.graphql": "plaintext",
+		"query.gql":     "plaintext",
 		// CSV
-		"data.csv":         "plaintext",
+		"data.csv": "plaintext",
 		// Name-based (no extension)
-		"Makefile":         "plaintext",
-		"GNUmakefile":      "plaintext",
-		"makefile":         "plaintext",
-		"Dockerfile":       "plaintext",
-		"Containerfile":    "plaintext",
-		".gitignore":       "plaintext",
-		".dockerignore":    "plaintext",
-		".gitattributes":   "plaintext",
-		".editorconfig":    "plaintext",
-		".nvmrc":           "plaintext",
-		".node-version":    "plaintext",
-		".python-version":  "plaintext",
+		"Makefile":        "plaintext",
+		"GNUmakefile":     "plaintext",
+		"makefile":        "plaintext",
+		"Dockerfile":      "plaintext",
+		"Containerfile":   "plaintext",
+		".gitignore":      "plaintext",
+		".dockerignore":   "plaintext",
+		".gitattributes":  "plaintext",
+		".editorconfig":   "plaintext",
+		".nvmrc":          "plaintext",
+		".node-version":   "plaintext",
+		".python-version": "plaintext",
 	}
 	for path, want := range cases {
 		got := DetectLanguage(path)
@@ -252,12 +252,12 @@ func TestPlaintextSignature_VariousFormats(t *testing.T) {
 		{"## H2 Section\n", "H2 Section"},
 		{"### Deep heading\nsome text", "Deep heading"},
 		{"\n\n# After blanks\n", "After blanks"},
-		{"---\nkey: value\n", "key: value"},         // skip YAML front-matter delimiter
-		{"...\nother: stuff\n", "other: stuff"},      // skip YAML end marker
+		{"---\nkey: value\n", "key: value"},     // skip YAML front-matter delimiter
+		{"...\nother: stuff\n", "other: stuff"}, // skip YAML end marker
 		{"name: my-policy\n", "name: my-policy"},
-		{"", ""},                                     // empty
-		{"\n\n\n", ""},                               // only blank lines
-		{"---\n---\n", ""},                           // only delimiters
+		{"", ""},           // empty
+		{"\n\n\n", ""},     // only blank lines
+		{"---\n---\n", ""}, // only delimiters
 	}
 	for _, c := range cases {
 		lines := strings.Split(c.content, "\n")

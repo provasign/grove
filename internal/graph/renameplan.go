@@ -92,9 +92,21 @@ func (g *CodeGraph) RenamePlan(query, newName string) (*RenamePlanResult, error)
 			return
 		}
 		before := lines[idx]
+		rawN := len(pat.FindAllStringIndex(before, -1))
+		strippedN := len(pat.FindAllStringIndex(stripCommentsAndStrings(before), -1))
+		if strippedN == 0 {
+			return // only comment/string-literal occurrences on this line
+		}
 		after := pat.ReplaceAllString(before, replacement)
 		if after == before {
 			return // name not on this line in call position
+		}
+		// A string-literal occurrence alongside a real one, or multiple
+		// same-name calls on one line (one may target an unindexed object):
+		// the blanket rewrite cannot be attributed per-occurrence — bucket
+		// Ambiguous, never confirmed.
+		if rawN != strippedN || rawN > 1 {
+			confirmed = false
 		}
 		e := RenameEdit{
 			FilePath: s.FilePath, Line: line,
@@ -108,18 +120,52 @@ func (g *CodeGraph) RenamePlan(query, newName string) (*RenamePlanResult, error)
 		}
 	}
 
+	// hasNonFamilySameName reports whether sym has a call edge to a
+	// same-named method OUTSIDE the family — per-line attribution is then
+	// uncertain for its call sites.
+	hasNonFamilySameName := func(id string) bool {
+		for _, ei := range g.outbound[id] {
+			e := g.edges[ei]
+			if e.Type != core.EdgeCalls || family[e.To] {
+				continue
+			}
+			if callee, ok := g.symbols[e.To]; ok && callee.Name == methodName {
+				return true
+			}
+		}
+		return false
+	}
+
 	// 1. Declarations + overrides: the signature line (first line in the
-	// symbol's span where the name appears in declaration position).
+	// symbol's span where the name appears in declaration position), PLUS
+	// the member's own same-name call sites — the delegating-override shape
+	// (`void speak() { super.speak(); }`) is the most common override body,
+	// and ChangeImpact's Callers list excludes family members.
 	for _, s := range sites {
 		if !family[s.ID] {
 			continue
 		}
+		declLine := -1
 		lines := strings.Split(s.RawText, "\n")
 		for i := range lines {
-			if pat.MatchString(lines[i]) {
-				editLine(s, s.Span.Start+i, true)
+			if pat.MatchString(stripCommentsAndStrings(lines[i])) {
+				declLine = s.Span.Start + i
+				editLine(s, declLine, true)
 				break
 			}
+		}
+		ambiguous := hasNonFamilySameName(s.ID)
+		seen := map[int]bool{declLine: true}
+		for _, cs := range s.CallSites {
+			bare := cs.Callee
+			if i := strings.LastIndex(bare, "."); i >= 0 {
+				bare = bare[i+1:]
+			}
+			if bare != methodName || seen[cs.Line] {
+				continue
+			}
+			seen[cs.Line] = true
+			editLine(s, cs.Line, !ambiguous)
 		}
 	}
 
@@ -127,17 +173,7 @@ func (g *CodeGraph) RenamePlan(query, newName string) (*RenamePlanResult, error)
 	// ALSO has a call edge to a same-named NON-family symbol makes its lines
 	// ambiguous — the graph cannot attribute individual lines to the family.
 	for _, c := range ci.Callers {
-		ambiguousCaller := false
-		for _, ei := range g.outbound[c.ID] {
-			e := g.edges[ei]
-			if e.Type != core.EdgeCalls || family[e.To] {
-				continue
-			}
-			if callee, ok := g.symbols[e.To]; ok && callee.Name == methodName {
-				ambiguousCaller = true
-				break
-			}
-		}
+		ambiguousCaller := hasNonFamilySameName(c.ID)
 		seen := map[int]bool{}
 		for _, cs := range c.CallSites {
 			bare := cs.Callee

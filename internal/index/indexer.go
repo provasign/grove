@@ -134,9 +134,13 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 
 		// Stat cache: size+mtime match means the content is unchanged —
 		// skip reading and hashing 1.4GB of sources on every rescan.
-		info, statErr := entry.Info()
+		// os.Stat (not entry.Info) so symlinked sources stat the TARGET;
+		// the link's own stat never changes when the target is edited.
+		// --force bypasses the shortcut: it is the recovery path for
+		// mtime-preserving writers (rsync -t, tar, build caches).
+		info, statErr := os.Stat(path)
 		meta, found := fileMeta[relPath]
-		if statErr == nil && found &&
+		if !opts.Force && statErr == nil && found &&
 			meta.Size == info.Size() && meta.Mtime == info.ModTime().UnixNano() {
 			result.FilesSkipped++
 			return nil

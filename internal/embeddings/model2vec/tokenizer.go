@@ -24,9 +24,9 @@ import (
 // raw text into content WordPieces and average their embeddings. The Encode
 // method therefore returns only content piece IDs.
 type Tokenizer struct {
-	vocab     map[string]int32
-	unkID     int32
-	maxChars  int // per-word safety cap (BERT default = 100)
+	vocab    map[string]int32
+	unkID    int32
+	maxChars int // per-word safety cap (BERT default = 100)
 }
 
 // LoadVocab reads a BERT vocab.txt (one token per line, line N maps to ID N)

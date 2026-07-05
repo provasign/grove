@@ -45,6 +45,12 @@ type goListPackage struct {
 	GoFiles     []string
 	TestGoFiles []string
 	Imports     []string
+	// Test-file imports are reported separately by go list; the scoped-delta
+	// reverse-importer closure must include them or packages whose TESTS
+	// import a changed package are never re-analyzed and their test edges
+	// silently drop (blob-SHA endpoints stop resolving).
+	TestImports  []string
+	XTestImports []string
 }
 
 func (goAnalyzer) Analyze(ctx context.Context, req Request) Result {
@@ -175,6 +181,12 @@ func goAffectedDirs(root string, changedFiles []string, pkgs []goListPackage) ma
 		for _, imp := range pkg.Imports {
 			importers[imp] = append(importers[imp], rel)
 		}
+		for _, imp := range pkg.TestImports {
+			importers[imp] = append(importers[imp], rel)
+		}
+		for _, imp := range pkg.XTestImports {
+			importers[imp] = append(importers[imp], rel)
+		}
 	}
 	affected := map[string]bool{}
 	queue := make([]string, 0, len(changedDirs))
@@ -196,6 +208,27 @@ func goAffectedDirs(root string, changedFiles []string, pkgs []goListPackage) ma
 			if !affected[d] {
 				affected[d] = true
 				queue = append(queue, d)
+			}
+		}
+	}
+	// The lexical passes (goCallSiteEdges/goTypeUseEdges) resolve imports by
+	// BASENAME, so a package importing any path whose last segment matches a
+	// changed dir's basename may hold edges into it even without a go-list
+	// import edge. One basename-level expansion (no transitive re-queue —
+	// lexical edges are caller→target one-hop) keeps those callers fresh.
+	changedBase := map[string]bool{}
+	for d := range changedDirs {
+		changedBase[lastPathSegment(d)] = true
+	}
+	for _, pkg := range pkgs {
+		rel, ok := relFile(root, pkg.Dir)
+		if !ok || affected[rel] {
+			continue
+		}
+		for _, imp := range append(append(append([]string(nil), pkg.Imports...), pkg.TestImports...), pkg.XTestImports...) {
+			if changedBase[lastPathSegment(imp)] {
+				affected[rel] = true
+				break
 			}
 		}
 	}
@@ -739,7 +772,7 @@ var goIdentRe = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]*`)
 // and tokenized exactly once and tokens are resolved through the type index;
 // the previous implementation compiled a fresh regex and re-stripped the
 // body for every (caller, type-name) pair, unbounded by the analyzer
-// timeout. ctx is checked so a timeout still ends the pass promptly.
+// completion (linear cost; the deadline governs subprocesses, not pure-Go passes).
 // goTypeUseEdges resolves type references for callers against the FULL
 // symbol index — callers may be scoped to changed packages, but their
 // targets live anywhere in the repo.
@@ -793,6 +826,14 @@ func goContainsType(rawText, name string) bool {
 // files, the sorted go-file set, and each file's import block.
 func goListTopologyKey(root string, files []string, symbols []core.SymbolRecord) string {
 	h := sha256.New()
+	// Environment and toolchain change go list output (GOOS/GOARCH gate file
+	// sets via build tags; GOFLAGS can add -mod=vendor). Known residual: an
+	// edited //go:build line rotates file content but not this key — rare,
+	// and recoverable with --force or any import-block change.
+	for _, env := range []string{"GOOS", "GOARCH", "GOFLAGS", "CGO_ENABLED"} {
+		h.Write([]byte(env + "=" + os.Getenv(env) + ";"))
+	}
+	h.Write([]byte(runtime.Version()))
 	for _, mod := range []string{"go.mod", "go.sum", "go.work", "go.work.sum"} {
 		if b, err := os.ReadFile(filepath.Join(root, mod)); err == nil {
 			h.Write([]byte(mod))
@@ -845,5 +886,9 @@ func saveGoListCache(path, key string, output []byte) {
 		return
 	}
 	_ = os.MkdirAll(filepath.Dir(path), 0o755)
-	_ = os.WriteFile(path, b, 0o644)
+	// temp+rename: a concurrent reader must never see torn JSON.
+	tmp := path + ".tmp"
+	if os.WriteFile(tmp, b, 0o644) == nil {
+		_ = os.Rename(tmp, path)
+	}
 }

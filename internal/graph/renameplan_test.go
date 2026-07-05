@@ -25,12 +25,13 @@ func renamePlanFixture() *CodeGraph {
 		{ID: "DiskStore.java::DiskStore@sha", FilePath: "DiskStore.java", Language: "java", Kind: core.KindClass,
 			Name: "DiskStore", QualifiedName: "DiskStore",
 			Signature: "public class DiskStore implements Store",
-			Span: core.LineRange{Start: 1, End: 10}},
+			Span:      core.LineRange{Start: 1, End: 10}},
 		{ID: "DiskStore.java::DiskStore.load@sha", FilePath: "DiskStore.java", Language: "java", Kind: core.KindMethod,
 			Name: "load", QualifiedName: "DiskStore.load", ParentSymbol: "DiskStore",
 			Signature: "public byte[] load(String key)",
-			RawText:   "@Override\npublic byte[] load(String key) {\n    return read(key);\n}",
-			Span:      core.LineRange{Start: 4, End: 7}},
+			RawText:   "@Override\npublic byte[] load(String key) {\n    return super.load(key);\n}",
+			Span:      core.LineRange{Start: 4, End: 7},
+			CallSites: []core.CallSite{{Callee: "super.load", Line: 6, Argc: 1}}},
 
 		{ID: "Cache.java::Cache@sha", FilePath: "Cache.java", Language: "java", Kind: core.KindClass,
 			Name: "Cache", QualifiedName: "Cache", Signature: "public class Cache",
@@ -93,6 +94,13 @@ func TestRenamePlan(t *testing.T) {
 		}
 	}
 
+	// The delegating override's own super.load(key) call (line 6) must be
+	// edited too — applying a plan that renames the declaration but not the
+	// delegation breaks the build.
+	if e, ok := byLine["DiskStore.java:6"]; !ok || !strings.Contains(e.After, "super.fetch(key)") {
+		t.Errorf("missing/wrong delegating-override call edit: %+v", e)
+	}
+
 	// syncBoth calls both DiskStore.load and Cache.load -> its lines are
 	// ambiguous, and Cache.load (non-family) must NOT appear anywhere.
 	if len(r.Ambiguous) != 2 {
@@ -117,3 +125,47 @@ func TestRenamePlan(t *testing.T) {
 	}
 }
 
+// String-literal and multi-occurrence lines must never land in confirmed
+// Edits — a blanket line rewrite cannot be attributed per-occurrence.
+func TestRenamePlanOccurrenceAmbiguity(t *testing.T) {
+	g := New()
+	g.ReplaceWithEdges([]core.SymbolRecord{
+		{ID: "S.java::S@sha", FilePath: "S.java", Language: "java", Kind: core.KindInterface,
+			Name: "S", QualifiedName: "S", Signature: "public interface S",
+			Span: core.LineRange{Start: 1, End: 3}},
+		{ID: "S.java::S.save@sha", FilePath: "S.java", Language: "java", Kind: core.KindMethod,
+			Name: "save", QualifiedName: "S.save", ParentSymbol: "S",
+			Signature: "void save()", RawText: "void save();",
+			Span: core.LineRange{Start: 2, End: 2}},
+		{ID: "A.java::A.log@sha", FilePath: "A.java", Language: "java", Kind: core.KindFunction,
+			Name: "log", QualifiedName: "A.log",
+			RawText: "void log(S s) {\n    audit(\"save()\"); s.save();\n}",
+			Span:    core.LineRange{Start: 10, End: 12},
+			CallSites: []core.CallSite{{Callee: "s.save", Line: 11, Argc: 0}}},
+	}, []core.Edge{
+		{From: "A.java::A.log@sha", To: "S.java::S.save@sha", Type: core.EdgeCalls, Confidence: 1},
+	}, 2)
+	r, err := g.RenamePlan("S.save", "persist")
+	if err != nil {
+		t.Fatalf("RenamePlan: %v", err)
+	}
+	for _, e := range r.Edits {
+		if e.FilePath == "A.java" && e.Line == 11 {
+			t.Errorf("string-contaminated line wrongly confirmed: %+v", e)
+		}
+	}
+	found := false
+	for _, e := range r.Ambiguous {
+		if e.FilePath == "A.java" && e.Line == 11 {
+			found = true
+			if strings.Contains(e.After, `audit("persist()")`) {
+				// the rewrite text may touch the literal — that is exactly
+				// why the line is ambiguous, not confirmed
+				_ = e
+			}
+		}
+	}
+	if !found {
+		t.Error("contaminated line missing from Ambiguous")
+	}
+}

@@ -102,7 +102,7 @@ func containsCall(text, name string) bool {
 }
 
 // identTokenRe extracts identifier-shaped tokens for typeTokensIn.
-var identTokenRe = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]*`)
+var identTokenRe = regexp.MustCompile(`[A-Za-z_$][A-Za-z0-9_$]*`)
 
 // typeTokensIn returns the distinct identifier tokens of text with quoted
 // text stripped. Type-use passes scan the body ONCE and look tokens up,

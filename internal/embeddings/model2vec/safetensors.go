@@ -25,8 +25,8 @@ import (
 
 // tensorMeta mirrors the per-tensor JSON entry in the safetensors header.
 type tensorMeta struct {
-	DType       string  `json:"dtype"`
-	Shape       []int64 `json:"shape"`
+	DType       string   `json:"dtype"`
+	Shape       []int64  `json:"shape"`
 	DataOffsets [2]int64 `json:"data_offsets"`
 }
 

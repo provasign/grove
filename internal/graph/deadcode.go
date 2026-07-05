@@ -14,9 +14,9 @@ import (
 // symbol alive). Anything static analysis cannot decide is bucketed
 // separately or excluded, never reported as dead.
 type DeadCodeResult struct {
-	RootCount      int      `json:"rootCount"`      // entry points seeded (mains, inits, tests, exported, extra)
-	ReachableCount int      `json:"reachableCount"` // symbols reached from the roots
-	Considered     int      `json:"considered"`     // production functions/methods examined
+	RootCount      int `json:"rootCount"`      // entry points seeded (mains, inits, tests, exported, extra)
+	ReachableCount int `json:"reachableCount"` // symbols reached from the roots
+	Considered     int `json:"considered"`     // production functions/methods examined
 
 	// Dead: unreachable, non-exported, name unreferenced anywhere in live
 	// code. The deletion-candidate list.

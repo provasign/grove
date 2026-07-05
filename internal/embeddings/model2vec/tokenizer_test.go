@@ -268,15 +268,15 @@ func TestSplitPunct_EmptyAndBoundaries(t *testing.T) {
 
 func TestIsCJK_Boundaries(t *testing.T) {
 	cases := map[rune]bool{
-		'A':       false, // ASCII letter
-		'1':       false, // digit
-		'中':       true,  // CJK Unified Ideographs
-		0x3400:    true,  // CJK Ext A start
-		0x4DBF:    true,  // CJK Ext A end
-		0x4DC0:    false, // just past Ext A
-		0xF900:    true,  // CJK Compat Ideographs start
-		0xFAFF:    true,  // CJK Compat Ideographs end
-		0x20000:   true,  // CJK Ext B start
+		'A':     false, // ASCII letter
+		'1':     false, // digit
+		'中':     true,  // CJK Unified Ideographs
+		0x3400:  true,  // CJK Ext A start
+		0x4DBF:  true,  // CJK Ext A end
+		0x4DC0:  false, // just past Ext A
+		0xF900:  true,  // CJK Compat Ideographs start
+		0xFAFF:  true,  // CJK Compat Ideographs end
+		0x20000: true,  // CJK Ext B start
 	}
 	for r, want := range cases {
 		if got := isCJK(r); got != want {
@@ -287,18 +287,18 @@ func TestIsCJK_Boundaries(t *testing.T) {
 
 func TestIsPunct_ASCIIAndUnicode(t *testing.T) {
 	cases := map[rune]bool{
-		'!':      true,
-		'.':      true,
-		',':      true,
-		'@':      true,
-		'[':      true,
-		'`':      true,
-		'{':      true,
-		'~':      true,
-		'a':      false,
-		'0':      false,
-		' ':      false,
-		'¶':      true, // Unicode punctuation
+		'!': true,
+		'.': true,
+		',': true,
+		'@': true,
+		'[': true,
+		'`': true,
+		'{': true,
+		'~': true,
+		'a': false,
+		'0': false,
+		' ': false,
+		'¶': true, // Unicode punctuation
 	}
 	for r, want := range cases {
 		if got := isPunct(r); got != want {

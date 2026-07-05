@@ -32,9 +32,9 @@ type Engine struct {
 	matrix    []float32 // flat row-major [vocab_size * dim]
 	dim       int
 
-	mu       sync.RWMutex
-	docVecs  []normalizedVec
-	symbols  []core.SymbolRecord
+	mu      sync.RWMutex
+	docVecs []normalizedVec
+	symbols []core.SymbolRecord
 }
 
 type normalizedVec struct {
