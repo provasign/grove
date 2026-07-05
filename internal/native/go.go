@@ -858,9 +858,38 @@ func goListTopologyKey(root string, files []string, symbols []core.SymbolRecord)
 			h.Write([]byte(imp))
 			h.Write([]byte{1})
 		}
+		// Build-constraint lines gate file-set membership per GOOS/GOARCH —
+		// an edited //go:build line must rotate the key. Reading one leading
+		// block per file (~1KB) costs far less than the go list subprocess
+		// the cache avoids.
+		h.Write(buildConstraintLines(filepath.Join(root, f)))
 		h.Write([]byte{2})
 	}
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// buildConstraintLines returns the //go:build and // +build lines from the
+// file's leading comment block (before the package clause).
+func buildConstraintLines(path string) []byte {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	buf := make([]byte, 4096)
+	n, _ := f.Read(buf)
+	var out []byte
+	for _, ln := range strings.Split(string(buf[:n]), "\n") {
+		t := strings.TrimSpace(ln)
+		if strings.HasPrefix(t, "package ") {
+			break
+		}
+		if strings.HasPrefix(t, "//go:build") || strings.HasPrefix(t, "// +build") {
+			out = append(out, t...)
+			out = append(out, 0)
+		}
+	}
+	return out
 }
 
 type goListCacheFile struct {

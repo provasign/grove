@@ -178,6 +178,7 @@ func newPHPIndex(symbols []core.SymbolRecord) phpIndex {
 
 func phpSemanticEdges(symbols []core.SymbolRecord, psr4 map[string][]string, fileScope map[string]bool) []core.Edge {
 	idx := newPHPIndex(symbols)
+	slowNames := slowTypeNames(idx.typesByName)
 	aliases := phpUseAliases(symbols)
 	var edges []core.Edge
 	seen := map[string]bool{}
@@ -222,6 +223,11 @@ func phpSemanticEdges(symbols []core.SymbolRecord, psr4 map[string][]string, fil
 			}
 		}
 		sort.Strings(names)
+		for _, name := range slowNames {
+			if containsTypeToken(symbol.RawText, name) {
+				names = append(names, name)
+			}
+		}
 		for _, name := range names {
 			if target, ok := phpBestType(idx, name, symbol.FilePath, psr4, fileScope); ok && target.ID != symbol.ID {
 				add(symbolEdge(symbol, target, core.EdgeUsesType, 0.9))

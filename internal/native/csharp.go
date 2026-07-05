@@ -146,6 +146,7 @@ func newCSharpIndex(symbols []core.SymbolRecord) csharpIndex {
 
 func csharpSemanticEdges(symbols []core.SymbolRecord) []core.Edge {
 	idx := newCSharpIndex(symbols)
+	slowNames := slowTypeNames(idx.typesByName)
 	var edges []core.Edge
 	seen := map[string]bool{}
 	add := func(edge core.Edge) {
@@ -188,6 +189,11 @@ func csharpSemanticEdges(symbols []core.SymbolRecord) []core.Edge {
 			}
 		}
 		sort.Strings(names)
+		for _, name := range slowNames {
+			if containsTypeToken(symbol.RawText, name) {
+				names = append(names, name)
+			}
+		}
 		for _, name := range names {
 			if target, ok := csharpBestType(idx, name, symbol.FilePath); ok && target.ID != symbol.ID {
 				add(symbolEdge(symbol, target, core.EdgeUsesType, 0.93))

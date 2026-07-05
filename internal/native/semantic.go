@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/provasign/grove/internal/core"
+	"sort"
 )
 
 var (
@@ -109,6 +110,23 @@ var identTokenRe = regexp.MustCompile(`[A-Za-z_$][A-Za-z0-9_$]*`)
 // replacing the per-(symbol, type-name) regex scans that made the java/
 // csharp/php analyzers quadratic (285s on a 1.2k-file repo — never noticed
 // while the 5s timeout killed them before completion).
+// asciiIdentRe: names the token pass can find. Anything else (unicode,
+// dotted, generic) falls back to the per-name regex scan — the quadratic
+// only bit when EVERY name took that path; the slow set is normally empty.
+var asciiIdentRe = regexp.MustCompile(`^[A-Za-z_$][A-Za-z0-9_$]*$`)
+
+// slowTypeNames returns the type names typeTokensIn cannot surface.
+func slowTypeNames(typesByName map[string][]core.SymbolRecord) []string {
+	var out []string
+	for name := range typesByName {
+		if !asciiIdentRe.MatchString(name) {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 func typeTokensIn(text string) map[string]bool {
 	tokens := map[string]bool{}
 	for _, t := range identTokenRe.FindAllString(stripQuotedText(text), -1) {

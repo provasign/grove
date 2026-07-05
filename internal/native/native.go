@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"errors"
 	"github.com/provasign/grove/internal/core"
 )
 
@@ -23,6 +24,9 @@ type Config struct {
 	Languages         map[string]bool
 	DisabledLanguages map[string]bool
 	Timeout           time.Duration
+	// TimeoutPinned marks an explicit user-set timeout (GROVE_NATIVE_TIMEOUT*)
+	// — size-scaling is skipped so the pin is honored exactly.
+	TimeoutPinned bool
 }
 
 func DefaultConfig() Config {
@@ -41,11 +45,13 @@ func ConfigFromEnv() Config {
 		cfg.DisabledLanguages = languageSet(value)
 	}
 	if value := strings.TrimSpace(os.Getenv("GROVE_NATIVE_TIMEOUT")); value != "" {
+		cfg.TimeoutPinned = true
 		if d, err := time.ParseDuration(value); err == nil && d > 0 {
 			cfg.Timeout = d
 		}
 	}
 	if value := strings.TrimSpace(os.Getenv("GROVE_NATIVE_TIMEOUT_MS")); value != "" {
+		cfg.TimeoutPinned = true
 		if ms, err := strconv.Atoi(value); err == nil && ms > 0 {
 			cfg.Timeout = time.Duration(ms) * time.Millisecond
 		}
@@ -162,7 +168,7 @@ func AnalyzeChangedFiles(ctx context.Context, root string, symbols []core.Symbol
 		// 19k files) and a starved analyzer used to land PARTIAL results —
 		// half a million edges flapping run to run.
 		timeout := cfg.Timeout
-		if cfg.Timeout == defaultTimeout {
+		if !cfg.TimeoutPinned {
 			if scaled := time.Duration(len(reqFiles)) * 4 * time.Millisecond; scaled > timeout {
 				timeout = scaled
 			}
@@ -172,7 +178,7 @@ func AnalyzeChangedFiles(ctx context.Context, root string, symbols []core.Symbol
 		}
 		runCtx, cancel := context.WithTimeout(ctx, timeout)
 		result := analyzer.Analyze(runCtx, Request{Root: root, Symbols: symbols, Files: reqFiles, ChangedFiles: changedFiles})
-		timedOut := runCtx.Err() != nil
+		timedOut := errors.Is(runCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
 		cancel()
 		for _, diag := range result.Diagnostics {
 			combined.Diagnostics = append(combined.Diagnostics, analyzer.Name()+": "+diag)
