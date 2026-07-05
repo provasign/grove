@@ -138,6 +138,9 @@ func TestParseNativeIndexArgs(t *testing.T) {
 	if cfg.Timeout.String() != "250ms" {
 		t.Fatalf("timeout = %s, want 250ms", cfg.Timeout)
 	}
+	if !cfg.TimeoutPinned {
+		t.Fatal("--native-timeout must pin the timeout (no size scaling)")
+	}
 	if !opts.Force {
 		t.Fatal("--force not parsed")
 	}
@@ -285,6 +288,14 @@ func TestRun_Tests(t *testing.T) {
 }
 
 func TestRun_TestsNoQuery(t *testing.T) {
+	// The lone positional is the root, not the query. Run from a cwd outside
+	// any repo: if the dir were misparsed as the query, root would resolve
+	// from cwd and fail here instead of succeeding via the fixture dir.
+	wd, _ := os.Getwd()
+	if err := os.Chdir(t.TempDir()); err != nil {
+		t.Skip("cannot chdir:", err)
+	}
+	defer os.Chdir(wd)
 	dir := goFixture(t)
 	if got := Run([]string{"tests", dir}); got != 0 {
 		t.Fatalf("want 0, got %d", got)

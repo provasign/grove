@@ -416,10 +416,17 @@ func tests(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int
 	args, refresh := stripRefresh(args)
 	query := ""
 	root := "."
-	if len(args) > 0 {
+	switch {
+	case len(args) == 1:
+		// `grove tests <dir>` (no query) is valid: a lone positional that
+		// names a directory is the root, not the query.
+		if fi, err := os.Stat(args[0]); err == nil && fi.IsDir() {
+			root = args[0]
+		} else {
+			query = args[0]
+		}
+	case len(args) > 1:
 		query = args[0]
-	}
-	if len(args) > 1 {
 		root = args[1]
 	}
 	cfg, err := config.Resolve(root)
@@ -599,6 +606,7 @@ func parseNativeIndexArgs(args []string) (string, native.Config, index.Options, 
 				return "", cfg, opts, fmt.Errorf("invalid --native-timeout: %s", value)
 			}
 			cfg.Timeout = d
+			cfg.TimeoutPinned = true
 		default:
 			if strings.HasPrefix(arg, "--native") {
 				return "", cfg, opts, fmt.Errorf("unknown native flag: %s", arg)
