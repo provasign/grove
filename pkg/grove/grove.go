@@ -320,6 +320,58 @@ func (e *Engine) ChangeImpact(ctx context.Context, query string) (ChangeImpactRe
 	}, nil
 }
 
+// RenameEdit is one suggested line edit in a rename plan.
+type RenameEdit struct {
+	FilePath string
+	Line     int    // 1-based
+	Before   string // source line as indexed
+	After    string // with the rename applied
+	SiteID   string // containing symbol ID
+	Site     string // "relpath:name" for relay
+}
+
+// RenamePlanResult converts a ChangeImpact set into concrete line edits.
+// Edits are confirmed (apply as-is); Ambiguous lines belong to methods that
+// also call a same-named non-family method and need receiver-type
+// verification before applying. Precision-first: nothing is silently
+// included or dropped.
+type RenamePlanResult struct {
+	Query   string
+	NewName string
+
+	Edits     []RenameEdit
+	Ambiguous []RenameEdit
+
+	SitesTotal        int
+	ExternalSupers    []string
+	OverridesExternal []string
+	Completeness      string // "closed" | "project-local"
+}
+
+// RenamePlan computes the change-impact set for query and converts it into
+// line edits renaming the member to newName.
+func (e *Engine) RenamePlan(ctx context.Context, query, newName string) (RenamePlanResult, error) {
+	raw, err := e.currentGraph().RenamePlan(query, newName)
+	if err != nil {
+		return RenamePlanResult{}, err
+	}
+	res := RenamePlanResult{
+		Query:             raw.Query,
+		NewName:           raw.NewName,
+		SitesTotal:        raw.SitesTotal,
+		ExternalSupers:    raw.ExternalSupers,
+		OverridesExternal: raw.OverridesExternal,
+		Completeness:      raw.Completeness,
+	}
+	for _, e := range raw.Edits {
+		res.Edits = append(res.Edits, RenameEdit(e))
+	}
+	for _, e := range raw.Ambiguous {
+		res.Ambiguous = append(res.Ambiguous, RenameEdit(e))
+	}
+	return res, nil
+}
+
 // MissingImplementationsResult is the deterministic answer to "which types
 // claiming this contract do not implement Type.method" — the companion to
 // ChangeImpact for interface evolution: ChangeImpact returns what must change

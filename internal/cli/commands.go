@@ -53,6 +53,8 @@ func Run(args []string) int {
 		return changeImpact(engine, codeGraph, args[1:])
 	case "missing-implementations":
 		return missingImplementations(engine, codeGraph, args[1:])
+	case "rename-plan":
+		return renamePlan(engine, codeGraph, args[1:])
 	case "untested-surface":
 		return untestedSurface(engine, codeGraph, args[1:])
 	case "dead-code":
@@ -319,6 +321,34 @@ func missingImplementations(engine *parser.Engine, codeGraph *graph.CodeGraph, a
 		return 1
 	}
 	result, err := codeGraph.MissingImplementations(query)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	return printJSON(result)
+}
+
+// renamePlan converts a change-impact set into concrete line edits with
+// suggested substitutions. Confirmed edits are safe to apply; Ambiguous
+// lines need receiver-type verification first (the containing method also
+// calls a same-named non-family method).
+func renamePlan(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int {
+	args, refresh := stripRefresh(args)
+	if len(args) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: grove rename-plan 'Type.method' <NewName> [dir] [--refresh]")
+		return 2
+	}
+	query, newName := args[0], args[1]
+	cfg, err := config.Resolve(argOrDefault(args, 2, "."))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	if err := prepareReadGraph(engine, codeGraph, cfg.Root, refresh); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	result, err := codeGraph.RenamePlan(query, newName)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -701,6 +731,7 @@ Usage:
   grove impact <symbol-or-file-query> [dir] [--refresh]
   grove change-impact <Type.method(Params)> [dir]   type-resolved change-set: declaration + override family + callers
   grove missing-implementations <Type.method> [dir]  types claiming the contract that do not implement the member
+  grove rename-plan <Type.method> <NewName> [dir]  change-set as concrete line edits with substitutions
   grove untested-surface <Type.method> [dir]     change-set partitioned by covering-test evidence
   grove dead-code [dir] [--roots a,b]            unreachable production functions/methods (precision-first)
   grove tests <file> [dir] [--refresh]
