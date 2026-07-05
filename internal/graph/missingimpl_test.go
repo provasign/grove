@@ -113,8 +113,10 @@ func TestMissingImplementationsDefaultMethod(t *testing.T) {
 	if !r.DefaultProvided {
 		t.Fatal("DefaultProvided = false for a default method")
 	}
-	if len(r.Missing) != 0 {
-		t.Errorf("Missing = %v, want empty under a default method", names(r.Missing))
+	// Buckets are still computed under a default body: XmlCodec inherits the
+	// default and is what breaks if the member becomes abstract/required.
+	if miss := names(r.Missing); !miss["XmlCodec"] || len(r.Missing) != 1 {
+		t.Errorf("Missing = %v, want exactly {XmlCodec} (inherits the default)", miss)
 	}
 }
 

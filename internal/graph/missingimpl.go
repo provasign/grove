@@ -42,8 +42,10 @@ type MissingImplementationsResult struct {
 
 	// DefaultProvided is true when the contract itself supplies a body every
 	// subtype inherits (a Java default method, or a concrete method on a
-	// class/abstract-class seed). No type is then "missing" and the buckets
-	// above are empty by construction.
+	// class/abstract-class seed). No type is then compile-broken today, and
+	// Missing reads as "inherits the default — breaks if the member becomes
+	// abstract/required", which is the interface-evolution question that
+	// motivates querying a defaulted member.
 	DefaultProvided bool
 
 	// Same contract-boundary reporting as ChangeImpactResult.
@@ -135,18 +137,23 @@ func (g *CodeGraph) MissingImplementations(query string) (*MissingImplementation
 		Completeness:      completeness,
 	}
 
-	// 3. A contract that carries its own body is inherited by every subtype:
-	// nothing can be missing. Java default methods; concrete methods when the
-	// seed is a class (subclasses inherit through extends).
+	// 3. A contract that carries its own body (a Java default method, or a
+	// concrete method on a class seed) is inherited by every subtype, so no
+	// type is compile-broken today. The buckets are still computed: under
+	// DefaultProvided they answer the evolution question "who inherits the
+	// default and breaks if the member becomes abstract/required?" — asking
+	// that hypothetical is the main reason to run this operation on a
+	// defaulted member.
 	seedKinds := make(map[string]core.SymbolKind, len(typeIDs))
 	for _, tid := range typeIDs {
 		if t, ok := g.symbols[tid]; ok {
 			seedKinds[tid] = t.Kind
 		}
 	}
-	if contractProvidesBody(contract, seedKinds) {
-		res.DefaultProvided = true
-		return res, nil
+	res.DefaultProvided = contractProvidesBody(contract, seedKinds)
+	contractIDs := make(map[string]bool, len(contract))
+	for _, c := range contract {
+		contractIDs[c.ID] = true
 	}
 
 	// 4. Subtype closure (downward), identical to ChangeImpact step 3.
@@ -188,7 +195,7 @@ func (g *CodeGraph) MissingImplementations(query string) (*MissingImplementation
 		default:
 			continue
 		}
-		covered, escapesIndex := g.implementationCoverage(id, methodName, declParams, wildcards)
+		covered, escapesIndex := g.implementationCoverage(id, methodName, declParams, wildcards, contractIDs)
 		switch {
 		case covered:
 			res.ImplementedCount++
@@ -211,7 +218,7 @@ func (g *CodeGraph) MissingImplementations(query string) (*MissingImplementation
 // any chain member declares a signature-compatible method, and whether the
 // chain names a superclass that is not indexed (external base: coverage
 // cannot be decided). Caller must hold g.mu.
-func (g *CodeGraph) implementationCoverage(typeID, methodName string, declParams []string, wildcards map[string]bool) (covered, escapesIndex bool) {
+func (g *CodeGraph) implementationCoverage(typeID, methodName string, declParams []string, wildcards map[string]bool, contractIDs map[string]bool) (covered, escapesIndex bool) {
 	visited := map[string]bool{}
 	frontier := []string{typeID}
 	for len(frontier) > 0 {
@@ -222,6 +229,13 @@ func (g *CodeGraph) implementationCoverage(typeID, methodName string, declParams
 		}
 		visited[node] = true
 		for _, m := range g.containedMethods([]string{node}, methodName) {
+			// The contract declaration itself never counts as coverage — a
+			// concrete body on the seed is the inherited default the
+			// DefaultProvided flag reports, not an implementation the
+			// subtype supplies.
+			if contractIDs[m.ID] {
+				continue
+			}
 			if signatureCompatible(declParams, paramTypesOf(&m), wildcards) && providesImplementation(&m) {
 				return true, false
 			}
