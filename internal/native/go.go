@@ -15,6 +15,8 @@ import (
 	"regexp"
 	"strings"
 
+	"crypto/sha256"
+	"encoding/hex"
 	"github.com/provasign/grove/internal/core"
 	"runtime"
 	"sort"
@@ -46,12 +48,22 @@ type goListPackage struct {
 }
 
 func (goAnalyzer) Analyze(ctx context.Context, req Request) Result {
-	cmd := exec.CommandContext(ctx, "go", "list", "-mod=readonly", "-json", "./...")
-	cmd.Dir = req.Root
-	cmd.Env = goAnalyzerEnv(req.Root)
-	out, err := cmd.Output()
-	if err != nil {
-		return Result{Diagnostics: []string{"go list failed: " + err.Error()}}
+	// go list output depends on module files, the go-file set, and import
+	// blocks — never on function bodies. Cache it keyed by exactly those
+	// inputs, so content-only edits skip the ~3s subprocess entirely.
+	topoKey := goListTopologyKey(req.Root, req.Files, req.Symbols)
+	cachePath := filepath.Join(req.Root, ".grove", "golist-cache.json")
+	out, cacheHit := loadGoListCache(cachePath, topoKey)
+	if !cacheHit {
+		cmd := exec.CommandContext(ctx, "go", "list", "-mod=readonly", "-json", "./...")
+		cmd.Dir = req.Root
+		cmd.Env = goAnalyzerEnv(req.Root)
+		var err error
+		out, err = cmd.Output()
+		if err != nil {
+			return Result{Diagnostics: []string{"go list failed: " + err.Error()}}
+		}
+		saveGoListCache(cachePath, topoKey, out)
 	}
 	dec := json.NewDecoder(bytesReader(out))
 	var pkgs []goListPackage
@@ -124,14 +136,18 @@ func (goAnalyzer) Analyze(ctx context.Context, req Request) Result {
 	typeUseEdges := goTypeUseEdges(ctx, semSymbols, req.Symbols)
 	edges = append(edges, typeUseEdges...)
 
+	head := []string{"go list resolved " + itoa(len(pkgs)) + " package(s)"}
+	if cacheHit {
+		head[0] += " (topology cache hit)"
+	}
+	head = append(head,
+		"resolved "+itoa(countEdgesOfType(callSiteEdges, core.EdgeCalls))+" native call-site edge(s)",
+		"resolved "+itoa(countEdgesOfType(typeUseEdges, core.EdgeUsesType))+" native lexical type-use edge(s)")
+	head = append(head, scopeDiag...)
 	return Result{
-		Edges:   edges,
-		Partial: partial,
-		Diagnostics: append(append([]string{
-			"go list resolved " + itoa(len(pkgs)) + " package(s)",
-			"resolved " + itoa(countEdgesOfType(callSiteEdges, core.EdgeCalls)) + " native call-site edge(s)",
-			"resolved " + itoa(countEdgesOfType(typeUseEdges, core.EdgeUsesType)) + " native lexical type-use edge(s)",
-		}, scopeDiag...), semanticDiagnostics...),
+		Edges:       edges,
+		Partial:     partial,
+		Diagnostics: append(head, semanticDiagnostics...),
 	}
 }
 
@@ -771,4 +787,63 @@ func goContainsType(rawText, name string) bool {
 	}
 	pattern := regexp.MustCompile(`\b[A-Za-z_][A-Za-z0-9_]*\.` + regexp.QuoteMeta(name) + `\b`)
 	return pattern.MatchString(stripQuotedText(rawText))
+}
+
+// goListTopologyKey hashes everything go list output depends on: module
+// files, the sorted go-file set, and each file's import block.
+func goListTopologyKey(root string, files []string, symbols []core.SymbolRecord) string {
+	h := sha256.New()
+	for _, mod := range []string{"go.mod", "go.sum", "go.work", "go.work.sum"} {
+		if b, err := os.ReadFile(filepath.Join(root, mod)); err == nil {
+			h.Write([]byte(mod))
+			h.Write(b)
+		}
+	}
+	importsByFile := map[string][]string{}
+	for i := range symbols {
+		sym := &symbols[i]
+		if sym.Language == "go" && len(sym.Imports) > 0 {
+			if _, ok := importsByFile[sym.FilePath]; !ok {
+				importsByFile[sym.FilePath] = sym.Imports
+			}
+		}
+	}
+	sorted := append([]string(nil), files...)
+	sort.Strings(sorted)
+	for _, f := range sorted {
+		h.Write([]byte(f))
+		h.Write([]byte{0})
+		for _, imp := range importsByFile[f] {
+			h.Write([]byte(imp))
+			h.Write([]byte{1})
+		}
+		h.Write([]byte{2})
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+type goListCacheFile struct {
+	Key    string `json:"key"`
+	Output []byte `json:"output"`
+}
+
+func loadGoListCache(path, key string) ([]byte, bool) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, false
+	}
+	var c goListCacheFile
+	if json.Unmarshal(b, &c) != nil || c.Key != key || len(c.Output) == 0 {
+		return nil, false
+	}
+	return c.Output, true
+}
+
+func saveGoListCache(path, key string, output []byte) {
+	b, err := json.Marshal(goListCacheFile{Key: key, Output: output})
+	if err != nil {
+		return
+	}
+	_ = os.MkdirAll(filepath.Dir(path), 0o755)
+	_ = os.WriteFile(path, b, 0o644)
 }

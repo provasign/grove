@@ -30,7 +30,7 @@ func TestUpsert_ReplaceEdges_Delete_AllSymbols_FTS(t *testing.T) {
 		// Duplicate ID should be skipped, not crash.
 		{ID: "a.go::Foo@sha1", FilePath: "a.go", BlobSHA: "sha1", Name: "Foo", Kind: core.KindFunction},
 	}
-	if err := st.UpsertFile(ctx, "a.go", "sha1", "go", syms); err != nil {
+	if err := st.UpsertFile(ctx, "a.go", "sha1", "go", -1, -1, syms); err != nil {
 		t.Fatal(err)
 	}
 	// FileBlobSHA round-trip

@@ -89,8 +89,15 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 		absPath string
 		relPath string
 		blobSHA string
+		size    int64
+		mtime   int64
 	}
 	var tasks []parseTask
+	fileMeta, err := i.store.AllFileMeta(ctx)
+	if err != nil {
+		return nil, result, err
+	}
+	statRefresh := map[string][2]int64{} // touched but content-identical
 	err = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			result.Errors = append(result.Errors, walkErr.Error())
@@ -125,23 +132,38 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 		result.FilesSeen++
 		currentFiles[relPath] = true
 
+		// Stat cache: size+mtime match means the content is unchanged —
+		// skip reading and hashing 1.4GB of sources on every rescan.
+		info, statErr := entry.Info()
+		meta, found := fileMeta[relPath]
+		if statErr == nil && found &&
+			meta.Size == info.Size() && meta.Mtime == info.ModTime().UnixNano() {
+			result.FilesSkipped++
+			return nil
+		}
 		blobSHA, err := parser.FileBlobSHA(path)
 		if err != nil {
 			result.Errors = append(result.Errors, fmt.Sprintf("%s: %v", relPath, err))
 			return nil
 		}
-		previousSHA, found, err := i.store.FileBlobSHA(ctx, relPath)
-		if err != nil {
-			return err
+		var size, mtime int64 = -1, -1
+		if statErr == nil {
+			size, mtime = info.Size(), info.ModTime().UnixNano()
 		}
-		if found && previousSHA == blobSHA {
+		if found && meta.BlobSHA == blobSHA {
+			// Touched (or first run after the stat-cache migration) but
+			// content-identical: refresh the stat so the next walk skips it.
 			result.FilesSkipped++
+			statRefresh[relPath] = [2]int64{size, mtime}
 			return nil
 		}
-		tasks = append(tasks, parseTask{absPath: path, relPath: relPath, blobSHA: blobSHA})
+		tasks = append(tasks, parseTask{absPath: path, relPath: relPath, blobSHA: blobSHA, size: size, mtime: mtime})
 		return nil
 	})
 	if err != nil {
+		return nil, result, err
+	}
+	if err := i.store.UpdateFileStats(ctx, statRefresh); err != nil {
 		return nil, result, err
 	}
 	tick("walk+sha-scan")
@@ -196,7 +218,7 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 			continue
 		}
 		language := parser.DetectLanguage(task.absPath)
-		if err := i.store.UpsertFile(ctx, task.relPath, task.blobSHA, language, outcomes[idx].symbols); err != nil {
+		if err := i.store.UpsertFile(ctx, task.relPath, task.blobSHA, language, task.size, task.mtime, outcomes[idx].symbols); err != nil {
 			return nil, result, err
 		}
 		changedLanguages[language] = true
@@ -261,28 +283,30 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 	// Carry forward stored native edges for the skipped analyzers' languages:
 	// their facts didn't change, and rebuilding edges from scratch below
 	// would otherwise drop them.
-	if len(nativeResult.SkippedLanguages) > 0 {
-		carried, err := i.carriedNativeEdges(ctx, symbols, nativeResult.SkippedLanguages)
+	if len(nativeResult.SkippedLanguages) > 0 || len(nativeResult.Partial) > 0 {
+		// One stored-edge load feeds both carry paths — each used to load
+		// the full edge table separately (1.5M rows each on a monorepo).
+		stored, err := i.store.AllEdges(ctx)
 		if err != nil {
 			return nil, result, err
 		}
-		nativeResult.Edges = append(nativeResult.Edges, carried...)
-	}
-	// Partially-analyzed languages: carry the stored native edges whose
-	// source file lives outside the analyzed package dirs — those packages'
-	// facts did not change and were not recomputed.
-	if len(nativeResult.Partial) > 0 {
-		carried, err := i.carriedPartialEdges(ctx, symbols, nativeResult.Partial)
-		if err != nil {
-			return nil, result, err
+		if len(nativeResult.SkippedLanguages) > 0 {
+			nativeResult.Edges = append(nativeResult.Edges,
+				carriedNativeEdges(stored, symbols, nativeResult.SkippedLanguages)...)
 		}
-		nativeResult.Edges = append(nativeResult.Edges, carried...)
+		// Partially-analyzed languages: carry the stored native edges whose
+		// source file lives outside the analyzed package dirs — those
+		// packages' facts did not change and were not recomputed.
+		if len(nativeResult.Partial) > 0 {
+			nativeResult.Edges = append(nativeResult.Edges,
+				carriedPartialEdges(stored, symbols, nativeResult.Partial)...)
+		}
 	}
 
 	codeGraph := graph.New()
 	codeGraph.ReplaceWithEdges(symbols, nativeResult.Edges, result.FilesSeen)
 	tick("edge-construction")
-	_, edges := codeGraph.Snapshot()
+	edges := codeGraph.EdgesSnapshot()
 	if err := i.store.ReplaceEdges(ctx, edges); err != nil {
 		return nil, result, err
 	}
@@ -297,11 +321,7 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 // endpoint belongs to one of the skipped languages and whose endpoints still
 // resolve against the current symbol set. Skipping an analyzer must not
 // erase the facts it produced last run.
-func (i *Indexer) carriedNativeEdges(ctx context.Context, symbols []core.SymbolRecord, skippedLanguages []string) ([]core.Edge, error) {
-	stored, err := i.store.AllEdges(ctx)
-	if err != nil {
-		return nil, err
-	}
+func carriedNativeEdges(stored []core.Edge, symbols []core.SymbolRecord, skippedLanguages []string) []core.Edge {
 	skipped := make(map[string]bool, len(skippedLanguages))
 	for _, l := range skippedLanguages {
 		skipped[l] = true
@@ -340,18 +360,14 @@ func (i *Indexer) carriedNativeEdges(ctx context.Context, symbols []core.SymbolR
 		}
 		out = append(out, e)
 	}
-	return out, nil
+	return out
 }
 
 // carriedPartialEdges returns stored native edges of partially-analyzed
 // languages whose SOURCE file is outside the analyzed package dirs (fresh
 // facts exist for files inside them). Endpoints must still resolve — edge
 // IDs embed blob SHAs, so edges into changed files drop out naturally.
-func (i *Indexer) carriedPartialEdges(ctx context.Context, symbols []core.SymbolRecord, partial map[string][]string) ([]core.Edge, error) {
-	stored, err := i.store.AllEdges(ctx)
-	if err != nil {
-		return nil, err
-	}
+func carriedPartialEdges(stored []core.Edge, symbols []core.SymbolRecord, partial map[string][]string) []core.Edge {
 	analyzed := map[string]map[string]bool{} // lang -> dir set
 	for lang, dirs := range partial {
 		set := map[string]bool{}
@@ -404,5 +420,5 @@ func (i *Indexer) carriedPartialEdges(ctx context.Context, symbols []core.Symbol
 		}
 		out = append(out, e)
 	}
-	return out, nil
+	return out
 }

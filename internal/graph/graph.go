@@ -199,6 +199,15 @@ func edgeTimer() func(string) {
 	}
 }
 
+// EdgesSnapshot returns a copy of the edge list only — the store write path
+// needs no symbols, and deep-copying 100k symbol records to discard them
+// dominated the write phase on monorepos.
+func (g *CodeGraph) EdgesSnapshot() []core.Edge {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return append([]core.Edge(nil), g.edges...)
+}
+
 func (g *CodeGraph) Snapshot() ([]core.SymbolRecord, []core.Edge) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()

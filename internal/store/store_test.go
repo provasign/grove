@@ -22,7 +22,7 @@ func TestUpsertFileAndAllSymbols(t *testing.T) {
 	st := openStore(t)
 	ctx := context.Background()
 
-	err := st.UpsertFile(ctx, "auth.go", "sha1", "go", []core.SymbolRecord{
+	err := st.UpsertFile(ctx, "auth.go", "sha1", "go", -1, -1, []core.SymbolRecord{
 		{ID: "auth.go::Login@sha1", FilePath: "auth.go", BlobSHA: "sha1", Language: "go",
 			Kind: core.KindFunction, Name: "Login", QualifiedName: "Login",
 			Signature: "func Login()", Docstring: "Authenticate the user",
@@ -75,11 +75,11 @@ func TestUpsertReplacesExistingSymbolsForFile(t *testing.T) {
 	ctx := context.Background()
 
 	first := []core.SymbolRecord{{ID: "a.go::Old@s", FilePath: "a.go", BlobSHA: "s", Language: "go", Kind: core.KindFunction, Name: "Old", QualifiedName: "Old"}}
-	if err := st.UpsertFile(ctx, "a.go", "s", "go", first); err != nil {
+	if err := st.UpsertFile(ctx, "a.go", "s", "go", -1, -1, first); err != nil {
 		t.Fatal(err)
 	}
 	second := []core.SymbolRecord{{ID: "a.go::New@s2", FilePath: "a.go", BlobSHA: "s2", Language: "go", Kind: core.KindFunction, Name: "New", QualifiedName: "New"}}
-	if err := st.UpsertFile(ctx, "a.go", "s2", "go", second); err != nil {
+	if err := st.UpsertFile(ctx, "a.go", "s2", "go", -1, -1, second); err != nil {
 		t.Fatal(err)
 	}
 
@@ -92,7 +92,7 @@ func TestUpsertReplacesExistingSymbolsForFile(t *testing.T) {
 func TestReplaceEdgesAndStatus(t *testing.T) {
 	st := openStore(t)
 	ctx := context.Background()
-	must(t, st.UpsertFile(ctx, "a.go", "s", "go", []core.SymbolRecord{
+	must(t, st.UpsertFile(ctx, "a.go", "s", "go", -1, -1, []core.SymbolRecord{
 		{ID: "a.go::F@s", FilePath: "a.go", BlobSHA: "s", Language: "go", Kind: core.KindFunction, Name: "F", QualifiedName: "F"},
 	}))
 	must(t, st.ReplaceEdges(ctx, []core.Edge{
@@ -110,10 +110,10 @@ func TestReplaceEdgesAndStatus(t *testing.T) {
 func TestDeleteFilesNotInPrunesStaleEntries(t *testing.T) {
 	st := openStore(t)
 	ctx := context.Background()
-	must(t, st.UpsertFile(ctx, "a.go", "s", "go", []core.SymbolRecord{
+	must(t, st.UpsertFile(ctx, "a.go", "s", "go", -1, -1, []core.SymbolRecord{
 		{ID: "a.go::F@s", FilePath: "a.go", BlobSHA: "s", Language: "go", Kind: core.KindFunction, Name: "F", QualifiedName: "F"},
 	}))
-	must(t, st.UpsertFile(ctx, "b.go", "s", "go", []core.SymbolRecord{
+	must(t, st.UpsertFile(ctx, "b.go", "s", "go", -1, -1, []core.SymbolRecord{
 		{ID: "b.go::G@s", FilePath: "b.go", BlobSHA: "s", Language: "go", Kind: core.KindFunction, Name: "G", QualifiedName: "G"},
 	}))
 

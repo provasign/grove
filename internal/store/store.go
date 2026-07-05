@@ -77,6 +77,10 @@ func (s *Store) runAlterMigrations(ctx context.Context) error {
 		`ALTER TABLE edges ADD COLUMN source            TEXT NOT NULL DEFAULT 'unknown'`,
 		`ALTER TABLE edges ADD COLUMN reason            TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE symbols ADD COLUMN attr_sites      TEXT NOT NULL DEFAULT '[]'`,
+		// Stat cache: the walk skips hashing files whose size+mtime are
+		// unchanged since the last index (-1 = unknown, forces one hash).
+		"ALTER TABLE file_index ADD COLUMN file_size  INTEGER NOT NULL DEFAULT -1",
+		"ALTER TABLE file_index ADD COLUMN file_mtime INTEGER NOT NULL DEFAULT -1",
 		// The FTS5 mirror was never queried by any retrieval path (search
 		// runs in-memory over the graph), yet its sync triggers doubled the
 		// cost of every symbol write and the table duplicated symbol text
@@ -110,7 +114,56 @@ func (s *Store) FileBlobSHA(ctx context.Context, filePath string) (string, bool,
 	return blobSHA, true, nil
 }
 
-func (s *Store) UpsertFile(ctx context.Context, filePath, blobSHA, language string, symbols []core.SymbolRecord) error {
+// FileMeta is the per-file identity the walk uses to decide whether a file
+// needs re-hashing (stat match) or re-parsing (blob mismatch).
+type FileMeta struct {
+	BlobSHA string
+	Size    int64
+	Mtime   int64
+}
+
+// AllFileMeta returns the stat cache for every indexed file in one query.
+func (s *Store) AllFileMeta(ctx context.Context) (map[string]FileMeta, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT file_path, blob_sha, file_size, file_mtime FROM file_index`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]FileMeta{}
+	for rows.Next() {
+		var p string
+		var m FileMeta
+		if err := rows.Scan(&p, &m.BlobSHA, &m.Size, &m.Mtime); err != nil {
+			return nil, err
+		}
+		out[p] = m
+	}
+	return out, rows.Err()
+}
+
+// UpdateFileStats refreshes size+mtime for files whose content was verified
+// unchanged (touched files: stat differs, blob identical).
+func (s *Store) UpdateFileStats(ctx context.Context, stats map[string][2]int64) error {
+	if len(stats) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for p, sm := range stats {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE file_index SET file_size = ?, file_mtime = ? WHERE file_path = ?`,
+			sm[0], sm[1], p); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) UpsertFile(ctx context.Context, filePath, blobSHA, language string, size, mtime int64, symbols []core.SymbolRecord) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -193,14 +246,16 @@ func (s *Store) UpsertFile(ctx context.Context, filePath, blobSHA, language stri
 	}
 
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO file_index (file_path, blob_sha, language, symbol_count, indexed_at)
-		VALUES (?, ?, ?, ?, ?)
+		INSERT INTO file_index (file_path, blob_sha, language, symbol_count, indexed_at, file_size, file_mtime)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(file_path) DO UPDATE SET
 			blob_sha     = excluded.blob_sha,
 			language     = excluded.language,
 			symbol_count = excluded.symbol_count,
-			indexed_at   = excluded.indexed_at
-	`, filePath, blobSHA, language, len(symbols), time.Now().UTC().Format(time.RFC3339))
+			indexed_at   = excluded.indexed_at,
+			file_size    = excluded.file_size,
+			file_mtime   = excluded.file_mtime
+	`, filePath, blobSHA, language, len(symbols), time.Now().UTC().Format(time.RFC3339), size, mtime)
 	if err != nil {
 		return err
 	}
