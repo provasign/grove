@@ -51,6 +51,8 @@ func Run(args []string) int {
 		return impact(engine, codeGraph, args[1:])
 	case "change-impact":
 		return changeImpact(engine, codeGraph, args[1:])
+	case "missing-implementations":
+		return missingImplementations(engine, codeGraph, args[1:])
 	case "tests":
 		return tests(engine, codeGraph, args[1:])
 	case "icr":
@@ -286,6 +288,33 @@ func changeImpact(engine *parser.Engine, codeGraph *graph.CodeGraph, args []stri
 		return 1
 	}
 	result, err := codeGraph.ChangeImpact(query)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	return printJSON(result)
+}
+
+// missingImplementations prints every type in the contract's subtype closure
+// that fails to implement the member — the interface-evolution companion to
+// change-impact (who is broken, rather than what must change).
+func missingImplementations(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int {
+	args, refresh := stripRefresh(args)
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: grove missing-implementations 'Type.method' | 'Type.method(ParamType, ...)' [dir] [--refresh]")
+		return 2
+	}
+	query := args[0]
+	cfg, err := config.Resolve(argOrDefault(args, 1, "."))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	if err := prepareReadGraph(engine, codeGraph, cfg.Root, refresh); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	result, err := codeGraph.MissingImplementations(query)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -611,6 +640,7 @@ Usage:
   grove deps <file> [dir] [--refresh]
   grove impact <symbol-or-file-query> [dir] [--refresh]
   grove change-impact <Type.method(Params)> [dir]   type-resolved change-set: declaration + override family + callers
+  grove missing-implementations <Type.method> [dir]  types claiming the contract that do not implement the member
   grove tests <file> [dir] [--refresh]
   grove icr <intent> [dir] [--refresh]
   grove certify <diff-file-or-> [dir]

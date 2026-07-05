@@ -320,6 +320,49 @@ func (e *Engine) ChangeImpact(ctx context.Context, query string) (ChangeImpactRe
 	}, nil
 }
 
+// MissingImplementationsResult is the deterministic answer to "which types
+// claiming this contract do not implement Type.method" — the companion to
+// ChangeImpact for interface evolution: ChangeImpact returns what must change
+// when a signature changes; this returns who is broken once the member is
+// required.
+type MissingImplementationsResult struct {
+	Query    string
+	Contract []Symbol // the member's declaration(s) on the named type
+
+	Missing         []Symbol // concrete closure types with no impl, own or inherited: compile errors
+	AbstractMissing []Symbol // abstract classes without an impl (their concrete subtypes are in Missing)
+	Unverifiable    []Symbol // types whose class-extends chain leaves the index (an external base may provide it)
+
+	ImplementedCount int  // closure types that do carry a compatible implementation
+	DefaultProvided  bool // the contract supplies a body every subtype inherits; nothing can be missing
+
+	ExternalSupers    []string
+	OverridesExternal []string
+	Completeness      string // "closed" | "project-local"
+}
+
+// MissingImplementations resolves a "Type.method" or
+// "Type.method(ParamType, ...)" query to every type in the subtype closure
+// that fails to implement the member.
+func (e *Engine) MissingImplementations(ctx context.Context, query string) (MissingImplementationsResult, error) {
+	raw, err := e.currentGraph().MissingImplementations(query)
+	if err != nil {
+		return MissingImplementationsResult{}, err
+	}
+	return MissingImplementationsResult{
+		Query:             raw.Query,
+		Contract:          raw.Contract,
+		Missing:           raw.Missing,
+		AbstractMissing:   raw.AbstractMissing,
+		Unverifiable:      raw.Unverifiable,
+		ImplementedCount:  raw.ImplementedCount,
+		DefaultProvided:   raw.DefaultProvided,
+		ExternalSupers:    raw.ExternalSupers,
+		OverridesExternal: raw.OverridesExternal,
+		Completeness:      raw.Completeness,
+	}, nil
+}
+
 // Neighbor is a symbol reached from a seed by one typed edge.
 type Neighbor struct {
 	Symbol     Symbol
