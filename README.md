@@ -260,6 +260,24 @@ grove query <intent> [dir] [--refresh]
 # Blast radius: what would break if this symbol changed?
 grove impact <symbol> [dir] [--refresh]
 
+# Type-resolved change-set for a method signature change: declaration +
+# override/implementation family (subtype closure) + all resolved callers,
+# in one deterministic call
+grove change-impact 'Type.method(ParamType, ...)' [dir]
+
+# Interface evolution: every type claiming the contract that does NOT
+# implement the member (missing / abstract / unverifiable buckets); under
+# a default body, "missing" = inherits the default, breaks if made required
+grove missing-implementations 'Type.method' [dir]
+
+# The change-set partitioned by covering-test evidence: covered (a test
+# within 3 resolved caller hops) vs untested (write tests here first)
+grove untested-surface 'Type.method' [dir]
+
+# Unreachable production functions/methods. Precision-first: unreachable
+# AND non-exported AND name-unreferenced; caveats are part of the answer
+grove dead-code [dir] [--roots a,b]
+
 # Which tests cover a symbol?
 grove tests <symbol> [dir] [--refresh]
 
