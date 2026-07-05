@@ -363,6 +363,74 @@ func (e *Engine) MissingImplementations(ctx context.Context, query string) (Miss
 	}, nil
 }
 
+// CoverageSite pairs a change-set site with the tests that reach it.
+type CoverageSite struct {
+	Symbol    Symbol
+	TestCount int
+	Tests     []Symbol // capped; TestCount carries the truth
+}
+
+// UntestedSurfaceResult partitions a method's change-set by test coverage:
+// "before I change Type.method, what in its blast radius has no test?"
+type UntestedSurfaceResult struct {
+	Query      string
+	Untested   []Symbol // change-set sites with no covering test
+	Covered    []CoverageSite
+	TotalSites int
+
+	ExternalSupers    []string
+	OverridesExternal []string
+	Completeness      string
+}
+
+// UntestedSurface computes the change-set for a "Type.method" query and
+// partitions it by covering-test evidence.
+func (e *Engine) UntestedSurface(ctx context.Context, query string) (UntestedSurfaceResult, error) {
+	raw, err := e.currentGraph().UntestedSurface(query)
+	if err != nil {
+		return UntestedSurfaceResult{}, err
+	}
+	covered := make([]CoverageSite, 0, len(raw.Covered))
+	for _, c := range raw.Covered {
+		covered = append(covered, CoverageSite{Symbol: c.Symbol, TestCount: c.TestCount, Tests: c.Tests})
+	}
+	return UntestedSurfaceResult{
+		Query:             raw.Query,
+		Untested:          raw.Untested,
+		Covered:           covered,
+		TotalSites:        raw.TotalSites,
+		ExternalSupers:    raw.ExternalSupers,
+		OverridesExternal: raw.OverridesExternal,
+		Completeness:      raw.Completeness,
+	}, nil
+}
+
+// DeadCodeResult reports production functions/methods nothing reaches.
+// Precision-first; Caveats are part of the result and must be relayed.
+type DeadCodeResult struct {
+	RootCount            int
+	ReachableCount       int
+	Considered           int
+	Dead                 []Symbol // unreachable, non-exported, name unreferenced: deletion candidates
+	ExportedUnreferenced []Symbol // exported with zero in-project reference; external liveness unknown
+	Caveats              []string
+}
+
+// DeadCode computes forward reachability from every entry point (main/init,
+// tests, exported symbols, plus extraRoots by name) and reports what nothing
+// reaches.
+func (e *Engine) DeadCode(ctx context.Context, extraRoots []string) (DeadCodeResult, error) {
+	raw := e.currentGraph().DeadCode(extraRoots)
+	return DeadCodeResult{
+		RootCount:            raw.RootCount,
+		ReachableCount:       raw.ReachableCount,
+		Considered:           raw.Considered,
+		Dead:                 raw.Dead,
+		ExportedUnreferenced: raw.ExportedUnreferenced,
+		Caveats:              raw.Caveats,
+	}, nil
+}
+
 // Neighbor is a symbol reached from a seed by one typed edge.
 type Neighbor struct {
 	Symbol     Symbol
