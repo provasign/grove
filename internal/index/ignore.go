@@ -5,6 +5,8 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+
+	"github.com/provasign/grove/internal/parser"
 )
 
 type ignoreRule struct {
@@ -200,8 +202,18 @@ func isSensitivePath(rel string) bool {
 	if strings.HasPrefix(base, ".env.") || strings.HasSuffix(base, ".env") {
 		return true
 	}
-	if strings.Contains(base, "secret") || strings.Contains(base, "credential") {
-		return true
+	// "secret"/"credential" in the name flags config/data files likely to
+	// hold real secret values (secrets.yaml, local-credentials.json).
+	// Exempt recognized source code: "secrets.go", "SecretManager.java",
+	// "PostgresConnectionCredentialsOptions.ts" are code that MANAGES
+	// secrets, not secret material itself. Without this, the check drops
+	// the entire file — every symbol it declares — from the index; on a
+	// real corpus (grafana) it silently excluded an interface declaration
+	// from an in-progress change-impact query with no error surfaced.
+	if lang := parser.DetectLanguage(rel); lang == "" || parser.IsPlaintext(lang) {
+		if strings.Contains(base, "secret") || strings.Contains(base, "credential") {
+			return true
+		}
 	}
 	switch ext {
 	case ".key", ".pem", ".crt", ".cer", ".p12", ".pfx", ".jks", ".keystore", ".pkcs12":

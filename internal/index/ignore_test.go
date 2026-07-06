@@ -46,6 +46,39 @@ func TestIndex_RespectsGroveIgnoreAndGitIgnore(t *testing.T) {
 	}
 }
 
+// TestIndex_SourceFilesNamedAfterSecretsAreIndexed guards against a real
+// regression found on grafana: "secret" appearing in a SOURCE file's
+// basename ("secrets.go", "SecretManager.java") is code that manages
+// secrets, not secret material — the sensitive-path heuristic must not drop
+// the whole file (and every symbol it declares) just because the name
+// contains the substring. Plaintext/config files with the same substring
+// ("secrets.yaml", "api-secret.json") are a different case and stay excluded.
+func TestIndex_SourceFilesNamedAfterSecretsAreIndexed(t *testing.T) {
+	idx, cleanup := newIdx(t)
+	defer cleanup()
+
+	root := t.TempDir()
+	files := map[string]string{
+		"secrets.go":          "package p\n\ntype DataKeyCache interface {\n\tGetById(id string) bool\n}\n",
+		"SecretManager.java":  "package p;\npublic class SecretManager {}\n",
+		"secrets.yaml":        "token: hunter2\n",
+		"api-credential.json": `{"token": "hunter2"}`,
+	}
+	for name, body := range files {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	_, res, err := idx.Index(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.FilesUpdated != 2 {
+		t.Fatalf("FilesUpdated = %d, want 2 (secrets.go + SecretManager.java; the yaml/json stay excluded)", res.FilesUpdated)
+	}
+}
+
 func TestIndex_SkipsSensitivePaths(t *testing.T) {
 	idx, cleanup := newIdx(t)
 	defer cleanup()
