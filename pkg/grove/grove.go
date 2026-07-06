@@ -271,6 +271,12 @@ type ChangeImpactResult struct {
 	Family       []Symbol
 	Callers      []Symbol
 
+	// DeclaringTypes: type declarations whose bodies contain a change-set
+	// member signature that is not indexed as its own symbol (Go and TS
+	// interface members) — the type's declaration block is itself a change
+	// site. Empty for languages whose member declarations are real symbols.
+	DeclaringTypes []Symbol
+
 	// ExternalSupers: supertype names declared in the hierarchy that resolve
 	// to no indexed type (JDK / dependency types). Informational.
 	ExternalSupers []string
@@ -314,6 +320,7 @@ func (e *Engine) ChangeImpact(ctx context.Context, query string) (ChangeImpactRe
 		Supers:            raw.Supers,
 		Family:            raw.Family,
 		Callers:           raw.Callers,
+		DeclaringTypes:    raw.DeclaringTypes,
 		ExternalSupers:    raw.ExternalSupers,
 		OverridesExternal: raw.OverridesExternal,
 		Completeness:      raw.Completeness,

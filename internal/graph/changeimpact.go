@@ -17,9 +17,17 @@ import (
 type ChangeImpactResult struct {
 	Query        string              // the query as given
 	Declarations []core.SymbolRecord // resolved declaration(s) on the named type
-	Supers       []core.SymbolRecord // same-signature declarations up the hierarchy (informational: changing a mid-hierarchy override usually forces these too)
+	Supers       []core.SymbolRecord // same-member declarations on other contracts (supertypes of the seed OR of any family member — a sibling interface satisfied by the same implementations breaks under the change exactly like the seed contract)
 	Family       []core.SymbolRecord // overrides/implementations in the subtype closure (excluding Declarations)
 	Callers      []core.SymbolRecord // methods with call edges into Declarations or Family (excluding both)
+
+	// DeclaringTypes: type declarations whose bodies contain a change-set
+	// member signature that is not indexed as its own symbol (Go and TS
+	// interface members). For those declarations the innermost enclosing
+	// symbol in the file IS the type, so the type's declaration block is
+	// the change site a diff, a scorer, or a reviewer names. Empty for
+	// languages whose member declarations are real symbols (Java, Python).
+	DeclaringTypes []core.SymbolRecord
 
 	// ExternalSupers lists supertype names declared in the hierarchy's
 	// extends/implements clauses that resolve to no indexed type (JDK or
@@ -162,26 +170,21 @@ func (g *CodeGraph) ChangeImpact(query string) (*ChangeImpactResult, error) {
 	if len(decls) == 0 && len(family) == 0 {
 		return nil, fmt.Errorf("change-impact: type %q declares no method %q and no subtype implements it", typeName, methodName)
 	}
+	declaringTypes := map[string]core.SymbolRecord{}
 	if len(decls) == 0 {
 		// The member exists in source but not as a symbol (TS interface
 		// members, Go interface specs). When the seed type's body declares
 		// it, synthesize the declaration record: the declaring file is part
-		// of the change-set.
+		// of the change-set — and surface the TYPE too, because for an
+		// unindexed member spec the innermost enclosing symbol in the file
+		// is the type declaration itself (what a diff or reviewer names).
 		for _, tid := range typeIDs {
 			t, ok := g.symbols[tid]
 			if !ok || !typeDeclaresMember(&t, methodName) {
 				continue
 			}
-			decls = append(decls, core.SymbolRecord{
-				ID:            t.ID + "#" + methodName,
-				FilePath:      t.FilePath,
-				Language:      t.Language,
-				Kind:          core.KindMethod,
-				Name:          methodName,
-				QualifiedName: t.Name + "." + methodName,
-				ParentSymbol:  t.Name,
-				Span:          t.Span,
-			})
+			decls = append(decls, synthesizeMemberDecl(&t, methodName))
+			declaringTypes[t.ID] = t
 		}
 	}
 
@@ -208,15 +211,62 @@ func (g *CodeGraph) ChangeImpact(query string) (*ChangeImpactResult, error) {
 			}
 		}
 	}
-	var supers []core.SymbolRecord
-	if len(superTypes) > 0 {
-		superIDs := make([]string, 0, len(superTypes))
-		for id := range superTypes {
-			superIDs = append(superIDs, id)
+	// 5b. Contract candidates reachable from the WHOLE closure, not just the
+	// seed: a family member may also satisfy other contracts (Go structural
+	// satisfaction, Java/TS multi-implements). A sibling interface that
+	// declares the same member and is satisfied by the same implementations
+	// breaks under the signature change exactly like the seed contract — but
+	// an upward walk rooted only at the seed never reaches it (the grafana
+	// routeService miss). Candidates carry the same evidence the family walk
+	// uses: an extends/implements edge from a closure member plus the member
+	// declared on the type.
+	contractTypes := make(map[string]bool, len(superTypes))
+	for id := range superTypes {
+		contractTypes[id] = true
+	}
+	for id := range closure {
+		for _, ei := range g.outbound[id] {
+			edge := g.edges[ei]
+			if edge.Type != core.EdgeExtends && edge.Type != core.EdgeImplements {
+				continue
+			}
+			if !closure[edge.To] {
+				contractTypes[edge.To] = true
+			}
 		}
-		for _, m := range g.containedMethods(superIDs, methodName) {
-			if !declIDs[m.ID] && signatureCompatible(declParams, paramTypesOf(&m), wildcards) {
+	}
+	var supers []core.SymbolRecord
+	superSeen := make(map[string]bool)
+	if len(contractTypes) > 0 {
+		contractIDs := make([]string, 0, len(contractTypes))
+		for id := range contractTypes {
+			contractIDs = append(contractIDs, id)
+		}
+		for _, m := range g.containedMethods(contractIDs, methodName) {
+			if !declIDs[m.ID] && !superSeen[m.ID] && signatureCompatible(declParams, paramTypesOf(&m), wildcards) {
+				superSeen[m.ID] = true
 				supers = append(supers, m)
+			}
+		}
+		// Members declared in the type body but not indexed as symbols
+		// (Go/TS interface specs): synthesize the declaration and surface
+		// the declaring type, as in step 4. Types that already contributed
+		// a real member symbol are skipped — nothing to synthesize.
+		for _, tid := range contractIDs {
+			t, ok := g.symbols[tid]
+			if !ok || !typeDeclaresMember(&t, methodName) {
+				continue
+			}
+			if _, dup := declaringTypes[t.ID]; dup {
+				continue
+			}
+			if len(g.containedMethods([]string{tid}, methodName)) > 0 {
+				continue
+			}
+			if syn := synthesizeMemberDecl(&t, methodName); !superSeen[syn.ID] && !declIDs[syn.ID] {
+				superSeen[syn.ID] = true
+				supers = append(supers, syn)
+				declaringTypes[t.ID] = t
 			}
 		}
 	}
@@ -252,7 +302,9 @@ func (g *CodeGraph) ChangeImpact(query string) (*ChangeImpactResult, error) {
 	// closure (seed types + indexed supertypes) that resolve to no indexed
 	// type are external. If the queried method is a member of a well-known
 	// external contract, the result is the project-local closure of a
-	// contract the project does not own — flag it.
+	// contract the project does not own — flag it. Deliberately fed by the
+	// SEED's hierarchy only (not the sibling contracts of step 5b), so the
+	// completeness semantics of the queried contract are unchanged.
 	hierarchyIDs := make([]string, 0, len(typeIDs)+len(superTypes))
 	hierarchyIDs = append(hierarchyIDs, typeIDs...)
 	for id := range superTypes {
@@ -264,20 +316,43 @@ func (g *CodeGraph) ChangeImpact(query string) (*ChangeImpactResult, error) {
 		completeness = "project-local"
 	}
 
+	declTypes := make([]core.SymbolRecord, 0, len(declaringTypes))
+	for _, t := range declaringTypes {
+		declTypes = append(declTypes, t)
+	}
 	sortSymbols(decls)
 	sortSymbols(family)
 	sortSymbols(supers)
 	sortSymbols(callers)
+	sortSymbols(declTypes)
 	return &ChangeImpactResult{
 		Query:             query,
 		Declarations:      decls,
 		Supers:            supers,
 		Family:            family,
 		Callers:           callers,
+		DeclaringTypes:    declTypes,
 		ExternalSupers:    externalSupers,
 		OverridesExternal: overridesExternal,
 		Completeness:      completeness,
 	}, nil
+}
+
+// synthesizeMemberDecl builds the declaration record for a member that
+// exists in a type's source body but not as an indexed symbol (Go interface
+// specs, TS interface members). The record carries the declaring file so the
+// change-set names it even without a real symbol.
+func synthesizeMemberDecl(t *core.SymbolRecord, methodName string) core.SymbolRecord {
+	return core.SymbolRecord{
+		ID:            t.ID + "#" + methodName,
+		FilePath:      t.FilePath,
+		Language:      t.Language,
+		Kind:          core.KindMethod,
+		Name:          methodName,
+		QualifiedName: t.Name + "." + methodName,
+		ParentSymbol:  t.Name,
+		Span:          t.Span,
+	}
 }
 
 // externalContract inspects the extends/implements clauses of the given type
