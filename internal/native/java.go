@@ -140,11 +140,15 @@ type javaInheritanceRef struct {
 
 func javaInheritanceRefs(text string) []javaInheritanceRef {
 	var refs []javaInheritanceRef
+	// Full dotted names pass through: javaBestType uses a Capitalized
+	// qualifier ("SettableBeanProperty.Delegating") to scope resolution to
+	// the right nested type — stripping it here re-created the bare-name
+	// fan-out the scoping exists to prevent.
 	for _, name := range javaMatchNameList(`\bextends\s+([A-Za-z_][A-Za-z0-9_.]*)`, text) {
-		refs = append(refs, javaInheritanceRef{Name: lastDottedName(name), EdgeType: core.EdgeExtends})
+		refs = append(refs, javaInheritanceRef{Name: name, EdgeType: core.EdgeExtends})
 	}
 	for _, name := range javaMatchNameList(`\bimplements\s+([A-Za-z_][A-Za-z0-9_.]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_.]*)*)`, text) {
-		refs = append(refs, javaInheritanceRef{Name: lastDottedName(name), EdgeType: core.EdgeImplements})
+		refs = append(refs, javaInheritanceRef{Name: name, EdgeType: core.EdgeImplements})
 	}
 	return refs
 }
@@ -205,9 +209,28 @@ func javaConstructedTypes(rawText string) []string {
 }
 
 func javaBestType(idx javaIndex, name, fromFile string) (core.SymbolRecord, bool) {
-	candidates := idx.typesByName[lastDottedName(name)]
+	simple := lastDottedName(name)
+	candidates := idx.typesByName[simple]
 	if len(candidates) == 0 {
 		return core.SymbolRecord{}, false
+	}
+	// A Capitalized qualifier names a nested type ("ValueInstantiator.Base")
+	// and SCOPES resolution to candidates declared inside that parent —
+	// without it, `extends ValueInstantiator.Base` resolved to arbitrary
+	// same-named types (jackson: every hierarchy owning a Base). Lowercase
+	// qualifiers are package segments; resolution proceeds by simple name.
+	if q := nestedQualifierOf(name); q != "" {
+		scoped := candidates[:0:0]
+		for _, c := range candidates {
+			if c.ParentSymbol == q || c.QualifiedName == q+"."+simple ||
+				strings.HasSuffix(c.QualifiedName, "."+q+"."+simple) {
+				scoped = append(scoped, c)
+			}
+		}
+		candidates = scoped
+		if len(candidates) == 0 {
+			return core.SymbolRecord{}, false // external nested type (Map.Entry)
+		}
 	}
 	for _, candidate := range candidates {
 		if candidate.FilePath == fromFile {
@@ -220,7 +243,31 @@ func javaBestType(idx javaIndex, name, fromFile string) (core.SymbolRecord, bool
 			return candidate, true
 		}
 	}
-	return candidates[0], true
+	// Cross-package: only an unambiguous name resolves. Returning an
+	// arbitrary candidate emitted confidently-wrong edges (0.97) that
+	// polluted every closure walk downstream.
+	if len(candidates) == 1 {
+		return candidates[0], true
+	}
+	return core.SymbolRecord{}, false
+}
+
+// nestedQualifierOf returns the innermost dotted qualifier when it names a
+// nested type (Capitalized, per Java/C# convention), "" otherwise.
+func nestedQualifierOf(name string) string {
+	name = strings.TrimSpace(name)
+	i := strings.LastIndexByte(name, '.')
+	if i <= 0 {
+		return ""
+	}
+	q := name[:i]
+	if j := strings.LastIndexByte(q, '.'); j >= 0 {
+		q = q[j+1:]
+	}
+	if q == "" || q[0] < 'A' || q[0] > 'Z' {
+		return ""
+	}
+	return q
 }
 
 func lastDottedName(name string) string {

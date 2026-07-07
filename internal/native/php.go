@@ -347,7 +347,13 @@ func phpBestType(idx phpIndex, name, fromFile string, psr4 map[string][]string, 
 			}
 		}
 	}
-	return candidates[0], true
+	// Neither same-file nor PSR-4-resolved: only an unambiguous name
+	// resolves — an arbitrary candidate is a confidently-wrong edge
+	// (see javaBestType).
+	if len(candidates) == 1 {
+		return candidates[0], true
+	}
+	return core.SymbolRecord{}, false
 }
 
 func phpResolveAlias(name string, aliases map[string]string) string {

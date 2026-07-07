@@ -265,9 +265,25 @@ func csharpConstructedTypes(rawText string) []string {
 }
 
 func csharpBestType(idx csharpIndex, name, fromFile string) (core.SymbolRecord, bool) {
-	candidates := idx.typesByName[lastDottedName(name)]
+	simple := lastDottedName(name)
+	candidates := idx.typesByName[simple]
 	if len(candidates) == 0 {
 		return core.SymbolRecord{}, false
+	}
+	// Nested-type qualifier scopes resolution; C# shares Java's Outer.Inner
+	// convention (see javaBestType).
+	if q := nestedQualifierOf(name); q != "" {
+		scoped := candidates[:0:0]
+		for _, c := range candidates {
+			if c.ParentSymbol == q || c.QualifiedName == q+"."+simple ||
+				strings.HasSuffix(c.QualifiedName, "."+q+"."+simple) {
+				scoped = append(scoped, c)
+			}
+		}
+		candidates = scoped
+		if len(candidates) == 0 {
+			return core.SymbolRecord{}, false
+		}
 	}
 	for _, candidate := range candidates {
 		if candidate.FilePath == fromFile {
@@ -280,7 +296,11 @@ func csharpBestType(idx csharpIndex, name, fromFile string) (core.SymbolRecord, 
 			return candidate, true
 		}
 	}
-	return candidates[0], true
+	// Cross-namespace: only an unambiguous name resolves (see javaBestType).
+	if len(candidates) == 1 {
+		return candidates[0], true
+	}
+	return core.SymbolRecord{}, false
 }
 
 func filesUnderDir(dir string, files []string, ext string) []string {

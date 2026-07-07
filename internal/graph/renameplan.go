@@ -141,8 +141,33 @@ func (g *CodeGraph) RenamePlan(query, newName string) (*RenamePlanResult, error)
 	// the member's own same-name call sites — the delegating-override shape
 	// (`void speak() { super.speak(); }`) is the most common override body,
 	// and ChangeImpact's Callers list excludes family members.
+	syntheticEdited := map[string]bool{}
 	for _, s := range sites {
 		if !family[s.ID] {
+			continue
+		}
+		if s.RawText == "" {
+			// Synthesized member declaration (Go/TS interface spec — the
+			// member is body text of the type, not an indexed symbol). The
+			// spec line lives in the declaring TYPE's RawText: without this
+			// branch the site fell straight into Unresolved, so an applied
+			// plan renamed every impl and caller but not the contract —
+			// guaranteed compile breakage. Every matching spec line is
+			// edited (TS interfaces may declare overload signatures).
+			if hash := strings.LastIndexByte(s.ID, '#'); hash > 0 {
+				if t, ok := g.symbols[s.ID[:hash]]; ok && t.RawText != "" {
+					before := len(res.Edits) + len(res.Ambiguous)
+					tLines := strings.Split(t.RawText, "\n")
+					for i := range tLines {
+						if pat.MatchString(stripCommentsAndStrings(tLines[i])) {
+							editLine(t, t.Span.Start+i, true)
+						}
+					}
+					if len(res.Edits)+len(res.Ambiguous) > before {
+						syntheticEdited[s.ID] = true
+					}
+				}
+			}
 			continue
 		}
 		declLine := -1
@@ -198,7 +223,7 @@ func (g *CodeGraph) RenamePlan(query, newName string) (*RenamePlanResult, error)
 		editedSites[e.SiteID] = true
 	}
 	for _, s := range sites {
-		if !editedSites[s.ID] {
+		if !editedSites[s.ID] && !syntheticEdited[s.ID] {
 			res.Unresolved = append(res.Unresolved, s.FilePath+":"+s.Name)
 		}
 	}

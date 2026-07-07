@@ -260,6 +260,11 @@ func (g *CodeGraph) implementationCoverage(typeID, methodName string, declParams
 			}
 		}
 		for _, name := range classExtendsNames(&t) {
+			// matchNameList keeps dotted qualifiers; this check wants the
+			// simple name ("ValueInstantiator.Base" → "Base").
+			if j := strings.LastIndexByte(name, '.'); j >= 0 {
+				name = name[j+1:]
+			}
 			if !resolvedSupers[name] && !g.hasIndexedType(name) && !knownEmptyBases[name] {
 				escapesIndex = true
 			}

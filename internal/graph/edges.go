@@ -614,6 +614,14 @@ func buildContains(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
 			continue
 		}
 		for _, parent := range idx.byName[strings.ToLower(symbol.ParentSymbol)] {
+			// The byName key is lowercase but identifiers are case-sensitive
+			// (PHP class names excepted): without this check a method whose
+			// receiver is `responseWriter` also attached to the interface
+			// `ResponseWriter` — Go idiomatically pairs exported/unexported
+			// names, so the conflation poisoned real interfaces.
+			if parent.Name != symbol.ParentSymbol && symbol.Language != "php" {
+				continue
+			}
 			if parent.FilePath != symbol.FilePath {
 				// Go receiver methods attach to their type across files:
 				// `func (s *T) M()` may live in any file of T's package.
@@ -1923,10 +1931,11 @@ func matchNameList(re *regexp.Regexp, text string) []string {
 		if i := strings.Index(name, "<"); i >= 0 {
 			name = name[:i]
 		}
-		// Drop dotted prefixes (java.util.List → List).
-		if i := strings.LastIndexByte(name, '.'); i >= 0 {
-			name = name[i+1:]
-		}
+		// Dotted qualifiers are KEPT ("ValueInstantiator.Base", "java.util.List"):
+		// a Capitalized qualifier names a nested type and scopes resolution —
+		// stripping it here made `extends ValueInstantiator.Base` resolve to
+		// every type named Base in the repo. Consumers that only need the
+		// simple name strip the prefix themselves.
 		if name != "" {
 			out = append(out, name)
 		}
@@ -1986,12 +1995,81 @@ func goEmbeddedTypes(body string) []string {
 
 // resolveTypeEdges returns 0 or more edges from `symbol` to a target type
 // resolved by name. If no concrete symbol is found, no edge is emitted.
+// resolveTypeEdges resolves a supertype reference from an extends/implements
+// clause to indexed type symbols and emits edges. targetName may be dotted:
+// a Capitalized qualifier names a nested type ("ValueInstantiator.Base") and
+// SCOPES resolution to candidates declared inside that parent — without the
+// scope, every same-named type in the repo matched (jackson: `extends
+// ValueInstantiator.Base` fanned out to 30+ unrelated Base types, polluting
+// every closure walk downstream). A lowercase qualifier is a package/module
+// path ("java.util.List") and resolution falls back to the simple name.
+// Candidates must be type declarations — the byName index also holds
+// constructors, which share their class's name.
 func resolveTypeEdges(idx *edgeIndex, symbol core.SymbolRecord, targetName string, edgeType core.EdgeType, confidence float64) []core.Edge {
-	var out []core.Edge
-	for _, target := range idx.byName[strings.ToLower(targetName)] {
+	simple := targetName
+	qualifier := ""
+	if i := strings.LastIndexByte(simple, '.'); i >= 0 {
+		qualifier = simple[:i]
+		simple = simple[i+1:]
+		if j := strings.LastIndexByte(qualifier, '.'); j >= 0 {
+			qualifier = qualifier[j+1:] // innermost qualifier segment
+		}
+	}
+	if simple == "" {
+		return nil
+	}
+	nestedQualifier := qualifier != "" && isUpperIdent(qualifier)
+	var cands []*core.SymbolRecord
+	for _, target := range idx.byName[strings.ToLower(simple)] {
 		if target.ID == symbol.ID {
 			continue
 		}
+		// Identifiers are case-sensitive in every indexed language except
+		// PHP class names; the lowercase index key must not conflate
+		// case-distinct names (Go pairs ResponseWriter/responseWriter).
+		if target.Name != simple && symbol.Language != "php" {
+			continue
+		}
+		switch target.Kind {
+		case core.KindClass, core.KindInterface, core.KindStruct, core.KindTrait, core.KindEnum, core.KindType:
+		default:
+			continue // constructors and methods share their class's name
+		}
+		if nestedQualifier && target.ParentSymbol != qualifier &&
+			target.QualifiedName != qualifier+"."+simple &&
+			// Leading dot keeps the boundary: NumberSerializers.Base must
+			// not satisfy a qualifier of Serializers.
+			!strings.HasSuffix(target.QualifiedName, "."+qualifier+"."+simple) {
+			continue
+		}
+		cands = append(cands, target)
+	}
+	// Local scope wins outright: a same-file candidate (Java test files
+	// nesting their own Base; sibling nested classes) or a same-directory
+	// candidate shadows same-named types elsewhere — without the tier,
+	// every test class `extends Base` edged into every hierarchy owning a
+	// Base. Cross-package ambiguity keeps the historical fan-out: nominal
+	// languages resolve through imports the graph does not model, and
+	// dropping those edges would break real cross-file hierarchies (TS).
+	var local []*core.SymbolRecord
+	for _, c := range cands {
+		if c.FilePath == symbol.FilePath {
+			local = append(local, c)
+		}
+	}
+	if local == nil {
+		dir := dirOf(symbol.FilePath)
+		for _, c := range cands {
+			if dirOf(c.FilePath) == dir {
+				local = append(local, c)
+			}
+		}
+	}
+	if local != nil {
+		cands = local
+	}
+	var out []core.Edge
+	for _, target := range cands {
 		out = append(out, core.Edge{
 			From:       symbol.ID,
 			To:         target.ID,
@@ -2002,6 +2080,13 @@ func resolveTypeEdges(idx *edgeIndex, symbol core.SymbolRecord, targetName strin
 		})
 	}
 	return out
+}
+
+// isUpperIdent reports whether the identifier starts with an uppercase
+// letter — the Java/TS convention separating a nested-type qualifier
+// (Outer.Inner) from a package/module path segment (java.util).
+func isUpperIdent(s string) bool {
+	return s != "" && s[0] >= 'A' && s[0] <= 'Z'
 }
 
 func firstLine(text string) string {
