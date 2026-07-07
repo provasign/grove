@@ -244,6 +244,17 @@ func (g *CodeGraph) implementationCoverage(typeID, methodName string, declParams
 		if !ok {
 			continue
 		}
+		// Go struct-embeds-interface: the embedded interface's method set is
+		// promoted onto the struct (delegation through the embedded field),
+		// so reaching an interface that declares the member IS coverage —
+		// gin's interceptedWriter{ResponseWriter} has Status() without
+		// declaring it, and the program compiles. Go-only: in nominal
+		// languages a supertype interface declares the obligation, never
+		// satisfies it.
+		if node != typeID && t.Language == "go" && t.Kind == core.KindInterface &&
+			typeDeclaresMember(&t, methodName) {
+			return true, false
+		}
 		// Python bases all grant implementation inheritance; for Java/TS/JS
 		// only the extends position does, and extends edges encode exactly
 		// that. An extends-clause superclass with no indexed resolution means

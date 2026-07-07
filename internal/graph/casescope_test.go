@@ -165,6 +165,39 @@ func TestResolveTypeEdges_PackageQualifierFallsBack(t *testing.T) {
 	}
 }
 
+// Go struct-embeds-interface: embedding promotes the interface's method set
+// onto the struct (delegation), so the embedding type is COVERED for
+// missing-implementations purposes — gin's interceptedWriter embeds
+// ResponseWriter, declares no Status() of its own, and compiles.
+func TestMissingImplementations_GoEmbeddedInterfaceIsCoverage(t *testing.T) {
+	g := New()
+	g.Replace([]core.SymbolRecord{
+		{ID: "rw.go::ResponseWriter@1", FilePath: "rw.go", BlobSHA: "1", Language: "go",
+			Kind: core.KindInterface, Name: "ResponseWriter", QualifiedName: "ResponseWriter",
+			RawText: "type ResponseWriter interface {\n\tStatus() int\n}"},
+		{ID: "rw.go::responseWriter@1", FilePath: "rw.go", BlobSHA: "1", Language: "go",
+			Kind: core.KindStruct, Name: "responseWriter", QualifiedName: "responseWriter",
+			RawText: "type responseWriter struct{}"},
+		{ID: "rw.go::responseWriter.Status@1", FilePath: "rw.go", BlobSHA: "1", Language: "go",
+			Kind: core.KindMethod, Name: "Status", QualifiedName: "responseWriter.Status",
+			ParentSymbol: "responseWriter", Signature: "func (w *responseWriter) Status() int",
+			RawText: "func (w *responseWriter) Status() int { return 0 }"},
+		// Embeds the interface; declares no Status of its own.
+		{ID: "t.go::interceptedWriter@1", FilePath: "t.go", BlobSHA: "1", Language: "go",
+			Kind: core.KindStruct, Name: "interceptedWriter", QualifiedName: "interceptedWriter",
+			RawText: "type interceptedWriter struct {\n\tResponseWriter\n\tbody *bytes.Buffer\n}"},
+	}, 3)
+	r, err := g.MissingImplementations("ResponseWriter.Status")
+	if err != nil {
+		t.Fatalf("MissingImplementations: %v", err)
+	}
+	for _, m := range r.Missing {
+		if m.Name == "interceptedWriter" {
+			t.Fatalf("embedding type wrongly flagged missing: %v", r.Missing)
+		}
+	}
+}
+
 // --- Fix C: rename-plan edits the interface member spec line ---------------
 //
 // The synthesized declaration has no RawText, so the plan previously dropped
