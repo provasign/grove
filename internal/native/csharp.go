@@ -208,7 +208,13 @@ type csharpInheritanceRef struct {
 	EdgeType core.EdgeType
 }
 
-var csharpDeclInheritancePattern = regexp.MustCompile(`\b(?:class|record|struct|interface)\s+[A-Za-z_][A-Za-z0-9_]*(?:<[^>{}]+>)?\s*:\s*([A-Za-z_][A-Za-z0-9_.,\s<>]*)`)
+// The base-list capture excludes newlines ([ \t], not \s): the caller feeds
+// `Signature + "\n" + firstLine(RawText)`, and a \s here swallowed the join
+// and ran into the duplicated second line, producing a garbage name that
+// resolved to nothing — so C# extends/implements resolution emitted zero
+// edges on real code. `{` is also excluded so a same-line body brace can't
+// leak in.
+var csharpDeclInheritancePattern = regexp.MustCompile(`\b(?:class|record|struct|interface)\s+[A-Za-z_][A-Za-z0-9_]*(?:<[^>{}]+>)?[ \t]*:[ \t]*([A-Za-z_][A-Za-z0-9_.,<> \t]*)`)
 
 func csharpInheritanceRefs(text string, kind core.SymbolKind) []csharpInheritanceRef {
 	match := csharpDeclInheritancePattern.FindStringSubmatch(text)

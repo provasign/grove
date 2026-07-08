@@ -29,10 +29,13 @@ var goIfaceMethodRe = regexp.MustCompile(`(?m)^\s*([A-Za-z_]\w*)\s*\(`)
 
 // tsIfaceMethodRe matches a TS/JS interface method signature line
 // ("escape(name: string): string", optionally generic or optional:
-// "clone?<T>(x: T): T"). Property members ("driver: Driver") and
-// function-typed properties ("handler: (x) => void") have ':' before any
+// "clone?<T>(x: T): T"). The generic group allows ONE level of nested
+// angle brackets so a bound like "save<T extends DeepPartial<Entity>>(...)"
+// (TypeORM's Repository shape) still matches — a flat [^>]* stopped at the
+// inner '>' and dropped the whole member. Property members ("driver: Driver")
+// and function-typed properties ("handler: (x) => void") have ':' before any
 // '(' and don't match.
-var tsIfaceMethodRe = regexp.MustCompile(`(?m)^\s*([A-Za-z_$][\w$]*)\??\s*(?:<[^>\n]*>)?\s*\(`)
+var tsIfaceMethodRe = regexp.MustCompile(`(?m)^\s*([A-Za-z_$][\w$]*)\??\s*(?:<(?:[^<>\n]|<[^<>\n]*>)*>)?\s*\(`)
 
 // interfaceMethodNames extracts the method names an interface declares.
 // Child method symbols (parent set to the interface) win when present —

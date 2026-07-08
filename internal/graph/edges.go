@@ -632,8 +632,13 @@ func buildContains(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
 					continue
 				}
 			}
+			// KindType included: a method can attach to a named non-struct
+			// type (`type Status int; func (s Status) String()`) — Go's most
+			// idiomatic non-struct receiver. Excluding it made every such
+			// type's methods invisible to change-impact / missing-impl.
 			if parent.Kind != core.KindStruct && parent.Kind != core.KindClass &&
-				parent.Kind != core.KindInterface && parent.Kind != core.KindTrait {
+				parent.Kind != core.KindInterface && parent.Kind != core.KindTrait &&
+				parent.Kind != core.KindType {
 				continue
 			}
 			edges = append(edges, core.Edge{
@@ -709,6 +714,29 @@ func buildExtendsImplements(idx *edgeIndex, symbols []core.SymbolRecord) []core.
 			for _, name := range matchNameList(implementsRe, text) {
 				edges = append(edges, resolveTypeEdges(idx, symbol, name, core.EdgeImplements, 0.85)...)
 			}
+		case "csharp":
+			// C# uses `class X : Base, IFoo` (colon, not keywords), so it
+			// needs its own parse. Without this graph-layer fallback, C#
+			// inheritance edges existed ONLY when the native (roslyn/project)
+			// analyzer ran — a bare source tree with no .csproj got zero
+			// extends/implements edges, so change-impact/missing-impl silently
+			// saw an empty closure. Both edge kinds are walked identically by
+			// the closure, so the base-vs-interface split is cosmetic; the
+			// I-prefix convention labels them for readers.
+			if symbol.Kind != core.KindClass && symbol.Kind != core.KindInterface {
+				continue
+			}
+			text := symbol.Signature
+			if text == "" {
+				text = firstLine(symbol.RawText)
+			}
+			for i, name := range csharpBaseNames(text) {
+				edgeType := core.EdgeImplements
+				if symbol.Kind == core.KindClass && i == 0 && !strings.HasPrefix(name, "I") {
+					edgeType = core.EdgeExtends
+				}
+				edges = append(edges, resolveTypeEdges(idx, symbol, name, edgeType, 0.85)...)
+			}
 		case "python":
 			if symbol.Kind != core.KindClass {
 				continue
@@ -741,11 +769,12 @@ func buildExtendsImplements(idx *edgeIndex, symbols []core.SymbolRecord) []core.
 				edges = append(edges, resolveTypeEdges(idx, symbol, traitName, core.EdgeImplements, 0.85)...)
 			}
 		case "go":
-			// Go has structural interface satisfaction; emitting implements
-			// edges accurately requires interface-method matching across the
-			// graph. We skip for v0.1; struct embedding (extends) is detected
-			// from RawText below.
-			if symbol.Kind != core.KindStruct {
+			// Go has structural interface satisfaction; broad implements edges
+			// are emitted by buildInterfaceSatisfaction. Here we detect
+			// EMBEDDING (extends): a struct embedding a type, or an interface
+			// embedding another interface — both promote the embedded type's
+			// method set onto the embedder, so an extends edge is correct.
+			if symbol.Kind != core.KindStruct && symbol.Kind != core.KindInterface {
 				continue
 			}
 			for _, name := range goEmbeddedTypes(symbol.RawText) {
@@ -1970,6 +1999,32 @@ func stripPythonBase(b string) string {
 	return b
 }
 
+// csharpBaseListRe captures the base-list of a C# type declaration — the
+// comma-separated names after the top-level `:`, stopping at a `where`
+// constraint clause or the body brace. [ \t] (not \s) keeps it on the
+// declaration line even if the signature carries a trailing newline.
+var csharpBaseListRe = regexp.MustCompile(`\b(?:class|struct|record|interface)\s+[A-Za-z_]\w*(?:<[^>{}]+>)?[ \t]*:[ \t]*([A-Za-z_][\w.,<> \t]*?)(?:[ \t]+where\b|[ \t]*\{|$)`)
+
+// csharpBaseNames extracts the simple base-type names from a C# declaration
+// signature (generic arguments and namespace qualifiers stripped).
+func csharpBaseNames(text string) []string {
+	m := csharpBaseListRe.FindStringSubmatch(text)
+	if len(m) != 2 {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(stripAngleBrackets(m[1]), ",") {
+		part = strings.TrimSpace(part)
+		if i := strings.LastIndexByte(part, '.'); i >= 0 {
+			part = part[i+1:]
+		}
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
 func goEmbeddedTypes(body string) []string {
 	// Look at lines between the first `{` and the matching `}` of the struct
 	// declaration. We consider each non-empty line consisting of a single
@@ -1984,7 +2039,14 @@ func goEmbeddedTypes(body string) []string {
 		body = body[:close]
 	}
 	var out []string
-	embeddedRe := regexp.MustCompile(`^\s*\*?([A-Z][A-Za-z0-9_]*)\s*(?://.*)?$`)
+	// A lone type reference on its own line is an embed: `Foo`, `*Foo`, or a
+	// cross-package `pkg.Foo` (the qualified form never matched before, so a
+	// struct/interface embedding an imported type was invisible). The final
+	// segment must be exported (uppercase) — cross-package embeds always are,
+	// and it avoids matching a bare unexported field-less line. A method spec
+	// (`Read() string`) has a `(` and does not match; a normal field
+	// (`name string`) has two tokens and does not match.
+	embeddedRe := regexp.MustCompile(`^\s*\*?((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Z][A-Za-z0-9_]*)\s*(?://.*)?$`)
 	for _, line := range strings.Split(body, "\n") {
 		if m := embeddedRe.FindStringSubmatch(line); len(m) == 2 {
 			out = append(out, m[1])

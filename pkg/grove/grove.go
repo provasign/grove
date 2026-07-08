@@ -290,12 +290,14 @@ type ChangeImpactResult struct {
 	Completeness string
 }
 
-// Sites returns the full change-set (declarations ∪ family ∪ callers) as one
-// deduplicated, file-ordered list.
+// Sites returns the change-set methods (declarations ∪ family ∪ callers ∪
+// supers) as one deduplicated, file-ordered list. Supers are included so a
+// sibling/supertype contract's member is not silently dropped; DeclaringTypes
+// (type declarations, not methods) is intentionally excluded here.
 func (r ChangeImpactResult) Sites() []Symbol {
 	seen := make(map[string]bool)
 	var out []Symbol
-	for _, group := range [][]Symbol{r.Declarations, r.Family, r.Callers} {
+	for _, group := range [][]Symbol{r.Declarations, r.Family, r.Callers, r.Supers} {
 		for _, s := range group {
 			if !seen[s.ID] {
 				seen[s.ID] = true

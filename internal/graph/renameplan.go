@@ -76,6 +76,15 @@ func (g *CodeGraph) RenamePlan(query, newName string) (*RenamePlanResult, error)
 	for _, s := range ci.Family {
 		family[s.ID] = true
 	}
+	// Supers are renamed at their declaration line exactly like family
+	// members: when the query seeds on an implementation, the interface's own
+	// member arrives here (as an indexed method, or as a synthesized
+	// empty-RawText member that the synthetic branch below turns into the
+	// interface spec-line edit). Omitting them silently dropped the contract
+	// declaration from the plan → an applied rename that breaks the build.
+	for _, s := range ci.Supers {
+		family[s.ID] = true
+	}
 
 	// identifier in call/declaration position
 	pat := regexp.MustCompile(`\b` + regexp.QuoteMeta(methodName) + `\b(\s*\()`)

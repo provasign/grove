@@ -191,7 +191,10 @@ func (g *CodeGraph) MissingImplementations(query string) (*MissingImplementation
 			continue
 		}
 		switch t.Kind {
-		case core.KindClass, core.KindStruct, core.KindEnum:
+		// KindType: a Go named non-struct type (`type Status int`) implements
+		// interfaces via methods on it — accepted as a seed at line 78 and by
+		// ChangeImpact, so it must be a valid closure member here too.
+		case core.KindClass, core.KindStruct, core.KindEnum, core.KindType:
 		default:
 			continue
 		}
@@ -299,6 +302,21 @@ func classExtendsNames(t *core.SymbolRecord) []string {
 			text = firstLine(t.RawText)
 		}
 		return matchNameList(extendsRe, stripAngleBrackets(text))
+	case "csharp":
+		// The base class (first non-interface entry) grants implementation
+		// inheritance; interfaces do not. Without a C# case here, a C#
+		// subtype with an unresolved/external base could never set
+		// escapesIndex and would be wrongly bucketed Missing rather than
+		// Unverifiable.
+		text := t.Signature
+		if text == "" {
+			text = firstLine(t.RawText)
+		}
+		names := csharpBaseNames(text)
+		if len(names) > 0 && !strings.HasPrefix(names[0], "I") {
+			return names[:1]
+		}
+		return nil
 	case "python":
 		return declaredSuperNames(t)
 	}

@@ -47,12 +47,20 @@ type ChangeImpactResult struct {
 	Completeness string
 }
 
-// Sites returns every symbol in the change-set (declarations, family,
-// callers) as one deduplicated, file-ordered list.
+// Sites returns every METHOD in the change-set — declarations, family,
+// callers, and supers — as one deduplicated, file-ordered list. Supers are
+// included because a same-member declaration on another contract (a sibling
+// interface satisfied by the same implementations, or a supertype when the
+// query seeded on an implementation) must change exactly like the seed:
+// omitting it silently dropped the interface's own member from rename-plan
+// and undercounted untested-surface. DeclaringTypes is deliberately NOT
+// unioned here — those are TYPE declarations, not methods; rename-plan
+// consumes them separately (they are edit sites) and untested-surface must
+// not (a type declaration has no test).
 func (r *ChangeImpactResult) Sites() []core.SymbolRecord {
 	seen := make(map[string]bool)
 	var out []core.SymbolRecord
-	for _, group := range [][]core.SymbolRecord{r.Declarations, r.Family, r.Callers} {
+	for _, group := range [][]core.SymbolRecord{r.Declarations, r.Family, r.Callers, r.Supers} {
 		for _, s := range group {
 			if !seen[s.ID] {
 				seen[s.ID] = true
@@ -167,9 +175,6 @@ func (g *CodeGraph) ChangeImpact(query string) (*ChangeImpactResult, error) {
 			family = append(family, m)
 		}
 	}
-	if len(decls) == 0 && len(family) == 0 {
-		return nil, fmt.Errorf("change-impact: type %q declares no method %q and no subtype implements it", typeName, methodName)
-	}
 	declaringTypes := map[string]core.SymbolRecord{}
 	if len(decls) == 0 {
 		// The member exists in source but not as a symbol (TS interface
@@ -178,6 +183,11 @@ func (g *CodeGraph) ChangeImpact(query string) (*ChangeImpactResult, error) {
 		// of the change-set — and surface the TYPE too, because for an
 		// unindexed member spec the innermost enclosing symbol in the file
 		// is the type declaration itself (what a diff or reviewer names).
+		// This MUST run before the empty-set gate below: an interface method
+		// with zero current implementors (family empty) is a completely
+		// ordinary "what breaks if I change this" query, and synthesis is
+		// what recognizes it — gating first threw a false "declares no
+		// method" error for exactly that case.
 		for _, tid := range typeIDs {
 			t, ok := g.symbols[tid]
 			if !ok || !typeDeclaresMember(&t, methodName) {
@@ -186,6 +196,9 @@ func (g *CodeGraph) ChangeImpact(query string) (*ChangeImpactResult, error) {
 			decls = append(decls, synthesizeMemberDecl(&t, methodName))
 			declaringTypes[t.ID] = t
 		}
+	}
+	if len(decls) == 0 && len(family) == 0 {
+		return nil, fmt.Errorf("change-impact: type %q declares no method %q and no subtype implements it", typeName, methodName)
 	}
 
 	// 5. Supers (upward, informational): same-signature declarations on

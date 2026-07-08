@@ -244,3 +244,161 @@ func TestRenamePlan_GoInterfaceSpecLineEdited(t *testing.T) {
 		}
 	}
 }
+
+// --- Review round 2: Go named non-struct types, zero-implementor interfaces,
+//     rename-from-implementation, interface-embeds-interface ---
+
+// A method on a named non-struct type (`type Status int`) is Go's idiomatic
+// non-struct receiver; excluding KindType from buildContains made it and its
+// whole interface-satisfaction invisible.
+func TestChangeImpact_GoNamedNonStructType(t *testing.T) {
+	g := New()
+	g.Replace([]core.SymbolRecord{
+		{ID: "x.go::Stringer@1", FilePath: "x.go", BlobSHA: "1", Language: "go",
+			Kind: core.KindInterface, Name: "Stringer", QualifiedName: "Stringer",
+			RawText: "type Stringer interface {\n\tString() string\n}"},
+		{ID: "x.go::Status@1", FilePath: "x.go", BlobSHA: "1", Language: "go",
+			Kind: core.KindType, Name: "Status", QualifiedName: "Status",
+			RawText: "type Status int"},
+		{ID: "x.go::Status.String@1", FilePath: "x.go", BlobSHA: "1", Language: "go",
+			Kind: core.KindMethod, Name: "String", QualifiedName: "Status.String",
+			ParentSymbol: "Status", Signature: "func (s Status) String() string",
+			RawText: "func (s Status) String() string { return \"\" }"},
+	}, 3)
+	r, err := g.ChangeImpact("Stringer.String")
+	if err != nil {
+		t.Fatalf("ChangeImpact errored on named non-struct type: %v", err)
+	}
+	found := false
+	for _, f := range r.Family {
+		if f.QualifiedName == "Status.String" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("Status.String (method on a named type) missing from family: %+v", r.Family)
+	}
+	mi, err := g.MissingImplementations("Stringer.String")
+	if err != nil {
+		t.Fatalf("MissingImplementations: %v", err)
+	}
+	if mi.ImplementedCount != 1 {
+		t.Fatalf("ImplementedCount = %d, want 1 (Status implements it)", mi.ImplementedCount)
+	}
+}
+
+// change-impact on an interface method with zero current implementors is an
+// ordinary "what breaks if I change this" query; the empty-set gate ran
+// before the contract-synthesis step and threw a false "declares no method".
+func TestChangeImpact_InterfaceWithNoImplementors(t *testing.T) {
+	g := New()
+	g.Replace([]core.SymbolRecord{
+		{ID: "x.go::Greeter@1", FilePath: "x.go", BlobSHA: "1", Language: "go",
+			Kind: core.KindInterface, Name: "Greeter", QualifiedName: "Greeter",
+			RawText: "type Greeter interface {\n\tGreet(name string) string\n}"},
+	}, 1)
+	r, err := g.ChangeImpact("Greeter.Greet")
+	if err != nil {
+		t.Fatalf("ChangeImpact errored on zero-implementor interface: %v", err)
+	}
+	if len(r.Declarations) != 1 || len(r.DeclaringTypes) != 1 {
+		t.Fatalf("want synthesized decl + declaringType, got decls=%v declaringTypes=%v",
+			r.Declarations, r.DeclaringTypes)
+	}
+}
+
+// A rename seeded on an IMPLEMENTATION must still edit the interface's own
+// member spec — it arrives via Supers, which Sites() excluded, so rename-plan
+// dropped the contract declaration and produced a build-breaking plan.
+func TestRenamePlan_FromImplementationEditsInterfaceSpec(t *testing.T) {
+	g := New()
+	g.Replace([]core.SymbolRecord{
+		{ID: "x.go::Reader@1", FilePath: "x.go", BlobSHA: "1", Language: "go",
+			Kind: core.KindInterface, Name: "Reader", QualifiedName: "Reader",
+			Span:    core.LineRange{Start: 3, End: 5},
+			RawText: "type Reader interface {\n\tRead(name string) string\n}"},
+		{ID: "x.go::FileImpl@1", FilePath: "x.go", BlobSHA: "1", Language: "go",
+			Kind: core.KindStruct, Name: "FileImpl", QualifiedName: "FileImpl",
+			Span: core.LineRange{Start: 6, End: 6}, RawText: "type FileImpl struct{}"},
+		{ID: "x.go::FileImpl.Read@1", FilePath: "x.go", BlobSHA: "1", Language: "go",
+			Kind: core.KindMethod, Name: "Read", QualifiedName: "FileImpl.Read",
+			ParentSymbol: "FileImpl", Span: core.LineRange{Start: 7, End: 7},
+			Signature: "func (f FileImpl) Read(name string) string",
+			RawText:   "func (f FileImpl) Read(name string) string { return name }"},
+	}, 3)
+	r, err := g.RenamePlan("FileImpl.Read", "ReadFile")
+	if err != nil {
+		t.Fatalf("RenamePlan: %v", err)
+	}
+	specEdited := false
+	for _, e := range r.Edits {
+		if e.Line == 4 && strings.Contains(e.After, "ReadFile(name string) string") &&
+			!strings.Contains(e.After, "func") {
+			specEdited = true
+		}
+	}
+	if !specEdited {
+		t.Fatalf("interface spec line (Reader.Read) not edited; edits=%+v", r.Edits)
+	}
+	for _, u := range r.Unresolved {
+		t.Fatalf("nothing should be Unresolved, got %v", u)
+	}
+}
+
+// An interface embedding another interface must produce an extends edge (the
+// embedded method set is promoted); the Go branch of buildExtendsImplements
+// only processed structs.
+func TestBuildEdges_GoInterfaceEmbedsInterface(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "x.go::Reader@1", FilePath: "x.go", BlobSHA: "1", Language: "go",
+			Kind: core.KindInterface, Name: "Reader", QualifiedName: "Reader",
+			RawText: "type Reader interface {\n\tRead() string\n}"},
+		{ID: "x.go::ReadWriter@1", FilePath: "x.go", BlobSHA: "1", Language: "go",
+			Kind: core.KindInterface, Name: "ReadWriter", QualifiedName: "ReadWriter",
+			RawText: "type ReadWriter interface {\n\tReader\n\tWrite(s string)\n}"},
+	}
+	found := false
+	for _, e := range BuildEdges(syms) {
+		if e.Type == core.EdgeExtends && e.From == "x.go::ReadWriter@1" && e.To == "x.go::Reader@1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("ReadWriter embedding Reader must produce an extends edge")
+	}
+}
+
+// C# uses `class X : Base, IFoo` (colon syntax). Without a graph-layer parse,
+// C# inheritance edges existed only when the native roslyn analyzer ran; a
+// bare source tree got zero edges and an empty change-impact closure.
+func TestBuildEdges_CSharpColonInheritance(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "s.cs::IShape@1", FilePath: "s.cs", BlobSHA: "1", Language: "csharp",
+			Kind: core.KindInterface, Name: "IShape", QualifiedName: "IShape",
+			Signature: "public interface IShape"},
+		{ID: "s.cs::Circle@1", FilePath: "s.cs", BlobSHA: "1", Language: "csharp",
+			Kind: core.KindClass, Name: "Circle", QualifiedName: "Circle",
+			Signature: "public class Circle : IShape"},
+		{ID: "s.cs::Base@1", FilePath: "s.cs", BlobSHA: "1", Language: "csharp",
+			Kind: core.KindClass, Name: "Base", QualifiedName: "Base",
+			Signature: "public class Base"},
+		{ID: "s.cs::Derived@1", FilePath: "s.cs", BlobSHA: "1", Language: "csharp",
+			Kind: core.KindClass, Name: "Derived", QualifiedName: "Derived",
+			Signature: "public class Derived : Base, IShape where T : struct"},
+	}
+	var impl, ext bool
+	for _, e := range BuildEdges(syms) {
+		if e.Type == core.EdgeImplements && e.From == "s.cs::Circle@1" && e.To == "s.cs::IShape@1" {
+			impl = true
+		}
+		if e.Type == core.EdgeExtends && e.From == "s.cs::Derived@1" && e.To == "s.cs::Base@1" {
+			ext = true
+		}
+	}
+	if !impl {
+		t.Error("Circle : IShape must produce an implements edge")
+	}
+	if !ext {
+		t.Error("Derived : Base (base class first) must produce an extends edge, and the where-clause must not corrupt parsing")
+	}
+}
