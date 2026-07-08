@@ -306,6 +306,14 @@ func (idx *edgeIndex) importedFiles(fromFile string) map[string]struct{} {
 		return out
 	}
 	for _, imp := range sortedKeys(imports) {
+		// Strip an `as <alias>` binding: the alias is a local name, not part
+		// of the module path, and left in place it broke resolution of the
+		// whole import (Python `import driver.dbapi as Database`, JS
+		// `import X as Y`). Do it first so every branch below sees the bare
+		// module path.
+		if i := strings.Index(imp, " as "); i >= 0 {
+			imp = imp[:i]
+		}
 		raw := strings.Trim(imp, "\"' ;")
 		// Relative imports name one specific file or directory: resolve them
 		// against the importing file's location and skip fuzzy matching —
@@ -2106,17 +2114,27 @@ func resolveTypeEdges(idx *edgeIndex, symbol core.SymbolRecord, targetName strin
 		}
 		cands = append(cands, target)
 	}
-	// Local scope wins outright: a same-file candidate (Java test files
-	// nesting their own Base; sibling nested classes) or a same-directory
-	// candidate shadows same-named types elsewhere — without the tier,
-	// every test class `extends Base` edged into every hierarchy owning a
-	// Base. Cross-package ambiguity keeps the historical fan-out: nominal
-	// languages resolve through imports the graph does not model, and
-	// dropping those edges would break real cross-file hierarchies (TS).
+	// Resolution tiers, most-specific first: (1) same file; (2) a file the
+	// referencing file imports; (3) same directory; (4) the historical
+	// cross-package fan-out. The import tier disambiguates a Capitalized
+	// module-alias base (Python `class C(Mod.Base)` from `import pkg as Mod`,
+	// stripped to `Base`) to the imported module's class rather than an
+	// arbitrary same-named local decoy — the same misresolution the TS
+	// receiver-chain fix addressed, here for supertype references. Import
+	// resolution the graph cannot model still falls through to the fan-out,
+	// so real cross-file hierarchies are never dropped.
 	var local []*core.SymbolRecord
 	for _, c := range cands {
 		if c.FilePath == symbol.FilePath {
 			local = append(local, c)
+		}
+	}
+	if local == nil && len(cands) > 1 {
+		scope := idx.importedFiles(symbol.FilePath)
+		for _, c := range cands {
+			if _, ok := scope[c.FilePath]; ok {
+				local = append(local, c)
+			}
 		}
 	}
 	if local == nil {

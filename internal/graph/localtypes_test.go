@@ -268,3 +268,60 @@ func TestJavaOverloadNarrowing(t *testing.T) {
 		t.Error("three-arg overload conflicts with argc 2")
 	}
 }
+
+// tsResolveClassFile must pick the class the referencing file imports, not
+// whichever same-named class sorts first — else a receiver chain
+// (this.connection.driver.escape) misattributes to an unrelated class.
+func TestTsResolveClassFile_ImportScope(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "a/conn.ts::Connection@1", FilePath: "a/conn.ts", Language: "typescript",
+			Kind: core.KindClass, Name: "Connection", QualifiedName: "Connection",
+			RawText: "class Connection { driver: FakeDriver; }"},
+		{ID: "z/conn.ts::Connection@1", FilePath: "z/conn.ts", Language: "typescript",
+			Kind: core.KindClass, Name: "Connection", QualifiedName: "Connection",
+			RawText: "class Connection { driver: Driver; }"},
+		{ID: "wrapper.ts::Wrapper@1", FilePath: "wrapper.ts", Language: "typescript",
+			Kind: core.KindClass, Name: "Wrapper", QualifiedName: "Wrapper",
+			RawText: "class Wrapper { connection: Connection; }",
+			Imports: []string{"./z/conn"}},
+	}
+	idx := newEdgeIndex(syms)
+	// Referenced from wrapper.ts, which imports z/conn: must resolve there,
+	// not to a/conn.ts (which sorts first).
+	got := tsResolveClassFile(idx, "Connection", "wrapper.ts")
+	if got != "z/conn.ts" {
+		t.Fatalf("tsResolveClassFile = %q, want z/conn.ts (the imported one)", got)
+	}
+	// No referencing scope: falls back to first-match (historical behavior).
+	if got := tsResolveClassFile(idx, "Connection", ""); got == "" {
+		t.Fatal("empty preferFile must still resolve (first-match fallback)")
+	}
+}
+
+// A Python module-aliased base (`import pkg as Mod; class C(Mod.Base)`) must
+// resolve to the imported module's class, not a same-named decoy elsewhere.
+// Exercises both the `as`-alias import stripping and the import-scope tier.
+func TestResolveTypeEdges_PythonModuleAliasBase(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "driver/dbapi.py::Cursor@1", FilePath: "driver/dbapi.py", Language: "python",
+			Kind: core.KindClass, Name: "Cursor", QualifiedName: "Cursor",
+			Signature: "class Cursor"},
+		{ID: "decoy/cursor.py::Cursor@1", FilePath: "decoy/cursor.py", Language: "python",
+			Kind: core.KindClass, Name: "Cursor", QualifiedName: "Cursor",
+			Signature: "class Cursor"},
+		{ID: "backend/base.py::Wrapper@1", FilePath: "backend/base.py", Language: "python",
+			Kind: core.KindClass, Name: "Wrapper", QualifiedName: "Wrapper",
+			Signature: "class Wrapper(Database.Cursor)",
+			RawText:   "class Wrapper(Database.Cursor):\n    pass",
+			Imports:   []string{"driver.dbapi as Database"}},
+	}
+	var targets []string
+	for _, e := range BuildEdges(syms) {
+		if e.Type == core.EdgeExtends && e.From == "backend/base.py::Wrapper@1" {
+			targets = append(targets, e.To)
+		}
+	}
+	if len(targets) != 1 || targets[0] != "driver/dbapi.py::Cursor@1" {
+		t.Fatalf("Wrapper(Database.Cursor) must resolve to the imported Cursor only, got %v", targets)
+	}
+}

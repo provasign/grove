@@ -114,7 +114,7 @@ func tsLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 					continue
 				}
 				seen[className] = true
-				tsClassFieldTypes(idx, className, out)
+				tsClassFieldTypes(idx, className, symbol.FilePath, out)
 				next = append(next, tsBaseClasses(idx, className, dirOf(symbol.FilePath))...)
 			}
 			classes = next
@@ -162,10 +162,56 @@ func tsLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 	return out
 }
 
+// tsResolveClassFile picks the file declaring className, resolved from the
+// perspective of preferFile: same file wins, then a file preferFile imports,
+// then a same-directory file, then the first candidate. Without the
+// import/dir preference, two classes sharing a name in different directories
+// resolved to whichever sorted first in byName — misattributing a receiver
+// chain (`this.connection.driver.escape`) to an unrelated same-named class.
+func tsResolveClassFile(idx *edgeIndex, className, preferFile string) string {
+	var first, sameDir, imported string
+	var scope map[string]struct{}
+	if preferFile != "" {
+		scope = idx.importedFiles(preferFile)
+	}
+	preferDir := dirOf(preferFile)
+	for _, cand := range idx.byName[strings.ToLower(className)] {
+		if cand.Name != className || (cand.Kind != core.KindClass && cand.Kind != core.KindInterface) {
+			continue
+		}
+		if preferFile != "" && cand.FilePath == preferFile {
+			return cand.FilePath
+		}
+		if imported == "" && scope != nil {
+			if _, ok := scope[cand.FilePath]; ok {
+				imported = cand.FilePath
+			}
+		}
+		if sameDir == "" && preferFile != "" && dirOf(cand.FilePath) == preferDir {
+			sameDir = cand.FilePath
+		}
+		if first == "" {
+			first = cand.FilePath
+		}
+	}
+	switch {
+	case imported != "":
+		return imported
+	case sameDir != "":
+		return sameDir
+	default:
+		return first
+	}
+}
+
 // tsClassFieldTypes records one class's field types from indexed field
 // symbols, its constructor's parameter properties, and this.x = new T()
 // assignments. Existing entries win (closer classes shadow ancestors).
-func tsClassFieldTypes(idx *edgeIndex, className string, out map[string]string) {
+// preferFile scopes the className→file resolution (see tsResolveClassFile);
+// the resolved file is returned so a receiver-chain walk can use it as the
+// scope for the next hop. Pass "" for preferFile when no referencing scope
+// is known (falls back to first-match, the historical behavior).
+func tsClassFieldTypes(idx *edgeIndex, className, preferFile string, out map[string]string) string {
 	record := func(name, typ string) {
 		if _, exists := out[name]; !exists && typ != "" {
 			out[name] = typ
@@ -176,15 +222,9 @@ func tsClassFieldTypes(idx *edgeIndex, className string, out map[string]string) 
 	// field (`this.queryRunner.connection.driver...` where queryRunner is a
 	// QueryRunner interface) resolves through the interface's property
 	// signatures, which parse exactly like class fields.
-	var classFile string
-	for _, cand := range idx.byName[strings.ToLower(className)] {
-		if cand.Name == className && (cand.Kind == core.KindClass || cand.Kind == core.KindInterface) {
-			classFile = cand.FilePath
-			break
-		}
-	}
+	classFile := tsResolveClassFile(idx, className, preferFile)
 	if classFile == "" {
-		return
+		return ""
 	}
 	// Class-body field declarations (`protected driver: Driver`). astkit does
 	// not emit TS class fields as KindField symbols, so the member loop below
@@ -239,6 +279,7 @@ func tsClassFieldTypes(idx *edgeIndex, className string, out map[string]string) 
 			}
 		}
 	}
+	return classFile
 }
 
 // tsReceiverChainRe captures a dotted receiver chain immediately before a
@@ -305,7 +346,7 @@ func tsFamilyLang(language string) bool {
 // through field types, one hop per segment, and returns the receiver's type
 // name. The first segment resolves against the caller's own local types; each
 // later segment against the running type's class fields. "" if any hop fails.
-func tsResolveReceiverChain(idx *edgeIndex, localTypes map[string]string, chain string) string {
+func tsResolveReceiverChain(idx *edgeIndex, localTypes map[string]string, chain, startFile string) string {
 	parts := strings.Split(chain, ".")
 	for len(parts) > 0 && (parts[0] == "this" || parts[0] == "self") {
 		parts = parts[1:]
@@ -318,14 +359,22 @@ func tsResolveReceiverChain(idx *edgeIndex, localTypes map[string]string, chain 
 		return ""
 	}
 	curType = strings.TrimPrefix(curType, "class:")
+	// curFile is the scope in which the next segment's type is resolved: the
+	// file of the class reached so far. Starts at the calling method's file
+	// and advances to each intermediate class's file, so a field's type
+	// binds to the class that file imports, not an arbitrary same-named one.
+	curFile := startFile
 	for _, seg := range parts[1:] {
 		fields := map[string]string{}
-		tsClassFieldTypes(idx, curType, fields)
+		classFile := tsClassFieldTypes(idx, curType, curFile, fields)
 		next, ok := fields[seg]
 		if !ok {
 			return ""
 		}
 		curType = strings.TrimPrefix(next, "class:")
+		if classFile != "" {
+			curFile = classFile
+		}
 	}
 	return curType
 }
@@ -334,7 +383,7 @@ func tsResolveReceiverChain(idx *edgeIndex, localTypes map[string]string, chain 
 // narrows candidates to that type or dispatches to its interface implementors.
 // Mirrors narrowByLocalType's contract (kept, dispatch, decided).
 func narrowByChainType(idx *edgeIndex, sat *interfaceSatisfaction, localTypes map[string]string, symbol *core.SymbolRecord, fullChain, calleeName string, cands []*core.SymbolRecord) (kept, dispatch []*core.SymbolRecord, decided bool) {
-	typ := tsResolveReceiverChain(idx, localTypes, fullChain)
+	typ := tsResolveReceiverChain(idx, localTypes, fullChain, symbol.FilePath)
 	if typ == "" {
 		return cands, nil, false
 	}
