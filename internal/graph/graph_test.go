@@ -183,6 +183,34 @@ func TestTestsFor(t *testing.T) {
 	}
 }
 
+func TestAffectedTests(t *testing.T) {
+	g := New()
+	g.Replace([]core.SymbolRecord{
+		{ID: "main.go::Login@sha", FilePath: "main.go", Language: "go", Kind: core.KindFunction, Name: "Login", QualifiedName: "Login"},
+		{ID: "main_test.go::TestLogin@sha", FilePath: "main_test.go", Language: "go", Kind: core.KindFunction, Name: "TestLogin", QualifiedName: "TestLogin"},
+		{ID: "other.go::Unrelated@sha", FilePath: "other.go", Language: "go", Kind: core.KindFunction, Name: "Unrelated", QualifiedName: "Unrelated"},
+	}, 3)
+
+	// A changed source file maps to the tests covering its symbols.
+	tests := g.AffectedTests([]string{"main.go"})
+	if len(tests) != 1 || tests[0].Name != "TestLogin" {
+		t.Fatalf("main.go should select TestLogin, got %+v", tests)
+	}
+	// A file whose symbols no test reaches selects nothing (the narrowing
+	// that makes "run only affected tests" worthwhile).
+	if got := g.AffectedTests([]string{"other.go"}); len(got) != 0 {
+		t.Fatalf("other.go should select no tests, got %+v", got)
+	}
+	// Unknown / non-indexed file: empty, no panic.
+	if got := g.AffectedTests([]string{"does-not-exist.go"}); len(got) != 0 {
+		t.Fatalf("unknown file should select nothing, got %+v", got)
+	}
+	// Empty input is a no-op, not a full-suite selection.
+	if got := g.AffectedTests(nil); len(got) != 0 {
+		t.Fatalf("no changed files should select no tests, got %+v", got)
+	}
+}
+
 func TestComputeICRAndDetectConflicts(t *testing.T) {
 	codeGraph := New()
 	codeGraph.Replace([]core.SymbolRecord{

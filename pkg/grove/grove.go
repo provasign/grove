@@ -531,6 +531,14 @@ func (e *Engine) Tests(ctx context.Context, query string) ([]Symbol, error) {
 	return e.currentGraph().TestsFor(query), nil
 }
 
+// AffectedTests returns the test symbols covering any symbol defined in the
+// given repo-relative files — "given this diff, which tests must run". The
+// file-diff analog of Tests(query): feed it `git diff --name-only` to select
+// exactly the tests a change can break, for a "run only affected tests" CI step.
+func (e *Engine) AffectedTests(ctx context.Context, files []string) ([]Symbol, error) {
+	return e.currentGraph().AffectedTests(files), nil
+}
+
 // References answers "where is NAME used?" by scanning code occurrences of the
 // name (comments/strings excluded), each attributed to its enclosing symbol.
 // Unlike Impact (which walks the resolved call graph), this is the resolution-

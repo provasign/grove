@@ -671,6 +671,40 @@ func (g *CodeGraph) TestsForSymbol(id string, policy TraversalPolicy) []core.Sym
 	return out
 }
 
+// AffectedTests returns the covering tests for every symbol defined in the
+// given repo-relative files — the file-diff form of TestsFor. It seeds the
+// inbound test-coverage closure with all symbols in the changed files at once
+// (one traversal), so a CI "run only the affected tests" step maps a
+// `git diff --name-only` straight to the set of test symbols to run. Uses the
+// same evidence-backed policy as TestsFor (low-confidence edges excluded, so a
+// weak bare-name match cannot sweep in unrelated tests across a monorepo).
+func (g *CodeGraph) AffectedTests(files []string) []core.SymbolRecord {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	want := make(map[string]bool, len(files))
+	for _, f := range files {
+		want[f] = true
+	}
+	seeds := make(map[string]bool)
+	for id, s := range g.symbols {
+		if want[s.FilePath] {
+			seeds[id] = true
+		}
+	}
+	tests := g.coveringTestsLocked(seeds, PolicyTests, PolicySkips{})
+	out := make([]core.SymbolRecord, 0, len(tests))
+	for _, t := range tests {
+		out = append(out, deepCopySymbol(t))
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].FilePath != out[j].FilePath {
+			return out[i].FilePath < out[j].FilePath
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out
+}
+
 func (g *CodeGraph) testsForWithPolicy(query string, policy TraversalPolicy) ([]core.SymbolRecord, PolicySkips) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
