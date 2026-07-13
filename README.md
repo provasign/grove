@@ -265,6 +265,10 @@ grove impact <symbol> [dir] [--refresh]
 # in one deterministic call
 grove change-impact 'Type.method(ParamType, ...)' [dir]
 
+# Rename a method: the change-impact set converted into concrete edit
+# lines (file, line, before/after), review-and-apply
+grove rename-plan 'Type.method' NewName [dir]
+
 # Interface evolution: every type claiming the contract that does NOT
 # implement the member (missing / abstract / unverifiable buckets); under
 # a default body, "missing" = inherits the default, breaks if made required
@@ -280,6 +284,10 @@ grove dead-code [dir] [--roots a,b]
 
 # Which tests cover a symbol?
 grove tests <symbol> [dir] [--refresh]
+
+# File-level test selection is an embedded-API operation: Engine.AffectedTests
+# (ctx, changedFiles) returns every test covering symbols in the changed files
+# — surfaced to agents/CI as `prism affected` (git diff --name-only | xargs prism affected)
 
 # Conservative structural certification for a unified diff.
 # Exit codes: 0 allow, 2 manual_review, 3 block, 1 runtime error.
