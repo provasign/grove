@@ -40,3 +40,18 @@ eval/cstruth/bin/
 eval/cstruth/obj/
 /.cache/
 /eval/grove-eval
+
+# prism-generated steering (mason is harness-first; steering regenerates via `prism init`)
+.clinerules
+.cursorrules
+.devin/
+.kiro/
+.windsurfrules
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+prism.yaml
+.github/copilot-instructions.md
+.mcp.json
+.vscode/
+.windsurf/
