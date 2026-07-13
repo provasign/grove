@@ -41,7 +41,7 @@ eval/cstruth/obj/
 /.cache/
 /eval/grove-eval
 
-# prism-generated steering (mason is harness-first; steering regenerates via `prism init`)
+# prism-generated agent steering (regenerates via `prism init`)
 .clinerules
 .cursorrules
 .devin/
