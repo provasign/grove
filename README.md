@@ -386,3 +386,13 @@ go test ./internal/parser/... -v                   # verbose parser tests
 ```
 
 Key test areas: language extractors (fixture-based), BFS traversal on known graph topologies, delta indexing, ignore/secret-safe indexing, MCP stdio framing, and FTS5 query ranking.
+
+**Regression gate — run before committing/releasing graph changes.** CI runs
+these on push (`.github/workflows/ci.yml`, `.github/workflows/eval.yml`):
+
+- `make test` / `go test ./...` — unit suite; must be green.
+- Edge-accuracy eval vs the Go SSA/VTA oracle: build `./cmd/grove-eval`, then
+  `truth` + `score` against `eval/baseline.json` (see `.github/workflows/eval.yml`).
+  `calls`-edge resolution must not regress below the committed baseline — that
+  is the accuracy number the whole toolchain depends on. Do not tag a release
+  with either red.
