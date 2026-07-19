@@ -33,6 +33,47 @@ func TestFileSymbols(t *testing.T) {
 	}
 }
 
+func TestSnapshotGraph(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	// b.go calls A so the snapshot must contain at least one calls edge.
+	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("package main\n\nfunc A() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "b.go"), []byte("package main\n\nfunc B() { A() }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := Open(ctx, Config{RepoRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	if _, err := eng.Index(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	symbols, edges := eng.SnapshotGraph(ctx)
+	if len(symbols) == 0 {
+		t.Fatal("SnapshotGraph returned no symbols")
+	}
+	var calls int
+	for _, e := range edges {
+		if e.Type == EdgeCalls {
+			calls++
+		}
+	}
+	if calls == 0 {
+		t.Fatalf("SnapshotGraph returned no calls edges (got %d edges total)", len(edges))
+	}
+	// The snapshot is a copy: mutating it must not corrupt the graph.
+	symbols[0].Name = "mutated"
+	again, _ := eng.SnapshotGraph(ctx)
+	for _, s := range again {
+		if s.Name == "mutated" {
+			t.Fatal("SnapshotGraph aliases internal graph state")
+		}
+	}
+}
+
 // TestDiffAgainstFileContent covers the merge-driver flow: the merged bytes
 // exist only in memory (git writes %A to the worktree after the driver
 // exits), so the drift must be computable without touching disk.

@@ -583,6 +583,15 @@ func (e *Engine) SnapshotSymbols(ctx context.Context) []Symbol {
 	return symbols
 }
 
+// SnapshotGraph returns a deep copy of every symbol plus every edge in the
+// current graph. This is the bulk export consumers use to build derived
+// projections (e.g. Prism's component-level views) without N per-symbol
+// round-trips; edges carry their evidence Source/Reason/Confidence so
+// derived results can report the tier of their constituent evidence.
+func (e *Engine) SnapshotGraph(ctx context.Context) ([]Symbol, []Edge) {
+	return e.currentGraph().Snapshot()
+}
+
 // PreviewFileSymbols parses in-memory content as if it lived at relPath
 // (repo-relative) and returns the symbols Grove would index for it. Combine
 // with Diff to compute the structural delta of content that is not on disk
