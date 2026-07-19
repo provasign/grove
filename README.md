@@ -2,7 +2,7 @@
 
 > **Your codebase's persistent long-term memory — queryable by any AI agent.**
 
-> **Embedded mode (current):** Grove is a Go library at `github.com/provasign/grove/pkg/grove`. Prism and Fuse link it directly and open the on-disk index in-process. There is no `grove serve` daemon, no port (7777/7778), and no `.grove/.token`. The CLI is available for explicit indexing plus read queries (`grove index .`, `grove symbols main`) and stdio MCP (`grove mcp`).
+> **Embedded mode (current):** Grove is the shared semantic graph engine at `github.com/provasign/grove/pkg/grove`. Prism embeds it and opens the on-disk index in-process. There is no `grove serve` daemon, no port (7777/7778), and no `.grove/.token`. Tool builders can also use the Go API, CLI (`grove index .`, `grove symbols main`), or stdio MCP (`grove mcp`) directly.
 
 ---
 
@@ -13,9 +13,12 @@ Grep answers "does this string appear somewhere?" A language server answers "whe
 - *What is the full dependency chain from this file?*
 - *What symbols are semantically related to this task description?*
 
-The difference is a graph. Grove indexes your source files into a persistent SQLite graph — 11 languages, 8 edge types, BFS traversal — and keeps it live with delta indexing (files whose content hash hasn't changed are never re-parsed). The graph is queryable through the embedded Go API, CLI, and MCP stdio.
+The difference is a graph. Grove indexes your source files into a persistent SQLite graph — 11 languages, 9 edge types, BFS traversal — and keeps it live with delta indexing (files whose content hash hasn't changed are never re-parsed). The graph is queryable through the embedded Go API, CLI, and MCP stdio.
 
-Grove is the foundation the rest of the toolchain is built on. Prism uses it to focus context. Fuse uses it to resolve conflicts. Shale will use it for intent-to-diff conformance. Without Grove, they fall back to line-level operations.
+Grove is infrastructure, not another setup step in the public product line.
+Prism embeds it to power change intelligence; tool builders can use it directly
+when they need the underlying graph primitives without Prism's task-shaped
+operations and context delivery.
 
 Grove also exposes a conservative certification report for unified diffs. This mode is additive: consumers see no change unless they explicitly opt into the report. The report labels heuristic evidence, returns `manual_review` for unsupported or unmapped changes, and only returns `allow` when changed code maps cleanly to indexed symbols with required test evidence.
 
@@ -48,7 +51,7 @@ Source files
 ┌─────────────────────────────────────────────────────────┐
 │  internal/graph/                                        │
 │  In-memory CodeGraph                                    │
-│  8 edge types                                           │
+│  9 edge types                                           │
 │  BFS traversal                                          │
 └──────┬─────────────────┬───────────────────────────────┘
        │
@@ -96,6 +99,13 @@ Source files
 | PHP | `.php .phtml` | AST walker + native semantic enrichment |
 
 Non-code files (`.md`, `.yaml`, `.json`, `.xml`, `.sh`, `.toml`, `.proto`, `.sql`, `Makefile`, `Dockerfile`, and more) are indexed as `document` symbols whose content feeds the semantic and lexical search indexes. Agents can query them alongside code symbols.
+
+Language support is not a claim that every operation has identical semantic
+quality. `grove doctor [dir]` emits the versioned, machine-readable capability
+manifest with `precise`, `measured`, `structural`, `heuristic`, and
+`unsupported` tiers, current index status, and operation caveats. Native
+analyzer availability can raise the evidence ceiling, but a timeout or missing
+tool must not be interpreted as compiler-resolved coverage.
 
 ---
 

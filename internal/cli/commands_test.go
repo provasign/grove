@@ -168,6 +168,13 @@ func TestRun_Status(t *testing.T) {
 	}
 }
 
+func TestRun_Doctor(t *testing.T) {
+	dir := goFixture(t)
+	if got := Run([]string{"doctor", dir}); got != 0 {
+		t.Fatalf("want 0, got %d", got)
+	}
+}
+
 // --- symbols / query ---
 
 func TestRun_Symbols(t *testing.T) {

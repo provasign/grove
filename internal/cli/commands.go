@@ -41,6 +41,8 @@ func Run(args []string) int {
 		return indexCommand(engine, codeGraph, args[1:])
 	case "status":
 		return status(engine, codeGraph, args[1:])
+	case "doctor":
+		return doctor(args[1:])
 	case "symbols":
 		return symbols(engine, codeGraph, args[1:])
 	case "query":
@@ -180,6 +182,52 @@ func status(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) in
 		return 1
 	}
 	return printJSON(status)
+}
+
+func doctor(args []string) int {
+	cfg, err := config.Resolve(argOrDefault(args, 0, "."))
+	if err != nil {
+		return printJSON(map[string]any{
+			"status": "error",
+			"error":  err.Error(),
+		})
+	}
+
+	indexStatus := core.Status{}
+	warnings := []string{}
+	state := "ok"
+	if !storeExists(cfg.Root) {
+		state = "warning"
+		warnings = append(warnings, "repository is not indexed; run grove index")
+	} else {
+		db, err := store.Open(cfg.Root)
+		if err != nil {
+			return printJSON(map[string]any{
+				"status": "error",
+				"root":   cfg.Root,
+				"error":  err.Error(),
+			})
+		}
+		defer db.Close()
+		indexStatus, err = db.Status(context.Background())
+		if err != nil {
+			return printJSON(map[string]any{
+				"status": "error",
+				"root":   cfg.Root,
+				"error":  err.Error(),
+			})
+		}
+	}
+
+	return printJSON(map[string]any{
+		"status":       state,
+		"version":      version.Version,
+		"root":         cfg.Root,
+		"storePath":    cfg.StorePath,
+		"index":        indexStatus,
+		"warnings":     warnings,
+		"capabilities": core.CurrentCapabilities(),
+	})
 }
 
 func symbols(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int {
@@ -733,6 +781,7 @@ Usage:
   grove init [dir]
   grove index [dir] [--force] [--no-native] [--native=false] [--native-languages=go,rust] [--native-disabled-languages=python] [--native-timeout=5s]
   grove status [dir] [--refresh]
+  grove doctor [dir]
   grove symbols <query> [dir] [--refresh]        lexical substring search over names/paths/signatures
   grove query <intent> [dir] [--refresh]         semantic search (Model2Vec embeddings)
   grove deps <file> [dir] [--refresh]
