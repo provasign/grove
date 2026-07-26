@@ -184,3 +184,44 @@ func Logout() {}
 		t.Fatalf("breaking = %+v, want Login", diff.BreakingChanges)
 	}
 }
+
+func TestQuickStatusMatchesEngineStatus(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	// b.go calls A so the index persists symbols AND edges — QuickStatus must
+	// report the identical triple the engine path reports.
+	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("package main\n\nfunc A() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "b.go"), []byte("package main\n\nfunc B() { A() }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := Open(ctx, Config{RepoRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.Index(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	full, err := eng.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Close the engine first: QuickStatus must work with no engine running.
+	if err := eng.Close(); err != nil {
+		t.Fatal(err)
+	}
+	quick, err := QuickStatus(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if quick != full {
+		t.Fatalf("QuickStatus = %+v, Engine.Status = %+v", quick, full)
+	}
+	if quick.SymbolCount == 0 || quick.EdgeCount == 0 {
+		t.Fatalf("expected non-empty index, got %+v", quick)
+	}
+	if _, err := QuickStatus(ctx, ""); err == nil {
+		t.Fatal("QuickStatus(\"\") should error")
+	}
+}

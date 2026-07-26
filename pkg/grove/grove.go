@@ -199,6 +199,26 @@ func (e *Engine) Status(ctx context.Context) (Status, error) {
 	return e.store.Status(ctx)
 }
 
+// QuickStatus reports the persisted index summary without constructing an
+// Engine. Open() rehydrates every stored symbol and edge into the in-memory
+// graph so reads work immediately — work Status never touches (it is three
+// live COUNT(*) queries against the store). Opening the store alone turns a
+// ~1.3s status call on a 500k-edge index into a few milliseconds, with
+// byte-identical results because both paths execute the same store.Status.
+// QuickStatus makes no freshness claim: counts reflect the last persisted
+// index, exactly like Engine.Status.
+func QuickStatus(ctx context.Context, repoRoot string) (Status, error) {
+	if repoRoot == "" {
+		return Status{}, errors.New("grove: RepoRoot is required")
+	}
+	st, err := store.Open(repoRoot)
+	if err != nil {
+		return Status{}, err
+	}
+	defer func() { _ = st.Close() }()
+	return st.Status(ctx)
+}
+
 // Query resolves a natural-language intent into ranked symbols by blending
 // TF-IDF semantic search with substring keyword matches.
 func (e *Engine) Query(ctx context.Context, intent string, limit int) ([]Symbol, error) {
