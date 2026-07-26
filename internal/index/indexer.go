@@ -125,6 +125,24 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 		if isSensitivePath(relPath) || ignore.Ignored(relPath, false) {
 			return nil
 		}
+		// A symlinked FILE entry inside root can point anywhere; WalkDir
+		// already refuses to descend into a symlinked DIRECTORY (its
+		// DirEntry.IsDir() is false for a symlink even when the target is a
+		// dir, so it falls through to this file branch and typically fails
+		// parser.Supported below) — but a symlinked file whose target has a
+		// recognized extension would otherwise have its content read,
+		// parsed, and exposed under the in-repo symlink name even though
+		// the real bytes live outside the indexed tree. Reject any entry
+		// whose resolved target escapes root before it is ever parsed.
+		if entry.Type()&os.ModeSymlink != 0 {
+			resolved, e := filepath.EvalSymlinks(path)
+			if e != nil {
+				return nil
+			}
+			if r, e := filepath.Rel(root, resolved); e != nil || r == ".." || strings.HasPrefix(r, ".."+string(filepath.Separator)) {
+				return nil
+			}
+		}
 		if !parser.Supported(path) {
 			return nil
 		}

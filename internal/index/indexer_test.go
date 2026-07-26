@@ -169,3 +169,39 @@ func TestScopedNativeAnalyzersCarryForwardEdges(t *testing.T) {
 		t.Fatalf("python native edges = %d after Go-only change, want %d (carried forward)", got, pyBefore)
 	}
 }
+
+func TestIndexRejectsSymlinkEscapingRoot(t *testing.T) {
+	ctx := context.Background()
+	secretDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(secretDir, "secret.go"),
+		[]byte("package secret\n\nfunc TopSecret() int { return 1 }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "normal.go"),
+		[]byte("package main\n\nfunc Normal() int { return 1 }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(secretDir, "secret.go"), filepath.Join(root, "leak.go")); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := store.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	idx := New(parser.NewEngine(), st)
+	_, result, err := idx.Index(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Only normal.go: the symlink resolves outside root and must be
+	// rejected before parsing, not walked/read/indexed under its in-repo
+	// name (the escape this test guards: search would otherwise surface
+	// TopSecret from outside the tree, labeled as leak.go).
+	if result.FilesSeen != 1 {
+		t.Fatalf("FilesSeen = %d, want 1 (the symlinked file must be rejected, not walked)", result.FilesSeen)
+	}
+}
