@@ -28,6 +28,21 @@ func (jsTSAnalyzer) Languages() []string {
 	return []string{"javascript", "typescript", "tsx"}
 }
 
+// trustRepoToolchain reports whether the operator has explicitly opted in to
+// loading a repository's OWN typescript for type-analysis. Off by default:
+// grove is used to review code you did not write (PRs, dependencies), and a
+// repo-resident node_modules/typescript executes on require(). Set it only for
+// repositories you trust as much as your own working tree.
+func trustRepoToolchain() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("GROVE_TRUST_REPO_TOOLCHAIN")))
+	return v == "1" || v == "true" || v == "yes" || v == "on"
+}
+
+// tsSkipReason explains the degrade-to-tree-sitter path in a way an operator
+// won't mistake for a bug: it states that structural analysis still works and
+// gives the two ways to enable full type-resolved TypeScript edges.
+const tsSkipReason = "TypeScript type-analysis skipped for safety (grove does not load a repo's own typescript — a hostile repo could run code on load). Tree-sitter symbol/structure analysis IS active. For full type-resolved TS edges: install typescript outside the repo (npm i -g typescript), or set GROVE_TRUST_REPO_TOOLCHAIN=1 for a repository you trust."
+
 func (jsTSAnalyzer) Available(_ context.Context, root string) Availability {
 	if !anyFile(root, "package.json", "tsconfig.json", "jsconfig.json") {
 		return Availability{Reason: "no package.json, tsconfig.json, or jsconfig.json"}
@@ -35,15 +50,21 @@ func (jsTSAnalyzer) Available(_ context.Context, root string) Availability {
 	if !commandExists("node") {
 		return Availability{Reason: "node executable not found"}
 	}
-	// Resolve typescript from a neutral cwd, NOT the repo — a repo-resident
-	// (untrusted) typescript must never be loaded. If only the repo ships
-	// typescript, this fails and the analyzer stays unavailable, degrading to
-	// the tree-sitter path.
+	// By default resolve typescript from a neutral cwd, NOT the repo, so a
+	// repo-resident (untrusted) typescript is never loaded. With the explicit
+	// trust opt-in, resolve from the repo like a normal dev tool would.
+	cwd := neutralNodeCWD()
+	if trustRepoToolchain() {
+		cwd = root
+	}
 	cmd := exec.Command("node", "-e", "require.resolve('typescript')")
-	cmd.Dir = neutralNodeCWD()
+	cmd.Dir = cwd
 	cmd.Env = scrubbedEnv()
 	if err := cmd.Run(); err != nil {
-		return Availability{Reason: "no trusted (non-repo) typescript resolvable"}
+		if trustRepoToolchain() {
+			return Availability{Reason: "typescript not resolvable in the project"}
+		}
+		return Availability{Reason: tsSkipReason}
 	}
 	return Availability{Available: true}
 }
@@ -134,10 +155,15 @@ for (const sf of program.getSourceFiles()) {
 }
 console.log(JSON.stringify({files: parsed.fileNames.length, config: cfg, edges, calls, types}));
 `)
-	// Run node from a neutral cwd so the repo's node_modules is never on the
-	// module-resolution path; the repo root reaches the script via GROVE_ROOT.
-	// appendEnv scrubs grove's secrets from the subprocess environment.
+	// Run node from a neutral cwd by default so the repo's node_modules is
+	// never on the module-resolution path; the repo root reaches the script
+	// via GROVE_ROOT. With the explicit trust opt-in, run in the repo so its
+	// own typescript is used (normal dev-tool behavior). appendEnv scrubs
+	// grove's secrets from the subprocess environment in both cases.
 	cmd.Dir = neutralNodeCWD()
+	if trustRepoToolchain() {
+		cmd.Dir = req.Root
+	}
 	cmd.Env = appendEnv("GROVE_FILES="+string(filesJSON), "GROVE_ROOT="+req.Root)
 	out, err := cmd.Output()
 	if err != nil {
