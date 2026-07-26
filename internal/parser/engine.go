@@ -131,6 +131,22 @@ func sha1Hex(content []byte) string {
 }
 
 func FileBlobSHA(path string) (string, error) {
+	// The tree walk hashes every candidate with FileBlobSHA BEFORE Parse gets
+	// to apply its MaxFileSizeBytes guard, so this must guard itself. An
+	// unbounded os.ReadFile here means a 2 GB file named x.go is slurped whole
+	// into RAM (OOM the indexer) and a named pipe / device named x.go blocks
+	// os.ReadFile forever (hang the index) — both trivially plantable in an
+	// untrusted repo. Reject non-regular files and cap the read.
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("not a regular file: %s", path)
+	}
+	if info.Size() > MaxFileSizeBytes {
+		return "", fmt.Errorf("file exceeds %d bytes: %s", MaxFileSizeBytes, path)
+	}
 	content, err := os.ReadFile(path)
 	if err != nil {
 		return "", err

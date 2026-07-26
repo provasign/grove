@@ -255,14 +255,26 @@ func filterSymbolsByDirs(symbols []core.SymbolRecord, dirs map[string]bool) []co
 	return out
 }
 
-// goAnalyzerEnv preserves the user environment. Earlier versions redirected
-// HOME (and therefore GOMODCACHE) plus GOCACHE into <repo>/.grove/, which
-// re-downloaded the entire module graph into every indexed repository
-// (hundreds of MB of read-only files) and broke GOPRIVATE/.netrc auth.
-// `go list -mod=readonly` is already side-effect free with respect to go.mod;
-// module downloads belong in the user's shared cache.
+// goAnalyzerEnv returns a scrubbed, hardened environment for `go list` run
+// against an untrusted repository. Two dangers it closes:
+//   - GOTOOLCHAIN unset (default "auto") lets a `toolchain goX.Y.Z` directive
+//     in a hostile go.mod make the go command DOWNLOAD AND RE-EXEC a different
+//     toolchain over the network — arbitrary code from repo content. Pinned to
+//     "local" so only the installed toolchain ever runs.
+//   - GOPROXY reaching the network lets `go list ./...` fetch attacker-named
+//     modules (forced egress / SSRF-ish). Set "off" so analysis is offline;
+//     -mod=readonly already blocks go.mod edits.
+// GOMODCACHE/GOCACHE/GOPATH are carried through the allowlist so the shared
+// module cache and build cache still work; module downloads are simply
+// disabled for this side-effect-free analysis pass.
 func goAnalyzerEnv(_ string) []string {
-	return os.Environ()
+	return scrubbedEnv(
+		"GOTOOLCHAIN=local",
+		"GOPROXY=off",
+		"GOFLAGS=-mod=readonly",
+		"GONOSUMCHECK=1",
+		"GOWORK=off",
+	)
 }
 
 // CleanupLegacyCaches removes the per-repo Go caches that earlier Grove

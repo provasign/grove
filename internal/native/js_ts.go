@@ -2,6 +2,7 @@ package native
 
 import (
 	"context"
+	"os"
 	"os/exec"
 	"strings"
 
@@ -9,6 +10,17 @@ import (
 )
 
 type jsTSAnalyzer struct{}
+
+// neutralNodeCWD is a directory OUTSIDE any indexed repository. Node resolves
+// `require('typescript')` by walking node_modules UP from the process working
+// directory, so running node here (instead of in the repo) guarantees the
+// repo's own node_modules — where a hostile clone plants a malicious
+// `typescript` whose entry point runs on require() — is never on the
+// resolution path. Only a typescript installed outside the repo (a trusted
+// global/toolchain install) can be loaded; if none exists the analyzer
+// degrades to the tree-sitter path. The repo root is passed to the script as
+// GROVE_ROOT for file access, never as the module-resolution cwd.
+func neutralNodeCWD() string { return os.TempDir() }
 
 func (jsTSAnalyzer) Name() string { return "js-ts" }
 
@@ -23,10 +35,15 @@ func (jsTSAnalyzer) Available(_ context.Context, root string) Availability {
 	if !commandExists("node") {
 		return Availability{Reason: "node executable not found"}
 	}
+	// Resolve typescript from a neutral cwd, NOT the repo — a repo-resident
+	// (untrusted) typescript must never be loaded. If only the repo ships
+	// typescript, this fails and the analyzer stays unavailable, degrading to
+	// the tree-sitter path.
 	cmd := exec.Command("node", "-e", "require.resolve('typescript')")
-	cmd.Dir = root
+	cmd.Dir = neutralNodeCWD()
+	cmd.Env = scrubbedEnv()
 	if err := cmd.Run(); err != nil {
-		return Availability{Reason: "project typescript package not resolvable"}
+		return Availability{Reason: "no trusted (non-repo) typescript resolvable"}
 	}
 	return Availability{Available: true}
 }
@@ -39,10 +56,10 @@ func (jsTSAnalyzer) Analyze(ctx context.Context, req Request) Result {
 	cmd := exec.CommandContext(ctx, "node", "-e", `
 const ts = require('typescript');
 const path = require('path');
-const root = process.cwd();
+const root = process.env.GROVE_ROOT;
 const inputFiles = JSON.parse(process.env.GROVE_FILES || '[]');
-const cfg = ts.findConfigFile(process.cwd(), ts.sys.fileExists, 'tsconfig.json')
-  || ts.findConfigFile(process.cwd(), ts.sys.fileExists, 'jsconfig.json');
+const cfg = ts.findConfigFile(root, ts.sys.fileExists, 'tsconfig.json')
+  || ts.findConfigFile(root, ts.sys.fileExists, 'jsconfig.json');
 if (!cfg) {
   console.log(JSON.stringify({files: 0, config: '', edges: [], calls: [], types: []}));
   process.exit(0);
@@ -117,8 +134,11 @@ for (const sf of program.getSourceFiles()) {
 }
 console.log(JSON.stringify({files: parsed.fileNames.length, config: cfg, edges, calls, types}));
 `)
-	cmd.Dir = req.Root
-	cmd.Env = appendEnv("GROVE_FILES=" + string(filesJSON))
+	// Run node from a neutral cwd so the repo's node_modules is never on the
+	// module-resolution path; the repo root reaches the script via GROVE_ROOT.
+	// appendEnv scrubs grove's secrets from the subprocess environment.
+	cmd.Dir = neutralNodeCWD()
+	cmd.Env = appendEnv("GROVE_FILES="+string(filesJSON), "GROVE_ROOT="+req.Root)
 	out, err := cmd.Output()
 	if err != nil {
 		return Result{Diagnostics: []string{"typescript language service bootstrap failed: " + err.Error()}}

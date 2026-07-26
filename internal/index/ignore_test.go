@@ -177,3 +177,25 @@ func TestIndex_NestedGitignore(t *testing.T) {
 		t.Fatalf("FilesUpdated = %d, want 4 (errors=%v)", res.FilesUpdated, res.Errors)
 	}
 }
+
+func TestIsSensitivePath_PrivateKeysAndCredStores(t *testing.T) {
+	// Security-audit additions: private keys / cred stores with no telltale
+	// extension and no "secret"/"credential" in the name must be excluded so
+	// their contents never enter grove's searchable index.
+	sensitive := []string{
+		".ssh/id_rsa", "id_ed25519", "deploy/id_ecdsa", "id_rsa_work",
+		".git-credentials", ".pgpass", ".htpasswd", ".dockercfg",
+		"kubeconfig", "key.ppk", "vault.kdbx",
+	}
+	for _, p := range sensitive {
+		if !isSensitivePath(p) {
+			t.Errorf("isSensitivePath(%q) = false, want true (secret material would be indexed)", p)
+		}
+	}
+	// Real source must still be indexed (no over-broad exclusion).
+	for _, p := range []string{"main.go", "id_generator.go", "src/KubeConfigLoader.java"} {
+		if isSensitivePath(p) {
+			t.Errorf("isSensitivePath(%q) = true, want false (real source excluded)", p)
+		}
+	}
+}

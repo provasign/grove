@@ -1,8 +1,12 @@
 package parser
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/provasign/grove/internal/core"
 )
@@ -1330,4 +1334,31 @@ func symbolByKind(syms []core.SymbolRecord, name string, kind core.SymbolKind) (
 		}
 	}
 	return core.SymbolRecord{}, false
+}
+
+func TestFileBlobSHA_RejectsNonRegularAndOversize(t *testing.T) {
+	dir := t.TempDir()
+	// Named pipe (fifo) named like source: os.ReadFile would block forever.
+	fifo := filepath.Join(dir, "x.go")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Skipf("mkfifo unavailable: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { _, err := FileBlobSHA(fifo); done <- err }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("FileBlobSHA(fifo) returned nil error — should reject non-regular files")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("FileBlobSHA(fifo) blocked — non-regular-file guard missing (index hang)")
+	}
+	// A regular file still hashes.
+	reg := filepath.Join(dir, "ok.go")
+	if err := os.WriteFile(reg, []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := FileBlobSHA(reg); err != nil {
+		t.Fatalf("FileBlobSHA(regular) errored: %v", err)
+	}
 }

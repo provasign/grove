@@ -128,7 +128,15 @@ for rel in files:
 print(json.dumps({"edges": edges, "calls": calls, "types": types}))
 `)
 	cmd.Dir = req.Root
-	cmd.Env = appendEnv("GROVE_FILES=" + string(filesJSON))
+	// PYTHONSAFEPATH=1 disables Python's implicit prepend of the `-c` working
+	// directory ('') to sys.path. Without it, cmd.Dir=req.Root means a repo
+	// that ships its own ast.py / json.py at the root SHADOWS this script's
+	// own stdlib imports (line "import ast, json, os, sys") and executes
+	// attacker code at index time. The script's later explicit
+	// sys.path.insert(root) for PathFinder resolution is unaffected — and
+	// PathFinder only resolves paths, it never imports/executes repo modules.
+	// appendEnv also scrubs grove's secrets from the subprocess environment.
+	cmd.Env = appendEnv("GROVE_FILES="+string(filesJSON), "PYTHONSAFEPATH=1")
 	out, err := cmd.Output()
 	if err != nil {
 		return Result{Diagnostics: []string{name + " failed: " + err.Error()}}

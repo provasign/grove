@@ -196,7 +196,18 @@ func isSensitivePath(rel string) bool {
 	ext := strings.ToLower(path.Ext(base))
 	switch base {
 	case ".gitignore", ".groveignore", ".env", ".envrc", ".npmrc", ".pypirc", ".netrc", "credentials",
-		"credentials.json", "secrets.json", "secrets.yaml", "secrets.yml":
+		"credentials.json", "secrets.json", "secrets.yaml", "secrets.yml",
+		// Private keys and credential stores that carry NO tell-tale extension
+		// and no "secret"/"credential" in the name — these would otherwise be
+		// indexed and their contents surfaced through grove's search/read.
+		"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "id_ed25519_sk", "id_ecdsa_sk",
+		".git-credentials", ".pgpass", ".htpasswd", ".dockercfg", "kubeconfig",
+		".s3cfg", ".pypirc.txt":
+		return true
+	}
+	// SSH-style private keys are sometimes suffixed (id_rsa_work, id_ed25519.bak).
+	if strings.HasPrefix(base, "id_rsa") || strings.HasPrefix(base, "id_ed25519") ||
+		strings.HasPrefix(base, "id_ecdsa") || strings.HasPrefix(base, "id_dsa") {
 		return true
 	}
 	if strings.HasPrefix(base, ".env.") || strings.HasSuffix(base, ".env") {
@@ -216,7 +227,7 @@ func isSensitivePath(rel string) bool {
 		}
 	}
 	switch ext {
-	case ".key", ".pem", ".crt", ".cer", ".p12", ".pfx", ".jks", ".keystore", ".pkcs12":
+	case ".key", ".pem", ".crt", ".cer", ".p12", ".pfx", ".jks", ".keystore", ".pkcs12", ".ppk", ".kdbx", ".asc":
 		return true
 	default:
 		return false

@@ -30,8 +30,41 @@ func unmarshalJSON(data []byte, v any) error {
 	return json.Unmarshal(data, v)
 }
 
+// envAllowlist is the set of environment variables a native analyzer
+// subprocess is permitted to inherit. Everything else — API keys, cloud
+// credentials, npm/pip tokens, anything secret in grove's own environment —
+// is dropped, so a subprocess that ends up running attacker-influenced code
+// (a repo-resident analyzer plugin, a hostile go.mod toolchain) cannot exfil
+// grove's secrets. Only variables the toolchains genuinely need to run are
+// carried.
+var envAllowlist = map[string]bool{
+	"PATH": true, "HOME": true, "TMPDIR": true, "TMP": true, "TEMP": true,
+	"LANG": true, "LC_ALL": true, "LC_CTYPE": true, "TERM": true,
+	// Windows runtime essentials.
+	"SystemRoot": true, "SystemDrive": true, "windir": true, "USERPROFILE": true,
+	"HOMEDRIVE": true, "HOMEPATH": true, "PATHEXT": true, "ComSpec": true,
+	// Language-runtime search/config that are safe and sometimes required.
+	"GOPATH": true, "GOMODCACHE": true, "GOCACHE": true, "NODE_PATH": true,
+}
+
+// scrubbedEnv returns a minimal, allowlisted environment plus the caller's
+// extra KEY=VALUE entries. Use this for every subprocess that runs inside or
+// against an untrusted repository.
+func scrubbedEnv(extra ...string) []string {
+	out := make([]string, 0, len(envAllowlist)+len(extra))
+	for _, kv := range os.Environ() {
+		if i := strings.IndexByte(kv, '='); i > 0 && envAllowlist[kv[:i]] {
+			out = append(out, kv)
+		}
+	}
+	return append(out, extra...)
+}
+
+// appendEnv carries only the allowlisted environment (see scrubbedEnv) plus
+// the given entries. It intentionally no longer inherits the full os.Environ()
+// — that leaked grove's secrets into every analyzer subprocess.
 func appendEnv(values ...string) []string {
-	return append(os.Environ(), values...)
+	return scrubbedEnv(values...)
 }
 
 func osReadFile(path string) ([]byte, error) {
