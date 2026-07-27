@@ -268,13 +268,19 @@ func filterSymbolsByDirs(symbols []core.SymbolRecord, dirs map[string]bool) []co
 // module cache and build cache still work; module downloads are simply
 // disabled for this side-effect-free analysis pass.
 func goAnalyzerEnv(_ string) []string {
-	return scrubbedEnv(
-		"GOTOOLCHAIN=local",
-		"GOPROXY=off",
-		"GOFLAGS=-mod=readonly",
-		"GONOSUMCHECK=1",
-		"GOWORK=off",
-	)
+	// GOTOOLCHAIN=local always: a `toolchain goX.Y.Z` directive in go.mod
+	// otherwise makes `go list` download and re-exec a different toolchain over
+	// the network — a surprise even for trusted repos, and arbitrary-code from
+	// repo content for untrusted ones. -mod=readonly always: analysis never
+	// edits go.mod. These do not degrade a normal `go list`.
+	env := scrubbedEnv("GOTOOLCHAIN=local", "GOFLAGS=-mod=readonly", "GOWORK=off")
+	if untrustedMode() {
+		// Cut network module fetches so a hostile go.mod cannot drive egress to
+		// attacker-named modules. In trusted mode the operator's GOPROXY (from
+		// the allowlist) is honored so dependency resolution works normally.
+		env = append(env, "GOPROXY=off", "GONOSUMCHECK=1")
+	}
+	return env
 }
 
 // CleanupLegacyCaches removes the per-repo Go caches that earlier Grove

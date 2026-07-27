@@ -44,7 +44,13 @@ var envAllowlist = map[string]bool{
 	"SystemRoot": true, "SystemDrive": true, "windir": true, "USERPROFILE": true,
 	"HOMEDRIVE": true, "HOMEPATH": true, "PATHEXT": true, "ComSpec": true,
 	// Language-runtime search/config that are safe and sometimes required.
+	// The Go vars let `go list` honor the operator's module setup (private
+	// proxies, GOPRIVATE) in trusted mode; untrusted mode overrides the
+	// network-facing ones explicitly (see goAnalyzerEnv).
 	"GOPATH": true, "GOMODCACHE": true, "GOCACHE": true, "NODE_PATH": true,
+	"GOPROXY": true, "GOFLAGS": true, "GOPRIVATE": true, "GONOSUMDB": true,
+	"GOSUMDB": true, "GOINSECURE": true, "GONOSUMCHECK": true, "GOOS": true,
+	"GOARCH": true, "GOROOT": true,
 }
 
 // scrubbedEnv returns a minimal, allowlisted environment plus the caller's
