@@ -1,14 +1,11 @@
 package parser
 
 import (
+	"github.com/provasign/grove/internal/core"
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
-	"time"
-
-	"github.com/provasign/grove/internal/core"
 )
 
 func TestDetectLanguage(t *testing.T) {
@@ -1338,22 +1335,25 @@ func symbolByKind(syms []core.SymbolRecord, name string, kind core.SymbolKind) (
 
 func TestFileBlobSHA_RejectsNonRegularAndOversize(t *testing.T) {
 	dir := t.TempDir()
-	// Named pipe (fifo) named like source: os.ReadFile would block forever.
-	fifo := filepath.Join(dir, "x.go")
-	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
-		t.Skipf("mkfifo unavailable: %v", err)
+	// A directory named like source is non-regular: FileBlobSHA must reject it
+	// via the IsRegular guard BEFORE os.ReadFile (which is also how the fifo
+	// hang is prevented — see the unix-only fifo test). Cross-platform.
+	subdir := filepath.Join(dir, "pkg.go")
+	if err := os.Mkdir(subdir, 0o755); err != nil {
+		t.Fatal(err)
 	}
-	done := make(chan error, 1)
-	go func() { _, err := FileBlobSHA(fifo); done <- err }()
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatal("FileBlobSHA(fifo) returned nil error — should reject non-regular files")
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("FileBlobSHA(fifo) blocked — non-regular-file guard missing (index hang)")
+	if _, err := FileBlobSHA(subdir); err == nil {
+		t.Fatal("FileBlobSHA(directory) returned nil — non-regular guard missing")
 	}
-	// A regular file still hashes.
+	// Oversize regular file must be rejected before the full read.
+	big := filepath.Join(dir, "big.go")
+	if err := os.WriteFile(big, make([]byte, MaxFileSizeBytes+1), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := FileBlobSHA(big); err == nil {
+		t.Fatalf("FileBlobSHA(>%d bytes) returned nil — size guard missing", MaxFileSizeBytes)
+	}
+	// A normal file still hashes.
 	reg := filepath.Join(dir, "ok.go")
 	if err := os.WriteFile(reg, []byte("package main\n"), 0o644); err != nil {
 		t.Fatal(err)
