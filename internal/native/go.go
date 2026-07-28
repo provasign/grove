@@ -135,7 +135,7 @@ func (goAnalyzer) Analyze(ctx context.Context, req Request) Result {
 			scopeDiag = []string{"scoped to " + itoa(len(dirs)) + " affected package dir(s); other packages' native edges carried forward"}
 		}
 	}
-	semanticEdges, semanticDiagnostics := goSemanticEdges(req.Root, semFiles, req.Symbols, pkgs)
+	semanticEdges, semanticDiagnostics := goSemanticEdges(ctx, req.Root, semFiles, req.Symbols, pkgs)
 	edges = append(edges, semanticEdges...)
 	callSiteEdges := goCallSiteEdges(semSymbols, req.Symbols)
 	edges = append(edges, callSiteEdges...)
@@ -355,7 +355,7 @@ func goCallableKey(dir, recv, name string) string {
 	return dir + "\x00" + name
 }
 
-func goSemanticEdges(root string, files []string, symbols []core.SymbolRecord, pkgs []goListPackage) ([]core.Edge, []string) {
+func goSemanticEdges(ctx context.Context, root string, files []string, symbols []core.SymbolRecord, pkgs []goListPackage) ([]core.Edge, []string) {
 	symbolIdx := newGoSymbolIndex(symbols)
 	pkgDirsByImport := map[string][]string{}
 	for _, pkg := range pkgs {
@@ -385,9 +385,6 @@ func goSemanticEdges(root string, files []string, symbols []core.SymbolRecord, p
 	}
 	outcomes := make([]dirOutcome, len(dirs))
 	workers := runtime.GOMAXPROCS(0)
-	if workers > 8 {
-		workers = 8
-	}
 	if workers < 1 {
 		workers = 1
 	}
@@ -398,6 +395,12 @@ func goSemanticEdges(root string, files []string, symbols []core.SymbolRecord, p
 		go func() {
 			defer wg.Done()
 			for di := range dirCh {
+				// Honor cancellation: a timed-out index must stop burning
+				// CPU here, not keep type-checking packages past deadline.
+				if err := ctx.Err(); err != nil {
+					outcomes[di] = dirOutcome{err: err}
+					continue
+				}
 				e, err := goSemanticPackageEdges(root, dirs[di], filesByDir[dirs[di]], symbolIdx, pkgDirsByImport)
 				outcomes[di] = dirOutcome{edges: e, err: err}
 			}
@@ -453,13 +456,14 @@ func goSemanticPackageEdges(root, dir string, files []string, symbolIdx goSymbol
 		edges = append(edges, edge)
 	}
 
-	for _, file := range parsed {
+	for fi, file := range parsed {
+		relPath := files[fi]
 		ast.Inspect(file, func(node ast.Node) bool {
 			fn, ok := node.(*ast.FuncDecl)
 			if !ok {
 				return true
 			}
-			caller, ok := goCallerSymbol(fset, fn, symbolIdx)
+			caller, ok := goCallerSymbolAt(relPath, fn, symbolIdx)
 			if !ok || fn.Body == nil {
 				return false
 			}
@@ -494,29 +498,14 @@ func goSemanticPackageEdges(root, dir string, files []string, symbolIdx goSymbol
 	return edges, nil
 }
 
-func goCallerSymbol(fset *token.FileSet, fn *ast.FuncDecl, symbolIdx goSymbolIndex) (core.SymbolRecord, bool) {
-	pos := fset.Position(fn.Pos())
-	file := filepath.ToSlash(pos.Filename)
-	if i := strings.LastIndex(file, "/"); i >= 0 {
-		// fset stores absolute paths; SymbolRecord uses repo-relative paths.
-		// Deterministic winner on multiple matches (vendored copies can
-		// share a path suffix): smallest key wins, never map order.
-		bestKey := ""
-		var best core.SymbolRecord
-		for key, symbol := range symbolIdx.byFileFunc {
-			if strings.HasSuffix(file, symbol.FilePath) && strings.Contains(key, "\x00") {
-				recv := goReceiverName(fn)
-				wantKey := goCallableKey(packageDir(symbol.FilePath), recv, fn.Name.Name)
-				if key == symbol.FilePath+"\x00"+wantKey && (bestKey == "" || key < bestKey) {
-					bestKey, best = key, symbol
-				}
-			}
-		}
-		if bestKey != "" {
-			return best, true
-		}
-	}
-	return core.SymbolRecord{}, false
+// goCallerSymbolAt maps a FuncDecl to its symbol by direct key lookup. The
+// caller knows the repo-relative path of the file being inspected, so no
+// suffix scan over the whole index is needed (the previous implementation
+// iterated every function in the repo per FuncDecl — quadratic on monorepos).
+func goCallerSymbolAt(relPath string, fn *ast.FuncDecl, symbolIdx goSymbolIndex) (core.SymbolRecord, bool) {
+	key := relPath + "\x00" + goCallableKey(packageDir(relPath), goReceiverName(fn), fn.Name.Name)
+	symbol, ok := symbolIdx.byFileFunc[key]
+	return symbol, ok
 }
 
 func goResolveCall(currentDir string, expr ast.Expr, info *types.Info, symbolIdx goSymbolIndex, pkgDirsByImport map[string][]string) (core.SymbolRecord, bool) {

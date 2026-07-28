@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -318,6 +319,44 @@ func (s *Store) ReplaceEdges(ctx context.Context, edges []core.Edge) error {
 		return nil
 	}
 
+	// Bulk load (cold index / huge delta): maintaining the three secondary
+	// indexes incrementally while millions of rows stream in thrashes b-tree
+	// pages through the default page cache — measured 600s of mostly system
+	// time for 6.3M edges on a monorepo. Dropping the indexes, loading with a
+	// large cache and no WAL checkpointing, then rebuilding each index as one
+	// sort brings the same load to well under a minute. Single-connection pool
+	// (SetMaxOpenConns(1)) means these session pragmas cannot leak to a
+	// concurrent writer.
+	bulk := len(upserts) > 200_000
+	if bulk {
+		// Insert in primary-key order: random-order TEXT-key insertion lands
+		// on random b-tree pages (the PK index cannot be dropped); sorted
+		// insertion is append-like and keeps the hot page set tiny.
+		order := make([]int, len(upserts))
+		for i := range order {
+			order[i] = i
+		}
+		sort.Slice(order, func(a, b int) bool { return upsertIDs[order[a]] < upsertIDs[order[b]] })
+		sortedUpserts := make([]core.Edge, len(upserts))
+		sortedIDs := make([]string, len(upserts))
+		for i, idx := range order {
+			sortedUpserts[i] = upserts[idx]
+			sortedIDs[i] = upsertIDs[idx]
+		}
+		upserts, upsertIDs = sortedUpserts, sortedIDs
+		for _, p := range []string{
+			`PRAGMA cache_size=-262144`, // 256MB
+			`PRAGMA wal_autocheckpoint=0`,
+			`DROP INDEX IF EXISTS idx_edge_from`,
+			`DROP INDEX IF EXISTS idx_edge_to`,
+			`DROP INDEX IF EXISTS idx_edge_type`,
+		} {
+			if _, err := s.db.ExecContext(ctx, p); err != nil {
+				return err
+			}
+		}
+	}
+
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -363,7 +402,26 @@ func (s *Store) ReplaceEdges(ctx context.Context, edges []core.Edge) error {
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if bulk {
+		// Rebuild what the bulk path dropped, restore steady-state pragmas,
+		// and truncate the WAL the disabled autocheckpoint let grow.
+		for _, p := range []string{
+			`CREATE INDEX IF NOT EXISTS idx_edge_from ON edges(from_node)`,
+			`CREATE INDEX IF NOT EXISTS idx_edge_to   ON edges(to_node)`,
+			`CREATE INDEX IF NOT EXISTS idx_edge_type ON edges(edge_type)`,
+			`PRAGMA wal_autocheckpoint=1000`,
+			`PRAGMA wal_checkpoint(TRUNCATE)`,
+			`PRAGMA cache_size=-2000`,
+		} {
+			if _, err := s.db.ExecContext(ctx, p); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // FilesNotIn returns the indexed file paths absent from current — the files

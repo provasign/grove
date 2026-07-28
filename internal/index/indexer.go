@@ -202,9 +202,6 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 	outcomes := make([]parseOutcome, len(tasks))
 	if len(tasks) > 0 {
 		workers := runtime.GOMAXPROCS(0)
-		if workers > 8 {
-			workers = 8
-		}
 		if workers > len(tasks) {
 			workers = len(tasks)
 		}
@@ -215,6 +212,12 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 			go func() {
 				defer wg.Done()
 				for idx := range taskCh {
+					// Honor cancellation so a timed-out index stops parsing
+					// instead of running the full task list past deadline.
+					if err := ctx.Err(); err != nil {
+						outcomes[idx] = parseOutcome{err: err}
+						continue
+					}
 					symbols, parseErr := i.parser.ExtractFile(tasks[idx].absPath, root)
 					outcomes[idx] = parseOutcome{symbols: symbols, err: parseErr}
 				}

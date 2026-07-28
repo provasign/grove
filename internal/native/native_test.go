@@ -645,7 +645,7 @@ func Caller() {
 		{ID: "main.go::Helper@1", FilePath: "main.go", Language: "go", Kind: core.KindFunction, Name: "Helper", QualifiedName: "Helper"},
 		{ID: "main.go::Caller@1", FilePath: "main.go", Language: "go", Kind: core.KindFunction, Name: "Caller", QualifiedName: "Caller"},
 	}
-	edges, diagnostics := goSemanticEdges(root, []string{"main.go"}, symbols, nil)
+	edges, diagnostics := goSemanticEdges(context.Background(), root, []string{"main.go"}, symbols, nil)
 	if len(diagnostics) == 0 {
 		t.Fatal("expected diagnostics")
 	}
