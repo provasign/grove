@@ -76,21 +76,23 @@ func (g *CodeGraph) UntestedSurface(query string) (*UntestedSurfaceResult, error
 			continue
 		}
 		cs := CoverageSite{Symbol: site, TestCount: len(covering)}
+		// Sort BEFORE capping: taking the first maxTestsPerSite entries in
+		// map-iteration order made the sampled tests differ run to run —
+		// nondeterministic CONTENT, not just ordering.
+		all := make([]core.SymbolRecord, 0, len(covering))
 		for _, t := range covering {
-			if len(cs.Tests) < maxTestsPerSite {
-				cs.Tests = append(cs.Tests, t)
-			}
+			all = append(all, t)
 		}
-		sortSymbols(cs.Tests)
+		sortSymbols(all)
+		if len(all) > maxTestsPerSite {
+			all = all[:maxTestsPerSite]
+		}
+		cs.Tests = all
 		res.Covered = append(res.Covered, cs)
 	}
 	sortSymbols(res.Untested)
 	sort.Slice(res.Covered, func(i, j int) bool {
-		a, b := res.Covered[i].Symbol, res.Covered[j].Symbol
-		if a.FilePath != b.FilePath {
-			return a.FilePath < b.FilePath
-		}
-		return a.Name < b.Name
+		return lessSymbols(&res.Covered[i].Symbol, &res.Covered[j].Symbol)
 	})
 	return res, nil
 }

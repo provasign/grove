@@ -668,6 +668,7 @@ func (g *CodeGraph) TestsForSymbol(id string, policy TraversalPolicy) []core.Sym
 	for _, t := range tests {
 		out = append(out, t)
 	}
+	sortSymbols(out)
 	return out
 }
 
@@ -696,12 +697,7 @@ func (g *CodeGraph) AffectedTests(files []string) []core.SymbolRecord {
 	for _, t := range tests {
 		out = append(out, deepCopySymbol(t))
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].FilePath != out[j].FilePath {
-			return out[i].FilePath < out[j].FilePath
-		}
-		return out[i].Name < out[j].Name
-	})
+	sortSymbols(out)
 	return out
 }
 
@@ -750,12 +746,7 @@ func (g *CodeGraph) testsForWithPolicy(query string, policy TraversalPolicy) ([]
 	for _, t := range tests {
 		out = append(out, t)
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].FilePath == out[j].FilePath {
-			return out[i].Span.Start < out[j].Span.Start
-		}
-		return out[i].FilePath < out[j].FilePath
-	})
+	sortSymbols(out)
 	return out, skips
 }
 

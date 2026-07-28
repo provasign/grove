@@ -298,12 +298,28 @@ func bucketByIdentity(symbols []core.SymbolRecord) map[string][]*core.SymbolReco
 	return out
 }
 
+// lessSymbols is the one total order every symbol list is emitted in.
+// (FilePath, Span.Start) alone is not total — same-file symbols can share a
+// start line (and same-file methods can share a bare Name across nested
+// types) — and sort.Slice is unstable, so tie order leaked map-iteration
+// randomness into query output run to run. QualifiedName then ID (globally
+// unique) make the order total.
+func lessSymbols(a, b *core.SymbolRecord) bool {
+	if a.FilePath != b.FilePath {
+		return a.FilePath < b.FilePath
+	}
+	if a.Span.Start != b.Span.Start {
+		return a.Span.Start < b.Span.Start
+	}
+	if a.QualifiedName != b.QualifiedName {
+		return a.QualifiedName < b.QualifiedName
+	}
+	return a.ID < b.ID
+}
+
 func sortSymbols(symbols []core.SymbolRecord) {
 	sort.Slice(symbols, func(i, j int) bool {
-		if symbols[i].FilePath == symbols[j].FilePath {
-			return symbols[i].Span.Start < symbols[j].Span.Start
-		}
-		return symbols[i].FilePath < symbols[j].FilePath
+		return lessSymbols(&symbols[i], &symbols[j])
 	})
 }
 
