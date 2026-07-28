@@ -181,7 +181,7 @@ func BuildEdges(symbols []core.SymbolRecord) []core.Edge {
 	decoEdges := buildDecoratorEdges(idx, symbols, callEdges)
 	edges = append(edges, decoEdges...)
 	tick("decorators")
-	edges = append(edges, buildTests(idx, symbols, append(callEdges, decoEdges...))...)
+	edges = append(edges, buildTests(idx, symbols, append(callEdges, decoEdges...), nil)...)
 	tick("tests")
 	return edges
 }

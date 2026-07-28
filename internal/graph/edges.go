@@ -846,7 +846,11 @@ func buildUsesType(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
 // Symbols count as tests if they live in a test file or carry a test
 // annotation (Rust #[test], JUnit @Test, xUnit [Fact], …) — the latter allows
 // same-file targets because such tests live alongside production code.
-func buildTests(idx *edgeIndex, symbols []core.SymbolRecord, callEdges []core.Edge) []core.Edge {
+// buildTests emits test-coverage edges. only (nil = every test) restricts
+// emission to the given test symbol IDs — the incremental path recomputes
+// affected tests against the full call adjacency while keeping every other
+// test's previous edges.
+func buildTests(idx *edgeIndex, symbols []core.SymbolRecord, callEdges []core.Edge, only map[string]bool) []core.Edge {
 	callAdj := map[string][]string{}
 	for _, e := range callEdges {
 		if e.Type == core.EdgeCalls {
@@ -857,6 +861,9 @@ func buildTests(idx *edgeIndex, symbols []core.SymbolRecord, callEdges []core.Ed
 	seen := make(map[string]bool)
 	for i := range symbols {
 		symbol := &symbols[i]
+		if only != nil && !only[symbol.ID] {
+			continue
+		}
 		inTestFile := isTestFile(symbol.FilePath)
 		annotated := core.HasTestAnnotation(symbol)
 		if !inTestFile && !annotated {
