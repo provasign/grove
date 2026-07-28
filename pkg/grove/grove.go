@@ -9,6 +9,8 @@ package grove
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -109,24 +111,11 @@ func Open(ctx context.Context, cfg Config) (*Engine, error) {
 		store:  st,
 		parser: p,
 		idx:    index.NewWithNativeConfig(p, st, nativeConfigFromPublic(cfg)),
-		graph:  graph.New(),
 	}
-	// Rehydrate graph from any previously-indexed symbols so reads work
-	// before the first Index call. Stored edges are the merged set the last
-	// index persisted, so they are installed verbatim — no rebuild.
-	symbols, err := st.AllSymbols(ctx)
-	if err != nil {
-		_ = st.Close()
-		return nil, err
-	}
-	if len(symbols) > 0 {
-		edges, err := st.AllEdges(ctx)
-		if err != nil {
-			_ = st.Close()
-			return nil, err
-		}
-		e.graph.ReplaceWithStoredEdges(symbols, edges, 0)
-	}
+	// The graph starts nil and is rehydrated lazily on first access (see
+	// currentGraph). Eager rehydration here made every Open pay the full
+	// AllSymbols+AllEdges load — tens of seconds on a monorepo — even for
+	// callers that never query the graph (one-shot `index`, status).
 	return e, nil
 }
 
@@ -169,11 +158,40 @@ func (e *Engine) Close() error {
 // Root returns the repository root the engine is attached to.
 func (e *Engine) Root() string { return e.root }
 
-// currentGraph returns the live graph under a read lock.
+// currentGraph returns the live graph, rehydrating it from the store on
+// first access. Stored edges are the merged set the last index persisted, so
+// they are installed verbatim — no rebuild (same invariant the eager Open
+// rehydration relied on). On a load error the empty graph is returned but
+// NOT cached, so the next call retries.
 func (e *Engine) currentGraph() *graph.CodeGraph {
 	e.mu.RLock()
-	defer e.mu.RUnlock()
-	return e.graph
+	g := e.graph
+	e.mu.RUnlock()
+	if g != nil {
+		return g
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.graph != nil {
+		return e.graph
+	}
+	ctx := context.Background()
+	g = graph.New()
+	symbols, err := e.store.AllSymbols(ctx)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "grove: graph rehydration failed:", err)
+		return g
+	}
+	if len(symbols) > 0 {
+		edges, err := e.store.AllEdges(ctx)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "grove: graph rehydration failed:", err)
+			return g
+		}
+		g.ReplaceWithStoredEdges(symbols, edges, 0)
+	}
+	e.graph = g
+	return g
 }
 
 // Index walks dir (defaults to RepoRoot), parses changed files via delta SHA,
@@ -184,13 +202,19 @@ func (e *Engine) Index(ctx context.Context, dir string) (IndexResult, error) {
 	}
 	e.indexMu.Lock()
 	defer e.indexMu.Unlock()
-	cg, result, err := e.idx.Index(ctx, dir)
+	// SkipNoopGraph: a no-change index returns a nil graph instead of
+	// reloading all stored symbols+edges. If a resident graph exists it is
+	// kept (set-equal to the store by the stored-edge invariant); if none
+	// exists yet, the first query rehydrates lazily via currentGraph.
+	cg, result, err := e.idx.IndexWithOptions(ctx, dir, index.Options{SkipNoopGraph: true})
 	if err != nil {
 		return result, err
 	}
-	e.mu.Lock()
-	e.graph = cg
-	e.mu.Unlock()
+	if cg != nil {
+		e.mu.Lock()
+		e.graph = cg
+		e.mu.Unlock()
+	}
 	return result, nil
 }
 

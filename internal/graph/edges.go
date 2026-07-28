@@ -1045,9 +1045,6 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 	}
 	results := make([][]core.Edge, len(symbols))
 	workers := runtime.GOMAXPROCS(0)
-	if workers > 8 {
-		workers = 8
-	}
 	if workers < 1 {
 		workers = 1
 	}

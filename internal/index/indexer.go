@@ -41,6 +41,13 @@ type Options struct {
 	// changed — needed after toolchain availability changes (e.g. installing
 	// go/node makes richer native edges possible without any file edits).
 	Force bool
+	// SkipNoopGraph makes a no-change index return a nil graph instead of
+	// rehydrating the stored one from AllSymbols/AllEdges (a multi-second
+	// load on monorepos). Callers that already hold a resident graph — or
+	// none at all, like one-shot CLI runs — opt in; result counts still come
+	// from the store. The stored-edge invariant (stored == what a rebuild
+	// would produce) is untouched.
+	SkipNoopGraph bool
 }
 
 // phaseTimer prints per-phase durations to stderr when GROVE_TIMING=1 —
@@ -263,30 +270,47 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 	result.FilesPruned = filesPruned
 
 	tick("persist-changed")
-	symbols, err := i.store.AllSymbols(ctx)
-	if err != nil {
-		return nil, result, err
-	}
-	tick("load-all-symbols")
 
 	// No file changed: the persisted edges are still exactly what a rebuild
 	// would produce, so reuse them instead of re-running native analyzers
 	// and edge construction (which previously made a no-change reindex take
 	// seconds instead of milliseconds). Force opts back into the full path.
+	// The check runs BEFORE AllSymbols so a no-op never pays the full symbol
+	// load; counts come from COUNT(*) queries instead of loaded slices.
 	if !opts.Force && result.FilesUpdated == 0 && result.FilesPruned == 0 {
-		edges, err := i.store.AllEdges(ctx)
+		status, err := i.store.Status(ctx)
 		if err != nil {
 			return nil, result, err
 		}
-		if len(edges) > 0 || len(symbols) == 0 {
+		// Same guard as the previous len(edges) > 0 || len(symbols) == 0:
+		// a legacy store with symbols but no edges falls through to a full
+		// rebuild.
+		if status.EdgeCount > 0 || status.SymbolCount == 0 {
+			result.SymbolCount = status.SymbolCount
+			result.EdgeCount = status.EdgeCount
+			result.Native = append(result.Native, "skipped: no file changes since last index (use --force to re-run analyzers)")
+			if opts.SkipNoopGraph {
+				return nil, result, nil
+			}
+			symbols, err := i.store.AllSymbols(ctx)
+			if err != nil {
+				return nil, result, err
+			}
+			edges, err := i.store.AllEdges(ctx)
+			if err != nil {
+				return nil, result, err
+			}
 			codeGraph := graph.New()
 			codeGraph.ReplaceWithStoredEdges(symbols, edges, result.FilesSeen)
-			result.SymbolCount = len(symbols)
-			result.EdgeCount = len(edges)
-			result.Native = append(result.Native, "skipped: no file changes since last index (use --force to re-run analyzers)")
 			return codeGraph, result, nil
 		}
 	}
+
+	symbols, err := i.store.AllSymbols(ctx)
+	if err != nil {
+		return nil, result, err
+	}
+	tick("load-all-symbols")
 
 	// Scope native analysis to the languages that changed. A cold index
 	// (store was empty before this run) or Force analyzes everything.
@@ -309,9 +333,12 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 	// their facts didn't change, and rebuilding edges from scratch below
 	// would otherwise drop them.
 	if len(nativeResult.SkippedLanguages) > 0 || len(nativeResult.Partial) > 0 {
-		// One stored-edge load feeds both carry paths — each used to load
-		// the full edge table separately (1.5M rows each on a monorepo).
-		stored, err := i.store.AllEdges(ctx)
+		// Both carry paths keep only Source==native edges, so load exactly
+		// those rows. Loading the full table here used to hold millions of
+		// discarded rows live through the allocation-heavy edge build below,
+		// and the GC pressure alone made delta edge construction ~5x slower
+		// than cold on monorepos.
+		stored, err := i.store.EdgesBySource(ctx, string(core.EvidenceSourceNative))
 		if err != nil {
 			return nil, result, err
 		}

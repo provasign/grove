@@ -171,15 +171,7 @@ func (s *Store) UpsertFile(ctx context.Context, filePath, blobSHA, language stri
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// Delete edges for this file using exact-prefix matching.
-	// Symbol IDs for a file have the form  "filePath::symbolName@sha".
-	// The file-level defines-edge source node is "file:filePath".
-	fileNode := "file:" + filePath
-	idPrefix := escapeLike(filePath) + "::"
-	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM edges WHERE from_node = ? OR from_node LIKE ? ESCAPE '\' OR to_node LIKE ? ESCAPE '\'`,
-		fileNode, idPrefix+"%", idPrefix+"%",
-	); err != nil {
+	if err := deleteFileEdges(ctx, tx, filePath); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM symbols WHERE file_path = ?`, filePath); err != nil {
@@ -461,13 +453,7 @@ func (s *Store) DeleteFilesNotIn(ctx context.Context, current map[string]bool) (
 	}
 	defer func() { _ = tx.Rollback() }()
 	for _, filePath := range stale {
-		// Same exact-prefix edge deletion as in UpsertFile
-		fileNode := "file:" + filePath
-		idPrefix := escapeLike(filePath) + "::"
-		if _, err := tx.ExecContext(ctx,
-			`DELETE FROM edges WHERE from_node = ? OR from_node LIKE ? ESCAPE '\' OR to_node LIKE ? ESCAPE '\'`,
-			fileNode, idPrefix+"%", idPrefix+"%",
-		); err != nil {
+		if err := deleteFileEdges(ctx, tx, filePath); err != nil {
 			return 0, err
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM symbols WHERE file_path = ?`, filePath); err != nil {
@@ -552,6 +538,37 @@ func (s *Store) AllEdges(ctx context.Context) ([]core.Edge, error) {
 	return edges, rows.Err()
 }
 
+// EdgesBySource returns stored edges whose evidence source equals source, in
+// the same (from_node, edge_type, to_node) order AllEdges uses, so callers
+// that previously filtered AllEdges see an identical sequence. On monorepos
+// this avoids materializing millions of rows the caller would discard (the
+// delta carry path keeps only native edges — ~1/6 of the table).
+func (s *Store) EdgesBySource(ctx context.Context, source string) ([]core.Edge, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT from_node, to_node, edge_type, confidence, COALESCE(source, 'unknown'), COALESCE(reason, '')
+		FROM edges
+		WHERE source = ?
+		ORDER BY from_node, edge_type, to_node
+	`, source)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var edges []core.Edge
+	for rows.Next() {
+		var edge core.Edge
+		var typ, src, reason string
+		if err := rows.Scan(&edge.From, &edge.To, &typ, &edge.Confidence, &src, &reason); err != nil {
+			return nil, err
+		}
+		edge.Type = core.EdgeType(typ)
+		edge.Source = core.EvidenceSource(src)
+		edge.Reason = core.EdgeReason(reason)
+		edges = append(edges, edge)
+	}
+	return edges, rows.Err()
+}
+
 func (s *Store) Status(ctx context.Context) (core.Status, error) {
 	var status core.Status
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM file_index`).Scan(&status.FilesIndexed); err != nil {
@@ -624,14 +641,32 @@ func (s *Store) ReleaseLocks(ctx context.Context, intentID string) (int64, error
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
-// escapeLike escapes SQLite LIKE wildcards in a literal prefix. Without
-// this, a path like "a_b.go" used as "a_b.go::%" also matches "axb.go::…"
-// because "_" is a single-character wildcard.
-func escapeLike(value string) string {
-	value = strings.ReplaceAll(value, `\`, `\\`)
-	value = strings.ReplaceAll(value, `%`, `\%`)
-	value = strings.ReplaceAll(value, `_`, `\_`)
-	return value
+// deleteFileEdges removes every edge anchored to a file: the file-level node
+// ("file:" + path) and every symbol-anchored endpoint ("path::name@sha").
+// The prefix match uses half-open range predicates instead of LIKE: the old
+// `LIKE ... ESCAPE` form could never be served by the BINARY-collation
+// from/to indexes (and ESCAPE disables the prefix optimization anyway), so
+// every per-file delete scanned the whole edge table — 16s per changed file
+// on a 6.3M-edge monorepo. Ranges compare raw bytes, so no wildcard escaping
+// is needed, and each statement provably uses idx_edge_from / idx_edge_to.
+// The prefix "path::" ends in ':' (0x3A), so "path:;" (';' == ':'+1) is its
+// exclusive upper bound. Three statements rather than one OR'd statement so
+// each gets its index; DELETE is idempotent per row, so the split is
+// set-identical.
+func deleteFileEdges(ctx context.Context, tx *sql.Tx, filePath string) error {
+	fileNode := "file:" + filePath
+	lo := filePath + "::"
+	hi := filePath + ":;"
+	if _, err := tx.ExecContext(ctx, `DELETE FROM edges WHERE from_node = ?`, fileNode); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM edges WHERE from_node >= ? AND from_node < ?`, lo, hi); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM edges WHERE to_node >= ? AND to_node < ?`, lo, hi); err != nil {
+		return err
+	}
+	return nil
 }
 
 // marshalSlice marshals a string slice to JSON, emitting "[]" for nil slices
