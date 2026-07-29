@@ -207,7 +207,7 @@ func (e *Engine) Index(ctx context.Context, dir string) (IndexResult, error) {
 	// kept (set-equal to the store by the stored-edge invariant); if none
 	// exists yet, the first query rehydrates lazily via currentGraph.
 	opts := index.Options{SkipNoopGraph: true}
-	if os.Getenv("GROVE_INCREMENTAL") == "1" {
+	if os.Getenv("GROVE_INCREMENTAL") != "0" {
 		// Incremental edge construction uses the resident graph as the
 		// previous-state baseline. Snapshot under the read lock; the
 		// indexer decides per-run whether the delta qualifies.

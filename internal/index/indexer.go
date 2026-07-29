@@ -134,10 +134,13 @@ func (i *Indexer) spliceEdgeWrite(ctx context.Context, symbols []core.SymbolReco
 	return nil
 }
 
-// incrementalEnabled gates incremental edge construction: opt-in while the
-// shadow-validation program runs; the full rebuild stays the default.
+// incrementalEnabled gates incremental edge construction — ON by default,
+// GROVE_INCREMENTAL=0 opts out. The path is guarded end to end: canonical
+// install order makes its in-memory state identical to a full rebuild's,
+// degenerate deltas fall back to a full rebuild automatically, and the store
+// splice self-heals through the full diff on any COUNT invariant miss.
 func incrementalEnabled() bool {
-	return os.Getenv("GROVE_INCREMENTAL") == "1"
+	return os.Getenv("GROVE_INCREMENTAL") != "0"
 }
 
 // fileDir returns the slash-path directory of a repo-relative file path.

@@ -92,6 +92,28 @@ func (g *CodeGraph) ReplaceWithStoredEdges(symbols []core.SymbolRecord, edges []
 }
 
 func (g *CodeGraph) install(symbols []core.SymbolRecord, edges []core.Edge, filesIndexed int) {
+	// Canonical edge order: the edge slice determines adjacency-iteration
+	// order and thus every order-sensitive query surface. Sorting makes the
+	// installed state a pure function of the edge SET — identical whether the
+	// set was produced by a full rebuild or an incremental delta, and
+	// identical run to run.
+	sort.Slice(edges, func(i, j int) bool {
+		a, b := &edges[i], &edges[j]
+		if a.From != b.From {
+			return a.From < b.From
+		}
+		if a.Type != b.Type {
+			return a.Type < b.Type
+		}
+		if a.To != b.To {
+			return a.To < b.To
+		}
+		if a.Confidence != b.Confidence {
+			return a.Confidence > b.Confidence
+		}
+		return a.Source < b.Source
+	})
+
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
@@ -101,12 +123,26 @@ func (g *CodeGraph) install(symbols []core.SymbolRecord, edges []core.Edge, file
 	}
 	g.edges = edges
 	g.filesIndexed = filesIndexed
+	// inbound and outbound key disjoint fields, so the two index builds are
+	// independent — build them concurrently (2x on the multi-million-edge
+	// installs that dominate monorepo deltas).
 	g.inbound = make(map[string][]int, len(g.edges))
 	g.outbound = make(map[string][]int, len(g.edges))
-	for i, e := range g.edges {
-		g.inbound[e.To] = append(g.inbound[e.To], i)
-		g.outbound[e.From] = append(g.outbound[e.From], i)
-	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := range g.edges {
+			g.inbound[g.edges[i].To] = append(g.inbound[g.edges[i].To], i)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := range g.edges {
+			g.outbound[g.edges[i].From] = append(g.outbound[g.edges[i].From], i)
+		}
+	}()
+	wg.Wait()
 
 	g.semMu.Lock()
 	g.semDirty = true

@@ -59,6 +59,34 @@ func storedEdgeDump(t *testing.T, root string) []string {
 // persists.
 func TestIncrementalIndexMatchesFullRebuild(t *testing.T) {
 	ctx := context.Background()
+	var queries string
+
+	// rawQueries captures order-sensitive query surfaces verbatim — the
+	// canonical install order must make full and incremental engines
+	// byte-identical here, not just set-equal.
+	rawQueries := func(t *testing.T, eng *Engine) string {
+		t.Helper()
+		var parts []string
+		n, err := eng.Neighbors(ctx, "Resolve", "in", EdgeCalls, EdgeTests)
+		if err != nil {
+			t.Fatal(err)
+		}
+		parts = append(parts, fmt.Sprintf("%+v", n))
+		imp, err := eng.Impact(ctx, "Resolve", 3)
+		if err == nil {
+			parts = append(parts, fmt.Sprintf("%+v", imp))
+		}
+		tests, err := eng.Tests(ctx, "Run")
+		if err == nil {
+			parts = append(parts, fmt.Sprintf("%+v", tests))
+		}
+		ci, err := eng.ChangeImpact(ctx, "core.Resolve")
+		if err == nil {
+			parts = append(parts, fmt.Sprintf("%+v", ci))
+		}
+		parts = append(parts, fmt.Sprintf("%+v", eng.FileSymbols(ctx, "app/app.go")))
+		return strings.Join(parts, "\n---\n")
+	}
 
 	run := func(t *testing.T, incremental bool) []string {
 		root := t.TempDir()
@@ -100,12 +128,17 @@ func TestIncrementalIndexMatchesFullRebuild(t *testing.T) {
 				t.Fatalf("incremental path not taken; diagnostics: %v", res.Native)
 			}
 		}
+		queries = rawQueries(t, eng)
 		return storedEdgeDump(t, root)
 	}
 
 	var full, incr []string
-	t.Run("full", func(t *testing.T) { full = run(t, false) })
-	t.Run("incremental", func(t *testing.T) { incr = run(t, true) })
+	var fullQ, incrQ string
+	t.Run("full", func(t *testing.T) { full = run(t, false); fullQ = queries })
+	t.Run("incremental", func(t *testing.T) { incr = run(t, true); incrQ = queries })
+	if fullQ == "" || fullQ != incrQ {
+		t.Fatalf("RAW query outputs diverge between full and incremental engines:\nfull: %.400s\nincr: %.400s", fullQ, incrQ)
+	}
 	if len(full) == 0 || len(incr) == 0 {
 		t.Fatal("one of the runs produced no edges")
 	}
