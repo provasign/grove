@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 
@@ -43,13 +44,20 @@ var deltaStats struct {
 	fallback    int
 }
 
-// BuildEdgesDelta computes the new edge set from the previous BASE edge set
-// (a prior BuildEdges/BuildEdgesDelta output — not the merged-with-native
-// set), the previous and current full symbol slices, and the set of changed
-// (added/modified/removed) repo-relative file paths. Falls back to
-// BuildEdges(symbols) whenever soundness of the scoping cannot be guaranteed
-// cheaply.
-func BuildEdgesDelta(prevEdges []core.Edge, prevSymbols, symbols []core.SymbolRecord, changedFiles map[string]bool) []core.Edge {
+// BuildEdgesDelta computes the new edge set from the previous edge set (a
+// prior base output, or the merged-with-native set when nativeAnalyzedDirs
+// names every natively re-analyzed package dir), the previous and current
+// full symbol slices, and the set of changed (added/modified/removed)
+// repo-relative file paths. Falls back to BuildEdges(symbols) whenever
+// soundness of the scoping cannot be guaranteed cheaply.
+//
+// Identity remap: symbol IDs embed the file blob SHA, so EVERY edit turns
+// over every ID in the file. Symbols whose resolution-relevant content is
+// unchanged (identityKey) keep their edges via an oldID→newID rewrite
+// instead of caller re-resolution — a comment-level edit re-resolves almost
+// nothing. Only semantically added/removed/changed symbols contribute to the
+// name delta and the affected set.
+func BuildEdgesDelta(prevEdges []core.Edge, prevSymbols, symbols []core.SymbolRecord, changedFiles map[string]bool, nativeAnalyzedDirs map[string]bool) []core.Edge {
 	if len(prevEdges) == 0 || len(changedFiles) == 0 {
 		deltaStats.fallback++
 		return BuildEdges(symbols)
@@ -59,27 +67,33 @@ func BuildEdgesDelta(prevEdges []core.Edge, prevSymbols, symbols []core.SymbolRe
 	idx := newEdgeIndex(symbols)
 	tick("edge-index")
 
-	// Names whose resolution meaning may have changed: every symbol name and
-	// parent-type name occurring in a changed file, in either the old or the
-	// new symbol set. A caller anywhere that references one of these names is
-	// re-resolved. Lowercased: edgeIndex.byName buckets are lowercase-keyed,
-	// so name-rule membership must compare in the same fold.
+	remap, semanticOld, semanticNew := identityRemap(prevSymbols, symbols, changedFiles)
+
+	// Names whose resolution meaning may have changed: names and parent-type
+	// names of SEMANTICALLY changed symbols only, on both sides. Lowercased:
+	// edgeIndex.byName buckets are lowercase-keyed, so name-rule membership
+	// must compare in the same fold.
 	nameDelta := map[string]bool{}
-	collectNames := func(list []core.SymbolRecord) {
+	changedSemFiles := map[string]bool{}
+	collectNames := func(list []core.SymbolRecord, semantic map[string]bool) {
 		for i := range list {
 			s := &list[i]
-			if changedFiles[s.FilePath] {
+			if semantic[s.ID] {
 				nameDelta[strings.ToLower(s.Name)] = true
 				if s.ParentSymbol != "" {
 					nameDelta[strings.ToLower(s.ParentSymbol)] = true
 				}
+				changedSemFiles[s.FilePath] = true
 			}
 		}
 	}
-	collectNames(prevSymbols)
-	collectNames(symbols)
+	collectNames(prevSymbols, semanticOld)
+	collectNames(symbols, semanticNew)
 
-	affected, ok := affectedCallers(idx, symbols, changedFiles, nameDelta)
+	affected, ok := affectedCallers(idx, symbols, changedSemFiles, nameDelta)
+	for id := range semanticNew {
+		affected[id] = true
+	}
 	if !ok || len(affected) > int(maxAffectedFraction*float64(len(symbols))) {
 		deltaStats.fallback++
 		if os.Getenv("GROVE_TIMING") != "" {
@@ -105,17 +119,47 @@ func BuildEdgesDelta(prevEdges []core.Edge, prevSymbols, symbols []core.SymbolRe
 	edges = append(edges, satEdges...)
 	tick("delta-cheap-passes")
 
-	// Partition the previous base edges once.
+	// Partition the previous edges once, normalizing endpoints into the new
+	// ID space via the identity remap. An edge that cannot be normalized
+	// (an endpoint's symbol was semantically changed or removed) is dropped
+	// here — its owner is in the affected set by construction, so the
+	// recomputation below replaces it. Previous native-source edges owned by
+	// a natively re-analyzed package are also dropped: this round's fresh
+	// native results replace them, and keeping them could strand an edge the
+	// re-analysis no longer produces.
 	currentID := make(map[string]bool, len(symbols))
 	for i := range symbols {
 		currentID[symbols[i].ID] = true
 	}
+	normalize := func(id string) (string, bool) {
+		if currentID[id] {
+			return id, true
+		}
+		if nid, ok := remap[id]; ok {
+			return nid, true
+		}
+		return "", false
+	}
 	var prevCalls, prevTests []core.Edge
 	for _, e := range prevEdges {
-		switch e.Type {
-		case core.EdgeCalls:
+		if e.Type != core.EdgeCalls && e.Type != core.EdgeTests {
+			continue
+		}
+		if e.Source == core.EvidenceSourceNative && nativeAnalyzedDirs[fileDirOfNode(e.From)] {
+			continue
+		}
+		from, ok := normalize(e.From)
+		if !ok {
+			continue
+		}
+		to, ok := normalize(e.To)
+		if !ok {
+			continue
+		}
+		e.From, e.To = from, to
+		if e.Type == core.EdgeCalls {
 			prevCalls = append(prevCalls, e)
-		case core.EdgeTests:
+		} else {
 			prevTests = append(prevTests, e)
 		}
 	}
@@ -133,7 +177,7 @@ func BuildEdgesDelta(prevEdges []core.Edge, prevSymbols, symbols []core.SymbolRe
 	decoNew := buildDecoratorEdges(idx, affectedSyms, callsNew)
 	keptCalls := make([]core.Edge, 0, len(prevCalls))
 	for _, e := range prevCalls {
-		if currentID[e.From] && !affected[e.From] {
+		if !affected[e.From] { // endpoints already normalized to current IDs
 			keptCalls = append(keptCalls, e)
 		}
 	}
@@ -148,11 +192,11 @@ func BuildEdgesDelta(prevEdges []core.Edge, prevSymbols, symbols []core.SymbolRe
 	// (name buckets), its import scope, and the call-graph closure within
 	// its bounded walk. affectedTests covers all three plus any test whose
 	// closure could touch a changed call edge.
-	testsAffected := affectedTests(idx, symbols, affected, changedFiles, nameDelta, prevCalls, allCalls)
+	testsAffected := affectedTests(idx, symbols, affected, changedSemFiles, nameDelta, prevCalls, allCalls)
 	testsNew := buildTests(idx, symbols, allCalls, testsAffected)
 	keptTests := make([]core.Edge, 0, len(prevTests))
 	for _, e := range prevTests {
-		if currentID[e.From] && !testsAffected[e.From] {
+		if !testsAffected[e.From] { // endpoints already normalized
 			keptTests = append(keptTests, e)
 		}
 	}
@@ -160,6 +204,126 @@ func BuildEdgesDelta(prevEdges []core.Edge, prevSymbols, symbols []core.SymbolRe
 	edges = append(edges, testsNew...)
 	tick("delta-tests")
 	return edges
+}
+
+// contentIdentityKey captures everything call/test resolution can read from a
+// symbol EXCEPT its ID and source spans (IDs embed the file blob SHA and
+// turn over on every edit; spans shift under comment/whitespace edits; edges
+// carry neither). Two symbols with equal keys resolve identically.
+func contentIdentityKey(s *core.SymbolRecord) string {
+	var b strings.Builder
+	b.WriteString(s.FilePath)
+	b.WriteByte(0)
+	b.WriteString(s.Language)
+	b.WriteByte(0)
+	b.WriteString(string(s.Kind))
+	b.WriteByte(0)
+	b.WriteString(s.Name)
+	b.WriteByte(0)
+	b.WriteString(s.QualifiedName)
+	b.WriteByte(0)
+	b.WriteString(s.ParentSymbol)
+	b.WriteByte(0)
+	b.WriteString(s.Signature)
+	b.WriteByte(0)
+	b.WriteString(s.RawText)
+	b.WriteByte(0)
+	if s.Exports {
+		b.WriteByte(1)
+	}
+	for _, imp := range s.Imports {
+		b.WriteString(imp)
+		b.WriteByte(1)
+	}
+	b.WriteByte(0)
+	for _, cs := range s.CallSites {
+		b.WriteString(cs.Callee)
+		b.WriteByte(1) // Line excluded: resolution reads Callee/Argc only
+		b.WriteString(fmt.Sprint(cs.Argc))
+		b.WriteByte(2)
+	}
+	b.WriteByte(0)
+	for _, as := range s.AttrSites {
+		b.WriteString(as.Callee)
+		b.WriteByte(1)
+	}
+	b.WriteByte(0)
+	for _, a := range s.Annotations {
+		b.WriteString(a)
+		b.WriteByte(1)
+	}
+	return b.String()
+}
+
+// identityRemap pairs old and new symbols of the changed files by content
+// identity. Equal-key groups pair positionally in span order when their
+// counts match; everything unpaired on either side is semantically changed.
+// Returns oldID→newID for the paired symbols plus the semantic remainder
+// (old-side IDs, new-side IDs).
+func identityRemap(prevSymbols, symbols []core.SymbolRecord, changedFiles map[string]bool) (map[string]string, map[string]bool, map[string]bool) {
+	group := func(list []core.SymbolRecord) map[string][]*core.SymbolRecord {
+		out := map[string][]*core.SymbolRecord{}
+		for i := range list {
+			s := &list[i]
+			if changedFiles[s.FilePath] {
+				out[contentIdentityKey(s)] = append(out[contentIdentityKey(s)], s)
+			}
+		}
+		for _, g := range out {
+			sort.Slice(g, func(a, b int) bool { return g[a].Span.Start < g[b].Span.Start })
+		}
+		return out
+	}
+	oldG, newG := group(prevSymbols), group(symbols)
+
+	remap := map[string]string{}
+	semanticOld := map[string]bool{}
+	semanticNew := map[string]bool{}
+	for key, olds := range oldG {
+		news := newG[key]
+		if len(news) == len(olds) {
+			for i := range olds {
+				remap[olds[i].ID] = news[i].ID
+			}
+			continue
+		}
+		for _, s := range olds {
+			semanticOld[s.ID] = true
+		}
+		for _, s := range news {
+			semanticNew[s.ID] = true
+		}
+	}
+	for key, news := range newG {
+		if _, seen := oldG[key]; !seen {
+			for _, s := range news {
+				semanticNew[s.ID] = true
+			}
+		}
+	}
+	return remap, semanticOld, semanticNew
+}
+
+// fileDirOfNode returns the package dir of the file a node ID is anchored to
+// ("path::name@sha" and "file:path" forms; anything else yields "").
+func fileDirOfNode(node string) string {
+	path := node
+	if rest, ok := strings.CutPrefix(node, "file:"); ok {
+		path = rest
+	} else if i := strings.Index(node, "::"); i >= 0 {
+		path = node[:i]
+	} else {
+		return ""
+	}
+	return fileDirOf(path)
+}
+
+// fileDirOf returns the slash-path directory of a repo-relative file path.
+func fileDirOf(path string) string {
+	if i := strings.LastIndexByte(path, '/'); i >= 0 {
+		return path[:i]
+	}
+	return "."
 }
 
 // affectedCallers returns the set of symbol IDs whose call/decorator edges

@@ -58,6 +58,10 @@ func fullRebuild(_ []core.Edge, _, symbols []core.SymbolRecord, _ map[string]boo
 type synthFile struct {
 	path  string
 	funcs []synthFunc
+	// rev models the file blob SHA: every mutation of the file bumps it,
+	// which turns over the IDs of ALL its symbols — exactly what a real
+	// reindex does. A pure comment edit bumps rev and nothing else.
+	rev int
 }
 
 type synthFunc struct {
@@ -126,7 +130,7 @@ func (c *synthCorpus) symbols() []core.SymbolRecord {
 			}
 			raw += " }"
 			out = append(out, core.SymbolRecord{
-				ID:            f.path + "::" + fn.name + "@s" + fmt.Sprint(i),
+				ID:            fmt.Sprintf("%s::%s@r%d_%d", f.path, fn.name, f.rev, i),
 				FilePath:      f.path,
 				Language:      "go",
 				Kind:          core.KindFunction,
@@ -153,9 +157,10 @@ func (c *synthCorpus) mutate() map[string]bool {
 	sort.Strings(paths)
 	p := paths[c.rng.Intn(len(paths))]
 	f := c.files[p]
+	f.rev++ // every touch turns over the file's symbol IDs
 	changed := map[string]bool{p: true}
 
-	switch c.rng.Intn(5) {
+	switch c.rng.Intn(6) {
 	case 0: // add a function that calls an existing name
 		target := paths[c.rng.Intn(len(paths))]
 		tf := c.files[target]
@@ -198,6 +203,8 @@ func (c *synthCorpus) mutate() map[string]bool {
 			calls: []string{callee},
 		}}}
 		changed[tp] = true
+	case 5: // pure comment edit: rev bump only — the common agent edit; a
+		// correct incremental builder should do (almost) no re-resolution
 	}
 	return changed
 }
@@ -271,7 +278,10 @@ func TestEquivalenceHarnessCatchesUnsoundBuilder(t *testing.T) {
 // falls back to full rebuild would pass equivalence vacuously).
 func TestBuildEdgesDeltaEquivalence(t *testing.T) {
 	deltaStats.incremental, deltaStats.fallback = 0, 0
-	runEquivalence(t, BuildEdgesDelta, []int64{1, 2, 3, 4, 5, 6, 7, 8}, 30)
+	delta := func(prevEdges []core.Edge, prevSymbols, symbols []core.SymbolRecord, changedFiles map[string]bool) []core.Edge {
+		return BuildEdgesDelta(prevEdges, prevSymbols, symbols, changedFiles, nil)
+	}
+	runEquivalence(t, delta, []int64{1, 2, 3, 4, 5, 6, 7, 8}, 30)
 	t.Logf("delta paths: incremental=%d fallback=%d", deltaStats.incremental, deltaStats.fallback)
 	if deltaStats.incremental == 0 {
 		t.Fatal("BuildEdgesDelta never took the incremental path — equivalence gate is vacuous")

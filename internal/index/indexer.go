@@ -382,26 +382,21 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 	codeGraph := graph.New()
 	if incrementalEnabled() && opts.PrevEdges != nil && scope != nil {
 		// Incremental edge construction: recompute only affected owners'
-		// call/test edges (graph.BuildEdgesDelta). The changed set is the
-		// re-parsed + pruned files WIDENED by every file in a natively
-		// re-analyzed package dir — a native edge that vanishes this round
-		// must not strand a kept edge under its key.
+		// call/test edges (graph.BuildEdgesDelta). Natively re-analyzed
+		// package dirs are passed separately — the delta path drops previous
+		// native-source edges they own (fresh native results replace them)
+		// instead of re-resolving every symbol in those packages.
 		changedSet := make(map[string]bool, len(changedRel))
 		for _, f := range changedRel {
 			changedSet[f] = true
 		}
+		analyzedDirs := map[string]bool{}
 		for _, dirs := range nativeResult.Partial {
-			dirSet := make(map[string]bool, len(dirs))
 			for _, d := range dirs {
-				dirSet[d] = true
-			}
-			for si := range symbols {
-				if dirSet[fileDir(symbols[si].FilePath)] {
-					changedSet[symbols[si].FilePath] = true
-				}
+				analyzedDirs[d] = true
 			}
 		}
-		base := graph.BuildEdgesDelta(opts.PrevEdges, opts.PrevSymbols, symbols, changedSet)
+		base := graph.BuildEdgesDelta(opts.PrevEdges, opts.PrevSymbols, symbols, changedSet, analyzedDirs)
 		codeGraph.ReplaceWithBaseEdges(symbols, base, nativeResult.Edges, result.FilesSeen)
 		result.Native = append(result.Native, "edge construction: incremental (GROVE_INCREMENTAL=1)")
 	} else {

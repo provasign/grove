@@ -213,7 +213,9 @@ func (e *Engine) Index(ctx context.Context, dir string) (IndexResult, error) {
 		// indexer decides per-run whether the delta qualifies.
 		e.mu.RLock()
 		if e.graph != nil {
-			opts.PrevSymbols, opts.PrevEdges = e.graph.Snapshot()
+			// Read-only baseline reference — no deep copy. The indexer only
+			// reads it, and a successful delta replaces e.graph wholesale.
+			opts.PrevSymbols, opts.PrevEdges = e.graph.BaselineRef()
 		}
 		e.mu.RUnlock()
 	}

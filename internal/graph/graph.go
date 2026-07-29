@@ -70,6 +70,14 @@ func (g *CodeGraph) ReplaceWithEdges(symbols []core.SymbolRecord, extraEdges []c
 	g.install(symbols, mergeEdges(BuildEdges(symbols), extraEdges), filesIndexed)
 }
 
+// ReplaceWithBaseEdges installs a precomputed BASE edge set (a
+// BuildEdges/BuildEdgesDelta output) merged with native analyzer edges —
+// the incremental counterpart of ReplaceWithEdges, which computes the base
+// itself.
+func (g *CodeGraph) ReplaceWithBaseEdges(symbols []core.SymbolRecord, base, extraEdges []core.Edge, filesIndexed int) {
+	g.install(symbols, mergeEdges(base, extraEdges), filesIndexed)
+}
+
 // ReplaceWithStoredEdges installs a previously-computed edge set verbatim —
 // the edges persisted by the last index are already the merged
 // (baseline + native) set, so rehydration must not pay the BuildEdges cost
@@ -206,6 +214,22 @@ func (g *CodeGraph) EdgesSnapshot() []core.Edge {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	return append([]core.Edge(nil), g.edges...)
+}
+
+// BaselineRef returns the live symbol and edge slices WITHOUT copying, for
+// read-only baseline use by incremental edge construction (deep-copying a
+// 6M-edge monorepo graph doubles peak heap and its GC cost dwarfs the delta
+// itself). The caller must treat both slices as immutable and drop them as
+// soon as the delta completes. Symbols are materialized from the map (order
+// is irrelevant to the delta path, which indexes by ID and file).
+func (g *CodeGraph) BaselineRef() ([]core.SymbolRecord, []core.Edge) {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	symbols := make([]core.SymbolRecord, 0, len(g.symbols))
+	for _, s := range g.symbols {
+		symbols = append(symbols, s)
+	}
+	return symbols, g.edges
 }
 
 func (g *CodeGraph) Snapshot() ([]core.SymbolRecord, []core.Edge) {
