@@ -200,6 +200,13 @@ How to read these:
 - Native analyzer timeouts default to 5 s per analyzer; very large repos
   may need `GROVE_NATIVE_TIMEOUT=60s` for `go list`/`tsc` to finish (skips
   degrade gracefully and are reported in the index diagnostics).
+- **Incremental edge construction** (v0.24.0, on by default;
+  `GROVE_INCREMENTAL=0` opts out): delta reindexes in a resident session
+  recompute only the edges an edit can affect, with an automatic
+  full-rebuild fallback and a byte-identical-output guarantee — a
+  single-file edit on a kubernetes-scale monorepo (160k symbols, 6.3M
+  edges) dropped ~95s → ~33s. Design, invariants, and verification gates:
+  [docs/INCREMENTAL_INDEXING.md](docs/INCREMENTAL_INDEXING.md).
 
 ---
 
