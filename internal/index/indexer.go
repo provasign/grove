@@ -60,6 +60,80 @@ type Options struct {
 	PrevSymbols []core.SymbolRecord
 }
 
+// spliceEdgeWrite persists an incremental delta's write-set: rows touching
+// changed files were already deleted by the persist phase; here the
+// recomputed owners' rows are deleted and every row the delta could have
+// altered is upserted with merge semantics. A COUNT(*) invariant guards the
+// splice — any divergence from the in-memory edge set self-heals through the
+// full ReplaceEdges diff in the same run.
+func (i *Indexer) spliceEdgeWrite(ctx context.Context, symbols []core.SymbolRecord, edges []core.Edge, meta *graph.DeltaMeta, result *core.IndexResult) error {
+	owners := make([]string, 0, len(meta.AffectedOwners)+len(meta.AffectedTests))
+	for id := range meta.AffectedOwners {
+		owners = append(owners, id)
+	}
+	for id := range meta.AffectedTests {
+		if !meta.AffectedOwners[id] {
+			owners = append(owners, id)
+		}
+	}
+
+	var nativeFiles []string
+	if len(meta.NativeAnalyzedDirs) > 0 {
+		seen := map[string]bool{}
+		for si := range symbols {
+			f := symbols[si].FilePath
+			if !seen[f] && meta.NativeAnalyzedDirs[fileDir(f)] {
+				seen[f] = true
+				nativeFiles = append(nativeFiles, f)
+			}
+		}
+	}
+
+	nodePath := func(n string) string {
+		if rest, ok := strings.CutPrefix(n, "file:"); ok {
+			return rest
+		}
+		if idx := strings.Index(n, "::"); idx >= 0 {
+			return n[:idx]
+		}
+		return ""
+	}
+	ownerSet := make(map[string]bool, len(owners))
+	for _, id := range owners {
+		ownerSet[id] = true
+	}
+	var inserts []core.Edge
+	for _, e := range edges {
+		fp, tp := nodePath(e.From), nodePath(e.To)
+		switch {
+		case meta.ChangedFiles[fp], meta.ChangedFiles[tp]:
+			inserts = append(inserts, e)
+		case ownerSet[e.From]:
+			inserts = append(inserts, e)
+		case e.Source == core.EvidenceSourceNative && (meta.NativeAnalyzedDirs[fileDir(fp)] || meta.NativeAnalyzedDirs[fileDir(tp)]):
+			inserts = append(inserts, e)
+		}
+	}
+
+	if err := i.store.SpliceEdges(ctx, owners, nativeFiles, inserts); err != nil {
+		return err
+	}
+	count, err := i.store.EdgeCount(ctx)
+	if err != nil {
+		return err
+	}
+	if count != len(edges) {
+		// Write-set miss: self-heal with the full diff and record it —
+		// a persistent mismatch is a bug in the splice enumeration.
+		result.Native = append(result.Native,
+			fmt.Sprintf("edge splice mismatch (stored %d != memory %d): healed via full diff", count, len(edges)))
+		return i.store.ReplaceEdges(ctx, edges)
+	}
+	result.Native = append(result.Native,
+		fmt.Sprintf("edge splice: %d owners, %d native files, %d upserts", len(owners), len(nativeFiles), len(inserts)))
+	return nil
+}
+
 // incrementalEnabled gates incremental edge construction: opt-in while the
 // shadow-validation program runs; the full rebuild stays the default.
 func incrementalEnabled() bool {
@@ -380,6 +454,7 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 	}
 
 	codeGraph := graph.New()
+	var deltaMeta *graph.DeltaMeta
 	if incrementalEnabled() && opts.PrevEdges != nil && scope != nil {
 		// Incremental edge construction: recompute only affected owners'
 		// call/test edges (graph.BuildEdgesDelta). Natively re-analyzed
@@ -396,15 +471,23 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 				analyzedDirs[d] = true
 			}
 		}
-		base := graph.BuildEdgesDelta(opts.PrevEdges, opts.PrevSymbols, symbols, changedSet, analyzedDirs)
+		base, meta := graph.BuildEdgesDeltaMeta(opts.PrevEdges, opts.PrevSymbols, symbols, changedSet, analyzedDirs)
 		codeGraph.ReplaceWithBaseEdges(symbols, base, nativeResult.Edges, result.FilesSeen)
 		result.Native = append(result.Native, "edge construction: incremental (GROVE_INCREMENTAL=1)")
+		deltaMeta = meta
 	} else {
 		codeGraph.ReplaceWithEdges(symbols, nativeResult.Edges, result.FilesSeen)
 	}
 	tick("edge-construction")
 	edges := codeGraph.EdgesSnapshot()
-	if err := i.store.ReplaceEdges(ctx, edges); err != nil {
+	if deltaMeta != nil {
+		// Splice write: apply the known write-set instead of diffing the
+		// whole table, then verify with a COUNT(*) invariant. Any mismatch
+		// self-heals through the full diff path in the same run.
+		if err := i.spliceEdgeWrite(ctx, symbols, edges, deltaMeta, &result); err != nil {
+			return nil, result, err
+		}
+	} else if err := i.store.ReplaceEdges(ctx, edges); err != nil {
 		return nil, result, err
 	}
 	tick("edge-store-write")

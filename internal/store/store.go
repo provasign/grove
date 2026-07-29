@@ -538,6 +538,82 @@ func (s *Store) AllEdges(ctx context.Context) ([]core.Edge, error) {
 	return edges, rows.Err()
 }
 
+// SpliceEdges applies an incremental write-set instead of ReplaceEdges' full
+// 6.3M-row diff: point-delete the out-rows of recomputed owners, range-delete
+// the native-source rows of natively re-analyzed files, then upsert the
+// insert rows with merge semantics (higher confidence wins, first-wins on
+// ties — the same resolution mergeEdges applies in memory). The caller
+// verifies the result with a COUNT(*) equality check and falls back to
+// ReplaceEdges on any mismatch, so a write-set miss self-heals in-run.
+func (s *Store) SpliceEdges(ctx context.Context, deleteOwners []string, nativeFiles []string, inserts []core.Edge) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	const chunk = 500
+	for start := 0; start < len(deleteOwners); start += chunk {
+		end := start + chunk
+		if end > len(deleteOwners) {
+			end = len(deleteOwners)
+		}
+		part := deleteOwners[start:end]
+		ph := strings.TrimSuffix(strings.Repeat("?,", len(part)), ",")
+		args := make([]any, len(part))
+		for i, id := range part {
+			args[i] = id
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM edges WHERE from_node IN (`+ph+`)`, args...); err != nil {
+			return err
+		}
+	}
+	for _, f := range nativeFiles {
+		lo, hi := f+"::", f+":;"
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM edges WHERE from_node >= ? AND from_node < ? AND source = 'native'`, lo, hi); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM edges WHERE from_node = ? AND source = 'native'`, "file:"+f); err != nil {
+			return err
+		}
+	}
+
+	const insertChunk = 342
+	for start := 0; start < len(inserts); start += insertChunk {
+		end := start + insertChunk
+		if end > len(inserts) {
+			end = len(inserts)
+		}
+		part := inserts[start:end]
+		var sb strings.Builder
+		sb.WriteString(`INSERT INTO edges (id, from_node, to_node, edge_type, confidence, source, reason) VALUES `)
+		args := make([]any, 0, len(part)*7)
+		for i, edge := range part {
+			if i > 0 {
+				sb.WriteString(",")
+			}
+			sb.WriteString("(?,?,?,?,?,?,?)")
+			id := edge.From + "::" + string(edge.Type) + "::" + edge.To
+			args = append(args, id, edge.From, edge.To, string(edge.Type), edge.Confidence, string(edge.Source), string(edge.Reason))
+		}
+		sb.WriteString(` ON CONFLICT(id) DO UPDATE SET confidence = excluded.confidence, source = excluded.source, reason = excluded.reason WHERE excluded.confidence > edges.confidence`)
+		if _, err := tx.ExecContext(ctx, sb.String(), args...); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// EdgeCount returns COUNT(*) of the edges table — the cheap post-splice
+// invariant check.
+func (s *Store) EdgeCount(ctx context.Context) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM edges`).Scan(&n)
+	return n, err
+}
+
 // EdgesBySource returns stored edges whose evidence source equals source, in
 // the same (from_node, edge_type, to_node) order AllEdges uses, so callers
 // that previously filtered AllEdges see an identical sequence. On monorepos

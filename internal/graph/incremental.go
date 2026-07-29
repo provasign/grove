@@ -57,10 +57,31 @@ var deltaStats struct {
 // instead of caller re-resolution — a comment-level edit re-resolves almost
 // nothing. Only semantically added/removed/changed symbols contribute to the
 // name delta and the affected set.
+// DeltaMeta describes the write-set of an incremental rebuild — everything a
+// store splice needs to bring the persisted table to the new state without a
+// full-table diff. Nil when the delta fell back to a full rebuild.
+type DeltaMeta struct {
+	// AffectedOwners: symbol IDs (in unchanged files) whose out-edges were
+	// recomputed — their stored rows must be deleted and reinserted.
+	AffectedOwners map[string]bool
+	// AffectedTests: test symbol IDs whose tests edges were recomputed.
+	AffectedTests map[string]bool
+	// ChangedFiles / NativeAnalyzedDirs: as passed in (splice needs them to
+	// select insert rows and native-row deletions).
+	ChangedFiles       map[string]bool
+	NativeAnalyzedDirs map[string]bool
+}
+
+// BuildEdgesDelta is the []core.Edge-only form of BuildEdgesDeltaMeta.
 func BuildEdgesDelta(prevEdges []core.Edge, prevSymbols, symbols []core.SymbolRecord, changedFiles map[string]bool, nativeAnalyzedDirs map[string]bool) []core.Edge {
+	edges, _ := BuildEdgesDeltaMeta(prevEdges, prevSymbols, symbols, changedFiles, nativeAnalyzedDirs)
+	return edges
+}
+
+func BuildEdgesDeltaMeta(prevEdges []core.Edge, prevSymbols, symbols []core.SymbolRecord, changedFiles map[string]bool, nativeAnalyzedDirs map[string]bool) ([]core.Edge, *DeltaMeta) {
 	if len(prevEdges) == 0 || len(changedFiles) == 0 {
 		deltaStats.fallback++
-		return BuildEdges(symbols)
+		return BuildEdges(symbols), nil
 	}
 
 	tick := edgeTimer()
@@ -100,7 +121,7 @@ func BuildEdgesDelta(prevEdges []core.Edge, prevSymbols, symbols []core.SymbolRe
 			fmt.Fprintf(os.Stderr, "[timing] delta-fallback: affected=%d/%d changedFiles=%d nameDelta=%d ok=%v\n",
 				len(affected), len(symbols), len(changedFiles), len(nameDelta), ok)
 		}
-		return BuildEdges(symbols)
+		return BuildEdges(symbols), nil
 	}
 	deltaStats.incremental++
 	if os.Getenv("GROVE_TIMING") != "" {
@@ -203,7 +224,31 @@ func BuildEdgesDelta(prevEdges []core.Edge, prevSymbols, symbols []core.SymbolRe
 	edges = append(edges, keptTests...)
 	edges = append(edges, testsNew...)
 	tick("delta-tests")
-	return edges
+
+	// Write-set metadata for the store splice: owners in UNCHANGED files
+	// whose rows must be replaced (changed-file rows are already handled by
+	// the per-file deletes in the persist phase).
+	ownersOutsideChanged := make(map[string]bool, len(affected))
+	for i := range symbols {
+		s := &symbols[i]
+		if affected[s.ID] && !changedFiles[s.FilePath] {
+			ownersOutsideChanged[s.ID] = true
+		}
+	}
+	testsOutsideChanged := make(map[string]bool, len(testsAffected))
+	for i := range symbols {
+		s := &symbols[i]
+		if testsAffected[s.ID] && !changedFiles[s.FilePath] {
+			testsOutsideChanged[s.ID] = true
+		}
+	}
+	meta := &DeltaMeta{
+		AffectedOwners:     ownersOutsideChanged,
+		AffectedTests:      testsOutsideChanged,
+		ChangedFiles:       changedFiles,
+		NativeAnalyzedDirs: nativeAnalyzedDirs,
+	}
+	return edges, meta
 }
 
 // contentIdentityKey captures everything call/test resolution can read from a

@@ -53,7 +53,36 @@ type goListPackage struct {
 	XTestImports []string
 }
 
+// ensureGOROOT repairs the build-time-baked GOROOT when it does not exist on
+// the running machine. Release binaries bake the CI runner's toolchain path
+// (e.g. /Users/runner/hostedtoolcache/...), which silently breaks
+// importer.Default()'s type resolution in the semantic pass — released
+// binaries produced slightly different native edges than locally-built ones
+// (measured: 190 of 6.3M rows on kubernetes). runtime.GOROOT() honors the
+// GOROOT env var, so setting it from `go env GOROOT` once restores identical
+// behavior across build environments.
+var ensureGOROOTOnce sync.Once
+
+func ensureGOROOT() {
+	ensureGOROOTOnce.Do(func() {
+		if root := os.Getenv("GOROOT"); root != "" {
+			return // operator override wins
+		}
+		if _, err := os.Stat(runtime.GOROOT()); err == nil {
+			return // baked path is valid on this machine
+		}
+		out, err := exec.Command("go", "env", "GOROOT").Output()
+		if err != nil {
+			return
+		}
+		if root := strings.TrimSpace(string(out)); root != "" {
+			os.Setenv("GOROOT", root)
+		}
+	})
+}
+
 func (goAnalyzer) Analyze(ctx context.Context, req Request) Result {
+	ensureGOROOT()
 	// go list output depends on module files, the go-file set, and import
 	// blocks — never on function bodies. Cache it keyed by exactly those
 	// inputs, so content-only edits skip the ~3s subprocess entirely.
@@ -264,6 +293,7 @@ func filterSymbolsByDirs(symbols []core.SymbolRecord, dirs map[string]bool) []co
 //   - GOPROXY reaching the network lets `go list ./...` fetch attacker-named
 //     modules (forced egress / SSRF-ish). Set "off" so analysis is offline;
 //     -mod=readonly already blocks go.mod edits.
+//
 // GOMODCACHE/GOCACHE/GOPATH are carried through the allowlist so the shared
 // module cache and build cache still work; module downloads are simply
 // disabled for this side-effect-free analysis pass.
