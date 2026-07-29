@@ -206,7 +206,18 @@ func (e *Engine) Index(ctx context.Context, dir string) (IndexResult, error) {
 	// reloading all stored symbols+edges. If a resident graph exists it is
 	// kept (set-equal to the store by the stored-edge invariant); if none
 	// exists yet, the first query rehydrates lazily via currentGraph.
-	cg, result, err := e.idx.IndexWithOptions(ctx, dir, index.Options{SkipNoopGraph: true})
+	opts := index.Options{SkipNoopGraph: true}
+	if os.Getenv("GROVE_INCREMENTAL") == "1" {
+		// Incremental edge construction uses the resident graph as the
+		// previous-state baseline. Snapshot under the read lock; the
+		// indexer decides per-run whether the delta qualifies.
+		e.mu.RLock()
+		if e.graph != nil {
+			opts.PrevSymbols, opts.PrevEdges = e.graph.Snapshot()
+		}
+		e.mu.RUnlock()
+	}
+	cg, result, err := e.idx.IndexWithOptions(ctx, dir, opts)
 	if err != nil {
 		return result, err
 	}

@@ -1,6 +1,8 @@
 package graph
 
 import (
+	"fmt"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -80,9 +82,17 @@ func BuildEdgesDelta(prevEdges []core.Edge, prevSymbols, symbols []core.SymbolRe
 	affected, ok := affectedCallers(idx, symbols, changedFiles, nameDelta)
 	if !ok || len(affected) > int(maxAffectedFraction*float64(len(symbols))) {
 		deltaStats.fallback++
+		if os.Getenv("GROVE_TIMING") != "" {
+			fmt.Fprintf(os.Stderr, "[timing] delta-fallback: affected=%d/%d changedFiles=%d nameDelta=%d ok=%v\n",
+				len(affected), len(symbols), len(changedFiles), len(nameDelta), ok)
+		}
 		return BuildEdges(symbols)
 	}
 	deltaStats.incremental++
+	if os.Getenv("GROVE_TIMING") != "" {
+		fmt.Fprintf(os.Stderr, "[timing] delta-scope: affected=%d/%d changedFiles=%d nameDelta=%d\n",
+			len(affected), len(symbols), len(changedFiles), len(nameDelta))
+	}
 	tick("delta-affected-set")
 
 	// Cheap passes: identical to BuildEdges.

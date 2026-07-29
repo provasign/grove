@@ -48,6 +48,30 @@ type Options struct {
 	// from the store. The stored-edge invariant (stored == what a rebuild
 	// would produce) is untouched.
 	SkipNoopGraph bool
+
+	// PrevEdges/PrevSymbols enable incremental edge construction on delta
+	// runs (gated additionally by GROVE_INCREMENTAL=1): the caller's
+	// resident graph state from the previous index. PrevEdges may be the
+	// MERGED (base+native) set — the delta path re-merges fresh native
+	// results, and the affected set is widened to every natively
+	// re-analyzed package so a vanished native edge cannot strand a stale
+	// kept edge. Nil disables the incremental path (full rebuild).
+	PrevEdges   []core.Edge
+	PrevSymbols []core.SymbolRecord
+}
+
+// incrementalEnabled gates incremental edge construction: opt-in while the
+// shadow-validation program runs; the full rebuild stays the default.
+func incrementalEnabled() bool {
+	return os.Getenv("GROVE_INCREMENTAL") == "1"
+}
+
+// fileDir returns the slash-path directory of a repo-relative file path.
+func fileDir(path string) string {
+	if i := strings.LastIndexByte(path, '/'); i >= 0 {
+		return path[:i]
+	}
+	return "."
 }
 
 // phaseTimer prints per-phase durations to stderr when GROVE_TIMING=1 —
@@ -356,7 +380,33 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 	}
 
 	codeGraph := graph.New()
-	codeGraph.ReplaceWithEdges(symbols, nativeResult.Edges, result.FilesSeen)
+	if incrementalEnabled() && opts.PrevEdges != nil && scope != nil {
+		// Incremental edge construction: recompute only affected owners'
+		// call/test edges (graph.BuildEdgesDelta). The changed set is the
+		// re-parsed + pruned files WIDENED by every file in a natively
+		// re-analyzed package dir — a native edge that vanishes this round
+		// must not strand a kept edge under its key.
+		changedSet := make(map[string]bool, len(changedRel))
+		for _, f := range changedRel {
+			changedSet[f] = true
+		}
+		for _, dirs := range nativeResult.Partial {
+			dirSet := make(map[string]bool, len(dirs))
+			for _, d := range dirs {
+				dirSet[d] = true
+			}
+			for si := range symbols {
+				if dirSet[fileDir(symbols[si].FilePath)] {
+					changedSet[symbols[si].FilePath] = true
+				}
+			}
+		}
+		base := graph.BuildEdgesDelta(opts.PrevEdges, opts.PrevSymbols, symbols, changedSet)
+		codeGraph.ReplaceWithBaseEdges(symbols, base, nativeResult.Edges, result.FilesSeen)
+		result.Native = append(result.Native, "edge construction: incremental (GROVE_INCREMENTAL=1)")
+	} else {
+		codeGraph.ReplaceWithEdges(symbols, nativeResult.Edges, result.FilesSeen)
+	}
 	tick("edge-construction")
 	edges := codeGraph.EdgesSnapshot()
 	if err := i.store.ReplaceEdges(ctx, edges); err != nil {
