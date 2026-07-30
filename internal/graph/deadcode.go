@@ -56,6 +56,7 @@ var identTokenRe = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]*`)
 // call, test, uses-type, and override edges, and reports the production
 // functions/methods nothing reaches.
 func (g *CodeGraph) DeadCode(extraRoots []string) *DeadCodeResult {
+	g.ensureTests()
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 

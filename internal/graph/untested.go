@@ -54,6 +54,7 @@ const (
 // edges only, so "covered" is never asserted off a regex-fallback edge, and
 // depth-bounded so "covered" means a test within coverageDepth caller hops.
 func (g *CodeGraph) UntestedSurface(query string) (*UntestedSurfaceResult, error) {
+	g.ensureTests()
 	impact, err := g.ChangeImpact(query)
 	if err != nil {
 		return nil, err
