@@ -37,7 +37,9 @@ func TestBuildEdges_EverySourceTagged(t *testing.T) {
 			Signature: "function use(b: Base): void", Imports: []string{"./base"}},
 	}
 
-	edges := BuildEdges(symbols)
+	g := New()
+	g.Replace(symbols, 4)
+	_, edges := g.Snapshot() // includes the lazy tests view
 	if len(edges) == 0 {
 		t.Fatal("fixture produced no edges")
 	}

@@ -100,6 +100,15 @@ func (s *Store) runAlterMigrations(ctx context.Context) error {
 			}
 		}
 	}
+	// Tests edges became a session-computed view (never persisted); purge
+	// rows written by earlier versions so stored counts and splice
+	// invariants stay consistent. Skipped under the rollback flag, which
+	// keeps the eager/persisted behavior.
+	if os.Getenv("GROVE_MATERIALIZED_TESTS") != "1" {
+		if _, err := s.db.ExecContext(ctx, `DELETE FROM edges WHERE edge_type = 'tests'`); err != nil {
+			return fmt.Errorf("migration (purge tests edges): %w", err)
+		}
+	}
 	return nil
 }
 

@@ -48,6 +48,16 @@ type CodeGraph struct {
 	inbound  map[string][]int
 	outbound map[string][]int
 
+	// testsBuilt marks whether the tests-edge view has been computed for the
+	// currently installed graph. Tests edges are a lazily-computed VIEW
+	// (46% of a monorepo's edges, a materialized cross-product of a cheap
+	// bounded BFS): install() skips them, and the first tests-consuming
+	// query runs buildTests over the installed graph and appends the result
+	// into edges/inbound/outbound, after which every consumer works
+	// unchanged. GROVE_MATERIALIZED_TESTS=1 restores the pre-view behavior
+	// (tests built eagerly in BuildEdges and persisted).
+	testsBuilt bool
+
 	// Lazily-built semantic-search engine. Invalidated on every Replace().
 	// semVecCache survives invalidation: vectors are keyed by symbol ID
 	// (content-hashed), so unchanged symbols skip re-embedding when the
@@ -56,6 +66,51 @@ type CodeGraph struct {
 	semEngine   embeddings.Engine
 	semDirty    bool
 	semVecCache map[string][]float32
+}
+
+// materializedTests reports whether the rollback flag pins the old behavior:
+// tests edges built eagerly during BuildEdges and persisted to the store.
+func materializedTests() bool {
+	return os.Getenv("GROVE_MATERIALIZED_TESTS") == "1"
+}
+
+// ensureTests computes the tests-edge view on first use. Idempotent per
+// install; a reindex resets the flag and the next tests query recomputes
+// against the fresh graph. The symbol slice is sorted before the build so
+// the view is deterministic (map iteration order must never leak in).
+func (g *CodeGraph) ensureTests() {
+	g.mu.RLock()
+	built := g.testsBuilt
+	g.mu.RUnlock()
+	if built {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.testsBuilt {
+		return
+	}
+	symbols := make([]core.SymbolRecord, 0, len(g.symbols))
+	for _, s := range g.symbols {
+		symbols = append(symbols, s)
+	}
+	sortSymbols(symbols)
+	var callEdges []core.Edge
+	for _, e := range g.edges {
+		if e.Type == core.EdgeCalls {
+			callEdges = append(callEdges, e)
+		}
+	}
+	idx := newEdgeIndex(symbols)
+	testEdges := buildTests(idx, symbols, callEdges, nil)
+	base := len(g.edges)
+	g.edges = append(g.edges, testEdges...)
+	for i := range testEdges {
+		e := &g.edges[base+i]
+		g.inbound[e.To] = append(g.inbound[e.To], base+i)
+		g.outbound[e.From] = append(g.outbound[e.From], base+i)
+	}
+	g.testsBuilt = true
 }
 
 func New() *CodeGraph {
@@ -144,6 +199,22 @@ func (g *CodeGraph) install(symbols []core.SymbolRecord, edges []core.Edge, file
 	}()
 	wg.Wait()
 
+	// Under the view model the freshly installed graph has no tests edges
+	// yet; under the rollback flag they were built eagerly (or restored
+	// verbatim from the store) and the view must not run again on top.
+	// Installing an edge set that ALREADY carries tests rows (a re-installed
+	// Snapshot, an old store under the rollback flag) also counts as built —
+	// running the view on top would duplicate them.
+	g.testsBuilt = materializedTests()
+	if !g.testsBuilt {
+		for i := range g.edges {
+			if g.edges[i].Type == core.EdgeTests {
+				g.testsBuilt = true
+				break
+			}
+		}
+	}
+
 	g.semMu.Lock()
 	g.semDirty = true
 	g.semEngine = nil
@@ -225,8 +296,12 @@ func BuildEdges(symbols []core.SymbolRecord) []core.Edge {
 	decoEdges := buildDecoratorEdges(idx, symbols, callEdges)
 	edges = append(edges, decoEdges...)
 	tick("decorators")
-	edges = append(edges, buildTests(idx, symbols, append(callEdges, decoEdges...), nil)...)
-	tick("tests")
+	// Tests edges are a lazily-computed view (see ensureTests) unless the
+	// rollback flag pins the eager/persisted behavior.
+	if materializedTests() {
+		edges = append(edges, buildTests(idx, symbols, append(callEdges, decoEdges...), nil)...)
+		tick("tests")
+	}
 	return edges
 }
 
@@ -245,11 +320,22 @@ func edgeTimer() func(string) {
 
 // EdgesSnapshot returns a copy of the edge list only — the store write path
 // needs no symbols, and deep-copying 100k symbol records to discard them
-// dominated the write phase on monorepos.
+// dominated the write phase on monorepos. Under the view model, tests edges
+// are session-computed and must never reach the store, so they are excluded
+// here even when ensureTests has appended them to the live graph.
 func (g *CodeGraph) EdgesSnapshot() []core.Edge {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-	return append([]core.Edge(nil), g.edges...)
+	if materializedTests() {
+		return append([]core.Edge(nil), g.edges...)
+	}
+	out := make([]core.Edge, 0, len(g.edges))
+	for _, e := range g.edges {
+		if e.Type != core.EdgeTests {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 // BaselineRef returns the live symbol and edge slices WITHOUT copying, for
@@ -269,6 +355,7 @@ func (g *CodeGraph) BaselineRef() ([]core.SymbolRecord, []core.Edge) {
 }
 
 func (g *CodeGraph) Snapshot() ([]core.SymbolRecord, []core.Edge) {
+	g.ensureTests()
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
@@ -418,6 +505,7 @@ func searchRank(symbol core.SymbolRecord, query string) int {
 // Uses exact-prefix matching: edges from "file:<path>" or whose node ID
 // begins with "<path>::" (symbol IDs in that file).
 func (g *CodeGraph) Deps(filePath string) []core.Edge {
+	g.ensureTests()
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
@@ -451,6 +539,9 @@ type Neighbor struct {
 // direction is "out", "in", or "both"/"". kinds filters by edge type; an empty
 // set returns every kind. Seeds are matched by exact name / qualified name / ID.
 func (g *CodeGraph) Neighbors(query, direction string, kinds map[core.EdgeType]bool) []Neighbor {
+	if len(kinds) == 0 || kinds[core.EdgeTests] {
+		g.ensureTests()
+	}
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
@@ -523,6 +614,7 @@ func (g *CodeGraph) Impact(query string, maxDepth int) []core.SymbolRecord {
 // PolicyCertification for a blast radius that only follows guarantee-grade
 // edges.
 func (g *CodeGraph) ImpactWithPolicy(query string, maxDepth int, policy TraversalPolicy) []core.SymbolRecord {
+	g.ensureTests()
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
@@ -721,6 +813,7 @@ func (g *CodeGraph) coveringTestsLocked(seeds map[string]bool, policy TraversalP
 // policy — the ID-seeded form of TestsFor, used to benchmark the closure (and
 // to compare policies) without the name-matching phase.
 func (g *CodeGraph) TestsForSymbol(id string, policy TraversalPolicy) []core.SymbolRecord {
+	g.ensureTests()
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	tests := g.coveringTestsLocked(map[string]bool{id: true}, policy, PolicySkips{})
@@ -740,6 +833,7 @@ func (g *CodeGraph) TestsForSymbol(id string, policy TraversalPolicy) []core.Sym
 // same evidence-backed policy as TestsFor (low-confidence edges excluded, so a
 // weak bare-name match cannot sweep in unrelated tests across a monorepo).
 func (g *CodeGraph) AffectedTests(files []string) []core.SymbolRecord {
+	g.ensureTests()
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	want := make(map[string]bool, len(files))
@@ -762,6 +856,7 @@ func (g *CodeGraph) AffectedTests(files []string) []core.SymbolRecord {
 }
 
 func (g *CodeGraph) testsForWithPolicy(query string, policy TraversalPolicy) ([]core.SymbolRecord, PolicySkips) {
+	g.ensureTests()
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 

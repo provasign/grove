@@ -166,6 +166,13 @@ func BuildEdgesDeltaMeta(prevEdges []core.Edge, prevSymbols, symbols []core.Symb
 		if e.Type != core.EdgeCalls && e.Type != core.EdgeTests {
 			continue
 		}
+		// Under the view model, any tests edges in the baseline are
+		// session-computed view rows (a prior tests query appended them to
+		// the resident graph) — never part of the base set this function
+		// produces. The view recomputes on demand after install.
+		if e.Type == core.EdgeTests && !materializedTests() {
+			continue
+		}
 		if e.Source == core.EvidenceSourceNative && nativeAnalyzedDirs[fileDirOfNode(e.From)] {
 			continue
 		}
@@ -213,6 +220,13 @@ func BuildEdgesDeltaMeta(prevEdges []core.Edge, prevSymbols, symbols []core.Symb
 	// (name buckets), its import scope, and the call-graph closure within
 	// its bounded walk. affectedTests covers all three plus any test whose
 	// closure could touch a changed call edge.
+	// Under the view model the delta produces no tests edges at all — the
+	// lazily-computed view recomputes them from the fresh graph on the next
+	// tests-consuming query.
+	if !materializedTests() {
+		tick("delta-tests")
+		return edges, buildDeltaMeta(symbols, affected, nil, changedFiles, nativeAnalyzedDirs)
+	}
 	testsAffected := affectedTests(idx, symbols, affected, changedSemFiles, nameDelta, prevCalls, allCalls)
 	testsNew := buildTests(idx, symbols, allCalls, testsAffected)
 	keptTests := make([]core.Edge, 0, len(prevTests))
@@ -224,31 +238,33 @@ func BuildEdgesDeltaMeta(prevEdges []core.Edge, prevSymbols, symbols []core.Symb
 	edges = append(edges, keptTests...)
 	edges = append(edges, testsNew...)
 	tick("delta-tests")
+	return edges, buildDeltaMeta(symbols, affected, testsAffected, changedFiles, nativeAnalyzedDirs)
+}
 
-	// Write-set metadata for the store splice: owners in UNCHANGED files
-	// whose rows must be replaced (changed-file rows are already handled by
-	// the per-file deletes in the persist phase).
+// buildDeltaMeta assembles the store-splice write-set metadata: owners in
+// UNCHANGED files whose rows must be replaced (changed-file rows are already
+// handled by the per-file deletes in the persist phase).
+func buildDeltaMeta(symbols []core.SymbolRecord, affected, testsAffected map[string]bool, changedFiles, nativeAnalyzedDirs map[string]bool) *DeltaMeta {
 	ownersOutsideChanged := make(map[string]bool, len(affected))
-	for i := range symbols {
-		s := &symbols[i]
-		if affected[s.ID] && !changedFiles[s.FilePath] {
-			ownersOutsideChanged[s.ID] = true
-		}
-	}
 	testsOutsideChanged := make(map[string]bool, len(testsAffected))
 	for i := range symbols {
 		s := &symbols[i]
-		if testsAffected[s.ID] && !changedFiles[s.FilePath] {
+		if changedFiles[s.FilePath] {
+			continue
+		}
+		if affected[s.ID] {
+			ownersOutsideChanged[s.ID] = true
+		}
+		if testsAffected[s.ID] {
 			testsOutsideChanged[s.ID] = true
 		}
 	}
-	meta := &DeltaMeta{
+	return &DeltaMeta{
 		AffectedOwners:     ownersOutsideChanged,
 		AffectedTests:      testsOutsideChanged,
 		ChangedFiles:       changedFiles,
 		NativeAnalyzedDirs: nativeAnalyzedDirs,
 	}
-	return edges, meta
 }
 
 // contentIdentityKey captures everything call/test resolution can read from a

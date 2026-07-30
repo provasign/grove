@@ -6,37 +6,24 @@ import (
 	"strings"
 
 	"github.com/provasign/grove/internal/core"
-	"github.com/provasign/grove/internal/store"
 	"github.com/provasign/grove/pkg/grove"
 )
 
-// loadGraph indexes the repo with Grove and returns the persisted symbols
-// and edges.
+// loadGraph indexes the repo with Grove and returns the graph's symbols and
+// edges (including the lazily-computed tests view).
 func loadGraph(ctx context.Context, repoRoot string) ([]core.SymbolRecord, []core.Edge, error) {
 	engine, err := grove.Open(ctx, grove.Config{RepoRoot: repoRoot})
 	if err != nil {
 		return nil, nil, fmt.Errorf("grove open: %w", err)
 	}
+	defer engine.Close()
 	if _, err := engine.Index(ctx, repoRoot); err != nil {
-		_ = engine.Close()
 		return nil, nil, fmt.Errorf("grove index: %w", err)
 	}
-	if err := engine.Close(); err != nil {
-		return nil, nil, err
-	}
-	st, err := store.Open(repoRoot)
-	if err != nil {
-		return nil, nil, fmt.Errorf("store open: %w", err)
-	}
-	defer st.Close()
-	symbols, err := st.AllSymbols(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-	edges, err := st.AllEdges(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
+	// Read through the graph snapshot, not the store: tests edges are a
+	// session-computed view that never persists, and the snapshot is what
+	// materializes it — scoring the store would score zero tests edges.
+	symbols, edges := engine.SnapshotGraph(ctx)
 	return symbols, edges, nil
 }
 

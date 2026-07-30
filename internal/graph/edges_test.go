@@ -370,7 +370,9 @@ func TestBuildTests_HelperTransitiveCoverage(t *testing.T) {
 		Language: "python", Kind: core.KindFunction,
 		Name: "create_app", QualifiedName: "create_app",
 	}
-	edges := BuildEdges([]core.SymbolRecord{test, helper, target})
+	g := New()
+	g.Replace([]core.SymbolRecord{test, helper, target}, 2)
+	_, edges := g.Snapshot() // tests edges are a lazy view; Snapshot materializes it
 	for _, e := range edges {
 		if e.Type == core.EdgeTests && e.From == test.ID && e.To == target.ID {
 			return
