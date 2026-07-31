@@ -101,6 +101,40 @@ func pyDefParams(rawText string) string {
 	return ""
 }
 
+// pyParamNames extracts every parameter name from a def's signature,
+// annotated or not — including callables like "loads: t.Callable = json.loads"
+// that pyLocalTypes' annotation-only pass drops (Callable isn't a bare
+// indexable type). A bare call through one of these names invokes whatever
+// was actually passed in, not any particular symbol in scope: resolving it
+// by matching the parameter's name against an unrelated same-named function
+// elsewhere in the file produces a confident-looking but fabricated edge
+// (observed: Config.from_prefixed_env's local `loads(value)` call resolving
+// to TaggedJSONSerializer.loads by bare name collision). Callers use this to
+// suppress resolution for qualifier-less calls to a shadowed parameter name.
+func pyParamNames(rawText string) map[string]bool {
+	out := map[string]bool{}
+	params := pyDefParams(rawText)
+	if params == "" {
+		return out
+	}
+	for _, g := range splitTopLevel(params, ',') {
+		g = strings.TrimSpace(g)
+		g = strings.TrimLeft(g, "*")
+		if g == "" {
+			continue
+		}
+		name := g
+		if i := strings.IndexAny(g, ":="); i >= 0 {
+			name = g[:i]
+		}
+		name = strings.TrimSpace(name)
+		if name != "" && name != "self" && name != "cls" {
+			out[name] = true
+		}
+	}
+	return out
+}
+
 // pyLocalTypes infers identifier → type name for one Python callable.
 func pyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 	out := map[string]string{}

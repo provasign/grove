@@ -1137,11 +1137,13 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 	if len(symbol.CallSites) > 0 {
 		selfVars := callerSelfQualifiers(&symbol)
 		var localTypes map[string]string
+		var pyParams map[string]bool
 		switch symbol.Language {
 		case "go":
 			localTypes = goLocalTypes(idx, &symbol)
 		case "python":
 			localTypes = pyLocalTypes(idx, &symbol)
+			pyParams = pyParamNames(symbol.RawText)
 		case "typescript", "tsx", "javascript":
 			localTypes = tsLocalTypes(idx, &symbol)
 		case "java":
@@ -1185,6 +1187,21 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// a bare "constructor" callee would match every class's
 				// constructor in scope.
 				continue
+			}
+			if symbol.Language == "python" && qualifier == "" && pyParams[calleeName] {
+				if _, typed := localTypes[calleeName]; !typed {
+					// Bare call through a parameter name (`loads(value)`
+					// where `loads` is a `Callable` parameter) invokes
+					// whatever the caller actually passed in — not any
+					// particular symbol in scope. Resolving it by matching
+					// the parameter's name against an unrelated function
+					// elsewhere fabricates an edge (see pyParamNames). A
+					// parameter localTypes DID resolve (e.g. `x: type[X]`,
+					// used as a factory) keeps its existing, deliberate
+					// constructor-narrowing path below — only the
+					// unresolvable case is suppressed here.
+					continue
+				}
 			}
 			// AST-extracted names are exact by construction: case-insensitive
 			// matching here let "writeContentType" (free function) claim every

@@ -171,6 +171,53 @@ func TestCallsAcrossImportedFiles(t *testing.T) {
 	}
 }
 
+// TestPythonBareCallThroughUnresolvedParamSuppressed guards against the
+// flask@36e4a824 false-edge bug: a bare call through a Callable parameter
+// (`loads: t.Callable = json.loads`, then `loads(value)`) must not resolve
+// by matching the parameter's NAME against an unrelated same-named function
+// elsewhere in scope — the caller's own from_prefixed_env never calls
+// TaggedJSONSerializer.loads, it calls whatever was passed as `loads`.
+func TestPythonBareCallThroughUnresolvedParamSuppressed(t *testing.T) {
+	g := New()
+	g.Replace([]core.SymbolRecord{
+		{ID: "config.py::from_prefixed_env@sha", FilePath: "config.py", Language: "python",
+			Kind: core.KindMethod, Name: "from_prefixed_env", QualifiedName: "Config.from_prefixed_env",
+			ParentSymbol: "Config",
+			RawText:      "def from_prefixed_env(self, prefix=\"FLASK\", *, loads=json.loads):\n    value = loads(raw)\n",
+			CallSites:    []core.CallSite{{Callee: "loads", Line: 2}}},
+		{ID: "tag.py::loads@sha", FilePath: "tag.py", Language: "python",
+			Kind: core.KindMethod, Name: "loads", QualifiedName: "TaggedJSONSerializer.loads",
+			ParentSymbol: "TaggedJSONSerializer", RawText: "def loads(self, value):\n    pass\n"},
+	}, 2)
+	if hasEdge(g, core.EdgeCalls, "config.py::from_prefixed_env@sha", "tag.py::loads@sha") {
+		t.Fatalf("bare call through a shadowing parameter name must not resolve to an unrelated same-named function")
+	}
+}
+
+// TestPythonTypedFactoryParamStillResolves guards the companion case: a
+// parameter annotated as a class reference (`tag_class: type[JSONTag]`) used
+// as a factory (`tag_class(self)`) is a genuine, statically-inferable
+// constructor call and must keep resolving — the fix above only suppresses
+// calls through parameters localTypes could NOT positively type.
+func TestPythonTypedFactoryParamStillResolves(t *testing.T) {
+	g := New()
+	g.Replace([]core.SymbolRecord{
+		{ID: "tag.py::register@sha", FilePath: "tag.py", Language: "python",
+			Kind: core.KindMethod, Name: "register", QualifiedName: "TaggedJSONSerializer.register",
+			ParentSymbol: "TaggedJSONSerializer",
+			RawText:      "def register(self, tag_class: type[JSONTag], force=False):\n    tag_class(self)\n",
+			CallSites:    []core.CallSite{{Callee: "tag_class", Line: 2}}},
+		{ID: "tag.py::JSONTag@sha", FilePath: "tag.py", Language: "python",
+			Kind: core.KindClass, Name: "JSONTag", QualifiedName: "JSONTag"},
+		{ID: "tag.py::JSONTag.__init__@sha", FilePath: "tag.py", Language: "python",
+			Kind: core.KindConstructor, Name: "__init__", QualifiedName: "JSONTag.__init__",
+			ParentSymbol: "JSONTag", RawText: "def __init__(self):\n    pass\n"},
+	}, 3)
+	if !hasEdge(g, core.EdgeCalls, "tag.py::register@sha", "tag.py::JSONTag.__init__@sha") {
+		t.Fatalf("expected constructor edge through a type[X]-typed factory parameter to still resolve")
+	}
+}
+
 // ─── TestsFor traverses tests edges and transitive callers ───────────────────
 
 func TestTestsForFollowsTestsEdge(t *testing.T) {
