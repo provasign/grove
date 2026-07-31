@@ -197,17 +197,18 @@ const (
 type EdgeReason string
 
 const (
-	ReasonASTNarrowed  EdgeReason = "ast-narrowed"   // AST call site resolved by receiver/type/import narrowing
-	ReasonDispatch     EdgeReason = "dispatch"       // interface/dynamic dispatch rescue (reduced confidence)
-	ReasonConstructor  EdgeReason = "constructor"    // class-instantiation / super()/this() constructor edge
-	ReasonInheritance  EdgeReason = "inheritance"    // super.method()/inherited method on a base class
-	ReasonProperty     EdgeReason = "property"       // attribute/property read (AttrSite)
-	ReasonRegexFallbck EdgeReason = "regex-fallback" // body-scan fallback (non-AST-callsite languages)
-	ReasonStructural   EdgeReason = "structural"     // defines/contains/imports — structural projection
-	ReasonTypeRef      EdgeReason = "type-ref"       // uses-type / extends / implements by name resolution
-	ReasonTestEvidence EdgeReason = "test-evidence"  // tests edge (annotation/name/call-derived)
-	ReasonMethodSet    EdgeReason = "method-set"     // overrides/implements by method-set inclusion
-	ReasonDecorator    EdgeReason = "decorator"      // decorator/wrapper call edge
+	ReasonASTNarrowed    EdgeReason = "ast-narrowed"    // AST call site resolved by receiver/type/import narrowing
+	ReasonDispatch       EdgeReason = "dispatch"        // interface/dynamic dispatch rescue (reduced confidence)
+	ReasonConstructor    EdgeReason = "constructor"     // class-instantiation / super()/this() constructor edge
+	ReasonInheritance    EdgeReason = "inheritance"     // super.method()/inherited method on a base class
+	ReasonProperty       EdgeReason = "property"        // attribute/property read (AttrSite)
+	ReasonRegexFallbck   EdgeReason = "regex-fallback"  // body-scan fallback (non-AST-callsite languages)
+	ReasonStructural     EdgeReason = "structural"      // defines/contains/imports — structural projection
+	ReasonTypeRef        EdgeReason = "type-ref"        // uses-type / extends / implements by name resolution
+	ReasonTestEvidence   EdgeReason = "test-evidence"   // tests edge (annotation/name/call-derived)
+	ReasonMethodSet      EdgeReason = "method-set"      // overrides/implements by method-set inclusion
+	ReasonDecorator      EdgeReason = "decorator"       // decorator/wrapper call edge
+	ReasonImplicitDunder EdgeReason = "implicit-dunder" // language-implicit protocol method (e.g. Python __setattr__ on "x.y = v") with no call site in source
 )
 
 type EvidenceRef struct {

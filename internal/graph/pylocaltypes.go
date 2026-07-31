@@ -135,6 +135,60 @@ func pyParamNames(rawText string) map[string]bool {
 	return out
 }
 
+// pySetattrAssignRe matches simple attribute-assignment statements
+// ("qualifier.attr = value"). The negative lookahead on a second "="
+// excludes comparisons (==); requiring "=" immediately after the attribute
+// name (no operator char before it) excludes augmented assignment (+=, -=,
+// ...) and comparisons whose operator has its own leading char (<=, >=, !=)
+// — those never reach the "=" at this position.
+var pySetattrAssignRe = regexp.MustCompile(`\b([A-Za-z_]\w*)\.[A-Za-z_]\w*\s*=(?:[^=]|$)`)
+
+// pySetattrTargets resolves attribute-assignment statements in symbol's body
+// ("g.foo = value") to the __setattr__ of the assigned-to class, for classes
+// that declare a CUSTOM __setattr__. Plain attribute assignment has no call
+// syntax — there is no "g.__setattr__(...)" site for astkit to extract — so
+// without this, the calls graph (and everything built on it: tests edges,
+// untested_surface, dead-code) is blind to any class that overrides
+// attribute assignment. Flask's _AppCtxGlobals is exactly this shape:
+// __setattr__ stores into __dict__, is genuinely covered by 11 real tests,
+// and every one of them assigns through a bare "g.attr = value" — grove
+// previously flagged it a coverage gap for lack of any resolvable edge.
+func pySetattrTargets(idx *edgeIndex, symbol *core.SymbolRecord, localTypes map[string]string, selfVars map[string]struct{}) []*core.SymbolRecord {
+	if symbol.RawText == "" {
+		return nil
+	}
+	body := stripCommentsAndStrings(symbol.RawText)
+	seenQual := map[string]bool{}
+	seenTarget := map[string]bool{}
+	var out []*core.SymbolRecord
+	for _, m := range pySetattrAssignRe.FindAllStringSubmatch(body, -1) {
+		qual := m[1]
+		if seenQual[qual] {
+			continue
+		}
+		seenQual[qual] = true
+		var className string
+		if _, isSelf := selfVars[qual]; isSelf {
+			className = symbol.ParentSymbol
+		} else if t, ok := localTypes[qual]; ok {
+			className = strings.TrimPrefix(t, "class:")
+		}
+		if className == "" {
+			continue
+		}
+		for _, cand := range idx.byName["__setattr__"] {
+			if cand.Name != "__setattr__" || cand.ParentSymbol != className {
+				continue
+			}
+			if !seenTarget[cand.ID] {
+				seenTarget[cand.ID] = true
+				out = append(out, cand)
+			}
+		}
+	}
+	return out
+}
+
 // pyLocalTypes infers identifier → type name for one Python callable.
 func pyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 	out := map[string]string{}

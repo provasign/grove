@@ -1133,6 +1133,18 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 		}
 	}
 
+	// ── Implicit dunder invocation: attribute assignment → __setattr__ ──
+	// "g.foo = value" has no call syntax, so a class overriding attribute
+	// assignment is otherwise invisible to the calls graph regardless of
+	// CallSites (see pySetattrTargets).
+	if symbol.Language == "python" {
+		dunderSelfVars := callerSelfQualifiers(&symbol)
+		dunderLocalTypes := pyLocalTypes(idx, &symbol)
+		for _, cand := range pySetattrTargets(idx, &symbol, dunderLocalTypes, dunderSelfVars) {
+			addEdge(symbol.ID, cand.ID, 0.7, core.EvidenceSourceHeuristic, core.ReasonImplicitDunder)
+		}
+	}
+
 	// ── High-confidence path: AST-extracted CallSites ───────────────────
 	if len(symbol.CallSites) > 0 {
 		selfVars := callerSelfQualifiers(&symbol)
