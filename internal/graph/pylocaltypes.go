@@ -160,6 +160,7 @@ func pySetattrTargets(idx *edgeIndex, symbol *core.SymbolRecord, localTypes map[
 	body := stripCommentsAndStrings(symbol.RawText)
 	seenQual := map[string]bool{}
 	seenTarget := map[string]bool{}
+	preferDir := dirOf(symbol.FilePath)
 	var out []*core.SymbolRecord
 	for _, m := range pySetattrAssignRe.FindAllStringSubmatch(body, -1) {
 		qual := m[1]
@@ -172,14 +173,18 @@ func pySetattrTargets(idx *edgeIndex, symbol *core.SymbolRecord, localTypes map[
 			className = symbol.ParentSymbol
 		} else if t, ok := localTypes[qual]; ok {
 			className = strings.TrimPrefix(t, "class:")
+		} else if t, ok := idx.pyModuleGlobals[qual]; ok {
+			// Assignment through a module-level global (Flask's `g`):
+			// resolve the global's declared type, then walk its base
+			// classes below — the declared type is often a proxy stub
+			// (`_AppCtxGlobalsProxy`) that inherits the class carrying the
+			// real __setattr__.
+			className = t
 		}
 		if className == "" {
 			continue
 		}
-		for _, cand := range idx.byName["__setattr__"] {
-			if cand.Name != "__setattr__" || cand.ParentSymbol != className {
-				continue
-			}
+		for _, cand := range pyDunderTargets(idx, className, "__setattr__", preferDir) {
 			if !seenTarget[cand.ID] {
 				seenTarget[cand.ID] = true
 				out = append(out, cand)
@@ -187,6 +192,79 @@ func pySetattrTargets(idx *edgeIndex, symbol *core.SymbolRecord, localTypes map[
 		}
 	}
 	return out
+}
+
+// pyModuleGlobalType extracts the class name from a module-global variable's
+// annotation signature ("g: _AppCtxGlobalsProxy" → "_AppCtxGlobalsProxy").
+// Unlike pyBareType it deliberately KEEPS underscore-leading names — a proxy
+// stub class like _AppCtxGlobalsProxy is exactly the case that matters — and
+// rejects only builtins, containers, and multi-token annotations.
+func pyModuleGlobalType(sig string) string {
+	_, ann, ok := strings.Cut(sig, ":")
+	if !ok {
+		return ""
+	}
+	ann = strings.TrimSpace(ann)
+	if parts := strings.Split(ann, "|"); len(parts) == 2 {
+		a, b := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+		if a == "None" {
+			ann = b
+		} else if b == "None" {
+			ann = a
+		}
+	}
+	for _, prefix := range []string{"Optional[", "t.Optional[", "typing.Optional["} {
+		if strings.HasPrefix(ann, prefix) && strings.HasSuffix(ann, "]") {
+			ann = strings.TrimSpace(ann[len(prefix) : len(ann)-1])
+		}
+	}
+	if i := strings.LastIndexByte(ann, '.'); i >= 0 {
+		ann = ann[i+1:]
+	}
+	if ann == "" || strings.ContainsAny(ann, "[]() ,|\"'") {
+		return ""
+	}
+	switch ann {
+	case "int", "str", "bool", "float", "bytes", "complex", "None",
+		"Any", "object", "dict", "list", "tuple", "set", "frozenset":
+		return ""
+	}
+	return ann
+}
+
+// pyDunderTargets finds the method named dunder ("__setattr__") that a call
+// through an instance of className would invoke: className's own declaration
+// if it has one, else the nearest ancestor's (Python MRO — the closest
+// definition wins). Walks up to five levels of base classes via pyBaseClasses,
+// which parses bases from class signatures (so proxy stubs that only exist for
+// type-checking still contribute their inheritance link once indexed).
+func pyDunderTargets(idx *edgeIndex, className, dunder, preferDir string) []*core.SymbolRecord {
+	seen := map[string]bool{className: true}
+	queue := []string{className}
+	for level := 0; level < 5 && len(queue) > 0; level++ {
+		var found []*core.SymbolRecord
+		for _, cn := range queue {
+			for _, cand := range idx.byName[strings.ToLower(dunder)] {
+				if cand.Name == dunder && cand.ParentSymbol == cn {
+					found = append(found, cand)
+				}
+			}
+		}
+		if len(found) > 0 {
+			return found // nearest definition in the hierarchy wins
+		}
+		var next []string
+		for _, cn := range queue {
+			for _, base := range pyBaseClasses(idx, cn, preferDir) {
+				if !seen[base] {
+					seen[base] = true
+					next = append(next, base)
+				}
+			}
+		}
+		queue = next
+	}
+	return nil
 }
 
 // pyLocalTypes infers identifier → type name for one Python callable.

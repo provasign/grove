@@ -55,6 +55,14 @@ type edgeIndex struct {
 	rustCrateOfFile map[string]string   // .rs file → crate root dir
 	rustCrateFiles  map[string][]string // crate root dir → files under it
 	rustCrateByName map[string]string   // normalized crate name → root dir
+
+	// pyModuleGlobals maps a Python module-level global's name to its declared
+	// class type ("g" → "_AppCtxGlobalsProxy"), built from KindVariable symbols
+	// astkit emits for annotated module-level assignments. Only unambiguous
+	// names are kept (a name declared with conflicting types across modules is
+	// dropped). Empty when the indexer predates module-var extraction, so the
+	// resolution paths that consult it are no-ops on older indexes.
+	pyModuleGlobals map[string]string
 }
 
 func newEdgeIndex(symbols []core.SymbolRecord) *edgeIndex {
@@ -98,7 +106,39 @@ func newEdgeIndex(symbols []core.SymbolRecord) *edgeIndex {
 		idx.baseToFiles[strings.ToLower(baseNameNoExt(f))] = append(idx.baseToFiles[strings.ToLower(baseNameNoExt(f))], f)
 	}
 	idx.buildRustCrates()
+	idx.buildPyModuleGlobals(symbols)
 	return idx
+}
+
+// buildPyModuleGlobals collects the name→class-type map from Python
+// module-level annotated variables (KindVariable symbols). A name declared
+// with two different types in different modules is ambiguous and dropped, so
+// resolution through it never guesses.
+func (idx *edgeIndex) buildPyModuleGlobals(symbols []core.SymbolRecord) {
+	var globals map[string]string
+	var ambiguous map[string]bool
+	for i := range symbols {
+		s := &symbols[i]
+		if s.Language != "python" || s.Kind != core.KindVariable {
+			continue
+		}
+		ct := pyModuleGlobalType(s.Signature)
+		if ct == "" {
+			continue
+		}
+		if globals == nil {
+			globals = map[string]string{}
+			ambiguous = map[string]bool{}
+		}
+		if prev, ok := globals[s.Name]; ok && prev != ct {
+			ambiguous[s.Name] = true
+		}
+		globals[s.Name] = ct
+	}
+	for name := range ambiguous {
+		delete(globals, name)
+	}
+	idx.pyModuleGlobals = globals
 }
 
 // sortedKeys returns a set-map's keys in lexicographic order — any loop
@@ -852,9 +892,19 @@ func buildUsesType(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
 // test's previous edges.
 func buildTests(idx *edgeIndex, symbols []core.SymbolRecord, callEdges []core.Edge, only map[string]bool) []core.Edge {
 	callAdj := map[string][]string{}
+	// dunderEdge marks calls edges that resolve an implicit protocol method
+	// (Python __setattr__ via attribute assignment) through a typed global or
+	// local. These are high-trust — the target class was pinned by type, not
+	// name proximity — and the assignment reaches it through a re-exported
+	// proxy (Flask's `g`), so the target's file is legitimately outside the
+	// caller's direct import scope. Such edges bypass the scope guard below.
+	dunderEdge := map[[2]string]bool{}
 	for _, e := range callEdges {
 		if e.Type == core.EdgeCalls {
 			callAdj[e.From] = append(callAdj[e.From], e.To)
+			if e.Reason == core.ReasonImplicitDunder {
+				dunderEdge[[2]string{e.From, e.To}] = true
+			}
 		}
 	}
 	var edges []core.Edge
@@ -870,7 +920,7 @@ func buildTests(idx *edgeIndex, symbols []core.SymbolRecord, callEdges []core.Ed
 			continue
 		}
 		scope := idx.importedFiles(symbol.FilePath)
-		add := func(target *core.SymbolRecord, allowSameFile bool, confidence float64) {
+		add := func(target *core.SymbolRecord, allowSameFile, trusted bool, confidence float64) {
 			if target.ID == symbol.ID {
 				return
 			}
@@ -880,7 +930,7 @@ func buildTests(idx *edgeIndex, symbols []core.SymbolRecord, callEdges []core.Ed
 			if isTestFile(target.FilePath) {
 				return
 			}
-			if _, ok := scope[target.FilePath]; !ok {
+			if _, ok := scope[target.FilePath]; !ok && !trusted {
 				return
 			}
 			key := symbol.ID + "::tests::" + target.ID
@@ -899,7 +949,7 @@ func buildTests(idx *edgeIndex, symbols []core.SymbolRecord, callEdges []core.Ed
 		}
 
 		for _, target := range testTargets(*symbol, idx) {
-			add(target, annotated, 0.8)
+			add(target, annotated, false, 0.8)
 		}
 
 		// Call-graph evidence: the calls edges were resolved with the full
@@ -937,13 +987,14 @@ func buildTests(idx *edgeIndex, symbols []core.SymbolRecord, callEdges []core.Ed
 					}
 					continue
 				}
+				trusted := dunderEdge[[2]string{cur.id, toID}]
 				if cur.prodDepth == 0 {
-					add(target, true, confByDepth[cur.depth])
+					add(target, true, trusted, confByDepth[cur.depth])
 				} else {
 					// One hop past the entry point: what the called function
 					// immediately does is still review-relevant, at low
 					// confidence.
-					add(target, true, 0.55)
+					add(target, true, trusted, 0.55)
 				}
 				if cur.prodDepth < maxProdDepth {
 					queue = append(queue, hop{toID, cur.depth, cur.prodDepth + 1})

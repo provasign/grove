@@ -218,6 +218,47 @@ func TestPythonTypedFactoryParamStillResolves(t *testing.T) {
 	}
 }
 
+// TestPythonModuleGlobalProxySetattr covers the flask@36e4a824 false-gap:
+// a test assigns `g.foo = value` where `g` is a module-level global typed as
+// a proxy stub (`_AppCtxGlobalsProxy`) that inherits the class carrying the
+// real __setattr__ (`_AppCtxGlobals`). Attribute assignment has no call site,
+// the global is reached through a re-export (not a direct import), and the
+// declared type is a type-checking stub — three reasons grove previously saw
+// no edge and reported __setattr__ as untested despite real coverage. Asserts
+// both the calls edge (test → __setattr__, resolved through the global's type
+// and a base-class walk) and the tests edge (which must bypass the import-
+// scope guard, since ctx.py is not in the test file's direct import scope).
+func TestPythonModuleGlobalProxySetattr(t *testing.T) {
+	g := New()
+	g.Replace([]core.SymbolRecord{
+		// Module-level global: `g: _AppCtxGlobalsProxy = LocalProxy(...)`.
+		{ID: "globals.py::g@sha", FilePath: "src/flask/globals.py", Language: "python",
+			Kind: core.KindVariable, Name: "g", QualifiedName: "g",
+			Signature: "g: _AppCtxGlobalsProxy"},
+		// Type-checking proxy stub, inherits the real class.
+		{ID: "globals.py::_AppCtxGlobalsProxy@sha", FilePath: "src/flask/globals.py", Language: "python",
+			Kind: core.KindClass, Name: "_AppCtxGlobalsProxy", QualifiedName: "_AppCtxGlobalsProxy",
+			Signature: "class _AppCtxGlobalsProxy(ProxyMixin[_AppCtxGlobals], _AppCtxGlobals)"},
+		// The class carrying the custom __setattr__.
+		{ID: "ctx.py::_AppCtxGlobals@sha", FilePath: "src/flask/ctx.py", Language: "python",
+			Kind: core.KindClass, Name: "_AppCtxGlobals", QualifiedName: "_AppCtxGlobals"},
+		{ID: "ctx.py::_AppCtxGlobals.__setattr__@sha", FilePath: "src/flask/ctx.py", Language: "python",
+			Kind: core.KindMethod, Name: "__setattr__", QualifiedName: "_AppCtxGlobals.__setattr__",
+			ParentSymbol: "_AppCtxGlobals", RawText: "def __setattr__(self, name, value):\n    self.__dict__[name] = value\n"},
+		// A test that assigns through the global. Imports flask, NOT flask.ctx.
+		{ID: "test_basic.py::test_g@sha", FilePath: "tests/test_basic.py", Language: "python",
+			Kind: core.KindFunction, Name: "test_g", QualifiedName: "test_g",
+			Imports: []string{"flask"},
+			RawText: "def test_g():\n    flask.g.foo = 42\n"},
+	}, 5)
+	if !hasEdge(g, core.EdgeCalls, "test_basic.py::test_g@sha", "ctx.py::_AppCtxGlobals.__setattr__@sha") {
+		t.Fatalf("expected calls edge from test through module-global proxy to _AppCtxGlobals.__setattr__")
+	}
+	if !hasEdge(g, core.EdgeTests, "test_basic.py::test_g@sha", "ctx.py::_AppCtxGlobals.__setattr__@sha") {
+		t.Fatalf("expected tests edge (scope guard must be bypassed for the trusted dunder edge)")
+	}
+}
+
 // ─── TestsFor traverses tests edges and transitive callers ───────────────────
 
 func TestTestsForFollowsTestsEdge(t *testing.T) {
