@@ -3,6 +3,8 @@ package graph
 import (
 	"fmt"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/provasign/grove/internal/core"
@@ -82,6 +84,23 @@ func (r *ChangeImpactResult) Sites() []core.SymbolRecord {
 func (g *CodeGraph) ChangeImpact(query string) (*ChangeImpactResult, error) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
+
+	// Accept a bare member name or file:line and pin it to the canonical
+	// Type.method form (unambiguous only — see resolveLooseQueryLocked).
+	// Already-canonical queries pass through untouched.
+	resolved, err := g.resolveLooseQueryLocked(query)
+	if err != nil {
+		return nil, err
+	}
+	query = resolved
+
+	// A package-level function has no declaring type, so there is no override
+	// family to close over and the Type.method parser below cannot represent
+	// it. Its blast radius is exactly its callers — reported as such, with
+	// completeness downgraded so no consumer mistakes it for a closed set.
+	if free := g.freeFunctionImpactLocked(query); free != nil {
+		return free, nil
+	}
 
 	typeName, methodName, queryParams, err := parseChangeImpactQuery(query)
 	if err != nil {
@@ -654,6 +673,266 @@ func (g *CodeGraph) containedMethods(typeIDs []string, methodName string) []core
 		}
 	}
 	return out
+}
+
+// maxLooseCandidates bounds how many candidates a bare-name error lists —
+// enough to disambiguate by hand, short enough to stay readable.
+const maxLooseCandidates = 10
+
+// resolveLooseQueryLocked turns a caller-friendly query into the canonical
+// "Type.method" form the change-set parser requires. The caller must hold at
+// least g.mu.RLock.
+//
+// Rationale: change_impact/rename_plan/missing_implementations demanded
+// "Type.method" and rejected everything else, so a perfectly unambiguous
+// `change-impact Render` failed outright — a real ergonomic wall (it is what
+// broke the gin task in our own benchmark harness).
+//
+// Deliberately never guesses. A name that resolves to exactly one member
+// symbol is pinned silently; anything ambiguous returns the candidates and
+// makes the caller choose, because the completeness claim these tools carry
+// is worthless if the tool silently answered about a different symbol.
+//
+// Accepted forms:
+//   - "Type.method", "Type.method(P)", "pkg.Type.method" — returned unchanged
+//     (fast path: an interior dot means it is already canonical).
+//   - "method"      — pinned to "Type.method" when exactly one member matches.
+//   - "file.go:120" — the member whose span contains that line.
+func (g *CodeGraph) resolveLooseQueryLocked(query string) (string, error) {
+	q := strings.TrimSpace(query)
+	// A parameter list may itself contain dots ("m(java.util.Map)"), so judge
+	// canonical-ness on the part before "(".
+	head := q
+	if i := strings.IndexByte(head, '('); i >= 0 {
+		head = head[:i]
+	}
+	if dot := strings.LastIndexByte(head, '.'); dot > 0 && dot < len(head)-1 {
+		if !looksLikeFileRef(head) {
+			return q, nil // already canonical
+		}
+	}
+
+	// file.go:120 — resolve through the symbol whose span covers the line.
+	if path, line, ok := parseFileLineRef(q); ok {
+		return g.resolveFileLineLocked(query, path, line)
+	}
+
+	if head == "" {
+		return "", fmt.Errorf("change-impact: empty query")
+	}
+
+	// Bare member name: collect every function/method symbol with that name.
+	type cand struct {
+		sym *core.SymbolRecord
+	}
+	var matches []cand
+	for i := range g.symbols {
+		s := g.symbols[i]
+		if s.Name != head {
+			continue
+		}
+		switch s.Kind {
+		case core.KindMethod, core.KindFunction, core.KindConstructor:
+		default:
+			continue
+		}
+		sym := s
+		matches = append(matches, cand{sym: &sym})
+	}
+	if len(matches) == 0 {
+		return "", fmt.Errorf("change-impact: no method or function named %q is indexed%s",
+			query, g.didYouMeanLocked(head))
+	}
+
+	// Collapse to the distinct canonical queries the matches imply: several
+	// files declaring the same Type.method (overrides) are ONE query, and
+	// resolving it is exactly what change_impact then expands.
+	canonical := map[string][]*core.SymbolRecord{}
+	var order []string
+	for _, m := range matches {
+		c := canonicalQueryFor(m.sym)
+		if _, seen := canonical[c]; !seen {
+			order = append(order, c)
+		}
+		canonical[c] = append(canonical[c], m.sym)
+	}
+	if len(order) == 1 {
+		return order[0], nil
+	}
+	sort.Strings(order)
+	return "", fmt.Errorf("change-impact: %q is ambiguous — %d candidates:%s\nre-run with one of these",
+		query, len(order), formatCandidates(order, canonical))
+}
+
+// freeFunctionImpactLocked returns the callers-only change-set for a
+// package-level function (a query with no dot that resolved to symbols
+// carrying no ParentSymbol), or nil when the query is not that shape.
+//
+// Completeness is "callers-only": there is no type hierarchy to close over,
+// so the answer is every resolved inbound call edge and nothing more. Callers
+// must not read it as the closed guarantee Type.method queries carry.
+func (g *CodeGraph) freeFunctionImpactLocked(query string) *ChangeImpactResult {
+	if strings.ContainsAny(query, ".(") {
+		return nil
+	}
+	var decls []core.SymbolRecord
+	declIDs := map[string]bool{}
+	for id := range g.symbols {
+		s := g.symbols[id]
+		if s.Name != query || s.ParentSymbol != "" {
+			continue
+		}
+		switch s.Kind {
+		case core.KindFunction, core.KindMethod, core.KindConstructor:
+		default:
+			continue
+		}
+		decls = append(decls, s)
+		declIDs[s.ID] = true
+	}
+	if len(decls) == 0 {
+		return nil
+	}
+	seen := map[string]bool{}
+	var callers []core.SymbolRecord
+	for id := range declIDs {
+		for _, ei := range g.inbound[id] {
+			edge := g.edges[ei]
+			if edge.Type != core.EdgeCalls || declIDs[edge.From] || seen[edge.From] {
+				continue
+			}
+			seen[edge.From] = true
+			if s, ok := g.symbols[edge.From]; ok {
+				callers = append(callers, s)
+			}
+		}
+	}
+	sortSymbols(decls)
+	sortSymbols(callers)
+	return &ChangeImpactResult{
+		Query:        query,
+		Declarations: decls,
+		Callers:      callers,
+		Completeness: "callers-only",
+	}
+}
+
+// canonicalQueryFor renders the canonical query for a symbol: "Type.method"
+// for members, and the bare name for a package-level function (which has no
+// declaring type — change_impact handles those through its callers-only path).
+func canonicalQueryFor(s *core.SymbolRecord) string {
+	if s.ParentSymbol != "" {
+		return s.ParentSymbol + "." + s.Name
+	}
+	return s.Name
+}
+
+// formatCandidates renders one line per candidate query with a sample location.
+func formatCandidates(order []string, byQuery map[string][]*core.SymbolRecord) string {
+	var b strings.Builder
+	for i, q := range order {
+		if i >= maxLooseCandidates {
+			fmt.Fprintf(&b, "\n  … and %d more", len(order)-maxLooseCandidates)
+			break
+		}
+		syms := byQuery[q]
+		fmt.Fprintf(&b, "\n  %s", q)
+		if len(syms) > 0 {
+			fmt.Fprintf(&b, "  (%s:%d", syms[0].FilePath, syms[0].Span.Start)
+			if n := len(syms); n > 1 {
+				fmt.Fprintf(&b, " +%d more", n-1)
+			}
+			b.WriteString(")")
+		}
+	}
+	return b.String()
+}
+
+// didYouMeanLocked appends a short list of indexed member names sharing the
+// query's case-insensitive prefix, so a typo is self-correcting.
+func (g *CodeGraph) didYouMeanLocked(name string) string {
+	if len(name) < 3 {
+		return ""
+	}
+	lower := strings.ToLower(name)
+	seen := map[string]bool{}
+	var near []string
+	for id := range g.symbols {
+		s := g.symbols[id]
+		switch s.Kind {
+		case core.KindMethod, core.KindFunction, core.KindConstructor:
+		default:
+			continue
+		}
+		ls := strings.ToLower(s.Name)
+		if ls == lower || seen[s.Name] {
+			continue
+		}
+		if strings.HasPrefix(ls, lower) || strings.HasPrefix(lower, ls) {
+			seen[s.Name] = true
+			near = append(near, canonicalQueryFor(&s))
+		}
+	}
+	if len(near) == 0 {
+		return ""
+	}
+	sort.Strings(near)
+	if len(near) > maxLooseCandidates {
+		near = near[:maxLooseCandidates]
+	}
+	return " — did you mean: " + strings.Join(near, ", ")
+}
+
+// looksLikeFileRef reports whether a dotted token is really a path reference
+// ("render/json.go:12", "config.py:40") rather than a Type.method query.
+func looksLikeFileRef(s string) bool {
+	_, _, ok := parseFileLineRef(s)
+	return ok
+}
+
+// parseFileLineRef splits "path/to/file.ext:120".
+func parseFileLineRef(s string) (path string, line int, ok bool) {
+	i := strings.LastIndexByte(s, ':')
+	if i <= 0 || i == len(s)-1 {
+		return "", 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(s[i+1:]))
+	if err != nil || n <= 0 {
+		return "", 0, false
+	}
+	p := strings.TrimSpace(s[:i])
+	if p == "" || !strings.Contains(p, ".") {
+		return "", 0, false
+	}
+	return p, n, true
+}
+
+// resolveFileLineLocked pins the innermost member whose span contains line.
+func (g *CodeGraph) resolveFileLineLocked(query, path string, line int) (string, error) {
+	var best *core.SymbolRecord
+	for id := range g.symbols {
+		s := g.symbols[id]
+		if s.FilePath != path {
+			continue
+		}
+		switch s.Kind {
+		case core.KindMethod, core.KindFunction, core.KindConstructor:
+		default:
+			continue
+		}
+		if line < s.Span.Start || line > s.Span.End {
+			continue
+		}
+		// Innermost wins: the tightest span containing the line.
+		if best == nil || (s.Span.End-s.Span.Start) < (best.Span.End-best.Span.Start) {
+			sym := s
+			best = &sym
+		}
+	}
+	if best == nil {
+		return "", fmt.Errorf("change-impact: no method or function at %s covering line %d", path, line)
+	}
+	return canonicalQueryFor(best), nil
 }
 
 // parseChangeImpactQuery splits "Type.method" / "Type.method(A, B)" /

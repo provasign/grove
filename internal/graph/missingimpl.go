@@ -63,6 +63,14 @@ func (g *CodeGraph) MissingImplementations(query string) (*MissingImplementation
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
+	// Same lenient front-end as ChangeImpact: a bare, unambiguous member name
+	// resolves to Type.method; ambiguity errors with candidates.
+	resolved, err := g.resolveLooseQueryLocked(query)
+	if err != nil {
+		return nil, err
+	}
+	query = resolved
+
 	typeName, methodName, queryParams, err := parseChangeImpactQuery(query)
 	if err != nil {
 		return nil, err

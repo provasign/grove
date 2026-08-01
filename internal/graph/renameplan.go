@@ -49,7 +49,11 @@ func (g *CodeGraph) RenamePlan(query, newName string) (*RenamePlanResult, error)
 	if err != nil {
 		return nil, err
 	}
-	_, methodName, _, err := parseChangeImpactQuery(query)
+	// Parse the RESOLVED query ChangeImpact reports, not the caller's raw
+	// input: with lenient resolution the two can differ ("Render" ->
+	// "Render.Render"), and re-parsing the raw form would either fail or
+	// recover a method name the plan was not computed for.
+	_, methodName, _, err := parseChangeImpactQuery(ci.Query)
 	if err != nil {
 		return nil, err
 	}
