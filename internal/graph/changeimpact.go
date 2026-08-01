@@ -109,6 +109,14 @@ func (g *CodeGraph) ChangeImpact(query string) (*ChangeImpactResult, error) {
 
 	// 1. The named type(s). Same-named types in distinct files all seed —
 	// the caller disambiguates by file path in the result.
+	//
+	// SORTED: g.symbols is a map, so an unsorted seed list makes
+	// containedMethods return declarations in map order. decls[0] anchors
+	// declParams/wildcards for the whole family filter below, so an unstable
+	// order silently drops legitimate overrides on some runs and not others
+	// (measured before this fix: 300 identical queries over two same-named
+	// types returned an empty family 231 times and the correct family 69).
+	// Determinism is the product's core claim; it starts here.
 	var typeIDs []string
 	for id, s := range g.symbols {
 		if s.Name != typeName {
@@ -119,6 +127,7 @@ func (g *CodeGraph) ChangeImpact(query string) (*ChangeImpactResult, error) {
 			typeIDs = append(typeIDs, id)
 		}
 	}
+	sort.Strings(typeIDs)
 	if len(typeIDs) == 0 {
 		// External-rooted query: the named type is not in the index (a JDK or
 		// dependency type, e.g. "java.util.Iterator.next"). The well-posed
@@ -130,6 +139,10 @@ func (g *CodeGraph) ChangeImpact(query string) (*ChangeImpactResult, error) {
 	// 2. Declaration(s): methods named methodName contained in the named type,
 	// filtered by the query's parameter list when one was given.
 	decls := g.containedMethods(typeIDs, methodName)
+	// Belt and braces on the anchor: sort the declarations themselves so
+	// decls[0] is a pure function of the graph content, independent of how
+	// the seeds were gathered.
+	sortSymbols(decls)
 	if len(queryParams) > 0 && len(decls) > 0 {
 		if byParams := filterByParamTypes(decls, queryParams); len(byParams) > 0 {
 			decls = byParams
@@ -152,6 +165,27 @@ func (g *CodeGraph) ChangeImpact(query string) (*ChangeImpactResult, error) {
 	if len(decls) > 0 {
 		declParams = paramTypesOf(&decls[0])
 		wildcards = typeParamWildcards(g.symbols, &decls[0])
+	}
+	// Every seeded declaration is an anchor, not just the first. Same-named
+	// types in distinct files all seed (see step 1), and they may declare
+	// DIFFERENT signatures — anchoring only on decls[0] silently dropped the
+	// implementations of every other seed from the family. A member is kept
+	// when it is compatible with ANY declaration in the change-set, which is
+	// the only reading consistent with returning all of them as sites.
+	anchors := []signatureAnchor{{params: declParams, wildcards: wildcards}}
+	for i := 1; i < len(decls); i++ {
+		anchors = append(anchors, signatureAnchor{
+			params:    paramTypesOf(&decls[i]),
+			wildcards: typeParamWildcards(g.symbols, &decls[i]),
+		})
+	}
+	compatibleWithAnyDecl := func(cand []string) bool {
+		for _, a := range anchors {
+			if signatureCompatible(a.params, cand, a.wildcards) {
+				return true
+			}
+		}
+		return false
 	}
 
 	// 3. Subtype closure (downward): inbound extends/implements edges.
@@ -185,12 +219,13 @@ func (g *CodeGraph) ChangeImpact(query string) (*ChangeImpactResult, error) {
 	for id := range closure {
 		closureIDs = append(closureIDs, id)
 	}
+	sort.Strings(closureIDs) // closure is a map; family order must not vary
 	var family []core.SymbolRecord
 	for _, m := range g.containedMethods(closureIDs, methodName) {
 		if declIDs[m.ID] {
 			continue
 		}
-		if signatureCompatible(declParams, paramTypesOf(&m), wildcards) {
+		if compatibleWithAnyDecl(paramTypesOf(&m)) {
 			family = append(family, m)
 		}
 	}
@@ -275,7 +310,7 @@ func (g *CodeGraph) ChangeImpact(query string) (*ChangeImpactResult, error) {
 			contractIDs = append(contractIDs, id)
 		}
 		for _, m := range g.containedMethods(contractIDs, methodName) {
-			if !declIDs[m.ID] && !superSeen[m.ID] && signatureCompatible(declParams, paramTypesOf(&m), wildcards) {
+			if !declIDs[m.ID] && !superSeen[m.ID] && compatibleWithAnyDecl(paramTypesOf(&m)) {
 				superSeen[m.ID] = true
 				supers = append(supers, m)
 			}
@@ -479,6 +514,7 @@ func (g *CodeGraph) externalRootedImpact(query, typeName, methodName string, que
 	for id := range closure {
 		closureIDs = append(closureIDs, id)
 	}
+	sort.Strings(closureIDs) // closure is a map; family order must not vary
 
 	family := g.containedMethods(closureIDs, methodName)
 	if len(queryParams) > 0 {
@@ -673,6 +709,13 @@ func (g *CodeGraph) containedMethods(typeIDs []string, methodName string) []core
 		}
 	}
 	return out
+}
+
+// signatureAnchor is one declaration's parameter list plus the type
+// parameters that act as wildcards when matching overrides against it.
+type signatureAnchor struct {
+	params    []string
+	wildcards map[string]bool
 }
 
 // maxLooseCandidates bounds how many candidates a bare-name error lists —

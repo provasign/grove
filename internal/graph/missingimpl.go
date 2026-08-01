@@ -2,6 +2,7 @@ package graph
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/provasign/grove/internal/core"
@@ -87,12 +88,18 @@ func (g *CodeGraph) MissingImplementations(query string) (*MissingImplementation
 			typeIDs = append(typeIDs, id)
 		}
 	}
+	// SORTED for the same reason as ChangeImpact: g.symbols is a map, and
+	// contract[0] anchors declParams/wildcards for the whole closure filter.
+	// An unstable seed order silently changes which types are reported as
+	// missing an implementation.
+	sort.Strings(typeIDs)
 	if len(typeIDs) == 0 {
 		return nil, fmt.Errorf("missing-implementations: type %q is not indexed (for an external contract, query a project type that declares it)", typeName)
 	}
 
 	// 2. The contract: the member's declaration(s) on the seed type.
 	contract := g.containedMethods(typeIDs, methodName)
+	sortSymbols(contract)
 	if len(queryParams) > 0 && len(contract) > 0 {
 		if byParams := filterByParamTypes(contract, queryParams); len(byParams) > 0 {
 			contract = byParams
