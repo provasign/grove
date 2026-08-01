@@ -7,6 +7,11 @@ on:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
   GO_VERSION: "1.26.3"
+  # The prism release grove dogfoods its own diffs against. BUMP THIS WITH
+  # EVERY PRISM RELEASE: a stale pin means the gate reporting on grove PRs is
+  # an old gate — v0.30.0 sat here through four releases, so grove's dogfood
+  # ran a verify missing every false-complete fix those releases carried.
+  PRISM_VERSION: "v0.34.0"
 jobs:
   test:
     name: Test (${{ matrix.os }})
@@ -41,7 +46,7 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
       - name: install prism (pinned)
-        run: go install github.com/provasign/prism/cmd/prism@v0.30.0
+        run: go install github.com/provasign/prism/cmd/prism@${{ env.PRISM_VERSION }}
       - name: verify diff vs base
         continue-on-error: true
         run: |
