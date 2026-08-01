@@ -43,10 +43,6 @@ type (
 	CertificationFinding = core.CertificationFinding
 	EvidenceRef          = core.EvidenceRef
 	Verdict              = core.Verdict
-	Scored               = struct {
-		Symbol *core.SymbolRecord
-		Score  float64
-	}
 )
 
 // Edge-type constants re-exported so consumers can filter Neighbors() without
@@ -255,54 +251,18 @@ func QuickStatus(ctx context.Context, repoRoot string) (Status, error) {
 	return st.Status(ctx)
 }
 
-// Query resolves a natural-language intent into ranked symbols by blending
-// TF-IDF semantic search with substring keyword matches.
-func (e *Engine) Query(ctx context.Context, intent string, limit int) ([]Symbol, error) {
-	if limit <= 0 {
-		limit = 50
-	}
-	cg := e.currentGraph()
-	scored := cg.SemanticSearch(intent, limit)
-	seen := make(map[string]bool, len(scored))
-	out := make([]Symbol, 0, limit)
-	for _, sc := range scored {
-		if sc.Symbol == nil {
-			continue
-		}
-		seen[sc.Symbol.ID] = true
-		out = append(out, *sc.Symbol)
-	}
-	for _, sym := range cg.Search(intent, limit) {
-		if seen[sym.ID] {
-			continue
-		}
-		out = append(out, sym)
-		if len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
 // Symbols returns symbols whose name/qualified-name matches query (substring).
+// This is the only lexical/name search Engine exposes: the embedding-based
+// Query/Semantic ops were removed (measured: an agent guessing one keyword
+// through this beats them on 12/15 concept queries — see the 2026-08-01
+// evaluation). A caller with no candidate name should derive one (grep a
+// domain term, read directory structure) rather than hand a raw sentence
+// here — Search is substring-only and a full sentence will not match.
 func (e *Engine) Symbols(ctx context.Context, query string, limit int) ([]Symbol, error) {
 	if limit <= 0 {
 		limit = 50
 	}
 	return e.currentGraph().Search(query, limit), nil
-}
-
-// Semantic returns TF-IDF-ranked symbols with cosine-similarity scores.
-func (e *Engine) Semantic(ctx context.Context, query string, limit int) ([]Scored, error) {
-	if limit <= 0 {
-		limit = 20
-	}
-	raw := e.currentGraph().SemanticSearch(query, limit)
-	out := make([]Scored, 0, len(raw))
-	for _, sc := range raw {
-		out = append(out, Scored{Symbol: sc.Symbol, Score: sc.Score})
-	}
-	return out, nil
 }
 
 // Deps returns the outgoing dependency edges for filePath.

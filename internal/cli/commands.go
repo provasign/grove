@@ -45,8 +45,6 @@ func Run(args []string) int {
 		return doctor(args[1:])
 	case "symbols":
 		return symbols(engine, codeGraph, args[1:])
-	case "query":
-		return query(engine, codeGraph, args[1:])
 	case "deps":
 		return deps(engine, codeGraph, args[1:])
 	case "impact":
@@ -246,37 +244,6 @@ func symbols(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) i
 	return printJSON(map[string]any{"symbols": codeGraph.Search(query, 50)})
 }
 
-// query is the semantic-search CLI: free-text intent → Model2Vec-ranked
-// symbols. Distinct from `symbols`, which does lexical substring matching
-// across name/qualifiedName/filePath/signature. The two commands map to
-// the two distinct retrieval surfaces Grove exposes.
-func query(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int {
-	args, refresh := stripRefresh(args)
-	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: grove query <intent> [dir] [--refresh]")
-		return 2
-	}
-	intent := args[0]
-	cfg, err := config.Resolve(argOrDefault(args, 1, "."))
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	root := cfg.Root
-	if err := prepareReadGraph(engine, codeGraph, root, refresh); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	scored := codeGraph.SemanticSearch(intent, 20)
-	results := make([]map[string]any, 0, len(scored))
-	for _, s := range scored {
-		results = append(results, map[string]any{
-			"symbol": s.Symbol,
-			"score":  s.Score,
-		})
-	}
-	return printJSON(map[string]any{"results": results})
-}
 
 func deps(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int {
 	args, refresh := stripRefresh(args)
@@ -729,7 +696,6 @@ Usage:
   grove status [dir] [--refresh]
   grove doctor [dir]
   grove symbols <query> [dir] [--refresh]        lexical substring search over names/paths/signatures
-  grove query <intent> [dir] [--refresh]         semantic search (Model2Vec embeddings)
   grove deps <file> [dir] [--refresh]
   grove impact <symbol-or-file-query> [dir] [--refresh]
   grove change-impact <Type.method(Params)> [dir]   type-resolved change-set: declaration + override family + callers

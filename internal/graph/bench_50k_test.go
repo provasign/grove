@@ -115,22 +115,6 @@ func Benchmark50K_BFSDepth3(b *testing.B) {
 	}
 }
 
-// Benchmark50K_Semantic measures a single TF-IDF query against the engine.
-func Benchmark50K_Semantic(b *testing.B) {
-	g := New()
-	g.Replace(generate50KSymbols(), 5000)
-	// Warm the engine so we measure query cost, not index build.
-	_ = g.SemanticSearch("handles request", 20)
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		out := g.SemanticSearch("handles request", 20)
-		if len(out) == 0 {
-			b.Fatal("expected results")
-		}
-	}
-}
-
 // Test50K_TargetsAreMet runs each benchmark once and prints a pass/fail
 // summary against the roadmap targets. This is a real Test (not a Benchmark)
 // so it shows up in `go test ./...`. Skipped in -short.
@@ -169,14 +153,6 @@ func Test50K_TargetsAreMet(t *testing.T) {
 	bfsPer := time.Since(start) / iters
 	t.Logf("BFS depth-3 50K: %v/op (target: <30ms)", bfsPer)
 
-	// Warm the semantic engine, then time a single query.
-	_ = g.SemanticSearch("handles request", 20)
-	start = time.Now()
-	for i := 0; i < iters; i++ {
-		_ = g.SemanticSearch("handles request", 20)
-	}
-	semPer := time.Since(start) / iters
-	t.Logf("SemanticSearch 50K: %v/op", semPer)
 }
 
 // Sanity: the generator must produce 50K symbols and a connected import chain.

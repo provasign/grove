@@ -27,7 +27,7 @@ func TestMCPToolsList(t *testing.T) {
 	if err := NewServer(root, graph.New(), parser.NewEngine(), st).Serve(input, &output); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(output.String(), "grove_query") {
+	if !strings.Contains(output.String(), "grove_symbols") {
 		t.Fatalf("unexpected output: %s", output.String())
 	}
 }

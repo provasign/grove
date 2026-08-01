@@ -11,28 +11,7 @@ import (
 	"time"
 
 	"github.com/provasign/grove/internal/core"
-	"github.com/provasign/grove/internal/embeddings"
-	"github.com/provasign/grove/internal/embeddings/model2vec"
 )
-
-// newSemanticEngine selects the embedding backend per process. Model2Vec is
-// the default — it ships embedded in the binary and delivers true semantic
-// similarity (synonym/paraphrase matching). TF-IDF is the lexical fallback
-// for users who explicitly opt out via GROVE_EMBEDDINGS=tfidf, and the
-// automatic fallback if Model2Vec initialisation ever fails.
-func newSemanticEngine() embeddings.Engine {
-	if os.Getenv("GROVE_EMBEDDINGS") == "tfidf" {
-		return embeddings.NewTFIDF()
-	}
-	eng, err := model2vec.Default()
-	if err != nil {
-		// Defensive: the model is //go:embed'd so this should never fail
-		// in practice, but if it ever does we want search to keep working
-		// rather than crash. TF-IDF retains the lexical baseline.
-		return embeddings.NewTFIDF()
-	}
-	return eng
-}
 
 type CodeGraph struct {
 	mu           sync.RWMutex
@@ -55,19 +34,11 @@ type CodeGraph struct {
 	// per install instead of once per query.
 	byName map[string][]string
 
-	// Lazily-built semantic-search engine. Invalidated on every Replace().
-	// semVecCache survives invalidation: vectors are keyed by symbol ID
-	// (content-hashed), so unchanged symbols skip re-embedding when the
-	// engine rebuilds after a delta reindex.
-	semMu       sync.Mutex
-	semEngine   embeddings.Engine
-	semDirty    bool
-	semVecCache map[string][]float32
 }
 
 
 func New() *CodeGraph {
-	return &CodeGraph{symbols: map[string]core.SymbolRecord{}, semDirty: true}
+	return &CodeGraph{symbols: map[string]core.SymbolRecord{}}
 }
 
 func (g *CodeGraph) Replace(symbols []core.SymbolRecord, filesIndexed int) {
@@ -170,10 +141,6 @@ func (g *CodeGraph) install(symbols []core.SymbolRecord, edges []core.Edge, file
 	}()
 	wg.Wait()
 
-	g.semMu.Lock()
-	g.semDirty = true
-	g.semEngine = nil
-	g.semMu.Unlock()
 }
 
 // idsNamed returns the IDs of every symbol whose Name is exactly name, in
@@ -825,39 +792,3 @@ func confidenceForSeeds(count int) float64 {
 	}
 }
 
-// SemanticSearch ranks symbols against a free-text intent using the
-// configured embedding backend (Model2Vec by default; TF-IDF if
-// GROVE_EMBEDDINGS=tfidf). Documents are constructed from
-// (name + qualifiedName + signature + docstring + parent). The engine is
-// built lazily and cached until the next Replace().
-func (g *CodeGraph) SemanticSearch(query string, limit int) []embeddings.Scored {
-	if limit <= 0 {
-		limit = 20
-	}
-	// Always acquire g.mu before g.semMu to match the order in Replace(),
-	// which holds g.mu.Lock then acquires g.semMu. Inverting the order
-	// (semMu then g.mu) creates a deadlock with a concurrent Replace().
-	g.mu.RLock()
-	g.semMu.Lock()
-	if g.semEngine == nil || g.semDirty {
-		syms := make([]core.SymbolRecord, 0, len(g.symbols))
-		for _, s := range g.symbols {
-			syms = append(syms, s)
-		}
-		eng := newSemanticEngine()
-		if cacher, ok := eng.(embeddings.VectorCacher); ok {
-			if g.semVecCache == nil {
-				g.semVecCache = map[string][]float32{}
-			}
-			cacher.IndexWithCache(syms, g.semVecCache)
-		} else {
-			eng.Index(syms)
-		}
-		g.semEngine = eng
-		g.semDirty = false
-	}
-	eng := g.semEngine
-	g.semMu.Unlock()
-	g.mu.RUnlock()
-	return eng.Query(query, limit)
-}

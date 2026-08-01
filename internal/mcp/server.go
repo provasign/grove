@@ -136,8 +136,6 @@ func (s *Server) callTool(name string, args map[string]any) (any, error) {
 		s.graph = codeGraph
 		s.mu.Unlock()
 		return result, nil
-	case "grove_query":
-		return map[string]any{"results": semanticResults(s.currentGraph(), stringArg(args, "intent", ""), intArg(args, "limit", 50))}, nil
 	case "grove_symbols":
 		return map[string]any{"symbols": slimSymbols(s.currentGraph().Search(stringArg(args, "query", ""), intArg(args, "limit", 50)), 0)}, nil
 	case "grove_deps":
@@ -257,24 +255,6 @@ func slimSymbols(symbols []core.SymbolRecord, limit int) []SlimSymbol {
 	return out
 }
 
-func semanticResults(codeGraph *graph.CodeGraph, intent string, limit int) []map[string]any {
-	if limit <= 0 {
-		limit = 50
-	}
-	scored := codeGraph.SemanticSearch(intent, limit)
-	results := make([]map[string]any, 0, len(scored))
-	for _, s := range scored {
-		if s.Symbol == nil {
-			continue
-		}
-		results = append(results, map[string]any{
-			"symbol": slimSymbol(*s.Symbol),
-			"score":  s.Score,
-		})
-	}
-	return results
-}
-
 func (s *Server) currentGraph() *graph.CodeGraph {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -308,14 +288,6 @@ func tools() []map[string]any {
 			"inputSchema": objectSchema(nil, map[string]any{
 				"dir":   dirProp,
 				"force": prop("boolean", "Re-run native analyzers and rebuild all edges even if no files changed (use after installing a language toolchain)."),
-			}),
-		},
-		{
-			"name":        "grove_query",
-			"description": "Semantic search: rank indexed symbols against a free-text intent using embeddings. Use for 'where is the code that does X' questions. Returns symbols with similarity scores.",
-			"inputSchema": objectSchema([]string{"intent"}, map[string]any{
-				"intent": prop("string", "Free-text description of what you are looking for, e.g. 'parse unified diff hunk headers'."),
-				"limit":  limitProp,
 			}),
 		},
 		{
