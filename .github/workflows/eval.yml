@@ -258,3 +258,11 @@ jobs:
         run: go build -o /tmp/grove-eval ./cmd/grove-eval
       - name: Score against snapshot baseline
         run: /tmp/grove-eval score --repo /tmp/commons-lang --truth eval/testdata/commons-lang@$COMMONSLANG_COMMIT/calls-truth.jsonl.gz --out-dir /tmp/eval-out --baseline eval/baseline.json
+      # Every other language job uploads its scorecard; this one did not, so a
+      # java regression failed the build and took the evidence with it.
+      - name: Upload scorecard
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: java-scorecard
+          path: /tmp/eval-out/
