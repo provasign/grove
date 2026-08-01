@@ -585,7 +585,7 @@ func (g *CodeGraph) ImpactWithPolicy(query string, maxDepth int, policy Traversa
 		for _, ei := range g.inbound[node] {
 			edge := g.edges[ei]
 			// Only traverse meaningful inbound edge types for blast radius
-			if edge.Type != core.EdgeCalls && edge.Type != core.EdgeTests &&
+			if edge.Type != core.EdgeCalls &&
 				edge.Type != core.EdgeContains && edge.Type != core.EdgeImplements &&
 				edge.Type != core.EdgeExtends && edge.Type != core.EdgeUsesType {
 				continue

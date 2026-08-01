@@ -252,6 +252,131 @@ func TestPythonModuleGlobalProxySetattr(t *testing.T) {
 	}
 }
 
+// TestPythonSetattrGuards covers the review-found precision holes in the
+// module-global __setattr__ resolution: (a) a parameter or local rebinding
+// that SHADOWS a module global must not resolve through the global's type;
+// (b) a chained attribute assignment through a VARIABLE head must resolve
+// nothing, even when the middle segment collides with a module global's
+// name; (c) a module-qualified chain (mod.global.attr=) resolves only when
+// the head is actually imported.
+func TestPythonSetattrGuards(t *testing.T) {
+	base := []core.SymbolRecord{
+		{ID: "globals.py::g@sha", FilePath: "globals.py", Language: "python",
+			Kind: core.KindVariable, Name: "g", QualifiedName: "g", Signature: "g: Holder"},
+		{ID: "globals.py::headers@sha", FilePath: "globals.py", Language: "python",
+			Kind: core.KindVariable, Name: "headers", QualifiedName: "headers", Signature: "headers: Holder"},
+		{ID: "holder.py::Holder@sha", FilePath: "holder.py", Language: "python",
+			Kind: core.KindClass, Name: "Holder", QualifiedName: "Holder"},
+		{ID: "holder.py::Holder.__setattr__@sha", FilePath: "holder.py", Language: "python",
+			Kind: core.KindMethod, Name: "__setattr__", QualifiedName: "Holder.__setattr__",
+			ParentSymbol: "Holder", RawText: "def __setattr__(self, n, v):\n    pass\n"},
+	}
+	target := "holder.py::Holder.__setattr__@sha"
+
+	// (a) parameter shadowing: def f(g): g.attr = 1 — param g is NOT the global.
+	g1 := New()
+	g1.Replace(append(append([]core.SymbolRecord{}, base...), core.SymbolRecord{
+		ID: "app.py::f@sha", FilePath: "app.py", Language: "python",
+		Kind: core.KindFunction, Name: "f", QualifiedName: "f",
+		RawText: "def f(g):\n    g.attr = 1\n"}), 3)
+	if hasEdge(g1, core.EdgeCalls, "app.py::f@sha", target) {
+		t.Fatalf("param-shadowed global must not resolve to __setattr__")
+	}
+
+	// (a2) local rebinding: g = make(); g.attr = 1 — local g is NOT the global.
+	g2 := New()
+	g2.Replace(append(append([]core.SymbolRecord{}, base...), core.SymbolRecord{
+		ID: "app.py::h@sha", FilePath: "app.py", Language: "python",
+		Kind: core.KindFunction, Name: "h", QualifiedName: "h",
+		RawText: "def h():\n    g = make()\n    g.attr = 1\n"}), 3)
+	if hasEdge(g2, core.EdgeCalls, "app.py::h@sha", target) {
+		t.Fatalf("locally-rebound global must not resolve to __setattr__")
+	}
+
+	// (b) chained through a variable head: resp.headers.foo = x — `headers`
+	// here is an attribute of resp, not the module global named headers.
+	g3 := New()
+	g3.Replace(append(append([]core.SymbolRecord{}, base...), core.SymbolRecord{
+		ID: "app.py::k@sha", FilePath: "app.py", Language: "python",
+		Kind: core.KindFunction, Name: "k", QualifiedName: "k",
+		RawText: "def k(resp):\n    resp.headers.foo = 1\n"}), 3)
+	if hasEdge(g3, core.EdgeCalls, "app.py::k@sha", target) {
+		t.Fatalf("variable-head chain must not resolve middle segment as a module global")
+	}
+
+	// (c) genuine unqualified global access still resolves.
+	g4 := New()
+	g4.Replace(append(append([]core.SymbolRecord{}, base...), core.SymbolRecord{
+		ID: "app.py::ok@sha", FilePath: "app.py", Language: "python",
+		Kind: core.KindFunction, Name: "ok", QualifiedName: "ok",
+		RawText: "def ok():\n    g.attr = 1\n"}), 3)
+	if !hasEdge(g4, core.EdgeCalls, "app.py::ok@sha", target) {
+		t.Fatalf("unshadowed global assignment must still resolve to __setattr__")
+	}
+}
+
+// TestPyParamNamesRobustness covers the review-found parsing holes: lambda
+// defaults and comma/paren-bearing string defaults must neither mint phantom
+// params (suppressing real call edges) nor abort parsing (disabling the
+// suppression guard entirely).
+func TestPyParamNamesRobustness(t *testing.T) {
+	// Lambda default: the lambda's own params are not params of f.
+	p := pyParamNames("def f(items, key=lambda a, b: cmp(a, b)):\n    pass")
+	if !p["items"] || !p["key"] {
+		t.Fatalf("real params missing: %v", p)
+	}
+	if p["a"] || p["b"] {
+		t.Fatalf("lambda params leaked as phantom params: %v", p)
+	}
+	// Comma inside a string default must not split.
+	p = pyParamNames(`def f(names="a, b, c", flag=True):` + "\n    pass")
+	if !p["names"] || !p["flag"] || p["b"] || p["c"] {
+		t.Fatalf("string-default comma mishandled: %v", p)
+	}
+	// Unbalanced paren inside a string default must not abort the scan —
+	// the suppression guard must still see `loads`.
+	p = pyParamNames(`def f(loads=json.loads, prompt="(y/n"):` + "\n    pass")
+	if !p["loads"] || !p["prompt"] {
+		t.Fatalf("quote-blind paren scan disabled param extraction: %v", p)
+	}
+}
+
+// TestPyDunderTargetsCrossFileCollision: an unrelated same-named class in
+// another package defining __setattr__ must not hijack resolution away from
+// the real hierarchy.
+func TestPyDunderTargetsCrossFileCollision(t *testing.T) {
+	g := New()
+	g.Replace([]core.SymbolRecord{
+		{ID: "globals.py::cfg@sha", FilePath: "app/globals.py", Language: "python",
+			Kind: core.KindVariable, Name: "cfg", QualifiedName: "cfg", Signature: "cfg: Config"},
+		// The REAL Config (no __setattr__ of its own) inherits Base.
+		{ID: "app/config.py::Config@sha", FilePath: "app/config.py", Language: "python",
+			Kind: core.KindClass, Name: "Config", QualifiedName: "Config",
+			Signature: "class Config(Base)"},
+		{ID: "app/base.py::Base@sha", FilePath: "app/base.py", Language: "python",
+			Kind: core.KindClass, Name: "Base", QualifiedName: "Base"},
+		{ID: "app/base.py::Base.__setattr__@sha", FilePath: "app/base.py", Language: "python",
+			Kind: core.KindMethod, Name: "__setattr__", QualifiedName: "Base.__setattr__",
+			ParentSymbol: "Base", RawText: "def __setattr__(self, n, v):\n    pass\n"},
+		// An UNRELATED Config in another package that happens to define one.
+		{ID: "vendor/other.py::Config@sha", FilePath: "vendor/other.py", Language: "python",
+			Kind: core.KindClass, Name: "Config", QualifiedName: "Config"},
+		{ID: "vendor/other.py::Config.__setattr__@sha", FilePath: "vendor/other.py", Language: "python",
+			Kind: core.KindMethod, Name: "__setattr__", QualifiedName: "Config.__setattr__",
+			ParentSymbol: "Config", RawText: "def __setattr__(self, n, v):\n    pass\n"},
+		// Caller in app/: its Config is app/config.py's (preferDir match).
+		{ID: "app/use.py::use@sha", FilePath: "app/use.py", Language: "python",
+			Kind: core.KindFunction, Name: "use", QualifiedName: "use",
+			RawText: "def use():\n    cfg.attr = 1\n"},
+	}, 5)
+	if hasEdge(g, core.EdgeCalls, "app/use.py::use@sha", "vendor/other.py::Config.__setattr__@sha") {
+		t.Fatalf("unrelated same-named class hijacked __setattr__ resolution")
+	}
+	if !hasEdge(g, core.EdgeCalls, "app/use.py::use@sha", "app/base.py::Base.__setattr__@sha") {
+		t.Fatalf("real hierarchy's inherited __setattr__ not reached")
+	}
+}
+
 func TestComputeICRNoSeedsHasZeroConfidence(t *testing.T) {
 	g := New()
 	icr := g.ComputeICR("nonexistent-feature")

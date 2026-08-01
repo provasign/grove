@@ -291,20 +291,10 @@ grove rename-plan 'Type.method' NewName [dir]
 # a default body, "missing" = inherits the default, breaks if made required
 grove missing-implementations 'Type.method' [dir]
 
-# The change-set partitioned by covering-test evidence: covered (a test
-# within 3 resolved caller hops) vs untested (write tests here first)
-grove untested-surface 'Type.method' [dir]
-
 # Unreachable production functions/methods. Precision-first: unreachable
 # AND non-exported AND name-unreferenced; caveats are part of the answer
 grove dead-code [dir] [--roots a,b]
 
-# Which tests cover a symbol?
-grove tests <symbol> [dir] [--refresh]
-
-# File-level test selection is an embedded-API operation: Engine.AffectedTests
-# (ctx, changedFiles) returns every test covering symbols in the changed files
-# — surfaced to agents/CI as `prism affected` (git diff --name-only | xargs prism affected)
 
 # Conservative structural certification for a unified diff.
 # Exit codes: 0 allow, 2 manual_review, 3 block, 1 runtime error.
@@ -358,7 +348,7 @@ There is no HTTP or gRPC daemon in the current embedded mode. Use `pkg/grove` fo
 
 ## MCP Tools
 
-Grove exposes nine tools over JSON-RPC 2.0 stdio, accessible to any MCP-capable AI agent. Every tool publishes a full JSON schema with per-parameter descriptions, so agents can discover arguments without guessing:
+Grove exposes eight tools over JSON-RPC 2.0 stdio, accessible to any MCP-capable AI agent. Every tool publishes a full JSON schema with per-parameter descriptions, so agents can discover arguments without guessing:
 
 | Tool | Purpose |
 |------|---------|
@@ -367,7 +357,6 @@ Grove exposes nine tools over JSON-RPC 2.0 stdio, accessible to any MCP-capable 
 | `grove_query` | Semantic search: ranked context for a free-text intent |
 | `grove_impact` | Blast radius for a symbol or file |
 | `grove_deps` | Dependency edges for a file |
-| `grove_tests` | Tests that cover a symbol |
 | `grove_icr` | Isolated Change Region for an intent |
 | `grove_conflicts` | Overlap check between two ICRs |
 | `grove_certify` | Conservative certification report for a unified diff |

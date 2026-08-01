@@ -75,7 +75,10 @@ func pyBareType(ann string) string {
 
 // pyDefParams extracts the parameter list of a def from its raw text,
 // scanning balanced parens (signatures are routinely multi-line, so the
-// stored first-line Signature is unusable).
+// stored first-line Signature is unusable). The scan is QUOTE-AWARE:
+// brackets inside string defaults (`prompt="(y/n"`) must not count, or the
+// list never closes and every downstream param-derived guard silently
+// disables itself.
 func pyDefParams(rawText string) string {
 	i := strings.Index(rawText, "def ")
 	if i < 0 {
@@ -87,8 +90,20 @@ func pyDefParams(rawText string) string {
 	}
 	start := i + j
 	depth := 0
+	var quote byte
 	for k := start; k < len(rawText); k++ {
-		switch rawText[k] {
+		c := rawText[k]
+		if quote != 0 {
+			if c == '\\' {
+				k++
+			} else if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch c {
+		case '\'', '"':
+			quote = c
 		case '(', '[', '{':
 			depth++
 		case ')', ']', '}':
@@ -117,7 +132,7 @@ func pyParamNames(rawText string) map[string]bool {
 	if params == "" {
 		return out
 	}
-	for _, g := range splitTopLevel(params, ',') {
+	for _, g := range pySplitParams(params) {
 		g = strings.TrimSpace(g)
 		g = strings.TrimLeft(g, "*")
 		if g == "" {
@@ -128,20 +143,97 @@ func pyParamNames(rawText string) map[string]bool {
 			name = g[:i]
 		}
 		name = strings.TrimSpace(name)
-		if name != "" && name != "self" && name != "cls" {
+		// Only accept fragments whose leading token is a plain identifier —
+		// a garbled fragment (unparseable default) must not mint a phantom
+		// param that would suppress a legitimate call edge.
+		if name != "" && name != "self" && name != "cls" && pyIdentRe.MatchString(name) {
 			out[name] = true
 		}
 	}
 	return out
 }
 
-// pySetattrAssignRe matches simple attribute-assignment statements
-// ("qualifier.attr = value"). The negative lookahead on a second "="
-// excludes comparisons (==); requiring "=" immediately after the attribute
-// name (no operator char before it) excludes augmented assignment (+=, -=,
-// ...) and comparisons whose operator has its own leading char (<=, >=, !=)
-// — those never reach the "=" at this position.
-var pySetattrAssignRe = regexp.MustCompile(`\b([A-Za-z_]\w*)\.[A-Za-z_]\w*\s*=(?:[^=]|$)`)
+var pyIdentRe = regexp.MustCompile(`^[A-Za-z_]\w*$`)
+
+// pySplitParams splits a def's parameter list at top-level commas, aware of
+// brackets, quotes, AND lambda defaults. splitTopLevel is quote-blind and
+// lambda-blind: `key=lambda a, b: cmp(a, b)` splits at the lambda's own
+// comma, and the fragment ` b: cmp(...)` minted a phantom param `b` that
+// wrongly suppressed calls to any real function named b (same failure via
+// comma-bearing string defaults, `names="a, b"`). Inside a lambda's
+// parameter list (from the `lambda` keyword to its top-level `:`), commas do
+// not split; inside quotes nothing splits or nests.
+func pySplitParams(s string) []string {
+	var parts []string
+	depth, start := 0, 0
+	var quote byte
+	inLambdaParams := false
+	for k := 0; k < len(s); k++ {
+		c := s[k]
+		if quote != 0 {
+			if c == '\\' {
+				k++
+			} else if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch c {
+		case '\'', '"':
+			quote = c
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			depth--
+		case ':':
+			if depth == 0 && inLambdaParams {
+				inLambdaParams = false
+			}
+		case ',':
+			if depth == 0 && !inLambdaParams {
+				parts = append(parts, s[start:k])
+				start = k + 1
+			}
+		default:
+			if c == 'l' && depth >= 0 && strings.HasPrefix(s[k:], "lambda") {
+				before := byte(' ')
+				if k > 0 {
+					before = s[k-1]
+				}
+				after := byte(' ')
+				if k+6 < len(s) {
+					after = s[k+6]
+				}
+				if !isWordByte(before) && !isWordByte(after) {
+					inLambdaParams = true
+					k += 5
+				}
+			}
+		}
+	}
+	parts = append(parts, s[start:])
+	return parts
+}
+
+func isWordByte(c byte) bool {
+	return c == '_' || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+// pySetattrAssignRe matches attribute-assignment statements of the forms
+// "qualifier.attr = value" and "module.qualifier.attr = value". The trailing
+// [^=] excludes comparisons (==); requiring "=" immediately after the
+// attribute name excludes augmented assignment (+=, -=, ...) and <=/>=/!=.
+// The LEADING [^.\w] (or start) anchors the chain head: with the old \b,
+// `resp.headers.foo = x` matched with qualifier `headers`, which was then
+// looked up as a bare NAME — any module global named `headers`/`session`
+// fabricated an implicit-dunder edge. Now the optional head group captures
+// the chain's first segment; the consumer accepts a two-segment chain ONLY
+// when the head is an imported module (flask.g.foo = x), never a variable.
+var pySetattrAssignRe = regexp.MustCompile(`(?:^|[^.\w])(?:([A-Za-z_]\w*)\.)?([A-Za-z_]\w*)\.[A-Za-z_]\w*\s*=(?:[^=]|$)`)
+
+// pyLocalRebindRe finds plain local rebindings ("name = expr" at statement
+// start) — used to detect names that shadow a module global inside a body.
+var pyLocalRebindRe = regexp.MustCompile(`(?m)^\s*([A-Za-z_]\w*)\s*=[^=]`)
 
 // pySetattrTargets resolves attribute-assignment statements in symbol's body
 // ("g.foo = value") to the __setattr__ of the assigned-to class, for classes
@@ -158,22 +250,53 @@ func pySetattrTargets(idx *edgeIndex, symbol *core.SymbolRecord, localTypes map[
 		return nil
 	}
 	body := stripCommentsAndStrings(symbol.RawText)
+	// Shadowing guard for the module-global fallback: a parameter or a plain
+	// local rebinding with the same name as a module global refers to the
+	// LOCAL value, not the global — resolving it through the global's type
+	// would fabricate an edge (the exact failure class the bare-call
+	// param-shadowing fix removed). Positive local typing (selfVars /
+	// localTypes) still wins above; this guard only blocks the fallback.
+	shadowed := pyParamNames(symbol.RawText)
+	for _, m := range pyLocalRebindRe.FindAllStringSubmatch(body, -1) {
+		shadowed[m[1]] = true
+	}
+	imports := idx.fileImports[symbol.FilePath]
+	isImportedModule := func(head string) bool {
+		if _, ok := imports[head]; ok {
+			return true
+		}
+		for imp := range imports {
+			if strings.HasSuffix(imp, "."+head) || strings.HasSuffix(imp, "/"+head) {
+				return true
+			}
+		}
+		return false
+	}
 	seenQual := map[string]bool{}
 	seenTarget := map[string]bool{}
 	preferDir := dirOf(symbol.FilePath)
 	var out []*core.SymbolRecord
 	for _, m := range pySetattrAssignRe.FindAllStringSubmatch(body, -1) {
-		qual := m[1]
-		if seenQual[qual] {
+		head, qual := m[1], m[2]
+		key := head + "." + qual
+		if seenQual[key] {
 			continue
 		}
-		seenQual[qual] = true
+		seenQual[key] = true
 		var className string
-		if _, isSelf := selfVars[qual]; isSelf {
+		if head != "" {
+			// Two-segment chain: accept only module-qualified global access
+			// (`flask.g.foo = x` with `import flask`). A variable head
+			// (`resp.headers.foo = x`) stays unresolved — the intermediate
+			// attribute's type is unknowable here.
+			if t, ok := idx.pyModuleGlobals[qual]; ok && isImportedModule(head) {
+				className = t
+			}
+		} else if _, isSelf := selfVars[qual]; isSelf {
 			className = symbol.ParentSymbol
 		} else if t, ok := localTypes[qual]; ok {
 			className = strings.TrimPrefix(t, "class:")
-		} else if t, ok := idx.pyModuleGlobals[qual]; ok {
+		} else if t, ok := idx.pyModuleGlobals[qual]; ok && !shadowed[qual] {
 			// Assignment through a module-level global (Flask's `g`):
 			// resolve the global's declared type, then walk its base
 			// classes below — the declared type is often a proxy stub
@@ -244,8 +367,18 @@ func pyDunderTargets(idx *edgeIndex, className, dunder, preferDir string) []*cor
 	for level := 0; level < 5 && len(queue) > 0; level++ {
 		var found []*core.SymbolRecord
 		for _, cn := range queue {
+			// Pin the class NAME to one class symbol (preferDir-preferred,
+			// same choice rule as pyBaseClasses) and accept only the dunder
+			// declared in THAT class's file. Bare ParentSymbol matching
+			// across all files let an unrelated same-named class in another
+			// package supply the wrong __setattr__ — and returned it at
+			// level 0, so the real ancestor was never reached.
+			cls := pyResolveClass(idx, cn, preferDir)
+			if cls == nil {
+				continue
+			}
 			for _, cand := range idx.byName[strings.ToLower(dunder)] {
-				if cand.Name == dunder && cand.ParentSymbol == cn {
+				if cand.Name == dunder && cand.ParentSymbol == cn && cand.FilePath == cls.FilePath {
 					found = append(found, cand)
 				}
 			}
@@ -265,6 +398,25 @@ func pyDunderTargets(idx *edgeIndex, className, dunder, preferDir string) []*cor
 		queue = next
 	}
 	return nil
+}
+
+// pyResolveClass picks the single class symbol a bare class name refers to,
+// preferring a declaration in preferDir (the caller's package) over
+// same-named classes elsewhere — the same choice rule pyBaseClasses applies.
+func pyResolveClass(idx *edgeIndex, className, preferDir string) *core.SymbolRecord {
+	var chosen *core.SymbolRecord
+	for _, cand := range idx.byName[strings.ToLower(className)] {
+		if cand.Name != className || cand.Kind != core.KindClass {
+			continue
+		}
+		if dirOf(cand.FilePath) == preferDir {
+			return cand
+		}
+		if chosen == nil {
+			chosen = cand
+		}
+	}
+	return chosen
 }
 
 // pyLocalTypes infers identifier → type name for one Python callable.

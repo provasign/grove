@@ -249,11 +249,30 @@ func missingTestFindings(changed []core.SymbolRecord, tests []core.SymbolRecord,
 	return findings
 }
 
+// symbolHasCoveringTest reports whether a covering test reaches symbolID
+// within a bounded INBOUND walk over impact edges. A single-hop check is not
+// enough: a test that exercises helper A which calls changed symbol B covers
+// B through the chain test→A→B — the removed heuristic tests edges used to
+// materialize that chain as one direct edge, so this walk restores the same
+// reach from the calls graph itself (mirrors coveringTests' depth bound).
 func symbolHasCoveringTest(symbolID string, testIDs map[string]struct{}, inbound map[string][]*core.Edge) bool {
-	for _, edge := range inbound[symbolID] {
-		if _, ok := testIDs[edge.From]; ok {
-			return true
+	const maxDepth = 6
+	visited := map[string]bool{symbolID: true}
+	frontier := []string{symbolID}
+	for depth := 0; depth < maxDepth && len(frontier) > 0; depth++ {
+		var next []string
+		for _, id := range frontier {
+			for _, edge := range inbound[id] {
+				if _, ok := testIDs[edge.From]; ok {
+					return true
+				}
+				if !visited[edge.From] && impactEdge(edge.Type) {
+					visited[edge.From] = true
+					next = append(next, edge.From)
+				}
+			}
 		}
+		frontier = next
 	}
 	return false
 }

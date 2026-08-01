@@ -444,3 +444,49 @@ func TestParseUnifiedDiffRejectsInvalidRange(t *testing.T) {
 		t.Fatal("expected invalid range error")
 	}
 }
+
+// TestCertifyDiffTransitiveTestCoverage: a test that exercises helper A
+// which calls changed symbol B must count as covering B — the removed
+// heuristic tests edges used to materialize test→B directly; the bounded
+// inbound walk in symbolHasCoveringTest must find it through the calls
+// chain instead.
+func TestCertifyDiffTransitiveTestCoverage(t *testing.T) {
+	cg := graph.New()
+	cg.Replace([]core.SymbolRecord{
+		{
+			ID: "auth.go::Helper@sha", FilePath: "auth.go", BlobSHA: "sha", Language: "go",
+			Kind: core.KindFunction, Name: "Helper", QualifiedName: "Helper",
+			Span:    core.LineRange{Start: 3, End: 6},
+			RawText: "func Helper() { Deep() }", CallSites: []core.CallSite{{Callee: "Deep", Line: 3}},
+		},
+		{
+			ID: "auth.go::Deep@sha", FilePath: "auth.go", BlobSHA: "sha", Language: "go",
+			Kind: core.KindFunction, Name: "Deep", QualifiedName: "Deep",
+			Span: core.LineRange{Start: 8, End: 11},
+		},
+		{
+			ID: "auth_test.go::TestHelper@sha", FilePath: "auth_test.go", BlobSHA: "sha", Language: "go",
+			Kind: core.KindFunction, Name: "TestHelper", QualifiedName: "TestHelper",
+			Span:    core.LineRange{Start: 3, End: 5},
+			RawText: "func TestHelper(t *testing.T) { Helper() }", CallSites: []core.CallSite{{Callee: "Helper", Line: 3}},
+		},
+	}, 2)
+
+	report := CertifyDiff(cg, core.DiffInput{
+		Policy: core.CertificationPolicy{RequireTestsForCode: true},
+		UnifiedDiff: `diff --git a/auth.go b/auth.go
+--- a/auth.go
++++ b/auth.go
+@@ -8,4 +8,4 @@
+ func Deep() {
+-	return
++	return // changed
+ }
+`})
+
+	for _, u := range report.Unknowns {
+		if u.Code == "tests_unknown" {
+			t.Fatalf("Deep is transitively covered by TestHelper via Helper; got spurious tests_unknown: %+v", report.Unknowns)
+		}
+	}
+}
