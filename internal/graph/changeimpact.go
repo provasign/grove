@@ -338,14 +338,23 @@ func (g *CodeGraph) ChangeImpact(query string) (*ChangeImpactResult, error) {
 		}
 	}
 
-	// 6. Callers: inbound call edges to any declaration or family member,
-	// resolved by symbol ID — never by name.
-	memberIDs := make(map[string]bool, len(decls)+len(family))
+	// 6. Callers: inbound call edges to any declaration, family member, OR
+	// super — resolved by symbol ID, never by name.
+	//
+	// Supers MUST be included. Sites() reports them as must-change sites and
+	// RenamePlan rewrites them at their declaration line, so a caller that
+	// reaches the member through a sibling contract is a real break: without
+	// this, the rename renamed the super's declaration and left its callers
+	// pointing at a method that no longer exists.
+	memberIDs := make(map[string]bool, len(decls)+len(family)+len(supers))
 	for id := range declIDs {
 		memberIDs[id] = true
 	}
 	for _, m := range family {
 		memberIDs[m.ID] = true
+	}
+	for _, s := range supers {
+		memberIDs[s.ID] = true
 	}
 	callerSeen := make(map[string]bool)
 	var callers []core.SymbolRecord
@@ -567,7 +576,10 @@ func (g *CodeGraph) externalRootedImpact(query, typeName, methodName string, que
 // reporting.
 func declaredSuperNames(s *core.SymbolRecord) []string {
 	switch s.Language {
-	case "typescript", "tsx", "javascript", "java":
+	case "typescript", "tsx", "javascript", "java", "php":
+		// PHP uses the same `extends`/`implements` keywords. Without this
+		// case a PHP class extending a vendor base always reported
+		// Completeness "closed" even though the contract left the index.
 		if s.Kind != core.KindClass && s.Kind != core.KindInterface {
 			return nil
 		}
@@ -578,6 +590,18 @@ func declaredSuperNames(s *core.SymbolRecord) []string {
 		text = stripAngleBrackets(text)
 		names := matchNameList(extendsRe, text)
 		return append(names, matchNameList(implementsRe, text)...)
+	case "csharp":
+		// `class Foo : Base, IThing` — base classes AND interfaces both
+		// carry the contract here, unlike classExtendsNames (missingimpl.go)
+		// which deliberately keeps only the base for inheritance purposes.
+		if s.Kind != core.KindClass && s.Kind != core.KindInterface && s.Kind != core.KindStruct {
+			return nil
+		}
+		text := s.Signature
+		if text == "" {
+			text = firstLine(s.RawText)
+		}
+		return csharpBaseNames(stripAngleBrackets(text))
 	case "python":
 		if s.Kind != core.KindClass {
 			return nil
@@ -594,6 +618,15 @@ func declaredSuperNames(s *core.SymbolRecord) []string {
 		}
 		return out
 	}
+	// Go and Rust have NO declared-supertype clause on the type: Go interface
+	// satisfaction is structural (derived by method-set inclusion, and only
+	// for interfaces we index) and Rust's is on separate `impl Trait for T`
+	// blocks. So there is no text to read here, and a type satisfying an
+	// EXTERNAL contract (io.Reader, a crate trait) cannot be detected — such
+	// a change-set is reported "closed" though it is really project-local.
+	// Detecting it needs method-set matching against unindexed dependency
+	// interfaces, which the index does not carry. Documented, not silently
+	// assumed.
 	return nil
 }
 

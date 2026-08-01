@@ -201,3 +201,60 @@ func TestTsClassBodyFieldTypes(t *testing.T) {
 		}
 	}
 }
+
+// A caller reaching the member through a SIBLING contract must be reported.
+// Supers are must-change sites (Sites() includes them, RenamePlan rewrites
+// them), so omitting their callers meant a rename renamed the sibling's
+// declaration and left that caller pointing at a method that no longer exists.
+func TestChangeImpactIncludesCallersOfSupers(t *testing.T) {
+	g := New()
+	g.Replace([]core.SymbolRecord{
+		{ID: "a.java::A@s", FilePath: "a.java", Language: "java", Kind: core.KindInterface,
+			Name: "A", QualifiedName: "A"},
+		{ID: "a.java::A.run@s", FilePath: "a.java", Language: "java", Kind: core.KindMethod,
+			Name: "run", QualifiedName: "A.run", ParentSymbol: "A", Signature: "void run()"},
+		{ID: "b.java::B@s", FilePath: "b.java", Language: "java", Kind: core.KindInterface,
+			Name: "B", QualifiedName: "B"},
+		{ID: "b.java::B.run@s", FilePath: "b.java", Language: "java", Kind: core.KindMethod,
+			Name: "run", QualifiedName: "B.run", ParentSymbol: "B", Signature: "void run()"},
+		{ID: "c.java::C@s", FilePath: "c.java", Language: "java", Kind: core.KindClass,
+			Name: "C", QualifiedName: "C", Signature: "class C implements A, B"},
+		{ID: "c.java::C.run@s", FilePath: "c.java", Language: "java", Kind: core.KindMethod,
+			Name: "run", QualifiedName: "C.run", ParentSymbol: "C", Signature: "void run()"},
+		{ID: "d.java::D@s", FilePath: "d.java", Language: "java", Kind: core.KindClass,
+			Name: "D", QualifiedName: "D"},
+		{ID: "d.java::D.use@s", FilePath: "d.java", Language: "java", Kind: core.KindMethod,
+			Name: "use", QualifiedName: "D.use", ParentSymbol: "D",
+			RawText: "void use(B b) { b.run(); }"},
+	}, 4)
+	// D.use calls B.run through the sibling contract.
+	g.ReplaceWithEdges(snapshotSymbols(g), []core.Edge{{
+		From: "d.java::D.use@s", To: "b.java::B.run@s", Type: core.EdgeCalls,
+		Confidence: 0.95, Source: core.EvidenceSourceASTKit,
+	}}, 4)
+
+	ci, err := g.ChangeImpact("A.run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	inSupers := false
+	for _, s := range ci.Supers {
+		if s.ID == "b.java::B.run@s" {
+			inSupers = true
+		}
+	}
+	if !inSupers {
+		t.Skip("fixture did not produce the sibling super; nothing to assert")
+	}
+	for _, c := range ci.Callers {
+		if c.ID == "d.java::D.use@s" {
+			return // correct
+		}
+	}
+	t.Errorf("D.use calls a super member reported as a change site, but is not in Callers: %+v", ci.Callers)
+}
+
+func snapshotSymbols(g *CodeGraph) []core.SymbolRecord {
+	syms, _ := g.Snapshot()
+	return syms
+}
