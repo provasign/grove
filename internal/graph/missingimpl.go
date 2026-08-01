@@ -2,7 +2,6 @@ package graph
 
 import (
 	"fmt"
-	"sort"
 	"strings"
 
 	"github.com/provasign/grove/internal/core"
@@ -78,21 +77,17 @@ func (g *CodeGraph) MissingImplementations(query string) (*MissingImplementation
 	}
 
 	// 1. The named type(s) — same seeding as ChangeImpact.
+	// idsNamed is pre-sorted. The seed order matters: contract[0] anchors
+	// declParams/wildcards for the whole closure filter, so an unstable
+	// order silently changes which types are reported as missing an
+	// implementation.
 	var typeIDs []string
-	for id, s := range g.symbols {
-		if s.Name != typeName {
-			continue
-		}
-		switch s.Kind {
+	for _, id := range g.idsNamed(typeName) {
+		switch g.symbols[id].Kind {
 		case core.KindClass, core.KindInterface, core.KindType, core.KindStruct, core.KindTrait, core.KindEnum:
 			typeIDs = append(typeIDs, id)
 		}
 	}
-	// SORTED for the same reason as ChangeImpact: g.symbols is a map, and
-	// contract[0] anchors declParams/wildcards for the whole closure filter.
-	// An unstable seed order silently changes which types are reported as
-	// missing an implementation.
-	sort.Strings(typeIDs)
 	if len(typeIDs) == 0 {
 		return nil, fmt.Errorf("missing-implementations: type %q is not indexed (for an external contract, query a project type that declares it)", typeName)
 	}

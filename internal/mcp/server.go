@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -118,6 +119,15 @@ func (s *Server) callTool(name string, args map[string]any) (any, error) {
 	case "grove_index":
 		root := stringArg(args, "dir", s.root)
 		opts := index.Options{Force: boolArg(args, "force")}
+		// Incremental edge construction needs the previous state. Without
+		// it every grove_index rebuilt every edge from scratch — the delta
+		// path was effectively off for MCP clients even though the resident
+		// graph was sitting right here.
+		if os.Getenv("GROVE_INCREMENTAL") != "0" {
+			if prev := s.currentGraph(); prev != nil {
+				opts.PrevSymbols, opts.PrevEdges = prev.BaselineRef()
+			}
+		}
 		codeGraph, result, err := index.New(s.parser, s.store).IndexWithOptions(context.Background(), root, opts)
 		if err != nil {
 			return nil, err

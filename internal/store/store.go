@@ -477,6 +477,11 @@ func (s *Store) DeleteFilesNotIn(ctx context.Context, current map[string]bool) (
 }
 
 func (s *Store) AllSymbols(ctx context.Context) ([]core.SymbolRecord, error) {
+	// Count BEFORE opening the row cursor: the pool is capped at one
+	// connection (SetMaxOpenConns(1)), so a query issued while rows are open
+	// waits for a connection the cursor will not release until it is drained
+	// — a self-deadlock, not a slow query.
+	nSymbols := s.countRows(ctx, `SELECT COUNT(*) FROM symbols`)
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, file_path, blob_sha, language, kind, name, qualified_name,
 		       signature, docstring, span_start, span_end, imports, exports,
@@ -491,7 +496,7 @@ func (s *Store) AllSymbols(ctx context.Context) ([]core.SymbolRecord, error) {
 	}
 	defer rows.Close()
 
-	var symbols []core.SymbolRecord
+	symbols := make([]core.SymbolRecord, 0, nSymbols)
 	for rows.Next() {
 		var symbol core.SymbolRecord
 		var kind, importsJSON, modifiersJSON, typeParamsJSON, annotationsJSON, callSitesJSON, attrSitesJSON string
@@ -521,6 +526,7 @@ func (s *Store) AllSymbols(ctx context.Context) ([]core.SymbolRecord, error) {
 }
 
 func (s *Store) AllEdges(ctx context.Context) ([]core.Edge, error) {
+	nEdges := s.countRows(ctx, `SELECT COUNT(*) FROM edges`) // before the cursor: see AllSymbols
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT from_node, to_node, edge_type, confidence, COALESCE(source, 'unknown'), COALESCE(reason, '')
 		FROM edges
@@ -530,7 +536,7 @@ func (s *Store) AllEdges(ctx context.Context) ([]core.Edge, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var edges []core.Edge
+	edges := make([]core.Edge, 0, nEdges)
 	for rows.Next() {
 		var edge core.Edge
 		var typ, source, reason string
@@ -648,6 +654,19 @@ func dedupeWriteSet(edges []core.Edge) []core.Edge {
 	return out
 }
 
+// countRows returns COUNT(*) for a table (optionally filtered) so the big
+// loaders can preallocate. Growing a 600k-element slice by append doubles it
+// ~20 times and copies tens of MB of string headers on every cold load; one
+// counting scan of an index is far cheaper. A failure just means no
+// preallocation, never an error.
+func (s *Store) countRows(ctx context.Context, query string, args ...any) int {
+	var n int
+	if err := s.db.QueryRowContext(ctx, query, args...).Scan(&n); err != nil {
+		return 0
+	}
+	return n
+}
+
 // EdgeCount returns COUNT(*) of the edges table — the cheap post-splice
 // invariant check.
 func (s *Store) EdgeCount(ctx context.Context) (int, error) {
@@ -662,6 +681,7 @@ func (s *Store) EdgeCount(ctx context.Context) (int, error) {
 // this avoids materializing millions of rows the caller would discard (the
 // delta carry path keeps only native edges — ~1/6 of the table).
 func (s *Store) EdgesBySource(ctx context.Context, source string) ([]core.Edge, error) {
+	nEdges := s.countRows(ctx, `SELECT COUNT(*) FROM edges WHERE source = ?`, source) // before the cursor: see AllSymbols
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT from_node, to_node, edge_type, confidence, COALESCE(source, 'unknown'), COALESCE(reason, '')
 		FROM edges
@@ -672,7 +692,7 @@ func (s *Store) EdgesBySource(ctx context.Context, source string) ([]core.Edge, 
 		return nil, err
 	}
 	defer rows.Close()
-	var edges []core.Edge
+	edges := make([]core.Edge, 0, nEdges)
 	for rows.Next() {
 		var edge core.Edge
 		var typ, src, reason string

@@ -47,6 +47,15 @@ type edgeIndex struct {
 	// importedFilesCache memoizes the result of importedFiles() per file.
 	importedFilesCache map[string]map[string]struct{}
 
+	// qualifierFiles memoizes importFilesForQualifier per (file, qualifier).
+	// Unlike importedFilesCache it cannot be pre-warmed — the qualifier set
+	// is only known while resolving call sites — so it is a sync.Map: the
+	// parallel call workers hit it concurrently, and a caller resolving
+	// "json.Marshal" in a 400-call file recomputes the identical import
+	// walk once per call site otherwise. Values are READ-ONLY; nothing
+	// mutates a returned map.
+	qualifierFiles sync.Map // string("file\x00qualifier") → qualifierFileSet
+
 	// Rust crate topology: visibility in Rust is crate-wide (any item is
 	// reachable through crate:: paths without a per-file use), so scope is
 	// the enclosing crate plus used workspace crates. A crate root is a
@@ -423,9 +432,15 @@ func (idx *edgeIndex) importedFiles(fromFile string) map[string]struct{} {
 		// segment equals the import's last segment. Suffix lookups make this
 		// O(import-depth) instead of a scan over every directory, which on a
 		// 19k-file monorepo was ~0.5 billion string comparisons per index.
-		parts := strings.Split(impNorm, "/")
-		for i := range parts {
-			suffix := strings.Join(parts[i:], "/")
+		// Slash-suffixes of impNorm, taken as substrings. The previous
+		// Split+Join per suffix allocated a slice and a fresh string for
+		// every segment of every import of every call site — the single
+		// hottest allocation in call resolution.
+		for i := 0; i <= len(impNorm); i++ {
+			if i != 0 && impNorm[i-1] != '/' {
+				continue
+			}
+			suffix := impNorm[i:]
 			if suffix == "" || suffix == "." {
 				continue
 			}
@@ -1818,6 +1833,23 @@ func narrowByImport(idx *edgeIndex, symbol *core.SymbolRecord, qualifier string,
 // imports to same-named in-repo dirs here ("encoding/json" → internal/json).
 // The second return reports whether such an import exists at all.
 func (idx *edgeIndex) importFilesForQualifier(fromFile, qualifier string) (map[string]struct{}, bool) {
+	key := fromFile + "\x00" + qualifier
+	if v, ok := idx.qualifierFiles.Load(key); ok {
+		hit := v.(qualifierFileSet)
+		return hit.files, hit.found
+	}
+	files, found := idx.computeImportFilesForQualifier(fromFile, qualifier)
+	idx.qualifierFiles.Store(key, qualifierFileSet{files: files, found: found})
+	return files, found
+}
+
+// qualifierFileSet is the memoized result of one qualifier resolution.
+type qualifierFileSet struct {
+	files map[string]struct{}
+	found bool
+}
+
+func (idx *edgeIndex) computeImportFilesForQualifier(fromFile, qualifier string) (map[string]struct{}, bool) {
 	imports, ok := idx.fileImports[fromFile]
 	if !ok {
 		return nil, false
@@ -1846,9 +1878,15 @@ func (idx *edgeIndex) importFilesForQualifier(fromFile, qualifier string) (map[s
 				out[f] = struct{}{}
 			}
 		}
-		parts := strings.Split(impNorm, "/")
-		for i := range parts {
-			suffix := strings.Join(parts[i:], "/")
+		// Slash-suffixes of impNorm, taken as substrings. The previous
+		// Split+Join per suffix allocated a slice and a fresh string for
+		// every segment of every import of every call site — the single
+		// hottest allocation in call resolution.
+		for i := 0; i <= len(impNorm); i++ {
+			if i != 0 && impNorm[i-1] != '/' {
+				continue
+			}
+			suffix := impNorm[i:]
 			if suffix == "" || suffix == "." {
 				continue
 			}
@@ -1861,8 +1899,9 @@ func (idx *edgeIndex) importFilesForQualifier(fromFile, qualifier string) (map[s
 		// Maven/Gradle layouts prefix source dirs ("src/main/java/org/..."),
 		// so the import path is a SUFFIX of the dir or file, not equal to it.
 		if len(out) == 0 {
+			slashImp := "/" + impNorm // hoisted: the loops below are over every dir / import path
 			for dir, files := range idx.dirFilesLower {
-				if strings.HasSuffix(dir, "/"+impNorm) || dir == impNorm {
+				if strings.HasSuffix(dir, slashImp) || dir == impNorm {
 					for _, f := range files {
 						if f != fromFile {
 							out[f] = struct{}{}
@@ -1871,7 +1910,7 @@ func (idx *edgeIndex) importFilesForQualifier(fromFile, qualifier string) (map[s
 				}
 			}
 			for pathKey, files := range idx.importPathToFiles {
-				if strings.HasSuffix(pathKey, "/"+impNorm) {
+				if strings.HasSuffix(pathKey, slashImp) {
 					for _, f := range files {
 						if f != fromFile {
 							out[f] = struct{}{}

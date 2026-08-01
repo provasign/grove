@@ -117,17 +117,14 @@ func (g *CodeGraph) ChangeImpact(query string) (*ChangeImpactResult, error) {
 	// (measured before this fix: 300 identical queries over two same-named
 	// types returned an empty family 231 times and the correct family 69).
 	// Determinism is the product's core claim; it starts here.
+	// idsNamed is pre-sorted, so the seed order is stable without a scan.
 	var typeIDs []string
-	for id, s := range g.symbols {
-		if s.Name != typeName {
-			continue
-		}
-		switch s.Kind {
+	for _, id := range g.idsNamed(typeName) {
+		switch g.symbols[id].Kind {
 		case core.KindClass, core.KindInterface, core.KindType, core.KindStruct, core.KindTrait, core.KindEnum:
 			typeIDs = append(typeIDs, id)
 		}
 	}
-	sort.Strings(typeIDs)
 	if len(typeIDs) == 0 {
 		// External-rooted query: the named type is not in the index (a JDK or
 		// dependency type, e.g. "java.util.Iterator.next"). The well-posed
@@ -633,11 +630,8 @@ func declaredSuperNames(s *core.SymbolRecord) []string {
 // hasIndexedType reports whether any indexed symbol of a type kind has the
 // given simple name. Caller must hold g.mu.
 func (g *CodeGraph) hasIndexedType(name string) bool {
-	for _, s := range g.symbols {
-		if s.Name != name {
-			continue
-		}
-		switch s.Kind {
+	for _, id := range g.idsNamed(name) {
+		switch g.symbols[id].Kind {
 		case core.KindClass, core.KindInterface, core.KindType, core.KindStruct, core.KindTrait, core.KindEnum:
 			return true
 		}
@@ -802,11 +796,8 @@ func (g *CodeGraph) resolveLooseQueryLocked(query string) (string, error) {
 		sym *core.SymbolRecord
 	}
 	var matches []cand
-	for i := range g.symbols {
+	for _, i := range g.idsNamed(head) {
 		s := g.symbols[i]
-		if s.Name != head {
-			continue
-		}
 		switch s.Kind {
 		case core.KindMethod, core.KindFunction, core.KindConstructor:
 		default:

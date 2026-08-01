@@ -560,6 +560,14 @@ func indexRootFull(engine *parser.Engine, codeGraph *graph.CodeGraph, root strin
 	}
 	defer store.Close()
 	idx := index.NewWithNativeConfig(engine, store, nativeCfg)
+	// Incremental edge construction needs the previous state as its
+	// baseline. codeGraph is the caller's resident graph — empty for a
+	// one-shot CLI run (so this is a no-op and the full build stands), but
+	// populated under `grove watch` and the long-lived server, which is
+	// exactly where re-resolving every caller on every edit is felt.
+	if os.Getenv("GROVE_INCREMENTAL") != "0" && codeGraph != nil && opts.PrevEdges == nil {
+		opts.PrevSymbols, opts.PrevEdges = codeGraph.BaselineRef()
+	}
 	indexedGraph, result, err := idx.IndexWithOptions(context.Background(), root, opts)
 	if err != nil {
 		return nil, err

@@ -48,6 +48,13 @@ type CodeGraph struct {
 	inbound  map[string][]int
 	outbound map[string][]int
 
+	// byName maps an exact symbol Name to the IDs carrying it, SORTED. Every
+	// change-set query starts by finding the symbols with a given name, and
+	// each of those scans used to walk all 70k+ symbols in map order — then
+	// sort the result to undo the map's randomness. The index does both once
+	// per install instead of once per query.
+	byName map[string][]string
+
 	// Lazily-built semantic-search engine. Invalidated on every Replace().
 	// semVecCache survives invalidation: vectors are keyed by symbol ID
 	// (content-hashed), so unchanged symbols skip re-embedding when the
@@ -119,8 +126,13 @@ func (g *CodeGraph) install(symbols []core.SymbolRecord, edges []core.Edge, file
 	defer g.mu.Unlock()
 
 	g.symbols = make(map[string]core.SymbolRecord, len(symbols))
+	g.byName = make(map[string][]string, len(symbols))
 	for _, s := range symbols {
 		g.symbols[s.ID] = s
+		g.byName[s.Name] = append(g.byName[s.Name], s.ID)
+	}
+	for _, ids := range g.byName {
+		sort.Strings(ids)
 	}
 	// Legacy stores may still carry persisted "tests" rows from before the
 	// heuristic test-coverage edges were removed; drop them BEFORE the
@@ -163,6 +175,10 @@ func (g *CodeGraph) install(symbols []core.SymbolRecord, edges []core.Edge, file
 	g.semEngine = nil
 	g.semMu.Unlock()
 }
+
+// idsNamed returns the IDs of every symbol whose Name is exactly name, in
+// sorted order. Callers must hold at least a read lock.
+func (g *CodeGraph) idsNamed(name string) []string { return g.byName[name] }
 
 // mergeEdges overlays native analyzer edges onto baseline graph edges. For a
 // duplicate (from, type, to), the higher-confidence edge wins.
@@ -277,6 +293,11 @@ func (g *CodeGraph) BaselineRef() ([]core.SymbolRecord, []core.Edge) {
 	for _, s := range g.symbols {
 		symbols = append(symbols, s)
 	}
+	// SORTED for the same reason Snapshot is: identityRemap pairs old and
+	// new symbols positionally within a content-identity bucket, so the
+	// baseline's order is an INPUT to the delta. Map order made that input
+	// vary run to run.
+	sort.Slice(symbols, func(i, j int) bool { return lessSymbols(&symbols[i], &symbols[j]) })
 	return symbols, g.edges
 }
 
@@ -288,6 +309,12 @@ func (g *CodeGraph) Snapshot() ([]core.SymbolRecord, []core.Edge) {
 	for _, s := range g.symbols {
 		symbols = append(symbols, deepCopySymbol(s))
 	}
+	// SORTED: g.symbols is a map, so an unsorted snapshot handed every
+	// consumer — cert's derived facts, Prism's component views, Diff — a
+	// different symbol order on every call. Same reasoning as install's edge
+	// sort: a snapshot must be a pure function of the graph STATE, not of
+	// this run's map seed. lessSymbols is the one total order.
+	sort.Slice(symbols, func(i, j int) bool { return lessSymbols(&symbols[i], &symbols[j]) })
 	return symbols, append([]core.Edge(nil), g.edges...)
 }
 
@@ -485,6 +512,18 @@ func (g *CodeGraph) Neighbors(query, direction string, kinds map[core.EdgeType]b
 		direction = "both"
 	}
 
+	// SORTED: seeds is a map, and both branches below walk it. Unsorted,
+	// the emitted neighbor order varied run to run for any query matching
+	// more than one symbol — and the first occurrence of a (neighbor, type,
+	// direction) is the one kept, so the CONTENT was stable but its order
+	// was not, which is exactly the kind of drift that makes a diff of two
+	// identical queries look like a change.
+	seedIDs := make([]string, 0, len(seeds))
+	for id := range seeds {
+		seedIDs = append(seedIDs, id)
+	}
+	sort.Strings(seedIDs)
+
 	var out []Neighbor
 	seen := make(map[string]bool)
 	add := func(neighborID string, t core.EdgeType, dir string, conf float64) {
@@ -500,15 +539,21 @@ func (g *CodeGraph) Neighbors(query, direction string, kinds map[core.EdgeType]b
 		out = append(out, Neighbor{Symbol: sym, EdgeType: t, Direction: dir, Confidence: conf})
 	}
 
+	// outbound/inbound are the by-node edge indexes; the "out" branch used
+	// to scan the WHOLE edge list (600k+ on a mid-size repo) to find the
+	// handful of edges leaving one symbol, while the "in" branch right
+	// beside it already used the index.
 	if direction == "out" || direction == "both" {
-		for _, e := range g.edges {
-			if seeds[e.From] && wantKind(e.Type) {
-				add(e.To, e.Type, "out", e.Confidence)
+		for _, seedID := range seedIDs {
+			for _, idx := range g.outbound[seedID] {
+				if e := g.edges[idx]; wantKind(e.Type) {
+					add(e.To, e.Type, "out", e.Confidence)
+				}
 			}
 		}
 	}
 	if direction == "in" || direction == "both" {
-		for seedID := range seeds {
+		for _, seedID := range seedIDs {
 			for _, idx := range g.inbound[seedID] {
 				if e := g.edges[idx]; wantKind(e.Type) {
 					add(e.From, e.Type, "in", e.Confidence)
@@ -675,11 +720,21 @@ func (g *CodeGraph) ComputeICR(intent string) core.IsolatedChangeRegion {
 	files := make(map[string]bool)
 	readable := make(map[string]bool)
 
+	// Deps is an O(all-edges) prefix scan. Seeds routinely share a file
+	// (Search returns 20, often several per file), so scanning once per
+	// UNIQUE file instead of once per seed cuts the work by the duplication
+	// factor without changing the result — the sets below are unions.
+	var seedFiles []string
 	for _, symbol := range seeds {
 		exclusive[symbol.ID] = true
+		if !files[symbol.FilePath] {
+			seedFiles = append(seedFiles, symbol.FilePath)
+		}
 		files[symbol.FilePath] = true
 		readable[symbol.FilePath] = true
-		for _, edge := range g.Deps(symbol.FilePath) {
+	}
+	for _, f := range seedFiles {
+		for _, edge := range g.Deps(f) {
 			boundary[edge.From+"::"+string(edge.Type)+"::"+edge.To] = true
 			shared[edge.From] = true
 			shared[edge.To] = true
