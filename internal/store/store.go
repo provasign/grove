@@ -104,8 +104,53 @@ func (s *Store) runAlterMigrations(ctx context.Context) error {
 	// written by earlier versions so stored counts and splice invariants
 	// stay consistent. (The GROVE_MATERIALIZED_TESTS rollback flag is gone —
 	// the eager/persisted behavior it restored no longer exists.)
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM edges WHERE edge_type = 'tests'`); err != nil {
-		return fmt.Errorf("migration (purge tests edges): %w", err)
+	//
+	// Runs ONCE per database. It used to run on every Open, and the only
+	// reason it was cheap is that idx_edge_type existed to serve it — an
+	// index over 7 distinct values across 600k rows, rebuilt at ~2s on every
+	// cold index, kept alive for a migration that can only fire once. Gate
+	// the purge and the index has no callers left.
+	if done, err := s.migrationDone(ctx, purgeTestsEdgesKey); err != nil {
+		return err
+	} else if !done {
+		if _, err := s.db.ExecContext(ctx, `DELETE FROM edges WHERE edge_type = 'tests'`); err != nil {
+			return fmt.Errorf("migration (purge tests edges): %w", err)
+		}
+		if err := s.markMigrationDone(ctx, purgeTestsEdgesKey); err != nil {
+			return err
+		}
+	}
+	// Drop AFTER the purge above, which is its last user on a legacy database.
+	if _, err := s.db.ExecContext(ctx, `DROP INDEX IF EXISTS idx_edge_type`); err != nil {
+		return fmt.Errorf("migration (drop idx_edge_type): %w", err)
+	}
+	return nil
+}
+
+// purgeTestsEdgesKey marks the one-shot removal of persisted heuristic
+// test-coverage edges.
+const purgeTestsEdgesKey = "migration:purge-tests-edges"
+
+// migrationDone reports whether a one-shot migration has already run against
+// this database. A missing meta table (a database older than it) reads as
+// not-done, which is the safe answer.
+func (s *Store) migrationDone(ctx context.Context, key string) (bool, error) {
+	var v string
+	err := s.db.QueryRowContext(ctx, `SELECT value FROM meta WHERE key = ?`, key).Scan(&v)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("migration marker %q: %w", key, err)
+	}
+	return v == "done", nil
+}
+
+func (s *Store) markMigrationDone(ctx context.Context, key string) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO meta (key, value) VALUES (?, 'done') ON CONFLICT(key) DO UPDATE SET value = 'done'`, key)
+	if err != nil {
+		return fmt.Errorf("migration marker %q: %w", key, err)
 	}
 	return nil
 }
@@ -269,6 +314,7 @@ func (s *Store) UpsertFile(ctx context.Context, filePath, blobSHA, language stri
 // delete-everything-reinsert paid the full million-row write every index
 // (21s on a 19k-file monorepo). Inserts are batched multi-row.
 func (s *Store) ReplaceEdges(ctx context.Context, edges []core.Edge) error {
+	tick := storeTimer("edgewrite")
 	type edgeMeta struct {
 		confidence float64
 		source     string
@@ -293,6 +339,8 @@ func (s *Store) ReplaceEdges(ctx context.Context, edges []core.Edge) error {
 		return err
 	}
 
+	tick("load-stored-ids")
+
 	wantIDs := make(map[string]bool, len(edges))
 	var upserts []core.Edge
 	var upsertIDs []string
@@ -314,6 +362,7 @@ func (s *Store) ReplaceEdges(ctx context.Context, edges []core.Edge) error {
 			deletes = append(deletes, id)
 		}
 	}
+	tick("diff")
 	if len(upserts) == 0 && len(deletes) == 0 {
 		return nil
 	}
@@ -348,7 +397,7 @@ func (s *Store) ReplaceEdges(ctx context.Context, edges []core.Edge) error {
 			`PRAGMA wal_autocheckpoint=0`,
 			`DROP INDEX IF EXISTS idx_edge_from`,
 			`DROP INDEX IF EXISTS idx_edge_to`,
-			`DROP INDEX IF EXISTS idx_edge_type`,
+			`DROP INDEX IF EXISTS idx_edge_source`,
 		} {
 			if _, err := s.db.ExecContext(ctx, p); err != nil {
 				return err
@@ -356,6 +405,7 @@ func (s *Store) ReplaceEdges(ctx context.Context, edges []core.Edge) error {
 		}
 	}
 
+	tick("bulk-prep")
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -379,6 +429,7 @@ func (s *Store) ReplaceEdges(ctx context.Context, edges []core.Edge) error {
 		}
 	}
 
+	tick("deletes")
 	const insertChunk = 342 // 7 columns × 342 = 2394 parameters per statement
 	for start := 0; start < len(upserts); start += insertChunk {
 		end := start + insertChunk
@@ -401,16 +452,18 @@ func (s *Store) ReplaceEdges(ctx context.Context, edges []core.Edge) error {
 			return err
 		}
 	}
+	tick("inserts")
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	tick("commit")
 	if bulk {
 		// Rebuild what the bulk path dropped, restore steady-state pragmas,
 		// and truncate the WAL the disabled autocheckpoint let grow.
 		for _, p := range []string{
-			`CREATE INDEX IF NOT EXISTS idx_edge_from ON edges(from_node)`,
-			`CREATE INDEX IF NOT EXISTS idx_edge_to   ON edges(to_node)`,
-			`CREATE INDEX IF NOT EXISTS idx_edge_type ON edges(edge_type)`,
+			`CREATE INDEX IF NOT EXISTS idx_edge_from   ON edges(from_node)`,
+			`CREATE INDEX IF NOT EXISTS idx_edge_to     ON edges(to_node)`,
+			`CREATE INDEX IF NOT EXISTS idx_edge_source ON edges(source)`,
 			`PRAGMA wal_autocheckpoint=1000`,
 			`PRAGMA wal_checkpoint(TRUNCATE)`,
 			`PRAGMA cache_size=-2000`,
@@ -418,9 +471,19 @@ func (s *Store) ReplaceEdges(ctx context.Context, edges []core.Edge) error {
 			if _, err := s.db.ExecContext(ctx, p); err != nil {
 				return err
 			}
+			tick("bulk-restore:" + firstWords(p))
 		}
 	}
 	return nil
+}
+
+// firstWords shortens a DDL/pragma statement to a timing label.
+func firstWords(stmt string) string {
+	f := strings.Fields(stmt)
+	if len(f) > 3 {
+		f = f[:3]
+	}
+	return strings.Join(f, " ")
 }
 
 // FilesNotIn returns the indexed file paths absent from current — the files
@@ -549,6 +612,21 @@ func (s *Store) AllEdges(ctx context.Context) ([]core.Edge, error) {
 		edges = append(edges, edge)
 	}
 	return edges, rows.Err()
+}
+
+// storeTimer mirrors graph.edgeTimer: sub-phase attribution for the edge
+// write, which is the single largest phase of a cold index (~7s of a ~14s
+// guava run) and was previously one opaque number.
+func storeTimer(label string) func(string) {
+	if os.Getenv("GROVE_TIMING") == "" {
+		return func(string) {}
+	}
+	last := time.Now()
+	return func(phase string) {
+		now := time.Now()
+		fmt.Fprintf(os.Stderr, "[timing]   %s/%-20s %8.2fs\n", label, phase, now.Sub(last).Seconds())
+		last = now
+	}
 }
 
 // SpliceEdges applies an incremental write-set instead of ReplaceEdges' full
@@ -885,9 +963,14 @@ CREATE TABLE IF NOT EXISTS edges (
     source     TEXT NOT NULL DEFAULT 'unknown'
 );
 
-CREATE INDEX IF NOT EXISTS idx_edge_from ON edges(from_node);
-CREATE INDEX IF NOT EXISTS idx_edge_to   ON edges(to_node);
-CREATE INDEX IF NOT EXISTS idx_edge_type ON edges(edge_type);
+CREATE INDEX IF NOT EXISTS idx_edge_from   ON edges(from_node);
+CREATE INDEX IF NOT EXISTS idx_edge_to     ON edges(to_node);
+-- edges(source): EdgesBySource('native') is the delta carry path's read, and
+-- native rows are ~5% of the table (30k of 612k on guava) — without this it
+-- scanned all 612k to return 30k. Measured 1.3-3.2s -> 0.8-1.0s, for a 0.9s
+-- build. No index on edge_type: 7 distinct values over 600k rows, and its one
+-- caller (the legacy tests-edge purge) now runs once per database.
+CREATE INDEX IF NOT EXISTS idx_edge_source ON edges(source);
 
 CREATE TABLE IF NOT EXISTS icr_locks (
     lock_key    TEXT PRIMARY KEY,
