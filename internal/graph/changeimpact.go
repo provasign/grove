@@ -54,11 +54,10 @@ type ChangeImpactResult struct {
 // included because a same-member declaration on another contract (a sibling
 // interface satisfied by the same implementations, or a supertype when the
 // query seeded on an implementation) must change exactly like the seed:
-// omitting it silently dropped the interface's own member from rename-plan
-// and undercounted untested-surface. DeclaringTypes is deliberately NOT
-// unioned here — those are TYPE declarations, not methods; rename-plan
-// consumes them separately (they are edit sites) and untested-surface must
-// not (a type declaration has no test).
+// omitting it silently dropped the interface's own member from rename-plan.
+// DeclaringTypes is deliberately NOT unioned here — those are TYPE
+// declarations, not methods; rename-plan consumes them separately (they are
+// edit sites), and a caller counting METHOD sites must not.
 func (r *ChangeImpactResult) Sites() []core.SymbolRecord {
 	seen := make(map[string]bool)
 	var out []core.SymbolRecord

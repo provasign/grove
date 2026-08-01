@@ -239,8 +239,8 @@ var pyLocalRebindRe = regexp.MustCompile(`(?m)^\s*([A-Za-z_]\w*)\s*=[^=]`)
 // ("g.foo = value") to the __setattr__ of the assigned-to class, for classes
 // that declare a CUSTOM __setattr__. Plain attribute assignment has no call
 // syntax — there is no "g.__setattr__(...)" site for astkit to extract — so
-// without this, the calls graph (and everything built on it: tests edges,
-// untested_surface, dead-code) is blind to any class that overrides
+// without this, the calls graph (and everything built on it: change-impact,
+// dead-code) is blind to any class that overrides
 // attribute assignment. Flask's _AppCtxGlobals is exactly this shape:
 // __setattr__ stores into __dict__, is genuinely covered by 11 real tests,
 // and every one of them assigns through a bare "g.attr = value" — grove
