@@ -587,6 +587,15 @@ func (s *Store) SpliceEdges(ctx context.Context, deleteOwners []string, nativeFi
 		}
 	}
 
+	// Dedupe the write-set in Go with mergeEdges' exact resolution (higher
+	// confidence wins, first-wins on ties) so the SQL upsert can be
+	// unconditional. A confidence-gated upsert would let a STALE stored row
+	// survive whenever it tied or beat the incoming row's confidence,
+	// keeping its old source/reason while the in-memory set — which the
+	// COUNT(*) invariant compares against, and which cannot see a metadata
+	// difference — moved on. That divergence is silent by construction.
+	inserts = dedupeWriteSet(inserts)
+
 	const insertChunk = 342
 	for start := 0; start < len(inserts); start += insertChunk {
 		end := start + insertChunk
@@ -605,12 +614,38 @@ func (s *Store) SpliceEdges(ctx context.Context, deleteOwners []string, nativeFi
 			id := edge.From + "::" + string(edge.Type) + "::" + edge.To
 			args = append(args, id, edge.From, edge.To, string(edge.Type), edge.Confidence, string(edge.Source), string(edge.Reason))
 		}
-		sb.WriteString(` ON CONFLICT(id) DO UPDATE SET confidence = excluded.confidence, source = excluded.source, reason = excluded.reason WHERE excluded.confidence > edges.confidence`)
+		sb.WriteString(` ON CONFLICT(id) DO UPDATE SET confidence = excluded.confidence, source = excluded.source, reason = excluded.reason`)
 		if _, err := tx.ExecContext(ctx, sb.String(), args...); err != nil {
 			return err
 		}
 	}
 	return tx.Commit()
+}
+
+// dedupeWriteSet collapses duplicate (from, type, to) rows using the same
+// resolution mergeEdges applies in memory: higher confidence wins, first
+// occurrence wins on a tie. Order of first appearance is preserved.
+func dedupeWriteSet(edges []core.Edge) []core.Edge {
+	type key struct {
+		from string
+		to   string
+		typ  core.EdgeType
+	}
+	pos := make(map[key]int, len(edges))
+	out := make([]core.Edge, 0, len(edges))
+	for _, e := range edges {
+		k := key{from: e.From, to: e.To, typ: e.Type}
+		i, seen := pos[k]
+		if !seen {
+			pos[k] = len(out)
+			out = append(out, e)
+			continue
+		}
+		if e.Confidence > out[i].Confidence {
+			out[i] = e
+		}
+	}
+	return out
 }
 
 // EdgeCount returns COUNT(*) of the edges table — the cheap post-splice

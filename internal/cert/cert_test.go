@@ -490,3 +490,66 @@ func TestCertifyDiffTransitiveTestCoverage(t *testing.T) {
 		}
 	}
 }
+
+// A similarity-100% move has no hunks. finish() used to discard hunkless
+// entries outright, so the move certified as `allow` with zero findings —
+// while every importer of the old path was broken.
+func TestParseUnifiedDiffKeepsRenameOnly(t *testing.T) {
+	files, err := ParseUnifiedDiff(`diff --git a/old.go b/new.go
+similarity index 100%
+rename from old.go
+rename to new.go
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("rename-only entry dropped: %+v", files)
+	}
+	if !files[0].Renamed || files[0].OldPath != "old.go" {
+		t.Errorf("rename not recorded: %+v", files[0])
+	}
+	report := CertifyDiff(graph.New(), core.DiffInput{UnifiedDiff: `diff --git a/old.go b/new.go
+similarity index 100%
+rename from old.go
+rename to new.go
+`})
+	if report.Verdict != core.VerdictManualReview {
+		t.Errorf("verdict = %q, want manual_review for a file move", report.Verdict)
+	}
+	if len(report.Unknowns) == 0 || report.Unknowns[0].Code != "file_renamed" {
+		t.Errorf("unknowns = %+v, want a file_renamed entry", report.Unknowns)
+	}
+}
+
+// An ADDED line whose content starts with "++ " arrives as "+++ ". Testing the
+// header cases before in-hunk content parsed it as a new-file header, which
+// hijacked the path and froze the line counter.
+func TestParseUnifiedDiffAddedLineLookingLikeHeader(t *testing.T) {
+	files, err := ParseUnifiedDiff(`diff --git a/x.md b/x.md
+--- a/x.md
++++ b/x.md
+@@ -1,2 +1,3 @@
+ intro
+++ x
+ outro
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("files = %+v", files)
+	}
+	if files[0].Path != "x.md" {
+		t.Errorf("path hijacked by hunk content: got %q, want x.md", files[0].Path)
+	}
+	if len(files[0].Hunks) != 1 {
+		t.Fatalf("hunks = %+v", files[0].Hunks)
+	}
+	// The parser records the CHANGED lines only. The added line sits at
+	// post-image line 2, so the range must pin exactly that. Before the fix
+	// this file parsed as path "x" with range {4,4}.
+	if h := files[0].Hunks[0]; h.NewRange.Start != 2 || h.NewRange.End != 2 {
+		t.Errorf("hunk range %+v, want {2,2} (the added line)", h.NewRange)
+	}
+}

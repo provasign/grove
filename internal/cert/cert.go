@@ -106,6 +106,9 @@ func fileLevelUnknown(file DiffFile, fileSymbols []core.SymbolRecord) (core.Cert
 		return fileUnknown(file.Path, "binary_change", "binary diff cannot be mapped to indexed symbols"), true
 	case file.Deleted:
 		return fileUnknown(file.Path, "deleted_file", "deleted file cannot be certified against the current index"), true
+	case file.Renamed && len(file.Hunks) == 0:
+		return fileUnknown(file.Path, "file_renamed",
+			"file was moved from "+file.OldPath+"; its content is unchanged but every importer of the old path must be updated"), true
 	case len(file.Hunks) == 0:
 		return fileUnknown(file.Path, "diff_no_hunks", "changed file has no parseable hunks"), true
 	case len(fileSymbols) == 0:
@@ -350,6 +353,11 @@ type DiffFile struct {
 	Path    string
 	Hunks   []DiffHunk
 	Deleted bool
+	// Renamed marks a `rename from`/`rename to` entry. A similarity-100%
+	// move has NO hunks, so without this flag finish() discarded it and a
+	// file move — which breaks every importer — certified as `allow`.
+	Renamed bool
+	OldPath string
 	Binary  bool
 }
 
@@ -382,22 +390,40 @@ type diffParser struct {
 }
 
 func (p *diffParser) handleLine(line string) error {
+	// ORDER MATTERS. "diff --git " and "@@ " are unambiguous at column 0: an
+	// added line is prefixed with "+", so it can never produce them. Every
+	// OTHER header prefix IS ambiguous with hunk content — an added source
+	// line beginning with "++ " arrives as "+++ ", and was being parsed as a
+	// new-file header, silently retargeting the file path and freezing the
+	// line counter so the real change was attributed elsewhere (or to a file
+	// named by the added text) and the actual file was never certified.
+	// So: unambiguous headers, then in-hunk content, then the rest.
 	switch {
 	case strings.HasPrefix(line, "diff --git "):
 		p.startFile(line)
-	case strings.HasPrefix(line, "+++ "):
-		return p.handleNewFileHeader(line)
-	case strings.HasPrefix(line, "deleted file mode "):
-		p.markDeleted()
-	case strings.HasPrefix(line, "Binary files ") || strings.HasPrefix(line, "GIT binary patch"):
-		p.markBinary(line)
 	case strings.HasPrefix(line, "@@ "):
 		return p.startHunk(line)
 	case p.hunk != nil:
 		return p.handleHunkLine(line)
+	case strings.HasPrefix(line, "+++ "):
+		return p.handleNewFileHeader(line)
+	case strings.HasPrefix(line, "deleted file mode "):
+		p.markDeleted()
+	case strings.HasPrefix(line, "rename from "):
+		if p.current != nil {
+			p.current.Renamed = true
+			p.current.OldPath = strings.TrimSpace(strings.TrimPrefix(line, "rename from "))
+		}
+	case strings.HasPrefix(line, "rename to "):
+		if p.current != nil {
+			p.current.Renamed = true
+		}
+	case strings.HasPrefix(line, "Binary files ") || strings.HasPrefix(line, "GIT binary patch"):
+		p.markBinary(line)
 	}
 	return nil
 }
+
 
 func (p *diffParser) startFile(line string) {
 	p.sawDiff = true
@@ -490,7 +516,11 @@ func (p *diffParser) finish() ([]DiffFile, error) {
 		if p.files[i].Path == "" {
 			return nil, errors.New("diff_malformed: changed file path is missing")
 		}
-		if len(p.files[i].Hunks) == 0 && !p.files[i].Binary && !p.files[i].Deleted {
+		// A hunkless entry is a rename or a mode change. A mode change has
+		// no content to certify and is correctly dropped; a RENAME must not
+		// be — a similarity-100% move breaks every importer, and dropping it
+		// certified the move as `allow` with zero findings.
+		if len(p.files[i].Hunks) == 0 && !p.files[i].Binary && !p.files[i].Deleted && !p.files[i].Renamed {
 			continue
 		}
 		out = append(out, p.files[i])

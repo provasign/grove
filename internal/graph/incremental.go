@@ -163,6 +163,13 @@ func BuildEdgesDeltaMeta(prevEdges []core.Edge, prevSymbols, symbols []core.Symb
 		if e.Type != core.EdgeCalls {
 			continue
 		}
+		// Decorator edges are regenerated wholesale below, never carried:
+		// they are a function of the FULL call-edge set, not of any one
+		// owner, so carrying a subset produced a different multiset than a
+		// full rebuild.
+		if e.Reason == core.ReasonDecorator {
+			continue
+		}
 		if e.Source == core.EvidenceSourceNative && nativeAnalyzedDirs[fileDirOfNode(e.From)] {
 			continue
 		}
@@ -188,17 +195,26 @@ func BuildEdgesDeltaMeta(prevEdges []core.Edge, prevSymbols, symbols []core.Symb
 		}
 	}
 	callsNew := scopedCalls(idx, affectedSyms, sat)
-	decoNew := buildDecoratorEdges(idx, affectedSyms, callsNew)
 	keptCalls := make([]core.Edge, 0, len(prevCalls))
 	for _, e := range prevCalls {
 		if !affected[e.From] { // endpoints already normalized to current IDs
 			keptCalls = append(keptCalls, e)
 		}
 	}
-	allCalls := make([]core.Edge, 0, len(keptCalls)+len(callsNew)+len(decoNew))
+	allCalls := make([]core.Edge, 0, len(keptCalls)+len(callsNew))
 	allCalls = append(allCalls, keptCalls...)
 	allCalls = append(allCalls, callsNew...)
-	allCalls = append(allCalls, decoNew...)
+	// Decorators over the FULL symbol and call sets, exactly as BuildEdges
+	// does. buildDecoratorEdges emits two families: wrapper->wrapped (from
+	// annotations) and caller->wrapper for every call edge into a wrapped
+	// symbol. Scoping it to affectedSyms/callsNew could only regenerate the
+	// second family for callers in the affected set, while the carry path
+	// had already dropped the previous edge because the wrapper's ID turned
+	// over — so editing the file that DEFINES a decorator silently lost
+	// every caller->wrapper edge. Equivalence with a full rebuild is the
+	// contract this function owes.
+	decoAll := buildDecoratorEdges(idx, symbols, allCalls)
+	allCalls = append(allCalls, decoAll...)
 	edges = append(edges, allCalls...)
 	tick("delta-calls")
 	return edges, buildDeltaMeta(symbols, affected, changedFiles, nativeAnalyzedDirs)
