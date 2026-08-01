@@ -73,8 +73,6 @@ jobs:
         run: go build -o /tmp/grove-eval ./cmd/grove-eval
       - name: Score calls edges against snapshot baseline
         run: /tmp/grove-eval score --repo /tmp/flask --truth eval/testdata/flask@$FLASK_COMMIT/calls-truth.jsonl.gz --out-dir /tmp/eval-out --baseline eval/baseline.json
-      - name: Score tests edges against snapshot baseline
-        run: /tmp/grove-eval score-tests --repo /tmp/flask --truth eval/testdata/flask@$FLASK_COMMIT/tests-truth.jsonl.gz --out-dir /tmp/eval-out --baseline eval/baseline-tests.json
       - name: Upload scorecards
         if: always()
         uses: actions/upload-artifact@v4

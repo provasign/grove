@@ -57,12 +57,8 @@ func Run(args []string) int {
 		return missingImplementations(engine, codeGraph, args[1:])
 	case "rename-plan":
 		return renamePlan(engine, codeGraph, args[1:])
-	case "untested-surface":
-		return untestedSurface(engine, codeGraph, args[1:])
 	case "dead-code":
 		return deadCode(engine, codeGraph, args[1:])
-	case "tests":
-		return tests(engine, codeGraph, args[1:])
 	case "icr":
 		return icr(engine, codeGraph, args[1:])
 	case "certify":
@@ -404,34 +400,6 @@ func renamePlan(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string
 	return printJSON(result)
 }
 
-// untestedSurface partitions a method's change-set by covering-test
-// evidence: the pre-refactor question "what in the blast radius has no test?"
-func untestedSurface(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int {
-	args, refresh := stripRefresh(args)
-	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: grove untested-surface 'Type.method' | 'Type.method(ParamType, ...)' [dir] [--refresh]")
-		return 2
-	}
-	query := args[0]
-	cfg, err := config.Resolve(argOrDefault(args, 1, "."))
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	if err := prepareReadGraph(engine, codeGraph, cfg.Root, refresh); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	result, err := codeGraph.UntestedSurface(query)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	return printJSON(result)
-}
-
-// deadCode reports production functions/methods unreachable from every entry
-// point. Precision-first; the caveats in the result are part of the answer.
 func deadCode(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int {
 	args, refresh := stripRefresh(args)
 	var roots []string
@@ -458,36 +426,6 @@ func deadCode(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) 
 		return 1
 	}
 	return printJSON(codeGraph.DeadCode(roots))
-}
-
-func tests(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int {
-	args, refresh := stripRefresh(args)
-	query := ""
-	root := "."
-	switch {
-	case len(args) == 1:
-		// `grove tests <dir>` (no query) is valid: a lone positional that
-		// names a directory is the root, not the query.
-		if fi, err := os.Stat(args[0]); err == nil && fi.IsDir() {
-			root = args[0]
-		} else {
-			query = args[0]
-		}
-	case len(args) > 1:
-		query = args[0]
-		root = args[1]
-	}
-	cfg, err := config.Resolve(root)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	root = cfg.Root
-	if err := prepareReadGraph(engine, codeGraph, root, refresh); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
-	}
-	return printJSON(map[string]any{"tests": codeGraph.TestsFor(query)})
 }
 
 func icr(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int {
@@ -789,9 +727,7 @@ Usage:
   grove change-impact <Type.method(Params)> [dir]   type-resolved change-set: declaration + override family + callers
   grove missing-implementations <Type.method> [dir]  types claiming the contract that do not implement the member
   grove rename-plan <Type.method> <NewName> [dir]  change-set as concrete line edits with substitutions
-  grove untested-surface <Type.method> [dir]     change-set partitioned by covering-test evidence
   grove dead-code [dir] [--roots a,b]            unreachable production functions/methods (precision-first)
-  grove tests <file> [dir] [--refresh]
   grove icr <intent> [dir] [--refresh]
   grove certify <diff-file-or-> [dir]
   grove conflicts <icr-a> <icr-b>

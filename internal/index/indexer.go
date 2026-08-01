@@ -67,14 +67,9 @@ type Options struct {
 // splice — any divergence from the in-memory edge set self-heals through the
 // full ReplaceEdges diff in the same run.
 func (i *Indexer) spliceEdgeWrite(ctx context.Context, symbols []core.SymbolRecord, edges []core.Edge, meta *graph.DeltaMeta, result *core.IndexResult) error {
-	owners := make([]string, 0, len(meta.AffectedOwners)+len(meta.AffectedTests))
+	owners := make([]string, 0, len(meta.AffectedOwners))
 	for id := range meta.AffectedOwners {
 		owners = append(owners, id)
-	}
-	for id := range meta.AffectedTests {
-		if !meta.AffectedOwners[id] {
-			owners = append(owners, id)
-		}
 	}
 
 	var nativeFiles []string

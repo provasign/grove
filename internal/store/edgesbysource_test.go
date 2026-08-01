@@ -22,7 +22,7 @@ func TestEdgesBySourceMatchesFilteredAllEdges(t *testing.T) {
 		{From: "a.go::A@s", To: "b.go::B@s", Type: core.EdgeCalls, Confidence: 0.7, Source: core.EvidenceSourceHeuristic},
 		{From: "a.go::A@s", To: "c.go::C@s", Type: core.EdgeUsesType, Confidence: 0.97, Source: core.EvidenceSourceNative},
 		{From: "file:a.go", To: "a.go::A@s", Type: core.EdgeDefines, Confidence: 1.0, Source: core.EvidenceSourceASTKit},
-		{From: "c.go::C@s", To: "a.go::A@s", Type: core.EdgeTests, Confidence: 0.8, Source: core.EvidenceSourceHeuristic},
+		{From: "c.go::C@s", To: "a.go::A@s", Type: core.EdgeCalls, Confidence: 0.8, Source: core.EvidenceSourceHeuristic},
 	}
 	if err := st.ReplaceEdges(ctx, seed); err != nil {
 		t.Fatal(err)

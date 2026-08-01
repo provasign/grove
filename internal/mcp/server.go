@@ -140,8 +140,6 @@ func (s *Server) callTool(name string, args map[string]any) (any, error) {
 			out["note"] = fmt.Sprintf("showing %d of %d impacted symbols", maxImpactNodes, len(nodes))
 		}
 		return out, nil
-	case "grove_tests":
-		return map[string]any{"tests": slimSymbols(s.currentGraph().TestsFor(stringArg(args, "query", stringArg(args, "file", ""))), 0)}, nil
 	case "grove_icr":
 		return s.currentGraph().ComputeICR(stringArg(args, "intent", "")), nil
 	case "grove_conflicts":
@@ -331,13 +329,6 @@ func tools() []map[string]any {
 			"description": "Dependency edges touching a file: its defines/imports edges plus edges in and out of the symbols it defines.",
 			"inputSchema": objectSchema([]string{"file"}, map[string]any{
 				"file": prop("string", "Repo-relative file path, e.g. 'internal/store/store.go'."),
-			}),
-		},
-		{
-			"name":        "grove_tests",
-			"description": "Tests covering a symbol or file, directly or transitively through the call graph.",
-			"inputSchema": objectSchema([]string{"query"}, map[string]any{
-				"query": prop("string", "Symbol name, qualified name, or file path whose covering tests you want."),
 			}),
 		},
 		{

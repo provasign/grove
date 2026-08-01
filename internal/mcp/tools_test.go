@@ -108,17 +108,17 @@ func TestMCPCertifyTool(t *testing.T) {
 	}
 }
 
-func TestMCPToolsListReturnsNineTools(t *testing.T) {
+func TestMCPToolsListReturnsExpectedTools(t *testing.T) {
 	s, _ := newMCPTestServer(t)
 	resp := rpcCall(t, s, "tools/list", nil)
 	result, _ := resp["result"].(map[string]any)
 	list, _ := result["tools"].([]any)
-	if len(list) != 9 {
-		t.Fatalf("expected 9 tools, got %d: %v", len(list), list)
+	if len(list) != 8 {
+		t.Fatalf("expected 8 tools, got %d: %v", len(list), list)
 	}
 	want := map[string]bool{
 		"grove_index": false, "grove_query": false, "grove_impact": false,
-		"grove_deps": false, "grove_tests": false, "grove_icr": false,
+		"grove_deps": false, "grove_icr": false,
 		"grove_conflicts": false, "grove_symbols": false, "grove_certify": false,
 	}
 	for _, tool := range list {
@@ -156,7 +156,6 @@ func TestMCPCallEveryTool(t *testing.T) {
 		{"grove_symbols", map[string]any{"query": "Logout", "limit": 5}},
 		{"grove_deps", map[string]any{"file": "auth.go"}},
 		{"grove_impact", map[string]any{"query": "Logout", "maxDepth": 3}},
-		{"grove_tests", map[string]any{"query": "Login"}},
 		{"grove_icr", map[string]any{"intent": "Login"}},
 	}
 	for _, c := range cases {

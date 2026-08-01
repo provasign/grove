@@ -218,16 +218,12 @@ func TestPythonTypedFactoryParamStillResolves(t *testing.T) {
 	}
 }
 
-// TestPythonModuleGlobalProxySetattr covers the flask@36e4a824 false-gap:
-// a test assigns `g.foo = value` where `g` is a module-level global typed as
-// a proxy stub (`_AppCtxGlobalsProxy`) that inherits the class carrying the
-// real __setattr__ (`_AppCtxGlobals`). Attribute assignment has no call site,
-// the global is reached through a re-export (not a direct import), and the
-// declared type is a type-checking stub — three reasons grove previously saw
-// no edge and reported __setattr__ as untested despite real coverage. Asserts
-// both the calls edge (test → __setattr__, resolved through the global's type
-// and a base-class walk) and the tests edge (which must bypass the import-
-// scope guard, since ctx.py is not in the test file's direct import scope).
+// TestPythonModuleGlobalProxySetattr: a test assigns `g.foo = value` where
+// `g` is a module-level global typed as a proxy stub (`_AppCtxGlobalsProxy`)
+// that inherits the class carrying the real __setattr__ (`_AppCtxGlobals`).
+// Attribute assignment has no call site and the declared type is a
+// type-checking stub, so resolving it exercises module-global type inference
+// plus a base-class walk. Asserts the calls edge test → __setattr__.
 func TestPythonModuleGlobalProxySetattr(t *testing.T) {
 	g := New()
 	g.Replace([]core.SymbolRecord{
@@ -254,98 +250,7 @@ func TestPythonModuleGlobalProxySetattr(t *testing.T) {
 	if !hasEdge(g, core.EdgeCalls, "test_basic.py::test_g@sha", "ctx.py::_AppCtxGlobals.__setattr__@sha") {
 		t.Fatalf("expected calls edge from test through module-global proxy to _AppCtxGlobals.__setattr__")
 	}
-	if !hasEdge(g, core.EdgeTests, "test_basic.py::test_g@sha", "ctx.py::_AppCtxGlobals.__setattr__@sha") {
-		t.Fatalf("expected tests edge (scope guard must be bypassed for the trusted dunder edge)")
-	}
 }
-
-// ─── TestsFor traverses tests edges and transitive callers ───────────────────
-
-func TestTestsForFollowsTestsEdge(t *testing.T) {
-	g := New()
-	g.Replace([]core.SymbolRecord{
-		{ID: "auth.go::Login@sha", FilePath: "auth.go", Language: "go", Kind: core.KindFunction, Name: "Login", QualifiedName: "Login"},
-		{ID: "auth_test.go::TestLogin@sha", FilePath: "auth_test.go", Language: "go", Kind: core.KindFunction, Name: "TestLogin", QualifiedName: "TestLogin"},
-	}, 2)
-
-	tests := g.TestsFor("Login")
-	if len(tests) != 1 || tests[0].Name != "TestLogin" {
-		t.Fatalf("expected TestLogin to cover Login, got: %+v", tests)
-	}
-}
-
-func TestTestsForTransitiveCaller(t *testing.T) {
-	// CallSites are populated as the parser would on real code: the closure
-	// follows AST-evidenced call edges (0.95). Cross-file regex-fallback
-	// edges (0.6) are deliberately below the traversal cut — see
-	// TestTestsForSkipsLowConfidenceEdges.
-	g := New()
-	g.Replace([]core.SymbolRecord{
-		{ID: "auth.go::Login@sha", FilePath: "auth.go", Language: "go", Kind: core.KindFunction, Name: "Login", QualifiedName: "Login",
-			RawText: "func Login() {}"},
-		{ID: "handler.go::Handle@sha", FilePath: "handler.go", Language: "go", Kind: core.KindFunction, Name: "Handle", QualifiedName: "Handle",
-			RawText: "func Handle() { Login() }", Imports: []string{"github.com/provasign/grove/auth"},
-			CallSites: []core.CallSite{{Callee: "Login", Line: 1}}},
-		{ID: "service.go::Serve@sha", FilePath: "service.go", Language: "go", Kind: core.KindFunction, Name: "Serve", QualifiedName: "Serve",
-			RawText: "func Serve() { Handle() }", Imports: []string{"github.com/provasign/grove/handler"},
-			CallSites: []core.CallSite{{Callee: "Handle", Line: 1}}},
-		{ID: "handler_test.go::TestHandle@sha", FilePath: "handler_test.go", Language: "go", Kind: core.KindFunction, Name: "TestHandle", QualifiedName: "TestHandle"},
-		{ID: "service_test.go::TestServe@sha", FilePath: "service_test.go", Language: "go", Kind: core.KindFunction, Name: "TestServe", QualifiedName: "TestServe"},
-	}, 3)
-
-	tests := g.TestsFor("Login")
-	foundHandle := false
-	foundServe := false
-	for _, t2 := range tests {
-		if t2.Name == "TestHandle" {
-			foundHandle = true
-		}
-		if t2.Name == "TestServe" {
-			foundServe = true
-		}
-	}
-	if !foundHandle || !foundServe {
-		t.Fatalf("expected transitive downstream tests for Login, got: %+v", tests)
-	}
-}
-
-// TestTestsEdgeScopedToImports guards against H3: TestOpen in one package
-// must not produce a tests edge to a same-named symbol in an unrelated,
-// non-imported package.
-func TestTestsEdgeScopedToImports(t *testing.T) {
-	g := New()
-	g.Replace([]core.SymbolRecord{
-		{ID: "internal/store/store.go::Open@sha", FilePath: "internal/store/store.go", Language: "go", Kind: core.KindFunction, Name: "Open", QualifiedName: "Open"},
-		{ID: "pkg/grove/grove.go::Open@sha", FilePath: "pkg/grove/grove.go", Language: "go", Kind: core.KindFunction, Name: "Open", QualifiedName: "Open"},
-		{ID: "internal/store/store_test.go::TestOpen@sha", FilePath: "internal/store/store_test.go", Language: "go", Kind: core.KindFunction, Name: "TestOpen", QualifiedName: "TestOpen"},
-	}, 3)
-
-	if !hasEdge(g, core.EdgeTests, "internal/store/store_test.go::TestOpen@sha", "internal/store/store.go::Open@sha") {
-		t.Fatal("missing tests edge to same-package Open")
-	}
-	if hasEdge(g, core.EdgeTests, "internal/store/store_test.go::TestOpen@sha", "pkg/grove/grove.go::Open@sha") {
-		t.Fatal("tests edge leaked to non-imported package's Open")
-	}
-}
-
-// TestRustAnnotatedTestGetsSameFileTestsEdge: Rust tests live in the same
-// file as production code (mod tests) and are identified by #[test], not by
-// file naming. Call-site evidence links them to what they exercise.
-func TestRustAnnotatedTestGetsSameFileTestsEdge(t *testing.T) {
-	g := New()
-	g.Replace([]core.SymbolRecord{
-		{ID: "src/lib.rs::parse_input@sha", FilePath: "src/lib.rs", Language: "rust", Kind: core.KindFunction, Name: "parse_input", QualifiedName: "parse_input"},
-		{ID: "src/lib.rs::handles_empty@sha", FilePath: "src/lib.rs", Language: "rust", Kind: core.KindFunction, Name: "handles_empty", QualifiedName: "handles_empty",
-			Annotations: []string{"#[test]"},
-			CallSites:   []core.CallSite{{Callee: "parse_input", Line: 42}}},
-	}, 1)
-
-	if !hasEdge(g, core.EdgeTests, "src/lib.rs::handles_empty@sha", "src/lib.rs::parse_input@sha") {
-		t.Fatal("missing tests edge from #[test] fn to called function")
-	}
-}
-
-// ─── ICR / conflict ─────────────────────────────────────────────────────────
 
 func TestComputeICRNoSeedsHasZeroConfidence(t *testing.T) {
 	g := New()
@@ -435,41 +340,6 @@ func itoa(i int) string {
 	}
 	return string(out)
 }
-
-// Tests edges must follow call edges through same-test-file helpers
-// (fixtures/builders) to the production symbols they reach.
-func TestBuildTests_HelperTransitiveCoverage(t *testing.T) {
-	test := core.SymbolRecord{
-		ID: "tests/test_app.py::test_login@1", FilePath: "tests/test_app.py", BlobSHA: "1",
-		Language: "python", Kind: core.KindFunction,
-		Name: "test_login", QualifiedName: "test_login",
-		Imports:   []string{"app"},
-		CallSites: []core.CallSite{{Callee: "make_client", Line: 2}},
-	}
-	helper := core.SymbolRecord{
-		ID: "tests/test_app.py::make_client@10", FilePath: "tests/test_app.py", BlobSHA: "1",
-		Language: "python", Kind: core.KindFunction,
-		Name: "make_client", QualifiedName: "make_client",
-		Imports:   []string{"app"},
-		CallSites: []core.CallSite{{Callee: "create_app", Line: 11}},
-	}
-	target := core.SymbolRecord{
-		ID: "app.py::create_app@5", FilePath: "app.py", BlobSHA: "1",
-		Language: "python", Kind: core.KindFunction,
-		Name: "create_app", QualifiedName: "create_app",
-	}
-	g := New()
-	g.Replace([]core.SymbolRecord{test, helper, target}, 2)
-	_, edges := g.Snapshot() // tests edges are a lazy view; Snapshot materializes it
-	for _, e := range edges {
-		if e.Type == core.EdgeTests && e.From == test.ID && e.To == target.ID {
-			return
-		}
-	}
-	t.Fatal("expected tests edge test_login → create_app through the helper")
-}
-
-// Property reads: "self.request.blueprints" must produce a calls edge to the
 // @property method blueprints, and never to a plain (non-property) method.
 func TestBuildCalls_PropertyReadEdges(t *testing.T) {
 	caller := core.SymbolRecord{

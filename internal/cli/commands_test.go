@@ -282,33 +282,6 @@ func TestRun_ImpactNoArgs(t *testing.T) {
 	}
 }
 
-// --- tests ---
-
-func TestRun_Tests(t *testing.T) {
-	dir := goFixture(t)
-	if got := Run([]string{"index", dir}); got != 0 {
-		t.Fatalf("index: want 0, got %d", got)
-	}
-	if got := Run([]string{"tests", "Login", dir}); got != 0 {
-		t.Fatalf("want 0, got %d", got)
-	}
-}
-
-func TestRun_TestsNoQuery(t *testing.T) {
-	// The lone positional is the root, not the query. Run from a cwd outside
-	// any repo: if the dir were misparsed as the query, root would resolve
-	// from cwd and fail here instead of succeeding via the fixture dir.
-	wd, _ := os.Getwd()
-	if err := os.Chdir(t.TempDir()); err != nil {
-		t.Skip("cannot chdir:", err)
-	}
-	defer os.Chdir(wd)
-	dir := goFixture(t)
-	if got := Run([]string{"tests", dir}); got != 0 {
-		t.Fatalf("want 0, got %d", got)
-	}
-}
-
 // --- icr ---
 
 func TestRun_ICR(t *testing.T) {

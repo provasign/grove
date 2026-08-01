@@ -67,7 +67,7 @@ func TestIncrementalIndexMatchesFullRebuild(t *testing.T) {
 	rawQueries := func(t *testing.T, eng *Engine) string {
 		t.Helper()
 		var parts []string
-		n, err := eng.Neighbors(ctx, "Resolve", "in", EdgeCalls, EdgeTests)
+		n, err := eng.Neighbors(ctx, "Resolve", "in", EdgeCalls)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -75,10 +75,6 @@ func TestIncrementalIndexMatchesFullRebuild(t *testing.T) {
 		imp, err := eng.Impact(ctx, "Resolve", 3)
 		if err == nil {
 			parts = append(parts, fmt.Sprintf("%+v", imp))
-		}
-		tests, err := eng.Tests(ctx, "Run")
-		if err == nil {
-			parts = append(parts, fmt.Sprintf("%+v", tests))
 		}
 		ci, err := eng.ChangeImpact(ctx, "core.Resolve")
 		if err == nil {

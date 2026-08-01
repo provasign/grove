@@ -55,7 +55,7 @@ func TestBuildEdges_EverySourceTagged(t *testing.T) {
 	}
 	// Sanity: the fixture must actually exercise the main builders, otherwise
 	// the guard could pass vacuously.
-	for _, want := range []core.EdgeType{core.EdgeCalls, core.EdgeDefines, core.EdgeContains, core.EdgeTests} {
+	for _, want := range []core.EdgeType{core.EdgeCalls, core.EdgeDefines, core.EdgeContains} {
 		if !seenTypes[want] {
 			t.Errorf("fixture did not produce any %q edges — guard is not covering it", want)
 		}

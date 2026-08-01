@@ -501,34 +501,6 @@ function-like macros expanding to `*_new` calls; Grove has no symbol for a
 macro, so calls through them are absent — the structural ceiling for a
 source-level graph of C.
 
-## Tests edges (runtime coverage oracle)
-
-`gen_truth.py --tests-out` also records which in-repo functions each test
-actually executed (transitively). `grove-eval score-tests` compares Grove's
-`tests` edges against that. Here precision is fully meaningful — the oracle
-saw everything each test touched, so a Grove tests-edge to an untouched
-function is a real false signal. The headline metric is the **function hit
-rate**: for what share of genuinely covered functions does Grove suggest at
-least one truly-covering test. That's the number RFC #5's "related tests"
-signal lives or dies by.
-
-Grove's tests edges are built from the fully-narrowed call graph: direct
-calls from the test (0.85), through same-test-file helpers/fixtures
-(0.75–0.6), and one hop past the entry point into production code (0.55) —
-confidence tiers let consumers trade precision for reach.
-
-### Baseline (2026-06-12, tests edges, Python)
-
-| Repo | Edge precision | Function hit rate |
-|---|---|---|
-| requests | 0.8176 | 0.5060 (85/168) |
-| flask | 0.5669 | 0.3356 (99/295) |
-
-Before this round Grove's tests edges were effectively broken for
-qualified call sites (26 in-universe edges on flask, 6% hit rate): the
-call-site evidence path skipped every dotted callee, which astkit v0.4.2's
-qualifiers had made nearly all of them.
-
 ## Impact (blast radius) accuracy
 
 `grove-eval score-impact` measures reverse reachability: for every truth

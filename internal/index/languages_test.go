@@ -178,9 +178,9 @@ func TestAllLanguagesProduceSymbolsAndEdges(t *testing.T) {
 		}
 	}
 
-	// 8 edge types present (allow extends to be missing if no extends in fixture).
+	// Core edge types present (allow extends to be missing if no extends in fixture).
 	have := edgeTypeSet(edges)
-	for _, e := range []core.EdgeType{core.EdgeDefines, core.EdgeImports, core.EdgeContains, core.EdgeExtends, core.EdgeImplements, core.EdgeCalls, core.EdgeTests} {
+	for _, e := range []core.EdgeType{core.EdgeDefines, core.EdgeImports, core.EdgeContains, core.EdgeExtends, core.EdgeImplements, core.EdgeCalls} {
 		if !have[e] {
 			t.Errorf("missing edge type %q in graph", e)
 		}

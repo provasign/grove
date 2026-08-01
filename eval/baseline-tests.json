@@ -1,8 +1,0 @@
-{
-  "flask": {
-    "commit": "36e4a824",
-    "precision": 0.7415,
-    "hitRate": 0.3627,
-    "tolerance": 0.005
-  }
-}

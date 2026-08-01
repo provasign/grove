@@ -29,6 +29,8 @@ func TestCertifyDiffAllowWithMappedSymbolAndTest(t *testing.T) {
 			Name:          "TestLogin",
 			QualifiedName: "TestLogin",
 			Span:          core.LineRange{Start: 3, End: 5},
+			RawText:       "func TestLogin(t *testing.T) { Login(\"u\", \"p\") }",
+			CallSites:     []core.CallSite{{Callee: "Login", Line: 3}},
 		},
 	}, 2)
 
@@ -240,6 +242,8 @@ func TestCertifyDiffManualReviewPartialTestCoverage(t *testing.T) {
 			Name:          "TestLogin",
 			QualifiedName: "TestLogin",
 			Span:          core.LineRange{Start: 3, End: 5},
+			RawText:       "func TestLogin(t *testing.T) { Login() }",
+			CallSites:     []core.CallSite{{Callee: "Login", Line: 3}},
 		},
 	}, 3)
 

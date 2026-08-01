@@ -164,53 +164,6 @@ func TestDepsExactPrefixNotSubstring(t *testing.T) {
 		}
 	}
 }
-
-func TestTestsFor(t *testing.T) {
-	codeGraph := New()
-	codeGraph.Replace([]core.SymbolRecord{
-		{ID: "main.go::Login@sha", FilePath: "main.go", Language: "go", Kind: core.KindFunction, Name: "Login", QualifiedName: "Login"},
-		{ID: "main_test.go::TestLogin@sha", FilePath: "main_test.go", Language: "go", Kind: core.KindFunction, Name: "TestLogin", QualifiedName: "TestLogin"},
-	}, 2)
-
-	tests := codeGraph.TestsFor("login")
-	if len(tests) != 1 || tests[0].Name != "TestLogin" {
-		t.Fatalf("unexpected tests: %+v", tests)
-	}
-
-	impact := codeGraph.Impact("Login", 3)
-	if len(impact) != 1 || impact[0].Name != "TestLogin" {
-		t.Fatalf("unexpected impact: %+v", impact)
-	}
-}
-
-func TestAffectedTests(t *testing.T) {
-	g := New()
-	g.Replace([]core.SymbolRecord{
-		{ID: "main.go::Login@sha", FilePath: "main.go", Language: "go", Kind: core.KindFunction, Name: "Login", QualifiedName: "Login"},
-		{ID: "main_test.go::TestLogin@sha", FilePath: "main_test.go", Language: "go", Kind: core.KindFunction, Name: "TestLogin", QualifiedName: "TestLogin"},
-		{ID: "other.go::Unrelated@sha", FilePath: "other.go", Language: "go", Kind: core.KindFunction, Name: "Unrelated", QualifiedName: "Unrelated"},
-	}, 3)
-
-	// A changed source file maps to the tests covering its symbols.
-	tests := g.AffectedTests([]string{"main.go"})
-	if len(tests) != 1 || tests[0].Name != "TestLogin" {
-		t.Fatalf("main.go should select TestLogin, got %+v", tests)
-	}
-	// A file whose symbols no test reaches selects nothing (the narrowing
-	// that makes "run only affected tests" worthwhile).
-	if got := g.AffectedTests([]string{"other.go"}); len(got) != 0 {
-		t.Fatalf("other.go should select no tests, got %+v", got)
-	}
-	// Unknown / non-indexed file: empty, no panic.
-	if got := g.AffectedTests([]string{"does-not-exist.go"}); len(got) != 0 {
-		t.Fatalf("unknown file should select nothing, got %+v", got)
-	}
-	// Empty input is a no-op, not a full-suite selection.
-	if got := g.AffectedTests(nil); len(got) != 0 {
-		t.Fatalf("no changed files should select no tests, got %+v", got)
-	}
-}
-
 func TestComputeICRAndDetectConflicts(t *testing.T) {
 	codeGraph := New()
 	codeGraph.Replace([]core.SymbolRecord{
@@ -260,37 +213,5 @@ func TestComputeICRNoMatchReturnsEmptyLowConfidenceRegion(t *testing.T) {
 	conflict := DetectConflicts(icr, other)
 	if conflict.Conflicts {
 		t.Fatalf("two no-match ICRs must not conflict, got %+v", conflict)
-	}
-}
-
-// TestsFor's closure must not traverse low-confidence fallback edges:
-// ambiguous bare-name call matches (0.6) connect unrelated subsystems on
-// large repos and swept in tests from across the monorepo (grafana,
-// 2026-06-12).
-func TestTestsForSkipsLowConfidenceEdges(t *testing.T) {
-	g := New()
-	syms := []core.SymbolRecord{
-		{ID: "a.go::Target@1", FilePath: "a.go", Kind: core.KindFunction, Name: "Target", QualifiedName: "Target", RawText: "func Target() {}"},
-		{ID: "b.go::Caller@1", FilePath: "b.go", Kind: core.KindFunction, Name: "Caller", QualifiedName: "Caller", RawText: "func Caller() { Target() }"},
-		{ID: "c.go::FarAway@1", FilePath: "c.go", Kind: core.KindFunction, Name: "FarAway", QualifiedName: "FarAway", RawText: "func FarAway() {}"},
-		{ID: "b_test.go::TestCaller@1", FilePath: "b_test.go", Kind: core.KindFunction, Name: "TestCaller", QualifiedName: "TestCaller", RawText: "func TestCaller(t *testing.T) { Caller() }"},
-		{ID: "c_test.go::TestFarAway@1", FilePath: "c_test.go", Kind: core.KindFunction, Name: "TestFarAway", QualifiedName: "TestFarAway", RawText: "func TestFarAway(t *testing.T) { FarAway() }"},
-	}
-	edges := []core.Edge{
-		{From: "b.go::Caller@1", To: "a.go::Target@1", Type: core.EdgeCalls, Confidence: 0.95},
-		{From: "b_test.go::TestCaller@1", To: "b.go::Caller@1", Type: core.EdgeTests, Confidence: 0.85},
-		// Fallback edge from an unrelated subsystem: ambiguous name match.
-		{From: "c.go::FarAway@1", To: "a.go::Target@1", Type: core.EdgeCalls, Confidence: 0.6},
-		{From: "c_test.go::TestFarAway@1", To: "c.go::FarAway@1", Type: core.EdgeTests, Confidence: 0.85},
-	}
-	g.ReplaceWithStoredEdges(syms, edges, 5)
-
-	tests := g.TestsFor("Target")
-	names := make([]string, 0, len(tests))
-	for _, ts := range tests {
-		names = append(names, ts.Name)
-	}
-	if len(tests) != 1 || tests[0].Name != "TestCaller" {
-		t.Fatalf("want only TestCaller via the high-confidence path, got %v", names)
 	}
 }

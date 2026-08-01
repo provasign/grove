@@ -53,10 +53,9 @@ var identTokenRe = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]*`)
 
 // DeadCode computes forward reachability from every entry point — main/init
 // functions, test symbols, exported symbols, plus extraRoots by name — over
-// call, test, uses-type, and override edges, and reports the production
+// call, uses-type, and override edges, and reports the production
 // functions/methods nothing reaches.
 func (g *CodeGraph) DeadCode(extraRoots []string) *DeadCodeResult {
-	g.ensureTests()
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
@@ -97,7 +96,10 @@ func (g *CodeGraph) DeadCode(extraRoots []string) *DeadCodeResult {
 		for _, ei := range g.outbound[node] {
 			edge := g.edges[ei]
 			switch edge.Type {
-			case core.EdgeCalls, core.EdgeTests, core.EdgeUsesType, core.EdgeOverrides:
+			case core.EdgeCalls, core.EdgeUsesType, core.EdgeOverrides:
+				// Test files are roots (isTestFilePath above) and reach the
+				// production code they exercise over calls edges, so the
+				// removed EdgeTests contributed no additional reachability.
 				if !reached[edge.To] {
 					reached[edge.To] = true
 					frontier = append(frontier, edge.To)

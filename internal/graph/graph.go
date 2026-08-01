@@ -48,16 +48,6 @@ type CodeGraph struct {
 	inbound  map[string][]int
 	outbound map[string][]int
 
-	// testsBuilt marks whether the tests-edge view has been computed for the
-	// currently installed graph. Tests edges are a lazily-computed VIEW
-	// (46% of a monorepo's edges, a materialized cross-product of a cheap
-	// bounded BFS): install() skips them, and the first tests-consuming
-	// query runs buildTests over the installed graph and appends the result
-	// into edges/inbound/outbound, after which every consumer works
-	// unchanged. GROVE_MATERIALIZED_TESTS=1 restores the pre-view behavior
-	// (tests built eagerly in BuildEdges and persisted).
-	testsBuilt bool
-
 	// Lazily-built semantic-search engine. Invalidated on every Replace().
 	// semVecCache survives invalidation: vectors are keyed by symbol ID
 	// (content-hashed), so unchanged symbols skip re-embedding when the
@@ -68,50 +58,6 @@ type CodeGraph struct {
 	semVecCache map[string][]float32
 }
 
-// materializedTests reports whether the rollback flag pins the old behavior:
-// tests edges built eagerly during BuildEdges and persisted to the store.
-func materializedTests() bool {
-	return os.Getenv("GROVE_MATERIALIZED_TESTS") == "1"
-}
-
-// ensureTests computes the tests-edge view on first use. Idempotent per
-// install; a reindex resets the flag and the next tests query recomputes
-// against the fresh graph. The symbol slice is sorted before the build so
-// the view is deterministic (map iteration order must never leak in).
-func (g *CodeGraph) ensureTests() {
-	g.mu.RLock()
-	built := g.testsBuilt
-	g.mu.RUnlock()
-	if built {
-		return
-	}
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.testsBuilt {
-		return
-	}
-	symbols := make([]core.SymbolRecord, 0, len(g.symbols))
-	for _, s := range g.symbols {
-		symbols = append(symbols, s)
-	}
-	sortSymbols(symbols)
-	var callEdges []core.Edge
-	for _, e := range g.edges {
-		if e.Type == core.EdgeCalls {
-			callEdges = append(callEdges, e)
-		}
-	}
-	idx := newEdgeIndex(symbols)
-	testEdges := buildTests(idx, symbols, callEdges, nil)
-	base := len(g.edges)
-	g.edges = append(g.edges, testEdges...)
-	for i := range testEdges {
-		e := &g.edges[base+i]
-		g.inbound[e.To] = append(g.inbound[e.To], base+i)
-		g.outbound[e.From] = append(g.outbound[e.From], base+i)
-	}
-	g.testsBuilt = true
-}
 
 func New() *CodeGraph {
 	return &CodeGraph{symbols: map[string]core.SymbolRecord{}, semDirty: true}
@@ -176,6 +122,19 @@ func (g *CodeGraph) install(symbols []core.SymbolRecord, edges []core.Edge, file
 	for _, s := range symbols {
 		g.symbols[s.ID] = s
 	}
+	// Legacy stores may still carry persisted "tests" rows from before the
+	// heuristic test-coverage edges were removed; drop them BEFORE the
+	// inbound/outbound indexes are built so no consumer sees the dead edge
+	// type and the indexes stay aligned.
+	{
+		kept := edges[:0]
+		for _, e := range edges {
+			if e.Type != core.EdgeTests {
+				kept = append(kept, e)
+			}
+		}
+		edges = kept
+	}
 	g.edges = edges
 	g.filesIndexed = filesIndexed
 	// inbound and outbound key disjoint fields, so the two index builds are
@@ -198,22 +157,6 @@ func (g *CodeGraph) install(symbols []core.SymbolRecord, edges []core.Edge, file
 		}
 	}()
 	wg.Wait()
-
-	// Under the view model the freshly installed graph has no tests edges
-	// yet; under the rollback flag they were built eagerly (or restored
-	// verbatim from the store) and the view must not run again on top.
-	// Installing an edge set that ALREADY carries tests rows (a re-installed
-	// Snapshot, an old store under the rollback flag) also counts as built —
-	// running the view on top would duplicate them.
-	g.testsBuilt = materializedTests()
-	if !g.testsBuilt {
-		for i := range g.edges {
-			if g.edges[i].Type == core.EdgeTests {
-				g.testsBuilt = true
-				break
-			}
-		}
-	}
 
 	g.semMu.Lock()
 	g.semDirty = true
@@ -296,12 +239,6 @@ func BuildEdges(symbols []core.SymbolRecord) []core.Edge {
 	decoEdges := buildDecoratorEdges(idx, symbols, callEdges)
 	edges = append(edges, decoEdges...)
 	tick("decorators")
-	// Tests edges are a lazily-computed view (see ensureTests) unless the
-	// rollback flag pins the eager/persisted behavior.
-	if materializedTests() {
-		edges = append(edges, buildTests(idx, symbols, append(callEdges, decoEdges...), nil)...)
-		tick("tests")
-	}
 	return edges
 }
 
@@ -320,22 +257,11 @@ func edgeTimer() func(string) {
 
 // EdgesSnapshot returns a copy of the edge list only — the store write path
 // needs no symbols, and deep-copying 100k symbol records to discard them
-// dominated the write phase on monorepos. Under the view model, tests edges
-// are session-computed and must never reach the store, so they are excluded
-// here even when ensureTests has appended them to the live graph.
+// dominated the write phase on monorepos.
 func (g *CodeGraph) EdgesSnapshot() []core.Edge {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-	if materializedTests() {
-		return append([]core.Edge(nil), g.edges...)
-	}
-	out := make([]core.Edge, 0, len(g.edges))
-	for _, e := range g.edges {
-		if e.Type != core.EdgeTests {
-			out = append(out, e)
-		}
-	}
-	return out
+	return append([]core.Edge(nil), g.edges...)
 }
 
 // BaselineRef returns the live symbol and edge slices WITHOUT copying, for
@@ -355,7 +281,6 @@ func (g *CodeGraph) BaselineRef() ([]core.SymbolRecord, []core.Edge) {
 }
 
 func (g *CodeGraph) Snapshot() ([]core.SymbolRecord, []core.Edge) {
-	g.ensureTests()
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
@@ -505,7 +430,6 @@ func searchRank(symbol core.SymbolRecord, query string) int {
 // Uses exact-prefix matching: edges from "file:<path>" or whose node ID
 // begins with "<path>::" (symbol IDs in that file).
 func (g *CodeGraph) Deps(filePath string) []core.Edge {
-	g.ensureTests()
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
@@ -539,9 +463,6 @@ type Neighbor struct {
 // direction is "out", "in", or "both"/"". kinds filters by edge type; an empty
 // set returns every kind. Seeds are matched by exact name / qualified name / ID.
 func (g *CodeGraph) Neighbors(query, direction string, kinds map[core.EdgeType]bool) []Neighbor {
-	if len(kinds) == 0 || kinds[core.EdgeTests] {
-		g.ensureTests()
-	}
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
@@ -614,7 +535,6 @@ func (g *CodeGraph) Impact(query string, maxDepth int) []core.SymbolRecord {
 // PolicyCertification for a blast radius that only follows guarantee-grade
 // edges.
 func (g *CodeGraph) ImpactWithPolicy(query string, maxDepth int, policy TraversalPolicy) []core.SymbolRecord {
-	g.ensureTests()
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
@@ -696,18 +616,6 @@ func (g *CodeGraph) ImpactWithPolicy(query string, maxDepth int, policy Traversa
 	return impacted
 }
 
-// TestsFor returns all test symbols that cover the given query target.
-// Resolution order:
-//  1. If the query matches an existing symbol name, walk the full inbound
-//     dependency closure (calls/contains/implements/extends/uses-type/tests)
-//     and gather every test symbol that reaches any node in that closure.
-//  2. Fallback: substring search in test files (for free-text queries).
-//
-// minTestTraversalConfidence bounds which edges the TestsFor closure walks.
-// Resolved call edges carry 0.85–0.95, containment 1.0; the fallback tiers
-// (ambiguous name-matched calls 0.6, type-use 0.5) sit below the cut.
-const minTestTraversalConfidence = 0.7
-
 // TraversalPolicy decides which edges a consumer closure may walk, by
 // confidence floor and resolver reason. Profiles let tests / impact /
 // certification / diagnostic consumers opt into different strictness instead of
@@ -733,11 +641,6 @@ func (p TraversalPolicy) Allows(e core.Edge) bool {
 var (
 	// PolicyDiagnostic walks every edge — debugging / full blast radius.
 	PolicyDiagnostic = TraversalPolicy{Name: "diagnostic"}
-	// PolicyTests: evidence-backed edges only. The 0.7 floor drops type-use
-	// (0.5) and ambiguous name-matched calls (0.6); the reason exclusion drops
-	// the regex body-scan fallback even at same-file confidence (0.85).
-	PolicyTests = TraversalPolicy{Name: "tests", MinConfidence: minTestTraversalConfidence,
-		ExcludeReason: map[core.EdgeReason]bool{core.ReasonRegexFallbck: true}}
 	// PolicyImpact: blast radius keeps dynamic dispatch (real edges) but drops
 	// the regex fallback and the weakest type-use guesses (0.5).
 	PolicyImpact = TraversalPolicy{Name: "impact", MinConfidence: 0.6,
@@ -757,153 +660,6 @@ var (
 // traversal — so consumers (certification) can cite the evidence they did not
 // trust.
 type PolicySkips map[core.EdgeReason]int
-
-func (g *CodeGraph) TestsFor(query string) []core.SymbolRecord {
-	tests, _ := g.testsForWithPolicy(query, PolicyTests)
-	return tests
-}
-
-// TestsForWithStats is TestsFor plus the per-reason counts of edges the policy
-// excluded from the closure — the evidence Grove chose not to trust, for
-// certification-style "included vs excluded" reporting.
-func (g *CodeGraph) TestsForWithStats(query string) ([]core.SymbolRecord, PolicySkips) {
-	return g.testsForWithPolicy(query, PolicyTests)
-}
-
-// coveringTestsLocked walks the inbound dependency closure from the seed nodes
-// and returns the test symbols that reach any node in it. The caller holds the
-// read lock; edges the policy excludes are accumulated into skips.
-func (g *CodeGraph) coveringTestsLocked(seeds map[string]bool, policy TraversalPolicy, skips PolicySkips) map[string]core.SymbolRecord {
-	tests := make(map[string]core.SymbolRecord)
-	if len(seeds) == 0 {
-		return tests
-	}
-	visited := make(map[string]bool, len(seeds))
-	queue := make([]string, 0, len(seeds))
-	for id := range seeds {
-		visited[id] = true
-		queue = append(queue, id)
-	}
-	for len(queue) > 0 {
-		node := queue[0]
-		queue = queue[1:]
-		for _, ei := range g.inbound[node] {
-			edge := g.edges[ei]
-			switch edge.Type {
-			case core.EdgeTests:
-				if t, ok := g.symbols[edge.From]; ok {
-					tests[t.ID] = t
-				}
-			case core.EdgeCalls, core.EdgeContains, core.EdgeImplements, core.EdgeExtends, core.EdgeUsesType:
-				if !policy.Allows(edge) {
-					skips[edge.Reason]++
-					continue
-				}
-				if !visited[edge.From] {
-					visited[edge.From] = true
-					queue = append(queue, edge.From)
-				}
-			}
-		}
-	}
-	return tests
-}
-
-// TestsForSymbol returns the covering tests for one symbol ID under the given
-// policy — the ID-seeded form of TestsFor, used to benchmark the closure (and
-// to compare policies) without the name-matching phase.
-func (g *CodeGraph) TestsForSymbol(id string, policy TraversalPolicy) []core.SymbolRecord {
-	g.ensureTests()
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-	tests := g.coveringTestsLocked(map[string]bool{id: true}, policy, PolicySkips{})
-	out := make([]core.SymbolRecord, 0, len(tests))
-	for _, t := range tests {
-		out = append(out, t)
-	}
-	sortSymbols(out)
-	return out
-}
-
-// AffectedTests returns the covering tests for every symbol defined in the
-// given repo-relative files — the file-diff form of TestsFor. It seeds the
-// inbound test-coverage closure with all symbols in the changed files at once
-// (one traversal), so a CI "run only the affected tests" step maps a
-// `git diff --name-only` straight to the set of test symbols to run. Uses the
-// same evidence-backed policy as TestsFor (low-confidence edges excluded, so a
-// weak bare-name match cannot sweep in unrelated tests across a monorepo).
-func (g *CodeGraph) AffectedTests(files []string) []core.SymbolRecord {
-	g.ensureTests()
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-	want := make(map[string]bool, len(files))
-	for _, f := range files {
-		want[f] = true
-	}
-	seeds := make(map[string]bool)
-	for id, s := range g.symbols {
-		if want[s.FilePath] {
-			seeds[id] = true
-		}
-	}
-	tests := g.coveringTestsLocked(seeds, PolicyTests, PolicySkips{})
-	out := make([]core.SymbolRecord, 0, len(tests))
-	for _, t := range tests {
-		out = append(out, deepCopySymbol(t))
-	}
-	sortSymbols(out)
-	return out
-}
-
-func (g *CodeGraph) testsForWithPolicy(query string, policy TraversalPolicy) ([]core.SymbolRecord, PolicySkips) {
-	g.ensureTests()
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-
-	skips := PolicySkips{}
-	needle := strings.ToLower(strings.TrimSpace(query))
-
-	// Phase 1: locate target symbols by exact or substring match.
-	targets := make(map[string]bool)
-	for id, symbol := range g.symbols {
-		if needle == "" {
-			break
-		}
-		if strings.EqualFold(symbol.Name, query) ||
-			strings.EqualFold(symbol.QualifiedName, query) ||
-			strings.EqualFold(symbol.FilePath, query) {
-			targets[id] = true
-		}
-	}
-
-	// Phase 2: walk the inbound dependency closure from each target.
-	// Any test symbol that reaches any node in that closure is included.
-	// Traversal follows only evidence-backed edges: low-confidence fallback
-	// edges (ambiguous bare-name call matches at 0.6, type-use guesses at
-	// 0.5) connect unrelated subsystems on large repos and made "tests for
-	// X" sweep in tests from across a monorepo.
-	tests := g.coveringTestsLocked(targets, policy, skips)
-
-	// Phase 3: substring fallback in test files.
-	if len(tests) == 0 {
-		for _, symbol := range g.symbols {
-			if !isTestFile(symbol.FilePath) {
-				continue
-			}
-			text := strings.ToLower(symbol.FilePath + " " + symbol.Name + " " + symbol.QualifiedName + " " + symbol.Signature)
-			if needle == "" || strings.Contains(text, needle) {
-				tests[symbol.ID] = symbol
-			}
-		}
-	}
-
-	out := make([]core.SymbolRecord, 0, len(tests))
-	for _, t := range tests {
-		out = append(out, t)
-	}
-	sortSymbols(out)
-	return out, skips
-}
 
 // ComputeICR computes an Isolated Change Region for the given intent string.
 // When no symbol matches the intent, the region is empty with floor

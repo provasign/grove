@@ -268,7 +268,10 @@ func isTestSymbol(symbol core.SymbolRecord) bool {
 
 func impactEdge(edgeType core.EdgeType) bool {
 	switch edgeType {
-	case core.EdgeCalls, core.EdgeTests, core.EdgeContains, core.EdgeImplements, core.EdgeExtends, core.EdgeUsesType:
+	case core.EdgeCalls, core.EdgeContains, core.EdgeImplements, core.EdgeExtends, core.EdgeUsesType:
+		// Covering tests are found by reaching test SYMBOLS over these edges;
+		// a test that exercises changed code has a resolved calls edge to it,
+		// so the removed heuristic EdgeTests added nothing here.
 		return true
 	default:
 		return false

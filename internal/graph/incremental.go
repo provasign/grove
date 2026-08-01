@@ -22,7 +22,6 @@ import (
 //
 //	calls+decorators — recomputed only for AFFECTED caller symbols; every
 //	  other caller's previous call/decorator edges are kept verbatim.
-//	tests            — recomputed only for AFFECTED test symbols.
 //
 // A caller is affected when any input its resolution reads could have
 // changed (see affectedCallers). The rules are deliberately conservative:
@@ -64,8 +63,6 @@ type DeltaMeta struct {
 	// AffectedOwners: symbol IDs (in unchanged files) whose out-edges were
 	// recomputed — their stored rows must be deleted and reinserted.
 	AffectedOwners map[string]bool
-	// AffectedTests: test symbol IDs whose tests edges were recomputed.
-	AffectedTests map[string]bool
 	// ChangedFiles / NativeAnalyzedDirs: as passed in (splice needs them to
 	// select insert rows and native-row deletions).
 	ChangedFiles       map[string]bool
@@ -161,16 +158,9 @@ func BuildEdgesDeltaMeta(prevEdges []core.Edge, prevSymbols, symbols []core.Symb
 		}
 		return "", false
 	}
-	var prevCalls, prevTests []core.Edge
+	var prevCalls []core.Edge
 	for _, e := range prevEdges {
-		if e.Type != core.EdgeCalls && e.Type != core.EdgeTests {
-			continue
-		}
-		// Under the view model, any tests edges in the baseline are
-		// session-computed view rows (a prior tests query appended them to
-		// the resident graph) — never part of the base set this function
-		// produces. The view recomputes on demand after install.
-		if e.Type == core.EdgeTests && !materializedTests() {
+		if e.Type != core.EdgeCalls {
 			continue
 		}
 		if e.Source == core.EvidenceSourceNative && nativeAnalyzedDirs[fileDirOfNode(e.From)] {
@@ -185,11 +175,7 @@ func BuildEdgesDeltaMeta(prevEdges []core.Edge, prevSymbols, symbols []core.Symb
 			continue
 		}
 		e.From, e.To = from, to
-		if e.Type == core.EdgeCalls {
-			prevCalls = append(prevCalls, e)
-		} else {
-			prevTests = append(prevTests, e)
-		}
+		prevCalls = append(prevCalls, e)
 	}
 
 	// calls + decorators, owner-scoped. An owner's edges are a pure function
@@ -215,38 +201,14 @@ func BuildEdgesDeltaMeta(prevEdges []core.Edge, prevSymbols, symbols []core.Symb
 	allCalls = append(allCalls, decoNew...)
 	edges = append(edges, allCalls...)
 	tick("delta-calls")
-
-	// tests, owner-scoped: a test's edges depend on the naming convention
-	// (name buckets), its import scope, and the call-graph closure within
-	// its bounded walk. affectedTests covers all three plus any test whose
-	// closure could touch a changed call edge.
-	// Under the view model the delta produces no tests edges at all — the
-	// lazily-computed view recomputes them from the fresh graph on the next
-	// tests-consuming query.
-	if !materializedTests() {
-		tick("delta-tests")
-		return edges, buildDeltaMeta(symbols, affected, nil, changedFiles, nativeAnalyzedDirs)
-	}
-	testsAffected := affectedTests(idx, symbols, affected, changedSemFiles, nameDelta, prevCalls, allCalls)
-	testsNew := buildTests(idx, symbols, allCalls, testsAffected)
-	keptTests := make([]core.Edge, 0, len(prevTests))
-	for _, e := range prevTests {
-		if !testsAffected[e.From] { // endpoints already normalized
-			keptTests = append(keptTests, e)
-		}
-	}
-	edges = append(edges, keptTests...)
-	edges = append(edges, testsNew...)
-	tick("delta-tests")
-	return edges, buildDeltaMeta(symbols, affected, testsAffected, changedFiles, nativeAnalyzedDirs)
+	return edges, buildDeltaMeta(symbols, affected, changedFiles, nativeAnalyzedDirs)
 }
 
 // buildDeltaMeta assembles the store-splice write-set metadata: owners in
 // UNCHANGED files whose rows must be replaced (changed-file rows are already
 // handled by the per-file deletes in the persist phase).
-func buildDeltaMeta(symbols []core.SymbolRecord, affected, testsAffected map[string]bool, changedFiles, nativeAnalyzedDirs map[string]bool) *DeltaMeta {
+func buildDeltaMeta(symbols []core.SymbolRecord, affected map[string]bool, changedFiles, nativeAnalyzedDirs map[string]bool) *DeltaMeta {
 	ownersOutsideChanged := make(map[string]bool, len(affected))
-	testsOutsideChanged := make(map[string]bool, len(testsAffected))
 	for i := range symbols {
 		s := &symbols[i]
 		if changedFiles[s.FilePath] {
@@ -255,13 +217,9 @@ func buildDeltaMeta(symbols []core.SymbolRecord, affected, testsAffected map[str
 		if affected[s.ID] {
 			ownersOutsideChanged[s.ID] = true
 		}
-		if testsAffected[s.ID] {
-			testsOutsideChanged[s.ID] = true
-		}
 	}
 	return &DeltaMeta{
 		AffectedOwners:     ownersOutsideChanged,
-		AffectedTests:      testsOutsideChanged,
 		ChangedFiles:       changedFiles,
 		NativeAnalyzedDirs: nativeAnalyzedDirs,
 	}
@@ -461,123 +419,6 @@ func splitCallSiteName(callee string) (string, string) {
 		}
 	}
 	return "", callee
-}
-
-// affectedTests returns the test symbols whose tests edges must be
-// recomputed: tests in changed files or already in the affected caller set,
-// tests whose naming-convention target intersects the name delta, and tests
-// whose bounded call-graph closure can reach an endpoint of any changed call
-// edge (computed as a reverse BFS from changed-edge endpoints over the union
-// of the old and new call adjacencies).
-func affectedTests(idx *edgeIndex, symbols []core.SymbolRecord, affected map[string]bool, changedFiles map[string]bool, nameDelta map[string]bool, prevCalls, newCalls []core.Edge) map[string]bool {
-	out := map[string]bool{}
-
-	// Endpoints of call edges that changed between the runs.
-	edgeKey := func(e core.Edge) string { return e.From + "\x00" + e.To }
-	prevSet := make(map[string]core.Edge, len(prevCalls))
-	for _, e := range prevCalls {
-		prevSet[edgeKey(e)] = e
-	}
-	newSet := make(map[string]core.Edge, len(newCalls))
-	for _, e := range newCalls {
-		newSet[edgeKey(e)] = e
-	}
-	deltaEndpoints := map[string]bool{}
-	for k, e := range prevSet {
-		if _, ok := newSet[k]; !ok {
-			deltaEndpoints[e.From] = true
-			deltaEndpoints[e.To] = true
-		}
-	}
-	for k, e := range newSet {
-		if _, ok := prevSet[k]; !ok {
-			deltaEndpoints[e.From] = true
-			deltaEndpoints[e.To] = true
-		}
-	}
-
-	// Reverse adjacency over old ∪ new call edges.
-	reverse := map[string][]string{}
-	for _, e := range prevCalls {
-		reverse[e.To] = append(reverse[e.To], e.From)
-	}
-	for _, e := range newCalls {
-		reverse[e.To] = append(reverse[e.To], e.From)
-	}
-
-	// The tests walk goes maxHelperDepth hops through helpers plus
-	// maxProdDepth past the first production symbol; +1 slack keeps the
-	// invalidation strictly conservative.
-	const reach = 5
-	visited := map[string]bool{}
-	frontier := make([]string, 0, len(deltaEndpoints))
-	for id := range deltaEndpoints {
-		visited[id] = true
-		frontier = append(frontier, id)
-	}
-	reachable := map[string]bool{}
-	for id := range deltaEndpoints {
-		reachable[id] = true
-	}
-	for depth := 0; depth < reach && len(frontier) > 0; depth++ {
-		var next []string
-		for _, id := range frontier {
-			for _, from := range reverse[id] {
-				if !visited[from] {
-					visited[from] = true
-					reachable[from] = true
-					next = append(next, from)
-				}
-			}
-		}
-		frontier = next
-	}
-
-	for i := range symbols {
-		s := &symbols[i]
-		if !isTestFile(s.FilePath) && !core.HasTestAnnotation(s) {
-			continue
-		}
-		switch {
-		case changedFiles[s.FilePath], affected[s.ID], reachable[s.ID]:
-			out[s.ID] = true
-			continue
-		}
-		// Naming-convention rule: the test's derived target names resolve
-		// through lowercased byName buckets; if any bucket it could hit
-		// changed, the test is re-resolved.
-		for _, candidate := range testTargetNames(s.Name) {
-			if nameDelta[candidate] {
-				out[s.ID] = true
-				break
-			}
-		}
-	}
-	return out
-}
-
-// testTargetNames returns the lowercased naming-convention target candidates
-// for a test symbol name — the same stripping rules testTargets applies
-// before its byName lookups.
-func testTargetNames(name string) []string {
-	var candidates []string
-	switch {
-	case strings.HasPrefix(name, "Test"):
-		candidates = append(candidates, strings.TrimPrefix(name, "Test"))
-	case strings.HasPrefix(name, "test_"):
-		candidates = append(candidates, strings.TrimPrefix(name, "test_"))
-	case strings.HasSuffix(name, "Test"):
-		candidates = append(candidates, strings.TrimSuffix(name, "Test"))
-	case strings.HasSuffix(name, "Spec"):
-		candidates = append(candidates, strings.TrimSuffix(name, "Spec"))
-	}
-	out := candidates[:0]
-	for _, c := range candidates {
-		if c != "" {
-			out = append(out, strings.ToLower(c))
-		}
-	}
-	return out
 }
 
 // scopedCalls is buildCalls restricted to the given symbols (the full index

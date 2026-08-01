@@ -58,7 +58,6 @@ const (
 	EdgeExtends    = core.EdgeExtends
 	EdgeImplements = core.EdgeImplements
 	EdgeUsesType   = core.EdgeUsesType
-	EdgeTests      = core.EdgeTests
 	EdgeContains   = core.EdgeContains
 	EdgeOverrides  = core.EdgeOverrides
 )
@@ -485,48 +484,6 @@ func (e *Engine) MissingImplementations(ctx context.Context, query string) (Miss
 	}, nil
 }
 
-// CoverageSite pairs a change-set site with the tests that reach it.
-type CoverageSite struct {
-	Symbol    Symbol
-	TestCount int
-	Tests     []Symbol // capped; TestCount carries the truth
-}
-
-// UntestedSurfaceResult partitions a method's change-set by test coverage:
-// "before I change Type.method, what in its blast radius has no test?"
-type UntestedSurfaceResult struct {
-	Query      string
-	Untested   []Symbol // change-set sites with no covering test
-	Covered    []CoverageSite
-	TotalSites int
-
-	ExternalSupers    []string
-	OverridesExternal []string
-	Completeness      string
-}
-
-// UntestedSurface computes the change-set for a "Type.method" query and
-// partitions it by covering-test evidence.
-func (e *Engine) UntestedSurface(ctx context.Context, query string) (UntestedSurfaceResult, error) {
-	raw, err := e.currentGraph().UntestedSurface(query)
-	if err != nil {
-		return UntestedSurfaceResult{}, err
-	}
-	covered := make([]CoverageSite, 0, len(raw.Covered))
-	for _, c := range raw.Covered {
-		covered = append(covered, CoverageSite{Symbol: c.Symbol, TestCount: c.TestCount, Tests: c.Tests})
-	}
-	return UntestedSurfaceResult{
-		Query:             raw.Query,
-		Untested:          raw.Untested,
-		Covered:           covered,
-		TotalSites:        raw.TotalSites,
-		ExternalSupers:    raw.ExternalSupers,
-		OverridesExternal: raw.OverridesExternal,
-		Completeness:      raw.Completeness,
-	}, nil
-}
-
 // DeadCodeResult reports production functions/methods nothing reaches.
 // Precision-first; Caveats are part of the result and must be relayed.
 type DeadCodeResult struct {
@@ -583,19 +540,6 @@ func (e *Engine) Neighbors(ctx context.Context, query, direction string, kinds .
 	return out, nil
 }
 
-// Tests returns the test symbols that cover the given symbol/file query.
-func (e *Engine) Tests(ctx context.Context, query string) ([]Symbol, error) {
-	return e.currentGraph().TestsFor(query), nil
-}
-
-// AffectedTests returns the test symbols covering any symbol defined in the
-// given repo-relative files — "given this diff, which tests must run". The
-// file-diff analog of Tests(query): feed it `git diff --name-only` to select
-// exactly the tests a change can break, for a "run only affected tests" CI step.
-func (e *Engine) AffectedTests(ctx context.Context, files []string) ([]Symbol, error) {
-	return e.currentGraph().AffectedTests(files), nil
-}
-
 // References answers "where is NAME used?" by scanning code occurrences of the
 // name (comments/strings excluded), each attributed to its enclosing symbol.
 // Unlike Impact (which walks the resolved call graph), this is the resolution-
@@ -606,18 +550,6 @@ func (e *Engine) AffectedTests(ctx context.Context, files []string) ([]Symbol, e
 // dead code.
 func (e *Engine) References(ctx context.Context, name string) (ReferenceResult, error) {
 	return parser.NewEngine().References(e.Root(), name)
-}
-
-// TestsWithEvidence returns the covering tests plus the per-reason counts of
-// edges the traversal policy excluded — the weak evidence Grove chose not to
-// trust. Lets a consumer report "related tests" alongside what was withheld.
-func (e *Engine) TestsWithEvidence(ctx context.Context, query string) ([]Symbol, map[string]int, error) {
-	tests, skips := e.currentGraph().TestsForWithStats(query)
-	out := make(map[string]int, len(skips))
-	for reason, n := range skips {
-		out[string(reason)] = n
-	}
-	return tests, out, nil
 }
 
 // ICR computes the Isolated Change Region for a given intent.
