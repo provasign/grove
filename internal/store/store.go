@@ -20,14 +20,41 @@ type Store struct {
 	db *sql.DB
 }
 
+// diagnoseOpenErr turns sqlite's bare open-time errors (e.g. "unable to open
+// database file (14)") into an actionable message that names the path and,
+// when detectable, the cause. SQLite needs WRITE access to the .grove
+// directory even for reads: WAL mode creates -wal/-shm sidecar files next to
+// the db, so a read-only .grove fails with CANTOPEN and no path.
+func diagnoseOpenErr(groveDir, dbPath string, err error) error {
+	// Probe directory writability — the most common cause in the field
+	// (.grove created by another user or with sudo).
+	probe := filepath.Join(groveDir, ".grove-write-probe")
+	if f, perr := os.Create(probe); perr != nil {
+		return fmt.Errorf("open %s: %w (the %s directory is not writable by this "+
+			"process — SQLite WAL mode needs to create sidecar files there; "+
+			"fix ownership/permissions, e.g. `chmod u+w %s`, or remove the "+
+			"directory and re-run `grove index`)", dbPath, err, groveDir, groveDir)
+	} else {
+		_ = f.Close()
+		_ = os.Remove(probe)
+	}
+	if fi, serr := os.Stat(dbPath); serr == nil && fi.Mode().Perm()&0o200 == 0 {
+		return fmt.Errorf("open %s: %w (the database file is read-only for this "+
+			"process; fix ownership/permissions or delete it and re-run "+
+			"`grove index`)", dbPath, err)
+	}
+	return fmt.Errorf("open %s: %w", dbPath, err)
+}
+
 func Open(root string) (*Store, error) {
 	groveDir := filepath.Join(root, ".grove")
 	if err := os.MkdirAll(groveDir, 0o755); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create %s: %w", groveDir, err)
 	}
-	db, err := sql.Open("sqlite", filepath.Join(groveDir, "grove.db"))
+	dbPath := filepath.Join(groveDir, "grove.db")
+	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
-		return nil, err
+		return nil, diagnoseOpenErr(groveDir, dbPath, err)
 	}
 	// Single writer connection prevents "database is locked" errors from
 	// concurrent agents (Copilot + Claude Code CLI + Relay) racing on writes.
@@ -44,13 +71,15 @@ func Open(root string) (*Store, error) {
 	for _, p := range pragmas {
 		if _, err := db.Exec(p); err != nil {
 			_ = db.Close()
-			return nil, err
+			// sql.Open is lazy: the real file open happens here, so this is
+			// where "unable to open database file (14)" surfaces.
+			return nil, diagnoseOpenErr(groveDir, dbPath, err)
 		}
 	}
 	store := &Store{db: db}
 	if err := store.Migrate(context.Background()); err != nil {
 		_ = db.Close()
-		return nil, err
+		return nil, diagnoseOpenErr(groveDir, dbPath, err)
 	}
 	return store, nil
 }
