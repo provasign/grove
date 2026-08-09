@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/provasign/astkit"
 	"github.com/provasign/grove/internal/core"
@@ -33,6 +34,11 @@ type ReferenceResult struct {
 	DefCount  int         `json:"defCount"`
 	Ambiguous bool        `json:"ambiguous"`
 	Refs      []Reference `json:"refs"`
+	// SkippedFiles counts files that could not be walked or read. A result
+	// that quietly omitted unreadable files reported the same completeness
+	// as one that read everything — "I could not look" must be visible,
+	// never folded into "nothing there".
+	SkippedFiles int `json:"skippedFiles,omitempty"`
 }
 
 // referenceNodeTypes are the tree-sitter node kinds that hold a name in
@@ -68,8 +74,10 @@ func (e *Engine) References(root, name string) (ReferenceResult, error) {
 		lang     astkit.LanguageKey
 	}
 	var tasks []task
+	var skipped atomic.Int64
 	err := filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
 		if err != nil {
+			skipped.Add(1) // unreadable dir/file: count it, never silently absent
 			return nil
 		}
 		if info.IsDir() {
@@ -112,7 +120,11 @@ func (e *Engine) References(root, name string) (ReferenceResult, error) {
 				for idx := range taskCh {
 					t := tasks[idx]
 					src, rerr := os.ReadFile(t.abs)
-					if rerr != nil || !bytes.Contains(src, leafBytes) {
+					if rerr != nil {
+						skipped.Add(1)
+						continue
+					}
+					if !bytes.Contains(src, leafBytes) {
 						continue
 					}
 					// Definitions named `leaf` here, and spans for enclosing.
@@ -146,6 +158,7 @@ func (e *Engine) References(root, name string) (ReferenceResult, error) {
 		res.Refs = append(res.Refs, o.refs...)
 	}
 	res.Ambiguous = res.DefCount > 1
+	res.SkippedFiles = int(skipped.Load())
 	return res, err
 }
 

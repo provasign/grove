@@ -952,9 +952,24 @@ func saveGoListCache(path, key string, output []byte) {
 		return
 	}
 	_ = os.MkdirAll(filepath.Dir(path), 0o755)
-	// temp+rename: a concurrent reader must never see torn JSON.
-	tmp := path + ".tmp"
-	if os.WriteFile(tmp, b, 0o644) == nil {
-		_ = os.Rename(tmp, path)
+	// temp+rename keeps READERS safe from torn JSON; a unique temp name keeps
+	// concurrent WRITERS from truncating each other's file mid-rename (the
+	// fixed path+".tmp" name was a writer/writer race).
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp*")
+	if err != nil {
+		return
+	}
+	name := tmp.Name()
+	if _, werr := tmp.Write(b); werr != nil {
+		_ = tmp.Close()
+		_ = os.Remove(name)
+		return
+	}
+	if cerr := tmp.Close(); cerr != nil {
+		_ = os.Remove(name)
+		return
+	}
+	if os.Rename(name, path) != nil {
+		_ = os.Remove(name)
 	}
 }
