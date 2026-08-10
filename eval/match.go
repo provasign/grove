@@ -23,7 +23,10 @@ func loadGraph(ctx context.Context, repoRoot string) ([]core.SymbolRecord, []cor
 	// Read through the graph snapshot, not the store: tests edges are a
 	// session-computed view that never persists, and the snapshot is what
 	// materializes it — scoring the store would score zero tests edges.
-	symbols, edges := engine.SnapshotGraph(ctx)
+	symbols, edges, err := engine.SnapshotGraph(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("grove snapshot: %w", err)
+	}
 	return symbols, edges, nil
 }
 

@@ -26,7 +26,7 @@ func TestLazyRehydrationServesQueriesBeforeIndex(t *testing.T) {
 	if _, err := eng.Index(ctx, ""); err != nil {
 		t.Fatal(err)
 	}
-	wantSyms := eng.FileSymbols(ctx, "a.go")
+	wantSyms := fileSyms(t, ctx, eng, "a.go")
 	if len(wantSyms) != 2 {
 		t.Fatalf("seed index produced %d symbols, want 2", len(wantSyms))
 	}
@@ -38,7 +38,7 @@ func TestLazyRehydrationServesQueriesBeforeIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer eng2.Close()
-	got := eng2.FileSymbols(ctx, "a.go")
+	got := fileSyms(t, ctx, eng2, "a.go")
 	if len(got) != len(wantSyms) {
 		t.Fatalf("pre-Index query after reopen: got %d symbols, want %d", len(got), len(wantSyms))
 	}
@@ -54,7 +54,7 @@ func TestLazyRehydrationServesQueriesBeforeIndex(t *testing.T) {
 	if res.SymbolCount != len(wantSyms) {
 		t.Fatalf("no-op index counts: %d symbols, want %d", res.SymbolCount, len(wantSyms))
 	}
-	if got := eng2.FileSymbols(ctx, "a.go"); len(got) != len(wantSyms) {
+	if got := fileSyms(t, ctx, eng2, "a.go"); len(got) != len(wantSyms) {
 		t.Fatalf("post-noop query: got %d symbols, want %d", len(got), len(wantSyms))
 	}
 
@@ -69,7 +69,7 @@ func TestLazyRehydrationServesQueriesBeforeIndex(t *testing.T) {
 	if res.FilesUpdated != 1 {
 		t.Fatalf("expected delta index, got %#v", res)
 	}
-	if got := eng2.FileSymbols(ctx, "a.go"); len(got) != 3 {
+	if got := fileSyms(t, ctx, eng2, "a.go"); len(got) != 3 {
 		t.Fatalf("post-delta query: got %d symbols, want 3", len(got))
 	}
 }
@@ -85,7 +85,7 @@ func TestFreshRepoQueryBeforeIndexIsEmptyNotFatal(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer eng.Close()
-	if got := eng.FileSymbols(ctx, "a.go"); len(got) != 0 {
+	if got := fileSyms(t, ctx, eng, "a.go"); len(got) != 0 {
 		t.Fatalf("fresh repo query returned %+v", got)
 	}
 	// Indexing afterwards must still populate the graph.
@@ -95,7 +95,7 @@ func TestFreshRepoQueryBeforeIndexIsEmptyNotFatal(t *testing.T) {
 	if _, err := eng.Index(ctx, ""); err != nil {
 		t.Fatal(err)
 	}
-	if got := eng.FileSymbols(ctx, "a.go"); len(got) != 1 {
+	if got := fileSyms(t, ctx, eng, "a.go"); len(got) != 1 {
 		t.Fatalf("post-index query returned %d symbols, want 1", len(got))
 	}
 }

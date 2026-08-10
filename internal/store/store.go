@@ -48,9 +48,14 @@ func diagnoseOpenErr(groveDir, dbPath string, err error) error {
 
 func Open(root string) (*Store, error) {
 	groveDir := filepath.Join(root, ".grove")
-	if err := os.MkdirAll(groveDir, 0o755); err != nil {
+	// The database stores full source bodies, so the index is private to the
+	// owner: 0700 dir, 0600 db. Chmod tightens directories created 0755 by
+	// earlier versions; failures are ignored (e.g. .grove owned by another
+	// user), leaving the write-probe below to produce the actionable error.
+	if err := os.MkdirAll(groveDir, 0o700); err != nil {
 		return nil, fmt.Errorf("create %s: %w", groveDir, err)
 	}
+	_ = os.Chmod(groveDir, 0o700)
 	dbPath := filepath.Join(groveDir, "grove.db")
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
@@ -80,6 +85,14 @@ func Open(root string) (*Store, error) {
 	if err := store.Migrate(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, diagnoseOpenErr(groveDir, dbPath, err)
+	}
+	// SQLite creates the db 0644 and WAL/SHM sidecars inherit its mode;
+	// tighten all three (best-effort) since they hold indexed source bodies.
+	for _, name := range []string{"grove.db", "grove.db-wal", "grove.db-shm"} {
+		p := filepath.Join(groveDir, name)
+		if _, statErr := os.Stat(p); statErr == nil {
+			_ = os.Chmod(p, 0o600)
+		}
 	}
 	return store, nil
 }

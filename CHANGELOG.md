@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.29.0 - 2026-08-09
+
+Robustness fixes from the 2026-08-09 cross-repo audit.
+
+- **BREAKING — store errors surface instead of returning empty results:**
+  `Engine.ICR`, `FileSymbols`, `SnapshotSymbols`, `SnapshotGraph`, and
+  `DiffSince` now return an error; every graph-backed method propagates
+  rehydration/database failures instead of printing to stderr and answering
+  with an empty graph (corruption was indistinguishable from "no matches").
+- **Indexer never prunes what it could not see:** a nonexistent/unreadable
+  root aborts the run with an error, and files under an unreadable subtree
+  are shielded from the deletion pass (a transient FS error could previously
+  empty a valid index).
+- **Parse failures invalidate stale symbols:** a changed file that fails to
+  parse now has its previously stored symbols pruned instead of serving the
+  last successfully parsed version.
+- **Private index permissions:** `.grove` is created (and tightened) to
+  0700 and `grove.db`/WAL/SHM to 0600 — the database stores full source
+  bodies.
+
 ## v0.6.3 - 2026-06-12
 
 Two precision fixes found by Prism's grafana-scale benchmark

@@ -7,6 +7,15 @@ import (
 	"testing"
 )
 
+func fileSyms(t *testing.T, ctx context.Context, eng *Engine, relPath string) []Symbol {
+	t.Helper()
+	syms, err := eng.FileSymbols(ctx, relPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return syms
+}
+
 func TestFileSymbols(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -24,11 +33,11 @@ func TestFileSymbols(t *testing.T) {
 	if _, err := eng.Index(ctx, ""); err != nil {
 		t.Fatal(err)
 	}
-	syms := eng.FileSymbols(ctx, "a.go")
+	syms := fileSyms(t, ctx, eng, "a.go")
 	if len(syms) != 1 || syms[0].Name != "A" {
 		t.Fatalf("FileSymbols(a.go) = %+v", syms)
 	}
-	if got := eng.FileSymbols(ctx, "missing.go"); len(got) != 0 {
+	if got := fileSyms(t, ctx, eng, "missing.go"); len(got) != 0 {
 		t.Fatalf("missing file returned %+v", got)
 	}
 }
@@ -51,7 +60,10 @@ func TestSnapshotGraph(t *testing.T) {
 	if _, err := eng.Index(ctx, ""); err != nil {
 		t.Fatal(err)
 	}
-	symbols, edges := eng.SnapshotGraph(ctx)
+	symbols, edges, err := eng.SnapshotGraph(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(symbols) == 0 {
 		t.Fatal("SnapshotGraph returned no symbols")
 	}
@@ -66,7 +78,7 @@ func TestSnapshotGraph(t *testing.T) {
 	}
 	// The snapshot is a copy: mutating it must not corrupt the graph.
 	symbols[0].Name = "mutated"
-	again, _ := eng.SnapshotGraph(ctx)
+	again, _, _ := eng.SnapshotGraph(ctx)
 	for _, s := range again {
 		if s.Name == "mutated" {
 			t.Fatal("SnapshotGraph aliases internal graph state")
@@ -97,7 +109,10 @@ func Logout() {}
 	if _, err := eng.Index(ctx, ""); err != nil {
 		t.Fatal(err)
 	}
-	before := eng.SnapshotSymbols(ctx)
+	before, err := eng.SnapshotSymbols(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	merged := []byte(`package main
 
@@ -121,8 +136,8 @@ func Refresh() {}
 		t.Fatalf("breaking = %+v", diff.BreakingChanges)
 	}
 	// The on-disk file is untouched; nothing was indexed.
-	if got := eng.DiffSince(ctx, before); !got.Empty() {
-		t.Fatalf("preview must not mutate the live graph: %+v", got)
+	if got, err := eng.DiffSince(ctx, before); err != nil || !got.Empty() {
+		t.Fatalf("preview must not mutate the live graph: %+v (err %v)", got, err)
 	}
 }
 
@@ -156,7 +171,10 @@ func Logout() {}
 		t.Fatal(err)
 	}
 
-	before := eng.SnapshotSymbols(ctx)
+	before, err := eng.SnapshotSymbols(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(before) == 0 {
 		t.Fatal("empty snapshot after index")
 	}
@@ -173,7 +191,10 @@ func Logout() {}
 		t.Fatal(err)
 	}
 
-	diff := eng.DiffSince(ctx, before)
+	diff, err := eng.DiffSince(ctx, before)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(diff.Added) != 0 || len(diff.Removed) != 0 {
 		t.Fatalf("expected no adds/removes, got %+v", diff)
 	}

@@ -201,9 +201,21 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 		return nil, result, err
 	}
 	statRefresh := map[string][2]int64{} // touched but content-identical
+	var walkFailed []string // relPaths whose subtree could not be read this run
 	err = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
+			// A failed subtree contributes nothing to currentFiles, so the
+			// prune pass below would silently delete its stored records. An
+			// unreadable root aborts the whole run (a nonexistent root must
+			// never empty an existing index); a failed sub-path is recorded so
+			// its stored files are shielded from pruning.
+			if path == root {
+				return walkErr
+			}
 			result.Errors = append(result.Errors, walkErr.Error())
+			if rel, relErr := filepath.Rel(root, path); relErr == nil {
+				walkFailed = append(walkFailed, filepath.ToSlash(rel))
+			}
 			return nil
 		}
 		relPath, err := filepath.Rel(root, path)
@@ -343,6 +355,14 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 		}
 		if outcomes[idx].err != nil {
 			result.Errors = append(result.Errors, outcomes[idx].err.Error())
+			// The file reached parsing only because its content changed, so
+			// any stored symbols describe bytes that no longer exist. Drop it
+			// from currentFiles so the prune pass removes them — queries must
+			// not keep serving the last successfully parsed version.
+			if _, stored := fileMeta[task.relPath]; stored {
+				// The prune pass marks changedLanguages for every pruned file.
+				delete(currentFiles, task.relPath)
+			}
 			continue
 		}
 		language := parser.DetectLanguage(task.absPath)
@@ -351,6 +371,18 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 		}
 		changedLanguages[language] = true
 		result.FilesUpdated++
+	}
+	// Shield stored files under unreadable subtrees from pruning: their
+	// absence from currentFiles reflects a read failure, not deletion.
+	if len(walkFailed) > 0 {
+		for relPath := range fileMeta {
+			for _, failed := range walkFailed {
+				if relPath == failed || strings.HasPrefix(relPath, failed+"/") {
+					currentFiles[relPath] = true
+					break
+				}
+			}
+		}
 	}
 	prunedFiles, err := i.store.FilesNotIn(ctx, currentFiles)
 	if err != nil {

@@ -80,7 +80,7 @@ func TestIncrementalIndexMatchesFullRebuild(t *testing.T) {
 		if err == nil {
 			parts = append(parts, fmt.Sprintf("%+v", ci))
 		}
-		parts = append(parts, fmt.Sprintf("%+v", eng.FileSymbols(ctx, "app/app.go")))
+		parts = append(parts, fmt.Sprintf("%+v", fileSyms(t, ctx, eng, "app/app.go")))
 		return strings.Join(parts, "\n---\n")
 	}
 

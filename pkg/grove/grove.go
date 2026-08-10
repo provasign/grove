@@ -156,37 +156,36 @@ func (e *Engine) Root() string { return e.root }
 // currentGraph returns the live graph, rehydrating it from the store on
 // first access. Stored edges are the merged set the last index persisted, so
 // they are installed verbatim — no rebuild (same invariant the eager Open
-// rehydration relied on). On a load error the empty graph is returned but
-// NOT cached, so the next call retries.
-func (e *Engine) currentGraph() *graph.CodeGraph {
+// rehydration relied on). A load error is returned to the caller and nothing
+// is cached, so the next call retries; a database failure must surface as an
+// error, never as an empty-but-successful graph.
+func (e *Engine) currentGraph() (*graph.CodeGraph, error) {
 	e.mu.RLock()
 	g := e.graph
 	e.mu.RUnlock()
 	if g != nil {
-		return g
+		return g, nil
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.graph != nil {
-		return e.graph
+		return e.graph, nil
 	}
 	ctx := context.Background()
 	g = graph.New()
 	symbols, err := e.store.AllSymbols(ctx)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "grove: graph rehydration failed:", err)
-		return g
+		return nil, fmt.Errorf("grove: graph rehydration failed: %w", err)
 	}
 	if len(symbols) > 0 {
 		edges, err := e.store.AllEdges(ctx)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "grove: graph rehydration failed:", err)
-			return g
+			return nil, fmt.Errorf("grove: graph rehydration failed: %w", err)
 		}
 		g.ReplaceWithStoredEdges(symbols, edges, 0)
 	}
 	e.graph = g
-	return g
+	return g, nil
 }
 
 // Index walks dir (defaults to RepoRoot), parses changed files via delta SHA,
@@ -262,17 +261,29 @@ func (e *Engine) Symbols(ctx context.Context, query string, limit int) ([]Symbol
 	if limit <= 0 {
 		limit = 50
 	}
-	return e.currentGraph().Search(query, limit), nil
+	g, err := e.currentGraph()
+	if err != nil {
+		return nil, err
+	}
+	return g.Search(query, limit), nil
 }
 
 // Deps returns the outgoing dependency edges for filePath.
 func (e *Engine) Deps(ctx context.Context, filePath string) ([]Edge, error) {
-	return e.currentGraph().Deps(filePath), nil
+	g, err := e.currentGraph()
+	if err != nil {
+		return nil, err
+	}
+	return g.Deps(filePath), nil
 }
 
 // Impact returns the blast radius for a symbol/file query.
 func (e *Engine) Impact(ctx context.Context, query string, maxDepth int) ([]Symbol, error) {
-	return e.currentGraph().Impact(query, maxDepth), nil
+	g, err := e.currentGraph()
+	if err != nil {
+		return nil, err
+	}
+	return g.Impact(query, maxDepth), nil
 }
 
 // ChangeImpactResult is the deterministic change-set for a method signature
@@ -328,7 +339,11 @@ func (r ChangeImpactResult) Sites() []Symbol {
 // query to the exact change-set for that method's signature — type-resolved
 // seeding, not name-substring seeding (contrast Impact).
 func (e *Engine) ChangeImpact(ctx context.Context, query string) (ChangeImpactResult, error) {
-	raw, err := e.currentGraph().ChangeImpact(query)
+	g, err := e.currentGraph()
+	if err != nil {
+		return ChangeImpactResult{}, err
+	}
+	raw, err := g.ChangeImpact(query)
 	if err != nil {
 		return ChangeImpactResult{}, err
 	}
@@ -379,7 +394,11 @@ type RenamePlanResult struct {
 // RenamePlan computes the change-impact set for query and converts it into
 // line edits renaming the member to newName.
 func (e *Engine) RenamePlan(ctx context.Context, query, newName string) (RenamePlanResult, error) {
-	raw, err := e.currentGraph().RenamePlan(query, newName)
+	g, err := e.currentGraph()
+	if err != nil {
+		return RenamePlanResult{}, err
+	}
+	raw, err := g.RenamePlan(query, newName)
 	if err != nil {
 		return RenamePlanResult{}, err
 	}
@@ -426,7 +445,11 @@ type MissingImplementationsResult struct {
 // "Type.method(ParamType, ...)" query to every type in the subtype closure
 // that fails to implement the member.
 func (e *Engine) MissingImplementations(ctx context.Context, query string) (MissingImplementationsResult, error) {
-	raw, err := e.currentGraph().MissingImplementations(query)
+	g, err := e.currentGraph()
+	if err != nil {
+		return MissingImplementationsResult{}, err
+	}
+	raw, err := g.MissingImplementations(query)
 	if err != nil {
 		return MissingImplementationsResult{}, err
 	}
@@ -459,7 +482,11 @@ type DeadCodeResult struct {
 // tests, exported symbols, plus extraRoots by name) and reports what nothing
 // reaches.
 func (e *Engine) DeadCode(ctx context.Context, extraRoots []string) (DeadCodeResult, error) {
-	raw := e.currentGraph().DeadCode(extraRoots)
+	g, err := e.currentGraph()
+	if err != nil {
+		return DeadCodeResult{}, err
+	}
+	raw := g.DeadCode(extraRoots)
 	return DeadCodeResult{
 		RootCount:            raw.RootCount,
 		ReachableCount:       raw.ReachableCount,
@@ -487,7 +514,11 @@ func (e *Engine) Neighbors(ctx context.Context, query, direction string, kinds .
 	for _, k := range kinds {
 		kindSet[k] = true
 	}
-	raw := e.currentGraph().Neighbors(query, direction, kindSet)
+	g, err := e.currentGraph()
+	if err != nil {
+		return nil, err
+	}
+	raw := g.Neighbors(query, direction, kindSet)
 	out := make([]Neighbor, 0, len(raw))
 	for _, n := range raw {
 		out = append(out, Neighbor{
@@ -513,23 +544,31 @@ func (e *Engine) References(ctx context.Context, name string) (ReferenceResult, 
 }
 
 // ICR computes the Isolated Change Region for a given intent.
-func (e *Engine) ICR(ctx context.Context, intent string) IsolatedChangeRegion {
-	return e.currentGraph().ComputeICR(intent)
+func (e *Engine) ICR(ctx context.Context, intent string) (IsolatedChangeRegion, error) {
+	g, err := e.currentGraph()
+	if err != nil {
+		return IsolatedChangeRegion{}, err
+	}
+	return g.ComputeICR(intent), nil
 }
 
 // FileSymbols returns the symbols currently indexed for one repo-relative
 // file path, ordered by span. Use this instead of SnapshotSymbols when only
 // a handful of files matter (e.g. working-set drift checks).
-func (e *Engine) FileSymbols(ctx context.Context, relPath string) []Symbol {
-	return e.currentGraph().FileSymbols(relPath)
+func (e *Engine) FileSymbols(ctx context.Context, relPath string) ([]Symbol, error) {
+	g, err := e.currentGraph()
+	if err != nil {
+		return nil, err
+	}
+	return g.FileSymbols(relPath), nil
 }
 
 // SnapshotSymbols returns a deep copy of every symbol in the current graph.
 // Capture one before a merge/reindex and pass it to Diff afterwards to get
 // the structural delta.
-func (e *Engine) SnapshotSymbols(ctx context.Context) []Symbol {
-	symbols, _ := e.currentGraph().Snapshot()
-	return symbols
+func (e *Engine) SnapshotSymbols(ctx context.Context) ([]Symbol, error) {
+	symbols, _, err := e.SnapshotGraph(ctx)
+	return symbols, err
 }
 
 // SnapshotGraph returns a deep copy of every symbol plus every edge in the
@@ -537,8 +576,13 @@ func (e *Engine) SnapshotSymbols(ctx context.Context) []Symbol {
 // projections (e.g. Prism's component-level views) without N per-symbol
 // round-trips; edges carry their evidence Source/Reason/Confidence so
 // derived results can report the tier of their constituent evidence.
-func (e *Engine) SnapshotGraph(ctx context.Context) ([]Symbol, []Edge) {
-	return e.currentGraph().Snapshot()
+func (e *Engine) SnapshotGraph(ctx context.Context) ([]Symbol, []Edge, error) {
+	g, err := e.currentGraph()
+	if err != nil {
+		return nil, nil, err
+	}
+	symbols, edges := g.Snapshot()
+	return symbols, edges, nil
 }
 
 // PreviewFileSymbols parses in-memory content as if it lived at relPath
@@ -580,8 +624,12 @@ func Diff(before, after []Symbol) GraphDiff {
 
 // DiffSince diffs a previously captured snapshot against the engine's
 // current graph.
-func (e *Engine) DiffSince(ctx context.Context, before []Symbol) GraphDiff {
-	return Diff(before, e.SnapshotSymbols(ctx))
+func (e *Engine) DiffSince(ctx context.Context, before []Symbol) (GraphDiff, error) {
+	after, err := e.SnapshotSymbols(ctx)
+	if err != nil {
+		return GraphDiff{}, err
+	}
+	return Diff(before, after), nil
 }
 
 // CertifyDiff maps a unified diff onto the indexed graph and returns a
@@ -590,5 +638,9 @@ func (e *Engine) DiffSince(ctx context.Context, before []Symbol) GraphDiff {
 // Changed files whose indexed content no longer matches the working tree are
 // reported as index_stale and escalate the verdict to manual_review.
 func (e *Engine) CertifyDiff(ctx context.Context, input DiffInput) (CertificationReport, error) {
-	return cert.CertifyDiffWithStaleness(e.currentGraph(), input, cert.RepoFileSHA(e.root)), nil
+	g, err := e.currentGraph()
+	if err != nil {
+		return CertificationReport{}, err
+	}
+	return cert.CertifyDiffWithStaleness(g, input, cert.RepoFileSHA(e.root)), nil
 }
