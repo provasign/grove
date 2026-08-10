@@ -19,9 +19,12 @@ func TestOpenReadOnlyGroveDirIsActionable(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(groveDir, 0o755) })
 
-	_, err := Open(root)
+	st, err := Open(root)
 	if err == nil {
-		t.Skip("running as root: read-only dir is still writable")
+		// Close before skipping: Windows cannot delete the TempDir while
+		// grove.db is open, and a failed cleanup marks the skip as a FAIL.
+		_ = st.Close()
+		t.Skip("read-only dir is still writable (root, or Windows attribute semantics)")
 	}
 	for _, want := range []string{groveDir, "not writable", "chmod"} {
 		if !strings.Contains(err.Error(), want) {
@@ -43,9 +46,10 @@ func TestOpenReadOnlyDBFileIsActionable(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(dbPath, 0o644) })
 
-	_, err := Open(root)
+	st, err := Open(root)
 	if err == nil {
-		t.Skip("running as root: read-only file is still writable")
+		_ = st.Close()
+		t.Skip("read-only file is still writable (root, or Windows attribute semantics)")
 	}
 	for _, want := range []string{dbPath, "read-only"} {
 		if !strings.Contains(err.Error(), want) {
