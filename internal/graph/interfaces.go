@@ -10,9 +10,9 @@ import (
 
 // interfaceSatisfaction records which concrete types satisfy which
 // interfaces, derived without a type checker. For Go this is method-set
-// inclusion by name: type T satisfies interface I when every method I
-// declares exists as a method on T. Name-only matching over-approximates
-// (signatures are not compared), so derived edges carry reduced confidence.
+// inclusion by name and parameter signature: type T satisfies interface I
+// when every method I declares has a compatible method on T. Return types are
+// not yet compared, so derived edges still carry reduced confidence.
 type interfaceSatisfaction struct {
 	// declaringIfaces maps a lowercase method name to the interface symbols
 	// that declare it.
@@ -81,6 +81,67 @@ func interfaceMethodNames(iface *core.SymbolRecord, idx *edgeIndex) []string {
 	return names
 }
 
+// interfaceMethodParamAnchors returns every indexed or source-declared
+// parameter list for one interface member. A nil list is neutral evidence:
+// callers retain the historical name-only behavior when a parser cannot
+// recover a signature, but use types whenever they are available.
+func interfaceMethodParamAnchors(iface *core.SymbolRecord, idx *edgeIndex, methodName string) [][]string {
+	var anchors [][]string
+	for _, cand := range idx.byFile[iface.FilePath] {
+		if cand.Kind != core.KindMethod || cand.ParentSymbol != iface.Name || cand.Name != methodName {
+			continue
+		}
+		anchors = append(anchors, paramTypesOf(cand))
+	}
+	if len(anchors) > 0 {
+		return anchors
+	}
+	for _, signature := range interfaceMemberSignatures(iface, methodName) {
+		anchors = append(anchors, paramTypesOf(&core.SymbolRecord{
+			Language:  iface.Language,
+			Kind:      core.KindMethod,
+			Signature: signature,
+		}))
+	}
+	return anchors
+}
+
+// interfaceMemberSignatures extracts complete method headers through the
+// closing parameter parenthesis. It supports multiline and nested function
+// parameters and is shared by interface satisfaction and synthesized
+// change-impact declarations.
+func interfaceMemberSignatures(iface *core.SymbolRecord, methodName string) []string {
+	if iface.RawText == "" {
+		return nil
+	}
+	var re *regexp.Regexp
+	switch iface.Language {
+	case "go":
+		re = goIfaceMethodRe
+	case "typescript", "tsx", "javascript":
+		re = tsIfaceMethodRe
+	default:
+		return nil
+	}
+	body := stripCommentsAndStrings(iface.RawText)
+	if i := strings.IndexByte(body, '{'); i >= 0 {
+		body = body[i+1:]
+	}
+	var signatures []string
+	for _, match := range re.FindAllStringSubmatchIndex(body, -1) {
+		if len(match) < 4 || body[match[2]:match[3]] != methodName {
+			continue
+		}
+		open := match[1] - 1 // both interface regexes end immediately after '('
+		_, close, ok := parenthesizedAt(body, open)
+		if !ok {
+			continue
+		}
+		signatures = append(signatures, strings.TrimSpace(body[match[0]:close+1]))
+	}
+	return signatures
+}
+
 // nominalInterfaceLang reports whether a language declares interface
 // implementation explicitly (implements/extends clauses, or Python base
 // classes), so structural method-set matching must not synthesize satisfaction
@@ -105,7 +166,13 @@ func buildInterfaceSatisfaction(idx *edgeIndex, symbols []core.SymbolRecord) (*i
 	// Concrete method sets, keyed by (package dir, type name) so same-named
 	// types in different packages stay separate.
 	type typeKey struct{ dir, name string }
-	methodsByType := map[typeKey]map[string]*core.SymbolRecord{}
+	// Every method per lowercase name, not one: Go types routinely pair an
+	// exported method with an unexported case-fold twin (grafana's
+	// WithDbSession / withDbSession(engine)), and a single-entry map made the
+	// signature check read whichever one landed last — failing the whole
+	// interface and severing every dispatch edge through it (the
+	// grafana-bigblast 1.00→0.02 regression).
+	methodsByType := map[typeKey]map[string][]*core.SymbolRecord{}
 	typeSymbols := map[typeKey]*core.SymbolRecord{}
 	for i := range symbols {
 		s := &symbols[i]
@@ -116,9 +183,10 @@ func buildInterfaceSatisfaction(idx *edgeIndex, symbols []core.SymbolRecord) (*i
 			}
 			key := typeKey{dirOf(s.FilePath), s.ParentSymbol}
 			if methodsByType[key] == nil {
-				methodsByType[key] = map[string]*core.SymbolRecord{}
+				methodsByType[key] = map[string][]*core.SymbolRecord{}
 			}
-			methodsByType[key][strings.ToLower(s.Name)] = s
+			ln := strings.ToLower(s.Name)
+			methodsByType[key][ln] = append(methodsByType[key][ln], s)
 		case core.KindStruct, core.KindClass, core.KindType:
 			typeSymbols[typeKey{dirOf(s.FilePath), s.Name}] = s
 		}
@@ -159,8 +227,10 @@ func buildInterfaceSatisfaction(idx *edgeIndex, symbols []core.SymbolRecord) (*i
 			continue
 		}
 		lower := make([]string, len(names))
+		paramAnchors := make(map[string][][]string, len(names))
 		for j, n := range names {
 			lower[j] = strings.ToLower(n)
+			paramAnchors[lower[j]] = interfaceMethodParamAnchors(iface, idx, n)
 		}
 		for _, key := range sortedTypeKeys {
 			methods := methodsByType[key]
@@ -168,12 +238,45 @@ func buildInterfaceSatisfaction(idx *edgeIndex, symbols []core.SymbolRecord) (*i
 			if key.name == iface.Name && key.dir == dirOf(iface.FilePath) {
 				continue
 			}
+			// Per member: pick the implementing method among the case-fold
+			// candidates — exact-name matches first, then any candidate
+			// signature-compatible with an anchor (no anchors = name-only,
+			// the historical behavior). The picked method, not an arbitrary
+			// map entry, is what gets recorded as the implementor below.
+			pick := func(cands []*core.SymbolRecord, anchors [][]string, exactName string) *core.SymbolRecord {
+				ok := func(m *core.SymbolRecord) bool {
+					if len(anchors) == 0 {
+						return true
+					}
+					candidate := paramTypesOf(m)
+					for _, anchor := range anchors {
+						if signatureCompatible(anchor, candidate, nil) {
+							return true
+						}
+					}
+					return false
+				}
+				for _, m := range cands {
+					if m.Name == exactName && ok(m) {
+						return m
+					}
+				}
+				for _, m := range cands {
+					if ok(m) {
+						return m
+					}
+				}
+				return nil
+			}
+			chosen := make(map[string]*core.SymbolRecord, len(lower))
 			satisfied := true
-			for _, n := range lower {
-				if _, ok := methods[n]; !ok {
+			for j, n := range lower {
+				m := pick(methods[n], paramAnchors[n], names[j])
+				if m == nil {
 					satisfied = false
 					break
 				}
+				chosen[n] = m
 			}
 			if !satisfied {
 				continue
@@ -191,7 +294,7 @@ func buildInterfaceSatisfaction(idx *edgeIndex, symbols []core.SymbolRecord) (*i
 			// structural index only for call-dispatch over-approximation.
 			nominal := nominalInterfaceLang(iface.Language)
 			for _, n := range lower {
-				m := methods[n]
+				m := chosen[n]
 				sat.implementors[iface.ID][n] = append(sat.implementors[iface.ID][n], m)
 				if !nominal {
 					addEdge(m.ID, iface.ID, core.EdgeOverrides)

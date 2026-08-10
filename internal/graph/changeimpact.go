@@ -147,10 +147,22 @@ func (g *CodeGraph) ChangeImpact(query string) (*ChangeImpactResult, error) {
 				typeName, methodName, strings.Join(queryParams, ", "))
 		}
 	}
-	// decls may be empty even though the type is indexed: TS and Go interface
-	// member signatures are not parsed as symbols. Proceed — the subtype
-	// closure below still yields the implementation family, which roots the
-	// change-set (validated after the closure walk).
+	// TS and Go interface member signatures are not indexed as symbols.
+	// Synthesize them BEFORE anchoring the family so their source-declared
+	// parameter types constrain structural satisfaction just like a real
+	// declaration. Waiting until after the family walk made an unqualified Go
+	// query accept every same-named method, regardless of signature.
+	declaringTypes := map[string]core.SymbolRecord{}
+	if len(decls) == 0 {
+		for _, tid := range typeIDs {
+			t, ok := g.symbols[tid]
+			if !ok || !typeDeclaresMember(&t, methodName) {
+				continue
+			}
+			decls = append(decls, synthesizeMemberDecl(&t, methodName))
+			declaringTypes[t.ID] = t
+		}
+	}
 
 	// The declaration's signature anchors family compatibility. Type
 	// parameters of the declaring type (and single-letter placeholders) are
@@ -158,7 +170,7 @@ func (g *CodeGraph) ChangeImpact(query string) (*ChangeImpactResult, error) {
 	// declaration, the query's own parameter list (possibly nil) anchors.
 	declParams := queryParams
 	wildcards := map[string]bool{}
-	if len(decls) > 0 {
+	if len(decls) > 0 && len(queryParams) == 0 {
 		declParams = paramTypesOf(&decls[0])
 		wildcards = typeParamWildcards(g.symbols, &decls[0])
 	}
@@ -169,7 +181,7 @@ func (g *CodeGraph) ChangeImpact(query string) (*ChangeImpactResult, error) {
 	// when it is compatible with ANY declaration in the change-set, which is
 	// the only reading consistent with returning all of them as sites.
 	anchors := []signatureAnchor{{params: declParams, wildcards: wildcards}}
-	for i := 1; i < len(decls); i++ {
+	for i := 1; i < len(decls) && len(queryParams) == 0; i++ {
 		anchors = append(anchors, signatureAnchor{
 			params:    paramTypesOf(&decls[i]),
 			wildcards: typeParamWildcards(g.symbols, &decls[i]),
@@ -223,28 +235,6 @@ func (g *CodeGraph) ChangeImpact(query string) (*ChangeImpactResult, error) {
 		}
 		if compatibleWithAnyDecl(paramTypesOf(&m)) {
 			family = append(family, m)
-		}
-	}
-	declaringTypes := map[string]core.SymbolRecord{}
-	if len(decls) == 0 {
-		// The member exists in source but not as a symbol (TS interface
-		// members, Go interface specs). When the seed type's body declares
-		// it, synthesize the declaration record: the declaring file is part
-		// of the change-set — and surface the TYPE too, because for an
-		// unindexed member spec the innermost enclosing symbol in the file
-		// is the type declaration itself (what a diff or reviewer names).
-		// This MUST run before the empty-set gate below: an interface method
-		// with zero current implementors (family empty) is a completely
-		// ordinary "what breaks if I change this" query, and synthesis is
-		// what recognizes it — gating first threw a false "declares no
-		// method" error for exactly that case.
-		for _, tid := range typeIDs {
-			t, ok := g.symbols[tid]
-			if !ok || !typeDeclaresMember(&t, methodName) {
-				continue
-			}
-			decls = append(decls, synthesizeMemberDecl(&t, methodName))
-			declaringTypes[t.ID] = t
 		}
 	}
 	if len(decls) == 0 && len(family) == 0 {
@@ -415,6 +405,10 @@ func (g *CodeGraph) ChangeImpact(query string) (*ChangeImpactResult, error) {
 // specs, TS interface members). The record carries the declaring file so the
 // change-set names it even without a real symbol.
 func synthesizeMemberDecl(t *core.SymbolRecord, methodName string) core.SymbolRecord {
+	signature := ""
+	if signatures := interfaceMemberSignatures(t, methodName); len(signatures) > 0 {
+		signature = signatures[0]
+	}
 	return core.SymbolRecord{
 		ID:            t.ID + "#" + methodName,
 		FilePath:      t.FilePath,
@@ -423,6 +417,7 @@ func synthesizeMemberDecl(t *core.SymbolRecord, methodName string) core.SymbolRe
 		Name:          methodName,
 		QualifiedName: t.Name + "." + methodName,
 		ParentSymbol:  t.Name,
+		Signature:     signature,
 		Span:          t.Span,
 	}
 }
@@ -1043,14 +1038,153 @@ func paramTypesOf(s *core.SymbolRecord) []string {
 		src = s.RawText
 	}
 	inner := tsDeclParams(src)
+	if s.Language == "go" {
+		inner = goDeclParams(src)
+		if inner == "" {
+			return nil
+		}
+		return goParamTokens(inner)
+	}
 	if inner == "" {
 		return nil
 	}
 	var out []string
 	for _, gr := range splitTopLevel(inner, ',') {
-		out = append(out, bareTypeToken(gr))
+		token := bareTypeToken(gr)
+		switch s.Language {
+		case "typescript", "tsx", "javascript":
+			token = tsParamTypeToken(gr)
+		}
+		if token == "" {
+			return nil
+		}
+		out = append(out, token)
 	}
 	return out
+}
+
+// goParamTokens tokenizes a Go parameter list into comparable type tokens.
+// Three Go-specific shapes a naive per-group split gets wrong:
+//   - grouped parameters share the trailing type: "a, b string" → [string string]
+//     (per-group, the bare "a" would tokenize as a type named "a");
+//   - function-typed parameters ("fn func(ctx context.Context) error") reduce
+//     to the canonical token "func" — strings.Fields would return "error";
+//   - unnamed lists (interface specs: "(context.Context, DBTransactionFunc)")
+//     tokenize each group as a bare type. Go forbids mixing named and unnamed
+//     parameters, so "any group carries name+type" decides the reading.
+//
+// Returns nil (neutral evidence, like paramTypesOf) when a token cannot be
+// recovered.
+func goParamTokens(inner string) []string {
+	groups := splitTopLevel(inner, ',')
+	n := len(groups)
+	types := make([]string, n)
+	named := false
+	for i, gr := range groups {
+		fields := strings.Fields(strings.TrimSpace(gr))
+		if len(fields) == 0 {
+			return nil
+		}
+		if len(fields) >= 2 {
+			named = true
+			types[i] = strings.Join(fields[1:], " ")
+		}
+	}
+	if !named {
+		for i, gr := range groups {
+			types[i] = strings.TrimSpace(gr)
+		}
+	} else {
+		// Right-to-left: a name-only group inherits the next declared type.
+		carry := ""
+		for i := n - 1; i >= 0; i-- {
+			if types[i] != "" {
+				carry = types[i]
+			} else {
+				types[i] = carry
+			}
+		}
+	}
+	out := make([]string, n)
+	for i, t := range types {
+		t = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(t), "..."))
+		t = strings.TrimPrefix(t, "*")
+		if strings.HasPrefix(t, "func") {
+			out[i] = "func"
+			continue
+		}
+		out[i] = bareTypeToken(t)
+		if out[i] == "" {
+			return nil
+		}
+	}
+	return out
+}
+
+// parenthesizedAt returns the content and closing offset of the balanced
+// parenthesis beginning at open. Nested function types are supported.
+func parenthesizedAt(text string, open int) (string, int, bool) {
+	if open < 0 || open >= len(text) || text[open] != '(' {
+		return "", 0, false
+	}
+	depth := 0
+	for i := open; i < len(text); i++ {
+		switch text[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return text[open+1 : i], i, true
+			}
+		}
+	}
+	return "", 0, false
+}
+
+// goDeclParams skips a method receiver before returning its parameter list.
+// Interface specs have no "func (receiver)" prefix and use the first list.
+func goDeclParams(signature string) string {
+	trimmed := strings.TrimSpace(signature)
+	open := strings.IndexByte(trimmed, '(')
+	if open < 0 {
+		return ""
+	}
+	if strings.HasPrefix(trimmed, "func (") {
+		_, receiverClose, ok := parenthesizedAt(trimmed, open)
+		if !ok {
+			return ""
+		}
+		open = strings.IndexByte(trimmed[receiverClose+1:], '(')
+		if open < 0 {
+			return ""
+		}
+		open += receiverClose + 1
+	}
+	params, _, ok := parenthesizedAt(trimmed, open)
+	if !ok {
+		return ""
+	}
+	return params
+}
+
+func tsParamTypeToken(param string) string {
+	depth := 0
+	for i, r := range param {
+		switch r {
+		case '(', '[', '{', '<':
+			depth++
+		case ')', ']', '}', '>':
+			if depth > 0 {
+				depth--
+			}
+		case ':':
+			if depth == 0 {
+				return bareTypeToken(param[i+1:])
+			}
+		}
+	}
+	return ""
 }
 
 // bareTypeToken reduces a parameter fragment to a bare comparable type token:
