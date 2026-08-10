@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.29.1 - 2026-08-09
+
+- **Windows:** the v0.29.0 permission tightening is now Unix-only —
+  `Chmod(0o700)` on Windows cleared the read-only attribute on a
+  deliberately read-only `.grove`, defeating the read-only diagnostics.
+  Windows has no POSIX permission bits to tighten.
+- eval module: astkit pin caught up with the main module (v0.4.23).
+
 ## v0.29.0 - 2026-08-09
 
 Robustness fixes from the 2026-08-09 cross-repo audit.

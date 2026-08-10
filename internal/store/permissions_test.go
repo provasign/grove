@@ -3,6 +3,7 @@ package store
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -10,6 +11,9 @@ import (
 // .grove must be 0700 and grove.db 0600 — including when a pre-existing
 // directory was created 0755 by an earlier Grove version.
 func TestOpenCreatesPrivateStore(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no POSIX permission bits on Windows; tightening is Unix-only")
+	}
 	root := t.TempDir()
 	groveDir := filepath.Join(root, ".grove")
 	if err := os.MkdirAll(groveDir, 0o755); err != nil { // legacy perms

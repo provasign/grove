@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/provasign/grove/internal/parser"
@@ -45,6 +46,9 @@ func TestIndexerNonexistentRootFails(t *testing.T) {
 // that cannot be read this run are absent from the walk for a transient
 // reason — their stored records must survive the prune pass.
 func TestIndexerShieldsUnreadableSubtreeFromPruning(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("chmod 000 does not make a directory unreadable on Windows")
+	}
 	if os.Getuid() == 0 {
 		t.Skip("permission bits do not bind root")
 	}
