@@ -1097,10 +1097,12 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			}
 			// astkit collapses a member-chain receiver to its last segment
 			// (`this.connection.driver.escape` → callee "driver.escape"), so
-			// fullChain lost the intermediate hops. For TS/JS recover the
+			// fullChain lost the intermediate hops. For TS/JS/Java recover the
 			// full chain from the caller's own source line to enable
-			// multi-hop field-type resolution below.
-			if tsFamilyLang(symbol.Language) && qualifier != "" && cs.Line > 0 {
+			// multi-hop field-type resolution below (Java shares the dotted
+			// receiver syntax, so the same source recovery applies:
+			// `w.serializer.serialize(...)` → chain "w.serializer").
+			if (tsFamilyLang(symbol.Language) || symbol.Language == "java") && qualifier != "" && cs.Line > 0 {
 				if chain := tsReceiverChainAt(symbol.RawText, cs.Line-symbol.Span.Start, calleeName); chain != "" {
 					fullChain = chain
 				}
@@ -1389,7 +1391,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// Receiver narrowing didn't fire; try the inferred type of
 				// the receiver variable, then import qualification.
 				kept, dispatch, decided := narrowByLocalType(idx, sat, localTypes, qualifier, calleeName, cands, scope)
-				if !decided && tsFamilyLang(symbol.Language) && strings.Contains(fullChain, ".") {
+				if !decided && (tsFamilyLang(symbol.Language) || symbol.Language == "java") && strings.Contains(fullChain, ".") {
 					// Multi-hop receiver (`this.connection.driver.escape`):
 					// walk the field-type chain and dispatch to the resolved
 					// type's implementors. The single-segment lookup above

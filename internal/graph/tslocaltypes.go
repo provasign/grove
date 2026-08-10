@@ -70,7 +70,13 @@ func tsBaseClasses(idx *edgeIndex, className, preferDir string) []string {
 	if chosen == nil {
 		return nil
 	}
-	sig := chosen.Signature
+	// Strip the class's own generic parameter list before locating "extends":
+	// in `class X<Entity extends Base> extends Y` the CONSTRAINT's "extends"
+	// wins a plain Index search and the real base class is lost (typeorm's
+	// TreeRepository chain miss). The first top-level <...> group before any
+	// "extends"/"{" is the parameter list; the base's own generic arguments
+	// come after "extends" and are untouched (tsBareType strips them later).
+	sig := stripLeadingGenericParams(chosen.Signature)
 	i := strings.Index(sig, "extends ")
 	if i < 0 {
 		return nil
@@ -97,6 +103,33 @@ func baseClassesFor(idx *edgeIndex, language, className, preferDir string) []str
 		return tsBaseClasses(idx, className, preferDir)
 	}
 	return nil
+}
+
+// stripLeadingGenericParams removes the first balanced top-level <...> group
+// from a class signature — the class's own type-parameter list. Arrow types in
+// parameter defaults (`<T = () => void>`) are handled: a '>' preceded by '='
+// is an arrow, not a closer.
+func stripLeadingGenericParams(sig string) string {
+	i := strings.IndexByte(sig, '<')
+	if i < 0 {
+		return sig
+	}
+	depth := 0
+	for j := i; j < len(sig); j++ {
+		switch sig[j] {
+		case '<':
+			depth++
+		case '>':
+			if j > 0 && sig[j-1] == '=' {
+				continue // "=>" arrow
+			}
+			depth--
+			if depth == 0 {
+				return sig[:i] + sig[j+1:]
+			}
+		}
+	}
+	return sig // unbalanced: leave untouched
 }
 
 // tsLocalTypes infers identifier → type name for one TS/JS callable.
@@ -346,7 +379,8 @@ func tsFamilyLang(language string) bool {
 // through field types, one hop per segment, and returns the receiver's type
 // name. The first segment resolves against the caller's own local types; each
 // later segment against the running type's class fields. "" if any hop fails.
-func tsResolveReceiverChain(idx *edgeIndex, localTypes map[string]string, chain, startFile string) string {
+// language selects the per-hop field parser (TS field syntax vs Java's).
+func tsResolveReceiverChain(idx *edgeIndex, localTypes map[string]string, chain, startFile, language string) string {
 	parts := strings.Split(chain, ".")
 	for len(parts) > 0 && (parts[0] == "this" || parts[0] == "self") {
 		parts = parts[1:]
@@ -366,7 +400,12 @@ func tsResolveReceiverChain(idx *edgeIndex, localTypes map[string]string, chain,
 	curFile := startFile
 	for _, seg := range parts[1:] {
 		fields := map[string]string{}
-		classFile := tsClassFieldTypes(idx, curType, curFile, fields)
+		var classFile string
+		if language == "java" {
+			classFile = javaClassFieldTypes(idx, curType, curFile, fields)
+		} else {
+			classFile = tsClassFieldTypes(idx, curType, curFile, fields)
+		}
 		next, ok := fields[seg]
 		if !ok {
 			return ""
@@ -379,16 +418,56 @@ func tsResolveReceiverChain(idx *edgeIndex, localTypes map[string]string, chain,
 	return curType
 }
 
+// javaClassFieldTypes records one Java class's field name → type from its
+// source (javaFieldRe), scoped like tsClassFieldTypes: className resolves to
+// one file from preferFile's perspective, and that file is returned so a
+// chain walk can scope its next hop.
+func javaClassFieldTypes(idx *edgeIndex, className, preferFile string, out map[string]string) string {
+	classFile := tsResolveClassFile(idx, className, preferFile)
+	if classFile == "" {
+		return ""
+	}
+	for _, cls := range idx.byName[strings.ToLower(className)] {
+		if cls.Name != className || cls.FilePath != classFile || cls.RawText == "" {
+			continue
+		}
+		switch cls.Kind {
+		case core.KindClass, core.KindInterface:
+		default:
+			continue
+		}
+		for _, m := range javaFieldRe.FindAllStringSubmatch(cls.RawText, -1) {
+			if t := javaBareType(m[1]); t != "" {
+				if _, exists := out[m[2]]; !exists {
+					out[m[2]] = t
+				}
+			}
+		}
+		break
+	}
+	return classFile
+}
+
 // narrowByChainType resolves a multi-hop TS/JS receiver chain to a type, then
 // narrows candidates to that type or dispatches to its interface implementors.
 // Mirrors narrowByLocalType's contract (kept, dispatch, decided).
 func narrowByChainType(idx *edgeIndex, sat *interfaceSatisfaction, localTypes map[string]string, symbol *core.SymbolRecord, fullChain, calleeName string, cands []*core.SymbolRecord) (kept, dispatch []*core.SymbolRecord, decided bool) {
-	typ := tsResolveReceiverChain(idx, localTypes, fullChain, symbol.FilePath)
+	typ := tsResolveReceiverChain(idx, localTypes, fullChain, symbol.FilePath, symbol.Language)
 	if typ == "" {
 		return cands, nil, false
 	}
 	if byType := filterByParent(cands, typ); len(byType) > 0 {
 		return byType, nil, true
+	}
+	// The resolved type's own declared member, looked up in the full index:
+	// candidate resolution is import-scoped, but a multi-hop chain routinely
+	// ends on a type the caller never imports (typeorm's TreeRepository
+	// reaches Driver.escape through manager.connection.driver without ever
+	// importing Driver). The chain hops themselves are the evidence — each
+	// hop resolved through a declared field type — so bind to the type's own
+	// member even outside import scope.
+	if member := tsTypeOwnMember(idx, typ, calleeName, symbol.FilePath); len(member) > 0 {
+		return member, nil, true
 	}
 	if sat != nil {
 		for _, iface := range idx.byName[strings.ToLower(typ)] {
@@ -406,6 +485,31 @@ func narrowByChainType(idx *edgeIndex, sat *interfaceSatisfaction, localTypes ma
 	// (source-recovered), and a decided-drop would also suppress the blanket
 	// dispatch rescue downstream.
 	return cands, nil, false
+}
+
+// tsTypeOwnMember returns typ's own declared method(s) named calleeName,
+// preferring the file tsResolveClassFile binds typ to from the caller's
+// perspective (same-named types elsewhere in a monorepo stay excluded when
+// the preferred file declares the member).
+func tsTypeOwnMember(idx *edgeIndex, typ, calleeName, preferFile string) []*core.SymbolRecord {
+	classFile := tsResolveClassFile(idx, typ, preferFile)
+	var inFile, anywhere []*core.SymbolRecord
+	for _, cand := range idx.byName[strings.ToLower(calleeName)] {
+		if cand.Name != calleeName || cand.ParentSymbol != typ {
+			continue
+		}
+		if cand.Kind != core.KindMethod && cand.Kind != core.KindFunction {
+			continue
+		}
+		if cand.FilePath == classFile {
+			inFile = append(inFile, cand)
+		}
+		anywhere = append(anywhere, cand)
+	}
+	if len(inFile) > 0 {
+		return inFile
+	}
+	return anywhere
 }
 
 // tsClassBodyFieldTypes scans a class's source for depth-1 field declarations
