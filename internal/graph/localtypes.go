@@ -20,6 +20,22 @@ var (
 	goNewCtorRe = regexp.MustCompile(`(?m)\b([a-zA-Z_]\w*)(?:\s*,\s*\w+)?\s*:=\s*(?:\w+\.)?New([A-Z]\w*)\(`)
 	// var x Type / var x *Type / var x []Type / var x pkg.Type
 	goVarDeclRe = regexp.MustCompile(`(?m)\bvar\s+([a-zA-Z_]\w*)\s+\*?(?:\[\])?(?:\w+\.)?([A-Za-z_]\w*)`)
+
+	// goConvRe: `w := ResponseWriter(writer)` — a type CONVERSION binds the
+	// variable to the named type. Textually identical to a function call, so
+	// the match is gated on the captured name resolving to an INDEXED TYPE
+	// (typeSymbolExists), exactly like the New-ctor heuristic below.
+	goConvRe = regexp.MustCompile(`(?m)\b([a-zA-Z_]\w*)\s*:?=\s*(?:\w+\.)?([A-Z]\w*)\(`)
+
+	// goCallResultRe: `c, _ := CreateTestContext(w)` — the FIRST variable of
+	// a call-result assignment binds to the called function's first return
+	// type, when that function is indexed and its return parses.
+	goCallResultRe = regexp.MustCompile(`(?m)\b([a-zA-Z_]\w*)(?:\s*,\s*[a-zA-Z_]\w*)*\s*:=\s*(?:\w+\.)?([A-Za-z_]\w*)\(`)
+
+	// goClosureParamRe: `func(c *Context) {` — closure-literal parameter
+	// lists. Scoped narrower than the whole function, so these bind at the
+	// LOWEST precedence and never overwrite an existing entry.
+	goClosureParamRe = regexp.MustCompile(`func\(([^()]*)\)`)
 	// struct field line: "Name Type" (embedded fields are single-token and
 	// don't match; func/map/chan/interface types are rejected below)
 	goStructFieldRe = regexp.MustCompile(`(?m)^\s*([A-Za-z_]\w*)\s+\*?(?:\[\])?(?:\w+\.)?([A-Za-z_]\w*)`)
@@ -75,9 +91,85 @@ func goLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 				out[m[1]] = typ
 			}
 		}
+		// Type conversions: only when the name IS an indexed type — a plain
+		// function call never binds here.
+		for _, m := range goConvRe.FindAllStringSubmatch(body, -1) {
+			if typeSymbolExists(idx, m[2]) {
+				out[m[1]] = m[2]
+			}
+		}
+		// Call results: first variable takes the called function's first
+		// return type, when the callee is indexed and its return parses.
+		for _, m := range goCallResultRe.FindAllStringSubmatch(body, -1) {
+			if _, exists := out[m[1]]; exists {
+				continue
+			}
+			if typ := goFirstReturnType(idx, m[2]); typ != "" {
+				out[m[1]] = typ
+			}
+		}
+		// Closure params, lowest precedence: never overwrite.
+		for _, m := range goClosureParamRe.FindAllStringSubmatch(body, -1) {
+			// goParamList requires the named form ("func name(params)") —
+			// a bare closure literal reads its params as a receiver.
+			for name, typ := range goParamTypes("func closure(" + m[1] + ")") {
+				if _, exists := out[name]; !exists {
+					out[name] = typ
+				}
+			}
+		}
 	}
 	delete(out, "_")
 	return out
+}
+
+// goFirstReturnType resolves an indexed Go FUNCTION's first return type to a
+// bare, indexed type name; "" when the callee is unknown, not a function, or
+// the return does not parse to an indexed type.
+func goFirstReturnType(idx *edgeIndex, fnName string) string {
+	for _, f := range idx.byName[strings.ToLower(fnName)] {
+		if f.Name != fnName || f.Language != "go" {
+			continue
+		}
+		switch f.Kind {
+		case core.KindFunction, core.KindMethod:
+		default:
+			continue
+		}
+		sig := f.Signature
+		close := strings.IndexByte(sig, ')')
+		if close < 0 {
+			continue
+		}
+		// Skip a leading receiver's parens for methods.
+		rest := strings.TrimSpace(sig[close+1:])
+		if strings.HasPrefix(rest, "(") {
+			rest = strings.TrimPrefix(rest, "(")
+		}
+		rest = strings.TrimSpace(rest)
+		if rest == "" || rest == "{" {
+			continue
+		}
+		first := rest
+		if i := strings.IndexAny(first, ",)"); i >= 0 {
+			first = first[:i]
+		}
+		// "c *Context" or "*Context" — take the last token, strip decorations.
+		fields := strings.Fields(first)
+		if len(fields) == 0 {
+			continue
+		}
+		tok := fields[len(fields)-1]
+		tok = strings.TrimLeft(tok, "*&[]")
+		if i := strings.LastIndexByte(tok, '.'); i >= 0 {
+			tok = tok[i+1:]
+		}
+		tok = strings.TrimRight(tok, "{")
+		if tok != "" && typeSymbolExists(idx, tok) {
+			return tok
+		}
+	}
+	return ""
 }
 
 // resolveCtorType maps a New<X> constructor suffix to an indexed type name:

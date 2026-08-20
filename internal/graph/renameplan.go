@@ -133,6 +133,45 @@ func (g *CodeGraph) RenamePlan(query, newName string) (*RenamePlanResult, error)
 		}
 	}
 
+	// Per-site receiver classification (renamesite.go): resolve each call
+	// site's receiver chain with the edge builder's local-type machinery.
+	// The caller-level flag below remains the FALLBACK for sites the
+	// resolver cannot decide — never worse than the old rule.
+	symbolsSlice := make([]core.SymbolRecord, 0, len(g.symbols))
+	for _, s := range g.symbols {
+		symbolsSlice = append(symbolsSlice, s)
+	}
+	siteIdx := newEdgeIndex(symbolsSlice)
+	familyTypes := map[string]bool{}
+	addFamilyType := func(qn string) {
+		if i := strings.LastIndex(qn, "."); i > 0 {
+			familyTypes[qn[:i]] = true
+		}
+	}
+	for _, s := range ci.Declarations {
+		addFamilyType(s.QualifiedName)
+	}
+	for _, s := range ci.Family {
+		addFamilyType(s.QualifiedName)
+	}
+	for _, s := range ci.Supers {
+		addFamilyType(s.QualifiedName)
+	}
+	for _, t := range ci.DeclaringTypes {
+		if t.Name != "" {
+			familyTypes[t.Name] = true
+		}
+	}
+	localTypesCache := map[string]map[string]string{}
+	siteVerdictFor := func(sym core.SymbolRecord, cs core.CallSite) siteVerdict {
+		lt, ok := localTypesCache[sym.ID]
+		if !ok {
+			lt = localTypesForSymbol(siteIdx, &sym)
+			localTypesCache[sym.ID] = lt
+		}
+		return classifySite(g, siteIdx, &sym, lt, cs, methodName, familyTypes)
+	}
+
 	// hasNonFamilySameName reports whether sym has a call edge to a
 	// same-named method OUTSIDE the family — per-line attribution is then
 	// uncertain for its call sites.
@@ -203,7 +242,15 @@ func (g *CodeGraph) RenamePlan(query, newName string) (*RenamePlanResult, error)
 				continue
 			}
 			seen[cs.Line] = true
-			editLine(s, cs.Line, !ambiguous)
+			switch siteVerdictFor(s, cs) {
+			case siteConfirm:
+				editLine(s, cs.Line, true)
+			case siteExclude:
+				// receiver confidently belongs to a non-family declarer of
+				// the same name: not a rename site at all.
+			default:
+				editLine(s, cs.Line, !ambiguous)
+			}
 		}
 	}
 
@@ -222,7 +269,14 @@ func (g *CodeGraph) RenamePlan(query, newName string) (*RenamePlanResult, error)
 				continue
 			}
 			seen[cs.Line] = true
-			editLine(c, cs.Line, !ambiguousCaller)
+			switch siteVerdictFor(c, cs) {
+			case siteConfirm:
+				editLine(c, cs.Line, true)
+			case siteExclude:
+				// not a site: the receiver is the OTHER same-named contract.
+			default:
+				editLine(c, cs.Line, !ambiguousCaller)
+			}
 		}
 	}
 

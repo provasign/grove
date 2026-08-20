@@ -10,7 +10,7 @@ import (
 // renamePlanFixture: interface Store { load(String) } with
 //   - DiskStore implements Store, declares load          -> decl edit
 //   - readAll calls DiskStore.load twice                 -> confirmed call edits
-//   - syncBoth calls DiskStore.load AND Cache.load       -> ambiguous (same-named non-family callee)
+//   - syncBoth calls DiskStore.load AND Cache.load       -> per-site: ds.load confirmed, c.load excluded
 func renamePlanFixture() *CodeGraph {
 	g := New()
 	g.ReplaceWithEdges([]core.SymbolRecord{
@@ -101,17 +101,28 @@ func TestRenamePlan(t *testing.T) {
 		t.Errorf("missing/wrong delegating-override call edit: %+v", e)
 	}
 
-	// syncBoth calls both DiskStore.load and Cache.load -> its lines are
-	// ambiguous, and Cache.load (non-family) must NOT appear anywhere.
-	if len(r.Ambiguous) != 2 {
-		t.Fatalf("Ambiguous = %d edits, want 2 (syncBoth lines): %+v", len(r.Ambiguous), r.Ambiguous)
+	// syncBoth calls both DiskStore.load and Cache.load. Per-site receiver
+	// classification (renamesite.go) resolves ds -> DiskStore (family:
+	// CONFIRMED) and c -> Cache, a non-family declarer of the same name
+	// (java is exclude-safe: NOT a site, dropped from the plan). The old
+	// caller-level rule marked both lines ambiguous — the over-broad bucket
+	// that drove a live agent to over-rename and then invert the whole
+	// rename (gin ResponseWriter.Status, 2026-08-20).
+	if len(r.Ambiguous) != 0 {
+		t.Fatalf("Ambiguous = %d edits, want 0 (per-site resolution decides both): %+v", len(r.Ambiguous), r.Ambiguous)
+	}
+	if e, ok := byLine["App.java:21"]; !ok || !strings.Contains(e.After, "ds.fetch(") {
+		t.Errorf("syncBoth's family call must be CONFIRMED per-site: %+v", e)
 	}
 	for _, e := range r.Edits {
-		if e.SiteID == "App.java::App.syncBoth@sha" {
-			t.Errorf("syncBoth line wrongly confirmed: %+v", e)
+		if e.SiteID == "App.java::App.syncBoth@sha" && e.Line != 21 {
+			t.Errorf("only syncBoth's family-receiver line may be confirmed: %+v", e)
 		}
 		if e.FilePath == "Cache.java" {
 			t.Errorf("non-family Cache.load wrongly edited: %+v", e)
+		}
+		if strings.Contains(e.Before, "c.load") {
+			t.Errorf("excluded Cache-receiver call site leaked into the plan: %+v", e)
 		}
 	}
 
@@ -169,3 +180,4 @@ func TestRenamePlanOccurrenceAmbiguity(t *testing.T) {
 		t.Error("contaminated line missing from Ambiguous")
 	}
 }
+

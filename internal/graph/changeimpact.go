@@ -1039,11 +1039,22 @@ func paramTypesOf(s *core.SymbolRecord) []string {
 	}
 	inner := tsDeclParams(src)
 	if s.Language == "go" {
-		inner = goDeclParams(src)
-		if inner == "" {
-			return nil
+		gi, ok := goDeclParamsOK(src)
+		if !ok {
+			return nil // unparsable: genuinely unknown, stays neutral
 		}
-		return goParamTokens(inner)
+		if gi == "" {
+			// A PARSED empty parameter list is hard evidence, not absence
+			// of evidence. Returning nil here made every zero-param Go
+			// member compatible with everything: a synthesized interface
+			// anchor like `Status() int` accepted same-named methods of ANY
+			// arity into the family — measured on a single-method-interface
+			// fixture, where Context.Status(int) joined ResponseWriter.
+			// Status()'s family and the rename plan edited the wrong
+			// method's declaration.
+			return []string{}
+		}
+		return goParamTokens(gi)
 	}
 	if inner == "" {
 		return nil
@@ -1145,27 +1156,35 @@ func parenthesizedAt(text string, open int) (string, int, bool) {
 // goDeclParams skips a method receiver before returning its parameter list.
 // Interface specs have no "func (receiver)" prefix and use the first list.
 func goDeclParams(signature string) string {
+	params, _ := goDeclParamsOK(signature)
+	return params
+}
+
+// goDeclParamsOK distinguishes "parsed, zero parameters" (ok=true, "") from
+// "no parameter list found" (ok=false) — signatureCompatible treats the two
+// completely differently (evidence vs neutrality).
+func goDeclParamsOK(signature string) (string, bool) {
 	trimmed := strings.TrimSpace(signature)
 	open := strings.IndexByte(trimmed, '(')
 	if open < 0 {
-		return ""
+		return "", false
 	}
 	if strings.HasPrefix(trimmed, "func (") {
 		_, receiverClose, ok := parenthesizedAt(trimmed, open)
 		if !ok {
-			return ""
+			return "", false
 		}
 		open = strings.IndexByte(trimmed[receiverClose+1:], '(')
 		if open < 0 {
-			return ""
+			return "", false
 		}
 		open += receiverClose + 1
 	}
 	params, _, ok := parenthesizedAt(trimmed, open)
 	if !ok {
-		return ""
+		return "", false
 	}
-	return params
+	return params, true
 }
 
 func tsParamTypeToken(param string) string {
