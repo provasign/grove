@@ -107,8 +107,17 @@ func extractSymbolsFromAST(language, filePath, blobSHA string, src []byte, fileI
 	if err != nil {
 		return nil, false, false
 	}
-	defer tree.Close()
-	hasErrors = tree.RootNode().HasError()
+	if tree == nil {
+		// No grammar for this language. Text-capable strategies (astkit
+		// TextStrategy) extract from src alone; everything else has no
+		// AST path. Unreachable for grammar-backed languages.
+		if !reg.TextCapable(key) {
+			return nil, false, false
+		}
+	} else {
+		defer tree.Close()
+		hasErrors = tree.RootNode().HasError()
+	}
 	akSyms, err := reg.Extract(key, tree, src)
 	if err != nil {
 		return nil, false, false
@@ -132,10 +141,12 @@ func extractImportsFromAST(language string, src []byte) ([]string, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), parseTimeout)
 	defer cancel()
 	tree, err := eng.Parse(ctx, key, src)
-	if err != nil || tree == nil {
+	if err != nil || (tree == nil && !reg.TextCapable(key)) {
 		return nil, false
 	}
-	defer tree.Close()
+	if tree != nil {
+		defer tree.Close()
+	}
 	akImports, err := reg.ExtractImports(key, tree, src)
 	if err != nil {
 		return nil, false
