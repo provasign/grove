@@ -69,6 +69,33 @@ func (e *Engine) ExtractContent(relPath string, content []byte) ([]core.SymbolRe
 	src := string(content)
 	imports := extractImports(language, src)
 	symbols := extractSymbols(language, relPath, blobSHA, src, imports)
+	if language == "cobol" && len(symbols) == 0 {
+		// A COBOL file that yields no symbols must still be resolvable as a
+		// COPY member and distinguishable from an unindexed file (spec
+		// R-7.3): member resolution keys on file basenames drawn from
+		// symbols, so a parse-empty copybook otherwise silently breaks the
+		// include graph for every unit that copies it.
+		base := relPath
+		if i := strings.LastIndexByte(base, '/'); i >= 0 {
+			base = base[i+1:]
+		}
+		if i := strings.IndexByte(base, '.'); i >= 0 {
+			base = base[:i]
+		}
+		name := strings.ToUpper(base)
+		symbols = append(symbols, core.SymbolRecord{
+			ID:            symID(relPath, name, blobSHA),
+			FilePath:      relPath,
+			BlobSHA:       blobSHA,
+			Language:      language,
+			Kind:          core.SymbolKind("copybook-member"),
+			Name:          name,
+			QualifiedName: name,
+			Signature:     "member (no symbols extracted)",
+			Span:          core.LineRange{Start: 1, End: 1},
+			Imports:       append([]string(nil), imports...),
+		})
+	}
 	ensureUniqueIDs(symbols)
 	return symbols, nil
 }
