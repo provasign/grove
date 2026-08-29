@@ -62,6 +62,10 @@ func languageToKey(language string) (astkit.LanguageKey, bool) {
 		return astkit.LangCSharp, true
 	case "php":
 		return astkit.LangPHP, true
+	case "cobol":
+		return astkit.LangCOBOL, true
+	case "jcl":
+		return astkit.LangJCL, true
 	}
 	return "", false
 }
@@ -80,6 +84,10 @@ func (e *Engine) ParseTree(language string, src []byte) error {
 	tree, err := eng.Parse(ctx, key, src)
 	if err != nil {
 		return err
+	}
+	if tree == nil {
+		// No grammar (text-strategy language): nothing to validate.
+		return nil
 	}
 	defer tree.Close()
 	if tree.RootNode().HasError() {

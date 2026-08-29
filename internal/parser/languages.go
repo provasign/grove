@@ -74,6 +74,10 @@ func DetectLanguage(path string) string {
 		return "csharp"
 	case ".php", ".php3", ".php4", ".php5", ".phtml":
 		return "php"
+	case ".cbl", ".cob", ".cobol", ".cpy", ".ccp", ".cpb":
+		return "cobol"
+	case ".jcl", ".prc":
+		return "jcl"
 
 	// ── Plaintext documents (indexed as whole-file records) ──
 	case ".md", ".mdx", ".markdown":
