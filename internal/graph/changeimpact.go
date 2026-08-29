@@ -119,6 +119,18 @@ func (g *CodeGraph) ChangeImpact(query string) (*ChangeImpactResult, error) {
 		return mf, nil
 	}
 
+	// A FIELD has no override family either — containedMethods only ever
+	// matched KindMethod/KindFunction, so a query naming a field (a class
+	// property an Angular template binds to, a Python model attribute a
+	// Jinja template reads) fell straight to "no method X", regardless of
+	// language, even though buildFrameworkEdges may have real inbound
+	// references to it. Field anchors are tried only when no method of that
+	// name exists on the type, so an ordinary Type.method query is never
+	// shadowed by a same-named field (rare, but the check is free).
+	if fld := g.fieldImpactLocked(query); fld != nil {
+		return fld, nil
+	}
+
 	typeName, methodName, queryParams, err := parseChangeImpactQuery(query)
 	if err != nil {
 		return nil, err
