@@ -45,8 +45,20 @@ type ChangeImpactResult struct {
 	// Completeness is "closed" when the override family is fully rooted in
 	// indexed types, "project-local" when it is bounded by an external
 	// contract (OverridesExternal non-empty, or the query named an external
-	// type directly).
+	// type directly), "callers-only" for a free function/mainframe anchor
+	// with no override family to close over. A SEPARATE field
+	// (HasHeuristicRefs), not a string suffix: consumers that compare
+	// Completeness by exact value (widerAnchorHint, verify.go) must keep
+	// working unmodified — a suffixed value broke both silently until this
+	// comment (2026-08-29).
 	Completeness string
+	// HasHeuristicRefs is true when the caller/impact set includes at least
+	// one name-derived edge (framework template/JPA references, evidence
+	// Heuristic or Regex) rather than only AST-certain ones. The set is
+	// deliberately over-inclusive rather than silently incomplete, but a
+	// caller distinguishing "certain" from "probably right" should check
+	// this rather than parse Completeness.
+	HasHeuristicRefs bool
 }
 
 // Sites returns every METHOD in the change-set — declarations, family,
@@ -387,13 +399,6 @@ func (g *CodeGraph) ChangeImpact(query string) (*ChangeImpactResult, error) {
 	if len(overridesExternal) > 0 {
 		completeness = "project-local"
 	}
-	if heuristicCallers {
-		// Name-derived framework references (template EL, JPA derived
-		// queries) are in the caller set at reduced confidence. The set is
-		// deliberately over-inclusive rather than silently incomplete, but
-		// it is not CLOSED in the certain sense — say so.
-		completeness += "+heuristic-refs"
-	}
 
 	declTypes := make([]core.SymbolRecord, 0, len(declaringTypes))
 	for _, t := range declaringTypes {
@@ -414,6 +419,7 @@ func (g *CodeGraph) ChangeImpact(query string) (*ChangeImpactResult, error) {
 		ExternalSupers:    externalSupers,
 		OverridesExternal: overridesExternal,
 		Completeness:      completeness,
+		HasHeuristicRefs:  heuristicCallers,
 	}, nil
 }
 
@@ -578,12 +584,8 @@ func (g *CodeGraph) externalRootedImpact(query, typeName, methodName string, que
 		Callers:           callers,
 		ExternalSupers:    []string{typeName},
 		OverridesExternal: []string{typeName + "#" + methodName},
-		Completeness: func() string {
-			if heuristicCallers {
-				return "project-local+heuristic-refs"
-			}
-			return "project-local"
-		}(),
+		Completeness:      "project-local",
+		HasHeuristicRefs:  heuristicCallers,
 	}, nil
 }
 
@@ -914,15 +916,11 @@ func (g *CodeGraph) freeFunctionImpactLocked(query string) *ChangeImpactResult {
 	sortSymbols(decls)
 	sortSymbols(callers)
 	return &ChangeImpactResult{
-		Query:        query,
-		Declarations: decls,
-		Callers:      callers,
-		Completeness: func() string {
-			if heuristicEdges {
-				return "callers-only+heuristic-refs"
-			}
-			return "callers-only"
-		}(),
+		Query:            query,
+		Declarations:     decls,
+		Callers:          callers,
+		Completeness:     "callers-only",
+		HasHeuristicRefs: heuristicEdges,
 	}
 }
 

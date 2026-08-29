@@ -315,6 +315,10 @@ type ChangeImpactResult struct {
 	// Completeness: "closed" (family fully rooted in indexed types) or
 	// "project-local" (bounded by an external contract).
 	Completeness string
+	// HasHeuristicRefs is true when the caller set includes at least one
+	// name-derived edge (framework template/JPA references) rather than
+	// only AST-certain ones — over-inclusive by design, not certain.
+	HasHeuristicRefs bool
 }
 
 // Sites returns the change-set methods (declarations ∪ family ∪ callers ∪
@@ -357,6 +361,7 @@ func (e *Engine) ChangeImpact(ctx context.Context, query string) (ChangeImpactRe
 		ExternalSupers:    raw.ExternalSupers,
 		OverridesExternal: raw.OverridesExternal,
 		Completeness:      raw.Completeness,
+		HasHeuristicRefs:  raw.HasHeuristicRefs,
 	}, nil
 }
 
