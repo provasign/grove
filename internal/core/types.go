@@ -77,6 +77,12 @@ const (
 	// declares it. Derived for Go by method-set inclusion, since Go
 	// interface satisfaction is implicit.
 	EdgeOverrides EdgeType = "overrides"
+
+	// Mainframe data-flow vocabulary (docs/mainframe-build-plan.md).
+	EdgeReads     EdgeType = "reads"         // symbol reads a data item
+	EdgeWrites    EdgeType = "writes"        // symbol writes a data item
+	EdgeRedefines EdgeType = "redefines"     // alternate view over the same storage
+	EdgeBinds     EdgeType = "binds-dataset" // logical file bound to a physical dataset
 )
 
 type Edge struct {
@@ -205,6 +211,7 @@ const (
 	ReasonRegexFallbck   EdgeReason = "regex-fallback"  // body-scan fallback (non-AST-callsite languages)
 	ReasonStructural     EdgeReason = "structural"      // defines/contains/imports — structural projection
 	ReasonTypeRef        EdgeReason = "type-ref"        // uses-type / extends / implements by name resolution
+	ReasonCrossArtifact  EdgeReason = "cross-artifact"  // derived by joining sites in different artifact types
 	ReasonTestEvidence   EdgeReason = "test-evidence"   // tests edge (annotation/name/call-derived)
 	ReasonMethodSet      EdgeReason = "method-set"      // overrides/implements by method-set inclusion
 	ReasonDecorator      EdgeReason = "decorator"       // decorator/wrapper call edge

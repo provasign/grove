@@ -49,6 +49,11 @@ func TestMainframeEstate_Symbols(t *testing.T) {
 		"data-item WS-FLAGS CUSTUPD.cbl",
 		"data-item WS-FLAGS.WS-EOF CUSTUPD.cbl",
 		"data-item WS-RPT-PGM CUSTUPD.cbl",
+		// Datasets are per-occurrence symbols; Name stays the bare DSN for
+		// estate-wide unification, QualifiedName carries the binding step.
+		"dataset UPDATE.PROD.CUST.MASTER NIGHTLY.jcl",
+		"dataset UPDATE.PROD.CUST.MASTER.G0001V00 NIGHTLY.jcl",
+		"dataset UPDATE.PROD.CUST.MASTER.NEW NIGHTLY.jcl",
 		"job NIGHTLY NIGHTLY.jcl",
 		// Paragraphs and logical files are program-qualified by grove's
 		// projection (ParentName folded into QualifiedName) — consistent
@@ -174,27 +179,68 @@ func diffSets(want, got []string) string {
 	return b.String()
 }
 
-// Field-reference (lineage) edges: paragraph bodies matched against data
-// items visible through the resolved include closure. Name-level, no
-// direction claim (confidence 0.7, regex evidence).
+// Directional field-reference (lineage) edges: verb-classified reads and
+// writes. Same-file fields roll up to the program symbol (volume bound);
+// copybook fields keep paragraph granularity.
 func TestMainframeEstate_FieldReferenceEdges(t *testing.T) {
 	_, edges := indexEstate(t)
 	var got []string
 	for _, e := range edges {
-		if e.Type != core.EdgeUsesType || !strings.Contains(e.From, ".cbl::") {
+		if e.Type != core.EdgeReads && e.Type != core.EdgeWrites {
 			continue
 		}
-		got = append(got, fmt.Sprintf("%s -> %s conf=%.1f", trimID(e.From), trimID(e.To), e.Confidence))
+		got = append(got, fmt.Sprintf("%s %s %s", trimID(e.From), e.Type, trimID(e.To)))
 	}
 	sort.Strings(got)
 	want := []string{
-		"CUSTUPD.cbl::CUSTUPD.INIT-PARA -> CUSTUPD.cbl::WS-FLAGS.WS-EOF conf=0.7",
-		"CUSTUPD.cbl::CUSTUPD.MAIN-PARA -> CUSTREC.cpy::CUST-REC conf=0.7",
-		"CUSTUPD.cbl::CUSTUPD.MAIN-PARA -> CUSTREC.cpy::CUST-REC.CUST-SSN conf=0.7",
-		"CUSTUPD.cbl::CUSTUPD.MAIN-PARA -> CUSTUPD.cbl::WS-RPT-PGM conf=0.7",
+		// MOVE ZEROS TO CUST-SSN: copybook field, paragraph-level write.
+		"CUSTUPD.cbl::CUSTUPD.MAIN-PARA writes CUSTREC.cpy::CUST-REC.CUST-SSN",
+		// CALL USING CUST-REC: copybook group, read.
+		"CUSTUPD.cbl::CUSTUPD.MAIN-PARA reads CUSTREC.cpy::CUST-REC",
+		// MOVE 'N' TO WS-EOF: same-file target — rolled up to the program.
+		"CUSTUPD.cbl::CUSTUPD writes CUSTUPD.cbl::WS-FLAGS.WS-EOF",
+		// CALL WS-RPT-PGM: same-file read, rolled up to the program.
+		"CUSTUPD.cbl::CUSTUPD reads CUSTUPD.cbl::WS-RPT-PGM",
 	}
 	sort.Strings(want)
 	if diff := diffSets(want, got); diff != "" {
 		t.Errorf("field-reference edge drift:\n%s", diff)
+	}
+}
+
+// REDEFINES is a first-class edge: CUST-ALT is an alternate view of CUST-SSN.
+func TestMainframeEstate_RedefinesEdges(t *testing.T) {
+	_, edges := indexEstate(t)
+	var got []string
+	for _, e := range edges {
+		if e.Type == core.EdgeRedefines {
+			got = append(got, fmt.Sprintf("%s -> %s", trimID(e.From), trimID(e.To)))
+		}
+	}
+	want := []string{"CUSTREC.cpy::CUST-REC.CUST-ALT -> CUSTREC.cpy::CUST-REC.CUST-SSN"}
+	if diff := diffSets(want, got); diff != "" {
+		t.Errorf("redefines edge drift:\n%s", diff)
+	}
+}
+
+// Cross-artifact dataset binding (R-5.3): CUSTUPD declares CUST-FILE ASSIGN
+// TO CUSTIN; step NIGHTLY.UPDATE executes CUSTUPD with CUSTIN DD naming two
+// concatenated datasets. The derived edges join both artifacts.
+func TestMainframeEstate_DatasetBinding(t *testing.T) {
+	_, edges := indexEstate(t)
+	var got []string
+	for _, e := range edges {
+		if e.Type == core.EdgeBinds {
+			got = append(got, fmt.Sprintf("%s -> %s conf=%.1f %s", trimID(e.From), trimID(e.To), e.Confidence, e.Reason))
+		}
+	}
+	sort.Strings(got)
+	want := []string{
+		"CUSTUPD.cbl::CUSTUPD.CUST-FILE -> NIGHTLY.jcl::UPDATE.PROD.CUST.MASTER conf=0.8 cross-artifact",
+		"CUSTUPD.cbl::CUSTUPD.CUST-FILE -> NIGHTLY.jcl::UPDATE.PROD.CUST.MASTER.G0001V00 conf=0.8 cross-artifact",
+	}
+	sort.Strings(want)
+	if diff := diffSets(want, got); diff != "" {
+		t.Errorf("dataset binding drift:\n%s", diff)
 	}
 }

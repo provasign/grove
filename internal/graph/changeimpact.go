@@ -876,7 +876,8 @@ func (g *CodeGraph) freeFunctionImpactLocked(query string) *ChangeImpactResult {
 	for id := range declIDs {
 		for _, ei := range g.inbound[id] {
 			edge := g.edges[ei]
-			accept := edge.Type == core.EdgeCalls || (dataAnchor && edge.Type == core.EdgeUsesType)
+			accept := edge.Type == core.EdgeCalls ||
+				(dataAnchor && (edge.Type == core.EdgeReads || edge.Type == core.EdgeWrites || edge.Type == core.EdgeRedefines))
 			if !accept || declIDs[edge.From] || seen[edge.From] {
 				continue
 			}

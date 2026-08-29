@@ -120,7 +120,14 @@ func hasMainframeSymbols(symbols []core.SymbolRecord) bool {
 	return false
 }
 
-var reFieldToken = regexp.MustCompile(`[A-Za-z0-9][A-Za-z0-9-]+`)
+var (
+	reFieldToken  = regexp.MustCompile(`[A-Za-z0-9][A-Za-z0-9-]+`)
+	reQuoted      = regexp.MustCompile(`'[^']*'|"[^"]*"`)
+	reAssignTo    = regexp.MustCompile(`(?i)ASSIGN\s+TO\s+([A-Za-z0-9-]+)`)
+	// Write-position captures: the clause after the verb up to the next
+	// keyword/period holds the targets.
+	reWriteTarget = regexp.MustCompile(`(?i)\b(?:MOVE\s+.*?\s+TO|ADD\s+.*?\s+TO|SUBTRACT\s+.*?\s+FROM|COMPUTE|INITIALIZE|SET|STRING\s+.*?\s+INTO|UNSTRING\s+.*?\s+INTO|READ\s+.*?\s+INTO|GIVING|VARYING)\s+([A-Za-z0-9-]+(?:\s*,?\s+[A-Za-z0-9-]+)*)`)
+)
 
 // buildMainframeDataEdges emits the lineage layer:
 //
@@ -193,7 +200,18 @@ func buildMainframeDataEdges(idx *edgeIndex, symbols []core.SymbolRecord) []core
 		}
 	}
 
-	// 2. Field references from paragraph/section/program bodies.
+	// 2. Directional field references from paragraph/section bodies.
+	//
+	// Statement verbs classify direction: MOVE/COMPUTE/ADD/SUBTRACT/SET/
+	// INITIALIZE/GIVING/INTO/VARYING targets are WRITES; every other
+	// referenced field in the statement is a READ. Quoted literals are
+	// stripped first so 'ACCT-NOT-FOUND' never matches a field.
+	//
+	// Volume discipline (measured on a real estate: undirected refs hit
+	// 2.7M edges, 80x the source size): fields declared in the SAME file
+	// (private working storage) roll up to ONE edge from the file's
+	// program symbol per direction; paragraph-level granularity is kept
+	// only for CROSS-FILE (copybook) fields, where lineage value lives.
 	fieldsByFile := map[string]map[string][]*core.SymbolRecord{}
 	fieldMap := func(file string) map[string][]*core.SymbolRecord {
 		if m, ok := fieldsByFile[file]; ok {
@@ -214,29 +232,153 @@ func buildMainframeDataEdges(idx *edgeIndex, symbols []core.SymbolRecord) []core
 		fieldsByFile[file] = m
 		return m
 	}
+	programOfFile := map[string]*core.SymbolRecord{}
+	for i := range symbols {
+		s := &symbols[i]
+		if string(s.Kind) == "program" {
+			programOfFile[s.FilePath] = s
+		}
+	}
 
 	seenRef := map[string]bool{}
+	emitRef := func(from *core.SymbolRecord, field *core.SymbolRecord, write bool) {
+		et := core.EdgeReads
+		if write {
+			et = core.EdgeWrites
+		}
+		// Same-file fields: attribute to the program, one edge per direction.
+		if field.FilePath == from.FilePath {
+			if prog := programOfFile[from.FilePath]; prog != nil {
+				from = prog
+			}
+		}
+		key := from.ID + string(et) + field.ID
+		if seenRef[key] {
+			return
+		}
+		seenRef[key] = true
+		edges = append(edges, core.Edge{
+			From: from.ID, To: field.ID,
+			Type: et, Confidence: 0.7,
+			Source: core.EvidenceSourceRegex, Reason: core.ReasonRegexFallbck,
+		})
+	}
+
 	for i := range symbols {
 		s := &symbols[i]
 		if s.Language != "cobol" || !mainframeCallerKind(s.Kind) || s.RawText == "" {
 			continue
 		}
 		visible := fieldMap(s.FilePath)
-		for _, tok := range reFieldToken.FindAllString(s.RawText, -1) {
-			for _, field := range visible[strings.ToUpper(tok)] {
-				key := s.ID + "->" + field.ID
-				if seenRef[key] {
+		for _, stmt := range strings.Split(s.RawText, "\n") {
+			stmt = reQuoted.ReplaceAllString(stmt, " ")
+			writeTargets := map[string]bool{}
+			for _, m := range reWriteTarget.FindAllStringSubmatch(stmt, -1) {
+				for _, tok := range reFieldToken.FindAllString(m[1], -1) {
+					writeTargets[strings.ToUpper(tok)] = true
+				}
+			}
+			for _, tok := range reFieldToken.FindAllString(stmt, -1) {
+				u := strings.ToUpper(tok)
+				fields := visible[u]
+				if len(fields) == 0 {
 					continue
 				}
-				seenRef[key] = true
-				edges = append(edges, core.Edge{
-					From: s.ID, To: field.ID,
-					Type: core.EdgeUsesType, Confidence: 0.7,
-					Source: core.EvidenceSourceRegex, Reason: core.ReasonRegexFallbck,
-				})
+				for _, field := range fields {
+					emitRef(s, field, writeTargets[u])
+				}
 			}
 		}
 	}
+
+	// 3. REDEFINES edges: the alternate-view relation, resolved within the
+	// declaring file (a redefinition legally targets a preceding sibling).
+	for i := range symbols {
+		s := &symbols[i]
+		if s.Language != "cobol" || !mainframeDataKind(s.Kind) {
+			continue
+		}
+		for _, mod := range s.Modifiers {
+			if !strings.HasPrefix(mod, "redefines:") {
+				continue
+			}
+			target := strings.ToUpper(strings.TrimPrefix(mod, "redefines:"))
+			for _, cand := range idx.byFile[s.FilePath] {
+				if mainframeDataKind(cand.Kind) && strings.ToUpper(cand.Name) == target && cand.ID != s.ID {
+					edges = append(edges, core.Edge{
+						From: s.ID, To: cand.ID,
+						Type: core.EdgeRedefines, Confidence: 1.0,
+						Source: core.EvidenceSourceASTKit, Reason: core.ReasonStructural,
+					})
+				}
+			}
+		}
+	}
+
+	// 4. Cross-artifact dataset binding (spec R-5.3): program declares
+	// logical file ASSIGN TO <dd>; a JCL step executes the program and its
+	// <dd> DD names a dataset. The derived edge joins the two artifacts at
+	// reduced confidence and cites the join in its reason.
+	datasetsByStepDD := map[string][]*core.SymbolRecord{}
+	for i := range symbols {
+		s := &symbols[i]
+		if string(s.Kind) != "dataset" {
+			continue
+		}
+		for _, mod := range s.Modifiers {
+			if strings.HasPrefix(mod, "dd:") {
+				key := strings.ToUpper(s.ParentSymbol) + "/" + strings.TrimPrefix(mod, "dd:")
+				datasetsByStepDD[key] = append(datasetsByStepDD[key], s)
+			}
+		}
+	}
+	if len(datasetsByStepDD) > 0 {
+		// Steps that execute each program, from the call edges built above
+		// plus estate-wide name resolution (same rule as call resolution).
+		stepsByProgram := map[string][]*core.SymbolRecord{}
+		for i := range symbols {
+			s := &symbols[i]
+			if string(s.Kind) != "step" {
+				continue
+			}
+			for _, cs := range s.CallSites {
+				stepsByProgram[strings.ToUpper(cs.Callee)] = append(stepsByProgram[strings.ToUpper(cs.Callee)], s)
+			}
+		}
+		seenBind := map[string]bool{}
+		for i := range symbols {
+			lf := &symbols[i]
+			if string(lf.Kind) != "logical-file" {
+				continue
+			}
+			dd := ""
+			if m := reAssignTo.FindStringSubmatch(lf.Signature); m != nil {
+				dd = strings.ToUpper(m[1])
+			}
+			if dd == "" {
+				continue
+			}
+			prog := programOfFile[lf.FilePath]
+			if prog == nil {
+				continue
+			}
+			for _, step := range stepsByProgram[strings.ToUpper(prog.Name)] {
+				for _, ds := range datasetsByStepDD[strings.ToUpper(step.Name)+"/"+dd] {
+					key := lf.ID + "->" + ds.ID
+					if seenBind[key] {
+						continue
+					}
+					seenBind[key] = true
+					edges = append(edges, core.Edge{
+						From: lf.ID, To: ds.ID,
+						Type: core.EdgeBinds, Confidence: 0.8,
+						Source: core.EvidenceSourceASTKit, Reason: core.ReasonCrossArtifact,
+					})
+				}
+			}
+		}
+	}
+
 	return edges
 }
 
@@ -277,7 +419,8 @@ func (g *CodeGraph) mainframeImpactLocked(query string) *ChangeImpactResult {
 	for id := range declIDs {
 		for _, ei := range g.inbound[id] {
 			edge := g.edges[ei]
-			ok := edge.Type == core.EdgeCalls || (dataAnchor && edge.Type == core.EdgeUsesType)
+			ok := edge.Type == core.EdgeCalls ||
+				(dataAnchor && (edge.Type == core.EdgeReads || edge.Type == core.EdgeWrites || edge.Type == core.EdgeRedefines))
 			if !ok || declIDs[edge.From] || seen[edge.From] {
 				continue
 			}
