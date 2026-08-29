@@ -197,6 +197,29 @@ func (s *Store) migrationDone(ctx context.Context, key string) (bool, error) {
 	return v == "done", nil
 }
 
+// GetMeta reads one key from the meta table ("" and false when absent).
+func (s *Store) GetMeta(ctx context.Context, key string) (string, bool, error) {
+	var v string
+	err := s.db.QueryRowContext(ctx, `SELECT value FROM meta WHERE key = ?`, key).Scan(&v)
+	if err == sql.ErrNoRows {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("meta %q: %w", key, err)
+	}
+	return v, true, nil
+}
+
+// SetMeta writes one key into the meta table.
+func (s *Store) SetMeta(ctx context.Context, key, value string) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, value)
+	if err != nil {
+		return fmt.Errorf("meta %q: %w", key, err)
+	}
+	return nil
+}
+
 func (s *Store) markMigrationDone(ctx context.Context, key string) error {
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO meta (key, value) VALUES (?, 'done') ON CONFLICT(key) DO UPDATE SET value = 'done'`, key)

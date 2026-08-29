@@ -200,6 +200,14 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 	if err != nil {
 		return nil, result, err
 	}
+	// A binary upgrade can change extraction semantics for unchanged bytes;
+	// the blobSHA cache cannot see that. A stamp mismatch re-extracts
+	// everything once, then records the new stamp.
+	storedExtractor, _, err := i.store.GetMeta(ctx, "extractor-version")
+	if err != nil {
+		return nil, result, err
+	}
+	forceExtract := opts.Force || storedExtractor != parser.ExtractorVersion
 	statRefresh := map[string][2]int64{} // touched but content-identical
 	var walkFailed []string // relPaths whose subtree could not be read this run
 	err = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
@@ -273,7 +281,7 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 		// mtime-preserving writers (rsync -t, tar, build caches).
 		info, statErr := os.Stat(path)
 		meta, found := fileMeta[relPath]
-		if !opts.Force && statErr == nil && found &&
+		if !forceExtract && statErr == nil && found &&
 			meta.Size == info.Size() && meta.Mtime == info.ModTime().UnixNano() {
 			result.FilesSkipped++
 			return nil
@@ -287,9 +295,11 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 		if statErr == nil {
 			size, mtime = info.Size(), info.ModTime().UnixNano()
 		}
-		if found && meta.BlobSHA == blobSHA {
+		if !forceExtract && found && meta.BlobSHA == blobSHA {
 			// Touched (or first run after the stat-cache migration) but
 			// content-identical: refresh the stat so the next walk skips it.
+			// forceExtract bypasses this too — force means force, and a
+			// changed extractor stamp must re-extract identical bytes.
 			result.FilesSkipped++
 			statRefresh[relPath] = [2]int64{size, mtime}
 			return nil
@@ -397,6 +407,14 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 	}
 	result.FilesPruned = filesPruned
 
+	// Extraction for this walk ran under the current semantics; stamp it so
+	// the next run only re-extracts on a real upgrade.
+	if storedExtractor != parser.ExtractorVersion {
+		if err := i.store.SetMeta(ctx, "extractor-version", parser.ExtractorVersion); err != nil {
+			return nil, result, err
+		}
+	}
+
 	tick("persist-changed")
 
 	// No file changed: the persisted edges are still exactly what a rebuild
@@ -405,7 +423,7 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 	// seconds instead of milliseconds). Force opts back into the full path.
 	// The check runs BEFORE AllSymbols so a no-op never pays the full symbol
 	// load; counts come from COUNT(*) queries instead of loaded slices.
-	if !opts.Force && result.FilesUpdated == 0 && result.FilesPruned == 0 {
+	if !forceExtract && result.FilesUpdated == 0 && result.FilesPruned == 0 {
 		status, err := i.store.Status(ctx)
 		if err != nil {
 			return nil, result, err
