@@ -76,7 +76,10 @@ func BuildEdgesDelta(prevEdges []core.Edge, prevSymbols, symbols []core.SymbolRe
 }
 
 func BuildEdgesDeltaMeta(prevEdges []core.Edge, prevSymbols, symbols []core.SymbolRecord, changedFiles map[string]bool, nativeAnalyzedDirs map[string]bool) ([]core.Edge, *DeltaMeta) {
-	if len(prevEdges) == 0 || len(changedFiles) == 0 {
+	if len(prevEdges) == 0 || len(changedFiles) == 0 || hasMainframeSymbols(symbols) {
+		// Mainframe estates force a full rebuild: the include closure makes
+		// per-file invalidation wrong until plan phase 0.4 lands, and these
+		// corpora are few-files so the full build is cheap.
 		deltaStats.fallback++
 		return BuildEdges(symbols), nil
 	}

@@ -16,6 +16,7 @@
 001600      PERFORM INIT-PARA THRU INIT-EXIT.                           ID73-80X
 001700      CALL 'AUDITLOG' USING CUST-REC.                             ID73-80X
 001800      CALL WS-RPT-PGM.                                            ID73-80X
+001850      MOVE ZEROS TO CUST-SSN.                                     ID73-80X
 001900      STOP RUN.                                                   ID73-80X
 002000  INIT-PARA.                                                      ID73-80X
 002100      MOVE 'N' TO WS-EOF.                                         ID73-80X

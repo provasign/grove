@@ -111,8 +111,11 @@ func TestMainframeEstate_IncludeAndDatasetEdges(t *testing.T) {
 	sort.Strings(got)
 
 	want := []string{
-		// COPY edges: the include graph.
+		// COPY edges: the textual include record plus the resolved
+		// member-to-file join.
+		"file:AUDITLOG.cbl -> file:CUSTREC.cpy",
 		"file:AUDITLOG.cbl -> import:CUSTREC",
+		"file:CUSTUPD.cbl -> file:CUSTREC.cpy",
 		"file:CUSTUPD.cbl -> import:CUSTREC",
 		// DD DSN= bindings, including the concatenated unnamed DD and the
 		// continued statement.
@@ -169,4 +172,29 @@ func diffSets(want, got []string) string {
 		}
 	}
 	return b.String()
+}
+
+// Field-reference (lineage) edges: paragraph bodies matched against data
+// items visible through the resolved include closure. Name-level, no
+// direction claim (confidence 0.7, regex evidence).
+func TestMainframeEstate_FieldReferenceEdges(t *testing.T) {
+	_, edges := indexEstate(t)
+	var got []string
+	for _, e := range edges {
+		if e.Type != core.EdgeUsesType || !strings.Contains(e.From, ".cbl::") {
+			continue
+		}
+		got = append(got, fmt.Sprintf("%s -> %s conf=%.1f", trimID(e.From), trimID(e.To), e.Confidence))
+	}
+	sort.Strings(got)
+	want := []string{
+		"CUSTUPD.cbl::CUSTUPD.INIT-PARA -> CUSTUPD.cbl::WS-FLAGS.WS-EOF conf=0.7",
+		"CUSTUPD.cbl::CUSTUPD.MAIN-PARA -> CUSTREC.cpy::CUST-REC conf=0.7",
+		"CUSTUPD.cbl::CUSTUPD.MAIN-PARA -> CUSTREC.cpy::CUST-REC.CUST-SSN conf=0.7",
+		"CUSTUPD.cbl::CUSTUPD.MAIN-PARA -> CUSTUPD.cbl::WS-RPT-PGM conf=0.7",
+	}
+	sort.Strings(want)
+	if diff := diffSets(want, got); diff != "" {
+		t.Errorf("field-reference edge drift:\n%s", diff)
+	}
 }

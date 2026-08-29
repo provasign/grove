@@ -101,6 +101,12 @@ func (g *CodeGraph) ChangeImpact(query string) (*ChangeImpactResult, error) {
 		return free, nil
 	}
 
+	// Mainframe anchors (programs, paragraphs, data items…) have their own
+	// resolution: dotted names are hierarchy paths, not type families.
+	if mf := g.mainframeImpactLocked(query); mf != nil {
+		return mf, nil
+	}
+
 	typeName, methodName, queryParams, err := parseChangeImpactQuery(query)
 	if err != nil {
 		return nil, err
@@ -795,7 +801,7 @@ func (g *CodeGraph) resolveLooseQueryLocked(query string) (string, error) {
 		switch s.Kind {
 		case core.KindMethod, core.KindFunction, core.KindConstructor:
 		default:
-			if !mainframeCallerKind(s.Kind) {
+			if !mainframeAnchorKind(s.Kind) {
 				continue
 			}
 		}
@@ -848,7 +854,7 @@ func (g *CodeGraph) freeFunctionImpactLocked(query string) *ChangeImpactResult {
 		switch s.Kind {
 		case core.KindFunction, core.KindMethod, core.KindConstructor:
 		default:
-			if !mainframeCallerKind(s.Kind) {
+			if !mainframeAnchorKind(s.Kind) {
 				continue
 			}
 		}
@@ -858,12 +864,20 @@ func (g *CodeGraph) freeFunctionImpactLocked(query string) *ChangeImpactResult {
 	if len(decls) == 0 {
 		return nil
 	}
+	dataAnchor := false
+	for _, d := range decls {
+		if mainframeDataKind(d.Kind) {
+			dataAnchor = true
+			break
+		}
+	}
 	seen := map[string]bool{}
 	var callers []core.SymbolRecord
 	for id := range declIDs {
 		for _, ei := range g.inbound[id] {
 			edge := g.edges[ei]
-			if edge.Type != core.EdgeCalls || declIDs[edge.From] || seen[edge.From] {
+			accept := edge.Type == core.EdgeCalls || (dataAnchor && edge.Type == core.EdgeUsesType)
+			if !accept || declIDs[edge.From] || seen[edge.From] {
 				continue
 			}
 			seen[edge.From] = true
@@ -927,7 +941,7 @@ func (g *CodeGraph) didYouMeanLocked(name string) string {
 		switch s.Kind {
 		case core.KindMethod, core.KindFunction, core.KindConstructor:
 		default:
-			if !mainframeCallerKind(s.Kind) {
+			if !mainframeAnchorKind(s.Kind) {
 				continue
 			}
 		}
@@ -985,7 +999,7 @@ func (g *CodeGraph) resolveFileLineLocked(query, path string, line int) (string,
 		switch s.Kind {
 		case core.KindMethod, core.KindFunction, core.KindConstructor:
 		default:
-			if !mainframeCallerKind(s.Kind) {
+			if !mainframeAnchorKind(s.Kind) {
 				continue
 			}
 		}

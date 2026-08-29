@@ -219,6 +219,8 @@ func BuildEdges(symbols []core.SymbolRecord) []core.Edge {
 	callEdges := buildCalls(idx, symbols, sat)
 	edges = append(edges, callEdges...)
 	tick("calls")
+	edges = append(edges, buildMainframeDataEdges(idx, symbols)...)
+	tick("mainframe-data")
 	decoEdges := buildDecoratorEdges(idx, symbols, callEdges)
 	edges = append(edges, decoEdges...)
 	tick("decorators")
