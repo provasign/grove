@@ -65,3 +65,21 @@ func TestDetectLanguageFile_ExtensionlessMember(t *testing.T) {
 		t.Errorf("main.go: got %q", got)
 	}
 }
+
+// Field-reported: mainframe exports carry uppercase extensions; the language
+// switch is case-sensitive by design for modern code (.C means C++), so the
+// mainframe set gets a lowercase fallback. 32% -> 99% include resolution.
+func TestDetectLanguage_UppercaseMainframeExtensions(t *testing.T) {
+	for path, want := range map[string]string{
+		"cobol/copybook/AUCCS020.CPY": "cobol",
+		"cobol/TESTPGM.CBL":           "cobol",
+		"jcl/NIGHTLY.JCL":             "jcl",
+		"legacy/Batch.Cbl":            "cobol",
+		"src/foo.C":                   "", // modern semantics preserved
+		"src/FOO.GO":                  "",
+	} {
+		if got := DetectLanguage(path); got != want {
+			t.Errorf("%s: got %q want %q", path, got, want)
+		}
+	}
+}
