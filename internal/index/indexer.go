@@ -258,7 +258,7 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 				return nil
 			}
 		}
-		if !parser.Supported(path) {
+		if !parser.SupportedFile(path) {
 			return nil
 		}
 
@@ -365,7 +365,7 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 			}
 			continue
 		}
-		language := parser.DetectLanguage(task.absPath)
+		language := parser.DetectLanguageFile(task.absPath)
 		if err := i.store.UpsertFile(ctx, task.relPath, task.blobSHA, language, task.size, task.mtime, outcomes[idx].symbols); err != nil {
 			return nil, result, err
 		}

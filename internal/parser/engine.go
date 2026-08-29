@@ -22,7 +22,7 @@ func NewEngine() *Engine {
 }
 
 func (e *Engine) ExtractFile(path string, root string) ([]core.SymbolRecord, error) {
-	language := DetectLanguage(path)
+	language := DetectLanguageFile(path)
 	if language == "" {
 		return nil, nil
 	}
@@ -52,7 +52,7 @@ func (e *Engine) ExtractFile(path string, root string) ([]core.SymbolRecord, err
 // symbols a not-yet-written file would index — e.g. a merge driver whose
 // result git only writes to the worktree after the driver exits.
 func (e *Engine) ExtractContent(relPath string, content []byte) ([]core.SymbolRecord, error) {
-	language := DetectLanguage(relPath)
+	language := DetectLanguageContent(relPath, content)
 	if language == "" {
 		return nil, nil
 	}
@@ -110,7 +110,7 @@ func (e *Engine) Walk(root string) ([]core.SymbolRecord, int, error) {
 			}
 			return nil
 		}
-		if !Supported(path) {
+		if !SupportedFile(path) {
 			return nil
 		}
 		extracted, err := e.ExtractFile(path, root)

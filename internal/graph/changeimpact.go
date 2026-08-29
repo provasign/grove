@@ -795,7 +795,9 @@ func (g *CodeGraph) resolveLooseQueryLocked(query string) (string, error) {
 		switch s.Kind {
 		case core.KindMethod, core.KindFunction, core.KindConstructor:
 		default:
-			continue
+			if !mainframeCallerKind(s.Kind) {
+				continue
+			}
 		}
 		sym := s
 		matches = append(matches, cand{sym: &sym})
@@ -846,7 +848,9 @@ func (g *CodeGraph) freeFunctionImpactLocked(query string) *ChangeImpactResult {
 		switch s.Kind {
 		case core.KindFunction, core.KindMethod, core.KindConstructor:
 		default:
-			continue
+			if !mainframeCallerKind(s.Kind) {
+				continue
+			}
 		}
 		decls = append(decls, s)
 		declIDs[s.ID] = true
@@ -923,7 +927,9 @@ func (g *CodeGraph) didYouMeanLocked(name string) string {
 		switch s.Kind {
 		case core.KindMethod, core.KindFunction, core.KindConstructor:
 		default:
-			continue
+			if !mainframeCallerKind(s.Kind) {
+				continue
+			}
 		}
 		ls := strings.ToLower(s.Name)
 		if ls == lower || seen[s.Name] {
@@ -979,7 +985,9 @@ func (g *CodeGraph) resolveFileLineLocked(query, path string, line int) (string,
 		switch s.Kind {
 		case core.KindMethod, core.KindFunction, core.KindConstructor:
 		default:
-			continue
+			if !mainframeCallerKind(s.Kind) {
+				continue
+			}
 		}
 		if line < s.Span.Start || line > s.Span.End {
 			continue
