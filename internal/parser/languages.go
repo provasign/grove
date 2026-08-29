@@ -111,6 +111,16 @@ func DetectLanguage(path string) string {
 		return PlaintextLanguage
 	case ".csv":
 		return PlaintextLanguage
+	// View templates: indexed as plaintext so framework reference edges
+	// (Thymeleaf/JSP EL -> entity accessors) have records to hang off —
+	// an EL property access invokes the getter at runtime, and un-indexed
+	// templates made change-impact claim "closed" while live bindings
+	// existed (measured: petclinic getFirstName, 2 sites claimed closed,
+	// 4+ template files referencing the property).
+	case ".jsp", ".ftl":
+		return PlaintextLanguage
+	case ".html", ".htm":
+		return PlaintextLanguage
 
 	default:
 		// Mainframe exports conventionally carry UPPERCASE extensions

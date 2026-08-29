@@ -349,12 +349,16 @@ func (g *CodeGraph) ChangeImpact(query string) (*ChangeImpactResult, error) {
 		memberIDs[s.ID] = true
 	}
 	callerSeen := make(map[string]bool)
+	heuristicCallers := false
 	var callers []core.SymbolRecord
 	for id := range memberIDs {
 		for _, ei := range g.inbound[id] {
 			edge := g.edges[ei]
 			if edge.Type != core.EdgeCalls {
 				continue
+			}
+			if edge.Source == core.EvidenceSourceHeuristic || edge.Source == core.EvidenceSourceRegex {
+				heuristicCallers = true
 			}
 			if memberIDs[edge.From] || callerSeen[edge.From] {
 				continue
@@ -382,6 +386,13 @@ func (g *CodeGraph) ChangeImpact(query string) (*ChangeImpactResult, error) {
 	completeness := "closed"
 	if len(overridesExternal) > 0 {
 		completeness = "project-local"
+	}
+	if heuristicCallers {
+		// Name-derived framework references (template EL, JPA derived
+		// queries) are in the caller set at reduced confidence. The set is
+		// deliberately over-inclusive rather than silently incomplete, but
+		// it is not CLOSED in the certain sense — say so.
+		completeness += "+heuristic-refs"
 	}
 
 	declTypes := make([]core.SymbolRecord, 0, len(declaringTypes))
@@ -538,12 +549,16 @@ func (g *CodeGraph) externalRootedImpact(query, typeName, methodName string, que
 		memberIDs[m.ID] = true
 	}
 	callerSeen := make(map[string]bool)
+	heuristicCallers := false
 	var callers []core.SymbolRecord
 	for id := range memberIDs {
 		for _, ei := range g.inbound[id] {
 			edge := g.edges[ei]
 			if edge.Type != core.EdgeCalls {
 				continue
+			}
+			if edge.Source == core.EvidenceSourceHeuristic || edge.Source == core.EvidenceSourceRegex {
+				heuristicCallers = true
 			}
 			if memberIDs[edge.From] || callerSeen[edge.From] {
 				continue
@@ -563,7 +578,12 @@ func (g *CodeGraph) externalRootedImpact(query, typeName, methodName string, que
 		Callers:           callers,
 		ExternalSupers:    []string{typeName},
 		OverridesExternal: []string{typeName + "#" + methodName},
-		Completeness:      "project-local",
+		Completeness: func() string {
+			if heuristicCallers {
+				return "project-local+heuristic-refs"
+			}
+			return "project-local"
+		}(),
 	}, nil
 }
 
@@ -871,6 +891,7 @@ func (g *CodeGraph) freeFunctionImpactLocked(query string) *ChangeImpactResult {
 			break
 		}
 	}
+	heuristicEdges := false
 	seen := map[string]bool{}
 	var callers []core.SymbolRecord
 	for id := range declIDs {
@@ -880,6 +901,9 @@ func (g *CodeGraph) freeFunctionImpactLocked(query string) *ChangeImpactResult {
 				(dataAnchor && (edge.Type == core.EdgeReads || edge.Type == core.EdgeWrites || edge.Type == core.EdgeRedefines))
 			if !accept || declIDs[edge.From] || seen[edge.From] {
 				continue
+			}
+			if edge.Source == core.EvidenceSourceHeuristic || edge.Source == core.EvidenceSourceRegex {
+				heuristicEdges = true
 			}
 			seen[edge.From] = true
 			if s, ok := g.symbols[edge.From]; ok {
@@ -893,7 +917,12 @@ func (g *CodeGraph) freeFunctionImpactLocked(query string) *ChangeImpactResult {
 		Query:        query,
 		Declarations: decls,
 		Callers:      callers,
-		Completeness: "callers-only",
+		Completeness: func() string {
+			if heuristicEdges {
+				return "callers-only+heuristic-refs"
+			}
+			return "callers-only"
+		}(),
 	}
 }
 
