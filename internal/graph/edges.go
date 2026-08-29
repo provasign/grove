@@ -858,6 +858,14 @@ func buildUsesType(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
 		if symbol.Signature == "" {
 			continue
 		}
+		if symbol.Language == "cobol" || symbol.Language == "jcl" {
+			// Mainframe signatures are lists of field names — matching them
+			// against in-scope names manufactured millions of vague edges
+			// (measured on a real estate: 2.08M, 63% of the whole index).
+			// The mainframe builder emits the precise vocabulary instead
+			// (reads/writes/redefines/binds-dataset).
+			continue
+		}
 		scope := idx.importedFiles(symbol.FilePath)
 		matches := usesTypeIdent.FindAllStringSubmatch(symbol.Signature, -1)
 		for _, m := range matches {

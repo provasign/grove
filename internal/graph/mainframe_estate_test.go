@@ -244,3 +244,21 @@ func TestMainframeEstate_DatasetBinding(t *testing.T) {
 		t.Errorf("dataset binding drift:\n%s", diff)
 	}
 }
+
+// The volume trap: the modern uses-type builder must never see mainframe
+// symbols (measured leak on a real estate: 2.08M vague edges, 63% of the
+// index). Their data flow is expressed by reads/writes/redefines only.
+func TestMainframeEstate_NoModernUsesTypeLeak(t *testing.T) {
+	symbols, edges := indexEstate(t)
+	mfIDs := map[string]bool{}
+	for _, s := range symbols {
+		if s.Language == "cobol" || s.Language == "jcl" {
+			mfIDs[s.ID] = true
+		}
+	}
+	for _, e := range edges {
+		if e.Type == core.EdgeUsesType && (mfIDs[e.From] || mfIDs[e.To]) {
+			t.Errorf("uses-type edge on mainframe symbol: %s -> %s", trimID(e.From), trimID(e.To))
+		}
+	}
+}
