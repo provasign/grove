@@ -96,6 +96,20 @@ func (g *CodeGraph) ChangeImpact(query string) (*ChangeImpactResult, error) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
+	// A bare TYPE name intercepts BEFORE resolveLooseQueryLocked: its
+	// bare-member matcher includes KindConstructor, so "ClassName" silently
+	// pinned to "ClassName.ClassName" (the constructor) whenever one
+	// existed — then containedMethods, which excludes constructors,
+	// couldn't find it again, producing "declares no method X" for a type
+	// that plainly exists (field-reported, 2026-08-30: change_impact on the
+	// class an agent had just edited dead-ended this way). A bare class
+	// name deserves the more useful type-level answer (all structural
+	// dependents), not a silent narrowing to just its constructor's
+	// callers — so this runs first and wins outright when it matches.
+	if ty := g.typeImpactLocked(query); ty != nil {
+		return ty, nil
+	}
+
 	// Accept a bare member name or file:line and pin it to the canonical
 	// Type.method form (unambiguous only — see resolveLooseQueryLocked).
 	// Already-canonical queries pass through untouched.

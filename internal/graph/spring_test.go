@@ -149,3 +149,58 @@ func TestFieldImpactLocked(t *testing.T) {
 		t.Fatalf("field path fired despite a same-name method: %+v", r2)
 	}
 }
+
+func TestTypeImpactLocked(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "c1", Language: "java", Kind: core.KindClass, Name: "Widget", QualifiedName: "Widget", FilePath: "Widget.java"},
+		// A constructor named identically to the class — the exact shape
+		// that caused resolveLooseQueryLocked to silently mis-pin a bare
+		// class-name query to "Widget.Widget" and dead-end with "declares
+		// no method" (field-reported 2026-08-30), since containedMethods
+		// excludes KindConstructor from its own re-lookup.
+		{ID: "ctor1", Language: "java", Kind: core.KindConstructor, Name: "Widget", QualifiedName: "Widget.Widget", ParentSymbol: "Widget", FilePath: "Widget.java"},
+		{ID: "m1", Language: "java", Kind: core.KindMethod, Name: "build", QualifiedName: "Widget.build", ParentSymbol: "Widget", FilePath: "Widget.java"},
+		// A caller of a MEMBER (not the type name itself) — must still count
+		// as a structural dependent of the type.
+		{ID: "caller1", Language: "java", Kind: core.KindMethod, Name: "make", QualifiedName: "Factory.make", ParentSymbol: "Factory", FilePath: "Factory.java", RawText: "Widget w = new Widget(); w.build();"},
+	}
+	extra := []core.Edge{
+		{From: "c1", To: "ctor1", Type: core.EdgeContains},
+		{From: "c1", To: "m1", Type: core.EdgeContains},
+		{From: "caller1", To: "m1", Type: core.EdgeCalls, Source: core.EvidenceSourceASTKit},
+		{From: "caller1", To: "c1", Type: core.EdgeUsesType, Source: core.EvidenceSourceASTKit},
+	}
+	g := New()
+	g.ReplaceWithEdges(syms, extra, len(syms))
+
+	r, err := g.ChangeImpact("Widget")
+	if err != nil {
+		t.Fatalf("bare class name errored: %v", err)
+	}
+	if r.Completeness != "type-level" {
+		t.Errorf("completeness = %q, want type-level", r.Completeness)
+	}
+	if len(r.Declarations) != 1 || r.Declarations[0].ID != "c1" {
+		t.Fatalf("declarations = %+v", r.Declarations)
+	}
+	found := false
+	for _, c := range r.Callers {
+		if c.ID == "caller1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected caller1 (calls a member AND uses-type the class) in callers: %+v", r.Callers)
+	}
+
+	// A same-named FUNCTION must still win — the type-level path never
+	// shadows a legitimate bare-function query.
+	syms2 := append(append([]core.SymbolRecord{}, syms...),
+		core.SymbolRecord{ID: "f1", Language: "go", Kind: core.KindFunction, Name: "Widget", QualifiedName: "Widget", FilePath: "widget.go"})
+	g2 := New()
+	g2.ReplaceWithEdges(syms2, extra, len(syms2))
+	r2 := g2.typeImpactLocked("Widget")
+	if r2 != nil {
+		t.Errorf("type-level path shadowed a same-named function: %+v", r2)
+	}
+}

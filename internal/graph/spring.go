@@ -289,3 +289,90 @@ func (g *CodeGraph) fieldImpactLocked(query string) *ChangeImpactResult {
 		Completeness: "callers-only", HasHeuristicRefs: heuristicCallers,
 	}
 }
+
+// typeImpactLocked answers change-impact for a BARE TYPE NAME — no method,
+// no field, just "what depends on this class/interface" (spec: the query an
+// agent naturally reaches for after editing a class, per the field-report
+// that change_impact on a bare class name dead-ended with "declares no
+// method X", 2026-08-30). Direct structural dependents only (Calls into the
+// type's own members, UsesType references, Extends/Implements) — depth 1,
+// matching change_impact's "direct blast radius" contract, not the
+// transitive multi-hop walk the separate Impact() verb does.
+//
+// Deliberately NOT exhaustive: a class that changes BEHAVIOR (not its
+// declared shape) can break consumers with no edge in this graph at all —
+// duck-typed `instanceof` checks against an unrelated type are the concrete
+// case that motivated this (StdConvertingSerializer's delegation broke a
+// consumer's `instanceof BeanSerializerBase` check with zero hierarchy
+// relationship between the two types). Completeness is "type-level" so the
+// text renderer can say so explicitly rather than let an empty or partial
+// caller list read as "nothing depends on this."
+func (g *CodeGraph) typeImpactLocked(query string) *ChangeImpactResult {
+	q := strings.TrimSpace(query)
+	if q == "" || strings.ContainsRune(q, '.') || strings.ContainsRune(q, '(') {
+		return nil // dotted/parenthesized queries are Type.method — not this path
+	}
+	var typeSym *core.SymbolRecord
+	var typeID string
+	for _, id := range g.idsNamed(q) {
+		s := g.symbols[id]
+		switch s.Kind {
+		case core.KindClass, core.KindInterface, core.KindType, core.KindStruct, core.KindTrait, core.KindEnum:
+			sc := s
+			typeSym, typeID = &sc, id
+		}
+	}
+	if typeSym == nil {
+		return nil
+	}
+	// If a method/function of this exact name also exists, the ordinary
+	// Type.method machinery already answers a DIFFERENT, valid question for
+	// a DIFFERENT symbol — do not shadow it. containedMethods needs
+	// typeIDs, not just this one type, but self-shadowing (a type and a
+	// same-named top-level function) is what matters here.
+	if len(g.idsNamed(q)) > 1 {
+		for _, id := range g.idsNamed(q) {
+			if s := g.symbols[id]; s.Kind == core.KindMethod || s.Kind == core.KindFunction {
+				return nil
+			}
+		}
+	}
+
+	seen := map[string]bool{typeID: true}
+	var callers []core.SymbolRecord
+	heuristicCallers := false
+	addFrom := func(id string) {
+		for _, ei := range g.inbound[id] {
+			edge := g.edges[ei]
+			switch edge.Type {
+			case core.EdgeCalls, core.EdgeUsesType, core.EdgeExtends, core.EdgeImplements:
+			default:
+				continue
+			}
+			if seen[edge.From] {
+				continue
+			}
+			seen[edge.From] = true
+			if edge.Source == core.EvidenceSourceHeuristic || edge.Source == core.EvidenceSourceRegex {
+				heuristicCallers = true
+			}
+			if s, ok := g.symbols[edge.From]; ok {
+				callers = append(callers, s)
+			}
+		}
+	}
+	addFrom(typeID)
+	// Members (methods/fields/contains) are structurally part of the type —
+	// a caller of ANY member is a dependent of the type, not just direct
+	// references to the type name itself.
+	for _, ei := range g.outbound[typeID] {
+		if e := g.edges[ei]; e.Type == core.EdgeContains {
+			addFrom(e.To)
+		}
+	}
+	sortSymbols(callers)
+	return &ChangeImpactResult{
+		Query: query, Declarations: []core.SymbolRecord{*typeSym},
+		Callers: callers, Completeness: "type-level", HasHeuristicRefs: heuristicCallers,
+	}
+}
