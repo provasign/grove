@@ -866,6 +866,16 @@ func buildUsesType(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
 			// (reads/writes/redefines/binds-dataset).
 			continue
 		}
+		if symbol.Language == "python" && symbol.Kind == core.KindField {
+			// Python class attributes (new 2026-08-30): their signatures
+			// are attribute declarations ("name: str = ..."), and token-
+			// matching them re-created the mainframe failure at django
+			// scale — +23.7k uses-type edges including gems like
+			// ListFilter.title -> CSP.NONE (the token "None" matching a
+			// field named NONE). Scoped to python fields only so every
+			// pre-existing language's counts stay byte-identical.
+			continue
+		}
 		scope := idx.importedFiles(symbol.FilePath)
 		matches := usesTypeIdent.FindAllStringSubmatch(symbol.Signature, -1)
 		for _, m := range matches {
@@ -874,6 +884,13 @@ func buildUsesType(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
 				continue
 			}
 			for _, target := range idx.byName[strings.ToLower(candidateName)] {
+				if target.Language == "python" && target.Kind == core.KindField {
+					// Same scoping as the source-side skip above: 166
+					// django fields named "model" as uses-type TARGETS of
+					// every class signature containing that token is
+					// noise, not typing evidence.
+					continue
+				}
 				if _, inScope := scope[target.FilePath]; !inScope {
 					continue
 				}

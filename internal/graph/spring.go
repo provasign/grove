@@ -150,9 +150,24 @@ func buildFrameworkEdges(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edg
 	// delimiter shapes cover Thymeleaf/JSP EL, Angular, and Jinja; running
 	// all three against every template is cheap and each is a no-op where
 	// its syntax does not occur.
+	// Fan-out cap for the TEMPLATE pass: a property name matched by more
+	// than maxTemplateFanout distinct accessors cannot be disambiguated
+	// from a type-less template expression — each edge would be 1/N likely
+	// wrong. Measured at django scale before this cap: 596 fields named
+	// "name" x hundreds of admin templates = 30k+ spurious template-caller
+	// edges (SimpleAdminConfig.name acquired 100+ template "callers").
+	// Distribution says the cap keeps the useful mass: 2,728 of ~2,900
+	// distinct django field names have <=5 candidates. Corpora with no
+	// templates (gin, jackson) are untouched by construction. The JPA pass
+	// is entity-scoped and needs no cap.
+	const maxTemplateFanout = 5
 	scanExpr := func(templateID, expr string) {
 		for _, ident := range reELIdent.FindAllString(expr, -1) {
-			for _, a := range accessors[strings.ToLower(ident)] {
+			cands := accessors[strings.ToLower(ident)]
+			if len(cands) > maxTemplateFanout {
+				continue
+			}
+			for _, a := range cands {
 				add(templateID, a.sym.ID, 0.6)
 			}
 		}
