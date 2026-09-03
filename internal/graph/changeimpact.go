@@ -93,6 +93,20 @@ func (r *ChangeImpactResult) Sites() []core.SymbolRecord {
 // compatibility, and callers via inbound call edges to those exact symbol
 // IDs — never to same-named methods on unrelated types.
 func (g *CodeGraph) ChangeImpact(query string) (*ChangeImpactResult, error) {
+	return g.ChangeImpactScoped(query, "")
+}
+
+// ChangeImpactScoped is ChangeImpact with an optional declaring-file filter:
+// when file is non-empty, only types declared in a file whose path contains
+// it seed the closure. This is the disambiguator for same-named types in
+// distinct packages — measured 2026-09-02 (prism BACKLOG addendum #5, grove
+// repo): "Engine.Query" merged pkg/grove/grove.go's Engine with
+// internal/embeddings/model2vec's Engine into ONE result whose 13 callers
+// all belonged to the embeddings type and zero to the queried one; the
+// agent distrusted the answer and re-derived it manually. The filter
+// applies to the type-seeded path (the ambiguous case); loose/field/free-
+// function resolution is already unambiguous-or-error and ignores it.
+func (g *CodeGraph) ChangeImpactScoped(query, file string) (*ChangeImpactResult, error) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
@@ -165,8 +179,14 @@ func (g *CodeGraph) ChangeImpact(query string) (*ChangeImpactResult, error) {
 	for _, id := range g.idsNamed(typeName) {
 		switch g.symbols[id].Kind {
 		case core.KindClass, core.KindInterface, core.KindType, core.KindStruct, core.KindTrait, core.KindEnum:
+			if file != "" && !strings.Contains(g.symbols[id].FilePath, file) {
+				continue
+			}
 			typeIDs = append(typeIDs, id)
 		}
+	}
+	if len(typeIDs) == 0 && file != "" {
+		return nil, fmt.Errorf("change-impact: no type named %q declared in a file matching %q — drop file= to search every declaration", typeName, file)
 	}
 	if len(typeIDs) == 0 {
 		// External-rooted query: the named type is not in the index (a JDK or

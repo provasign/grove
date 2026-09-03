@@ -343,11 +343,17 @@ func (r ChangeImpactResult) Sites() []Symbol {
 // query to the exact change-set for that method's signature — type-resolved
 // seeding, not name-substring seeding (contrast Impact).
 func (e *Engine) ChangeImpact(ctx context.Context, query string) (ChangeImpactResult, error) {
+	return e.ChangeImpactScoped(ctx, query, "")
+}
+
+// ChangeImpactScoped is ChangeImpact with an optional declaring-file filter
+// for same-named types in distinct packages (see CodeGraph.ChangeImpactScoped).
+func (e *Engine) ChangeImpactScoped(ctx context.Context, query, file string) (ChangeImpactResult, error) {
 	g, err := e.currentGraph()
 	if err != nil {
 		return ChangeImpactResult{}, err
 	}
-	raw, err := g.ChangeImpact(query)
+	raw, err := g.ChangeImpactScoped(query, file)
 	if err != nil {
 		return ChangeImpactResult{}, err
 	}

@@ -75,3 +75,49 @@ func TestJavaPackageSuffix(t *testing.T) {
 		}
 	}
 }
+
+// TestChangeImpactScoped_FileDisambiguatesSameNamedTypes: BACKLOG addendum
+// #5 (grove repo, 2026-09-02) — "Engine.Query" merged pkg/grove/grove.go's
+// Engine with internal/embeddings/model2vec's Engine into one closure whose
+// callers all belonged to the type the agent was NOT asking about; it
+// distrusted the answer and re-derived it manually. file= scopes the seed
+// types to a declaring-file fragment.
+func TestChangeImpactScoped_FileDisambiguatesSameNamedTypes(t *testing.T) {
+	g := New()
+	g.Replace([]core.SymbolRecord{
+		{ID: "pkg/g/g.go::Engine@sha", FilePath: "pkg/g/g.go", Language: "go", Kind: core.KindStruct,
+			Name: "Engine", QualifiedName: "Engine", Signature: "type Engine struct"},
+		{ID: "pkg/g/g.go::Engine.Query@sha", FilePath: "pkg/g/g.go", Language: "go", Kind: core.KindMethod,
+			Name: "Query", QualifiedName: "Engine.Query", ParentSymbol: "Engine",
+			Signature: "func (e *Engine) Query(q string) []string"},
+		{ID: "internal/emb/model.go::Engine@sha", FilePath: "internal/emb/model.go", Language: "go", Kind: core.KindStruct,
+			Name: "Engine", QualifiedName: "Engine", Signature: "type Engine struct"},
+		{ID: "internal/emb/model.go::Engine.Query@sha", FilePath: "internal/emb/model.go", Language: "go", Kind: core.KindMethod,
+			Name: "Query", QualifiedName: "Engine.Query", ParentSymbol: "Engine",
+			Signature: "func (e *Engine) Query(v []float32) []int"},
+	}, 3)
+
+	// Unscoped: both same-named types seed (existing behavior, unchanged).
+	r, err := g.ChangeImpact("Engine.Query")
+	if err != nil {
+		t.Fatalf("ChangeImpact: %v", err)
+	}
+	if len(r.Declarations) != 2 {
+		t.Fatalf("unscoped declarations = %d, want 2 (both types)", len(r.Declarations))
+	}
+
+	// Scoped: only the matching file's type.
+	r, err = g.ChangeImpactScoped("Engine.Query", "pkg/g")
+	if err != nil {
+		t.Fatalf("ChangeImpactScoped: %v", err)
+	}
+	if len(r.Declarations) != 1 || r.Declarations[0].FilePath != "pkg/g/g.go" {
+		t.Fatalf("scoped declarations = %+v, want exactly pkg/g/g.go", r.Declarations)
+	}
+
+	// A scope matching nothing errors with guidance instead of silently
+	// widening back out.
+	if _, err := g.ChangeImpactScoped("Engine.Query", "no/such/dir"); err == nil {
+		t.Fatal("scope matching no declaration must error, not widen")
+	}
+}
