@@ -284,6 +284,34 @@ func (idx *edgeIndex) importedFiles(fromFile string) map[string]struct{} {
 				out[f] = struct{}{}
 			}
 		}
+		// Java's package identity SPANS source roots: src/test/java/com/x
+		// and src/main/java/com/x are the same package, and test classes
+		// conventionally sit in the package of the code under test exactly
+		// so no import is needed. Same-directory-only scope made every
+		// such caller invisible — measured 2026-09-02 (dubbo
+		// MetadataInfo.ServiceInfo.getMethodParameter): change-impact
+		// answered "callers (2), completeness: closed" while
+		// MetadataInfoTest.java called the method twice; a minimal
+		// two-file fixture reproduced it (same-package caller missed,
+		// explicitly-imported caller found). Include every directory
+		// whose package path (the suffix after the src/<set>/java/
+		// source-root marker) matches.
+		if lang == "java" {
+			if pkg, ok := javaPackageSuffix(fromDir); ok {
+				for dir, files := range idx.dirToFiles {
+					if dir == fromDir {
+						continue
+					}
+					if p2, ok2 := javaPackageSuffix(dir); ok2 && p2 == pkg {
+						for _, f := range files {
+							if f != fromFile {
+								out[f] = struct{}{}
+							}
+						}
+					}
+				}
+			}
+		}
 	}
 	if lang == "rust" && idx.rustCrateOfFile != nil {
 		// Rust visibility is crate-wide: crate::/super:: paths reach any
@@ -2175,3 +2203,18 @@ func firstLine(text string) string {
 	}
 	return strings.TrimSpace(text)
 }
+
+// javaPackageSuffix maps a directory to its Java package path — the suffix
+// after the conventional source-root marker (src/<sourceSet>/java/, covering
+// Maven and Gradle main/test/it/generated source sets). ok=false when the
+// path carries no such marker; directory identity is then the only
+// same-package signal (handled by the caller's same-dir pass).
+func javaPackageSuffix(dir string) (string, bool) {
+	d := strings.ReplaceAll(dir, "\\", "/")
+	if i := javaSrcRootRe.FindStringIndex(d); i != nil {
+		return d[i[1]:], true
+	}
+	return "", false
+}
+
+var javaSrcRootRe = regexp.MustCompile(`(^|/)src/[^/]+/java/`)
