@@ -1,5 +1,68 @@
 # Changelog
 
+## v0.42.0 - 2026-09-02
+
+- change-impact: `file=` scoping disambiguates same-named types in
+  different packages (`Engine.ChangeImpactScoped`); unscoped behavior
+  unchanged.
+- graph: Java package scope spans Maven/Gradle source roots —
+  same-package test callers (src/test/java mirroring src/main/java, no
+  import needed) join call resolution and change-impact sets.
+
+## v0.41.0 - 2026-08-30
+
+- graph: Python class attributes join the graph as fields, with
+  uses-type/fan-out guards.
+
+## v0.40.0 - 2026-08-30
+
+- change-impact: bare TYPE-NAME queries answer with the type-level
+  dependent set instead of dead-ending on the constructor.
+
+## v0.39.0 - 2026-08-29
+
+- framework edges generalize past Java (Angular templates, Flask routes);
+  field-anchor change-impact.
+
+## v0.38.0 / v0.38.1 - 2026-08-29
+
+- framework edges: JPA derived queries, template expression language;
+  honest completeness reporting (heuristic-refs as a structured field).
+
+## v0.37.0 - 2026-08-28
+
+- index: extractor-version stamp; `--force` actually re-extracts.
+
+## v0.33.0 - v0.36.3 - 2026-08-28
+
+- Mainframe estate: COBOL/JCL parsing conformance corpus, data-flow
+  lineage (directional reads/writes, REDEFINES, dataset binding),
+  change-impact anchors for mainframe kinds, extensionless-member
+  content sniffing, uppercase-extension detection (32% -> 99% include
+  resolution).
+
+## v0.30.0 - v0.32.0 - 2026-08-10 - 2026-08-20
+
+- Receiver resolution: multi-hop chains, generic-constraint extends,
+  signature-aware interface satisfaction, per-site receiver
+  classification for rename plans, Go local types for conversions/call
+  results/closure params.
+
+## Earlier removals worth knowing (v0.26-v0.27, 2026-08)
+
+- v0.26.0 REMOVED heuristic test-coverage (`tests`) edges: measured
+  4-12% recall against real per-test runtime coverage — an unreliable
+  signal shipped as a guarantee is worse than none. Covering-test
+  questions answer over resolved `calls` edges (a test that exercises
+  code calls it); dead-code reachability verified byte-identical
+  before/after.
+- v0.27.0 REMOVED embedding-based semantic search (Model2Vec): measured
+  2026-08-01 on 15 hand-verified concept queries across 5 corpora, an
+  agent guessing one keyword through lexical search beat or tied the
+  embedding fallback in 12/15 cases. The graph is calls/types, queried
+  lexically.
+
+
 ## v0.29.1 - 2026-08-09
 
 - **Windows:** the v0.29.0 permission tightening is now Unix-only —

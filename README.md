@@ -9,11 +9,9 @@
 Grep answers "does this string appear somewhere?" A language server answers "where is this symbol defined?" Grove answers the harder questions AI agents actually need:
 
 - *What does changing this function break — across the entire codebase?*
-- *Which tests cover this method, directly or transitively?*
 - *What is the full dependency chain from this file?*
-- *What symbols are semantically related to this task description?*
 
-The difference is a graph. Grove indexes your source files into a persistent SQLite graph — 11 languages, 9 edge types, BFS traversal — and keeps it live with delta indexing (files whose content hash hasn't changed are never re-parsed). The graph is queryable through the embedded Go API, CLI, and MCP stdio.
+The difference is a graph. Grove indexes your source files into a persistent SQLite graph — 11 languages, 8 core edge types (plus 4 mainframe data-flow kinds), BFS traversal — and keeps it live with delta indexing (files whose content hash hasn't changed are never re-parsed). The graph is queryable through the embedded Go API, CLI, and MCP stdio.
 
 Grove is infrastructure, not another setup step in the public product line.
 Prism embeds it to power change intelligence; tool builders can use it directly
@@ -51,7 +49,7 @@ Source files
 ┌─────────────────────────────────────────────────────────┐
 │  internal/graph/                                        │
 │  In-memory CodeGraph                                    │
-│  9 edge types                                           │
+│  8 core edge types                                           │
 │  BFS traversal                                          │
 └──────┬─────────────────┬───────────────────────────────┘
        │
@@ -61,7 +59,7 @@ Source files
 │ internal/  │        │ pkg/grove          │
 │ mcp/       │        │ Embedded Go API    │
 │ 9 tools    │        │ Query / impact /   │
-│ JSON-RPC   │        │ deps / tests / ICR │
+│ JSON-RPC   │        │ deps / impact / ICR │
 │ stdio      │        │ / certify / diff   │
 └────────────┘        └────────────────────┘
 ```
@@ -98,7 +96,7 @@ Source files
 | C# | `.cs` | AST walker + native semantic enrichment |
 | PHP | `.php .phtml` | AST walker + native semantic enrichment |
 
-Non-code files (`.md`, `.yaml`, `.json`, `.xml`, `.sh`, `.toml`, `.proto`, `.sql`, `Makefile`, `Dockerfile`, and more) are indexed as `document` symbols whose content feeds the semantic and lexical search indexes. Agents can query them alongside code symbols.
+Non-code files (`.md`, `.yaml`, `.json`, `.xml`, `.sh`, `.toml`, `.proto`, `.sql`, `Makefile`, `Dockerfile`, and more) are indexed as `document` symbols whose content feeds the lexical search index. Agents can query them alongside code symbols.
 
 Language support is not a claim that every operation has identical semantic
 quality. `grove doctor [dir]` emits the versioned, machine-readable capability
@@ -141,10 +139,11 @@ Notes on reading these honestly:
   that matters. The static-oracle languages are the inverse — precision is
   the lower bound where a true edge runs through an untested or dynamically
   dispatched path the structural graph can't pin to one target.
-- Test-relatedness edges are scored against per-test runtime coverage:
-  flask edge precision 0.74, with a truly-covering test suggested for 36%
-  of covered functions. Blast radius (depth-2 reverse reachability on gin)
-  scores F1 0.88.
+- Heuristic test-coverage edges were REMOVED (v0.34-era measurement:
+  4-12% recall against real runtime coverage — an unreliable signal is
+  worse than none). A test that exercises code has a resolved `calls`
+  edge to it; covering-test questions answer over the calls graph.
+  Blast radius (depth-2 reverse reachability on gin) scores F1 0.88.
 - Every number above is a CI gate (`.github/workflows/eval.yml`), including
   a universe-match floor that catches tree-sitter grammar drift when new
   language syntax ships.
@@ -165,7 +164,6 @@ them.
 | `implements` | Class implements an interface |
 | `calls` | Function calls another function (scoped) |
 | `uses-type` | Function/field uses a type (scoped) |
-| `tests` | Test function covers a named symbol |
 | `overrides` | Concrete method implements an interface/abstract declaration |
 
 ---
@@ -271,9 +269,6 @@ grove status [dir] [--refresh]
 # Symbol search
 grove symbols <query> [dir] [--refresh]
 
-# Intent-based semantic query (Model2Vec embeddings + BFS graph ranking)
-grove query <intent> [dir] [--refresh]
-
 # Blast radius: what would break if this symbol changed?
 grove impact <symbol> [dir] [--refresh]
 
@@ -281,6 +276,10 @@ grove impact <symbol> [dir] [--refresh]
 # override/implementation family (subtype closure) + all resolved callers,
 # in one deterministic call
 grove change-impact 'Type.method(ParamType, ...)' [dir]
+# Same-named types in different packages? Scope to a declaring file via the
+# Go API: Engine.ChangeImpactScoped(ctx, query, file). Java package scope
+# spans Maven/Gradle source roots (src/test/java/com/x sees src/main/java/
+# com/x without an import), so same-package test callers are in the set.
 
 # Rename a method: the change-impact set converted into concrete edit
 # lines (file, line, before/after), review-and-apply
