@@ -216,6 +216,42 @@ func (idx *edgeIndex) pyModuleFiles(fromFile, modPath string) []string {
 	return out
 }
 
+// rustImportHeads returns the crate-name heads of one `use` statement:
+// "grep::regex::X" → [grep]; "pub use grep_printer as printer" →
+// [grep_printer]; the 2018 grouped form "{grep::matcher::Matcher,
+// termcolor::WriteColor}" → [grep termcolor] (it used to read as the
+// crate "{grep" and ripgrep's grouped imports never joined scope).
+// crate/self/super/std/core/alloc are dropped.
+func rustImportHeads(imp string) []string {
+	seg := strings.TrimPrefix(imp, "pub ")
+	seg = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(seg), "use "))
+	var parts []string
+	if strings.HasPrefix(seg, "{") {
+		inner := strings.TrimSuffix(strings.TrimPrefix(seg, "{"), "}")
+		parts = splitTopLevel(inner, ',')
+	} else {
+		parts = []string{seg}
+	}
+	var out []string
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if i := strings.Index(p, "::"); i >= 0 {
+			p = p[:i]
+		}
+		// "grep_printer as printer" — the crate name ends at the first space.
+		if i := strings.IndexByte(p, ' '); i >= 0 {
+			p = p[:i]
+		}
+		p = strings.ToLower(strings.TrimSpace(p))
+		switch p {
+		case "", "crate", "super", "self", "std", "core", "alloc":
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
 // rustInlinePathRe matches the leading segment of an inline path
 // (`grep::regex::`), excluding `::` continuations of a longer path.
 var rustInlinePathRe = regexp.MustCompile(`(?:^|[^\w:])([a-z][a-z0-9_]*)::`)
@@ -580,32 +616,19 @@ func (idx *edgeIndex) importedFiles(fromFile string) map[string]struct{} {
 						// re-export chains.
 						continue
 					}
-					seg := strings.TrimPrefix(imp, "pub ")
-					seg = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(seg), "use "))
-					if i := strings.Index(seg, "::"); i >= 0 {
-						seg = seg[:i]
-					}
-					// "pub use grep_printer as printer" — the crate name
-					// ends at the first space.
-					if i := strings.IndexByte(seg, ' '); i >= 0 {
-						seg = seg[:i]
-					}
-					seg = strings.ToLower(strings.TrimSpace(seg))
-					switch seg {
-					case "", "crate", "super", "self", "std", "core", "alloc":
-						continue
-					}
-					crateRoot, ok := idx.rustCrateByName[seg]
-					if !ok {
-						// Package names commonly prefix the directory name
-						// (use grep_searcher → crates/searcher): retry on
-						// the path's last underscore token.
-						if i := strings.LastIndexByte(seg, '_'); i >= 0 && i+1 < len(seg) {
-							crateRoot, ok = idx.rustCrateByName[seg[i+1:]]
+					for _, seg := range rustImportHeads(imp) {
+						crateRoot, ok := idx.rustCrateByName[seg]
+						if !ok {
+							// Package names commonly prefix the directory name
+							// (use grep_searcher → crates/searcher): retry on
+							// the path's last underscore token.
+							if i := strings.LastIndexByte(seg, '_'); i >= 0 && i+1 < len(seg) {
+								crateRoot, ok = idx.rustCrateByName[seg[i+1:]]
+							}
 						}
-					}
-					if ok && !visited[crateRoot] {
-						queue = append(queue, crateRoot)
+						if ok && !visited[crateRoot] {
+							queue = append(queue, crateRoot)
+						}
 					}
 				}
 			}
