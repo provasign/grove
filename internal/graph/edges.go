@@ -284,6 +284,57 @@ func rustPinByPath(idx *edgeIndex, symbol *core.SymbolRecord, cs core.CallSite, 
 	return cands
 }
 
+// anyInFile reports whether a candidate is declared in file — a local
+// definition shadows any import of the same name.
+func anyInFile(cands []*core.SymbolRecord, file string) bool {
+	for _, c := range cands {
+		if c.FilePath == file {
+			return true
+		}
+	}
+	return false
+}
+
+// rustImportedExternal reports whether the file imports a bare name from
+// a crate outside the workspace (`use regex_syntax::escape;`,
+// `use std::mem::replace;`, grouped forms included).
+func rustImportedExternal(idx *edgeIndex, symbol *core.SymbolRecord, name string) bool {
+	// The name must be a bound member: preceded by "::", "{" or ", " and
+	// followed by a delimiter — never a module segment of a longer path.
+	re := localFnRes.get(`(?:::|\{|,\s*)` + regexp.QuoteMeta(name) + `(?:\s*[,}]|\s+as\s|\s*$)`)
+	for imp := range idx.fileImports[symbol.FilePath] {
+		imp = strings.TrimSpace(strings.TrimPrefix(imp, "pub "))
+		if !re.MatchString(imp) {
+			continue
+		}
+		// The statement's ROOT head decides (`crate::{pathutil::{is_hidden}}`
+		// is ours however deep the group nests).
+		head := imp
+		if strings.HasPrefix(head, "{") {
+			// `use {a::x, b::y}`: find the member's own group.
+			continue
+		}
+		if i := strings.Index(head, "::"); i >= 0 {
+			head = head[:i]
+		}
+		head = strings.ToLower(strings.TrimSpace(head))
+		switch head {
+		case "crate", "self", "super":
+			return false
+		case "std", "core", "alloc":
+			return true
+		}
+		if _, ok := idx.rustCrateByName[head]; ok {
+			return false
+		}
+		if i := strings.LastIndexByte(head, '_'); i >= 0 && idx.rustCrateByName[head[i+1:]] != "" {
+			return false
+		}
+		return true
+	}
+	return false
+}
+
 // rustImportHeads returns the crate-name heads of one `use` statement:
 // "grep::regex::X" → [grep]; "pub use grep_printer as printer" →
 // [grep_printer]; the 2018 grouped form "{grep::matcher::Matcher,
@@ -1745,6 +1796,12 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			}
 			if symbol.Language == "rust" && qualifier != "" && len(cands) > 1 {
 				cands = rustPinByPath(idx, &symbol, cs, qualifier, cands)
+			}
+			if symbol.Language == "rust" && qualifier == "" && len(cands) > 0 && !anyInFile(cands, symbol.FilePath) && rustImportedExternal(idx, &symbol, calleeName) {
+				// `use regex_syntax::escape;` then `escape(pattern)`: the
+				// function is the external crate's, not any same-named
+				// function of ours.
+				cands = nil
 			}
 			if symbol.Language == "rust" && qualifier != "" && len(cands) > 0 {
 				// Static typing, Rust edition of the Java rule. An
