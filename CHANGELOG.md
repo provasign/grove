@@ -1,5 +1,52 @@
 # Changelog
 
+## v0.43.0 - 2026-09-05
+
+Engine-ceiling program, measured against compiler/runtime oracles
+(`eval/baseline.json` floors raised; P/R before -> after):
+commons-lang .697/.891 -> .856/.896, newtonsoft .672/.702 -> .849/.816,
+flask .830/.646 -> .829/.704, socket.io .849/.963 -> .898/.975,
+ripgrep .851/.597 -> .899/.896, php-parser .770/.536 -> .825/.571,
+jansson .879/.564 -> .876/.867.
+
+- Java: overload resolution by argument types — primitive arrays never
+  bind `T[]`/`Object[]`, exact-type overloads beat boxing/wildcard
+  siblings per declaring type, varargs element binding, shape rules
+  (array vs Collection, lambda vs primitive), boxing pairs, class field
+  types and a JDK return-type table as argument evidence; declaration
+  parsing skips leading annotations/Javadoc; cast, array-element and
+  `X.class` receivers are qualified; `super.` receivers reach the call.
+- C#: base-class parsing (previously absent), `base.`/`this.` receivers
+  reach the call, argument-type overload narrowing with BCL alias
+  folding, `params`, extension-method receivers, subtype assignability,
+  literal conversion ranking, enum-member typing, nested-`new` markers,
+  preprocessor-split files re-parsed with `#else` branches blanked.
+- Python: `with` items -> `__enter__`/`__exit__`, return-annotation
+  typing, from-import submodule binding, imported module globals,
+  template-method dispatch, class-attr types only through `self.`.
+- Rust: re-export-only facade files and `mod x;` exist to the graph,
+  inline crate paths and grouped/nested `use` join scope, builder chains
+  survive one unparseable return type, same-file-wins no longer shadows
+  typed type paths, same-named cross-crate types pinned by path/import.
+- PHP: namespace-aware `new`, `$x = Class::m()` locals, interface
+  member parsing.
+- C: a regex-found callable the AST already declared is not a second
+  function (jansson do_dump lost all 64 calls to a 1-line twin).
+- TypeScript: multi-line generic field types keep their head, declared
+  non-class receivers drop, inherited self-calls prefer in-scope ancestors.
+- All class languages: class-hierarchy dispatch through typed receivers
+  (`reason=dispatch`, capped); `new X(...)` sites bind constructors only;
+  bare calls to functions declared in the caller's own body emit nothing;
+  candidate lists sorted for determinism.
+- change-impact: constructors count as members (`GlobSetBuilder.new`
+  reported "declares no method new").
+- eval: deterministic declaration claiming when two oracle decls land on
+  one symbol; `GROVE_EVAL_MAX_EXAMPLES`; dispatch edges are neither TP
+  nor FP under declaration-binding oracles (`ignoredDispatch`).
+- `GROVE_TRACE_CALLS=1` prints every call site's candidates, arguments
+  and narrowed set, plus the Rust scope walk.
+- Requires astkit v0.9.0.
+
 ## v0.42.0 - 2026-09-02
 
 - change-impact: `file=` scoping disambiguates same-named types in
