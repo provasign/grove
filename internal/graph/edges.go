@@ -1721,12 +1721,18 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					_, typed := localTypes[qualifier]
 					if !isSelf && !typed && !typeSymbolExists(idx, qualifier) {
 						if strings.HasSuffix(qualifier, "()") {
-							if ret := javaCallResultType(idx, qualifier, scope); ret != "" {
-								if byType := filterByParent(cands, ret); len(byType) > 0 {
-									cands = byType
-								} else {
-									cands = nil
+							if rets := javaCallResultTypes(idx, qualifier, scope); len(rets) > 0 {
+								var byType []*core.SymbolRecord
+								for t := range rets {
+									byType = append(byType, filterByParent(cands, t)...)
 								}
+								if len(byType) == 0 {
+									// The result type's file is not in
+									// the caller's import scope (it never
+									// has to be — see javaMethodsOfTypes).
+									byType = javaMethodsOfTypes(idx, rets, calleeName, dirOf(symbol.FilePath))
+								}
+								cands = byType
 							} else {
 								cands = nil
 							}

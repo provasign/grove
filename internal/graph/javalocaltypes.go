@@ -496,11 +496,17 @@ var jdkReturnTypes = map[string]string{
 	"getParameterTypes": "Class[]", "getDeclaringClass": "Class", "getModifiers": "int",
 }
 
-// javaCallResultType resolves a "name()" qualifier to the named function's
-// declared return type, when all in-scope declarations agree.
-func javaCallResultType(idx *edgeIndex, qualifier string, scope map[string]struct{}) string {
+// javaCallResultTypes resolves a "name()" qualifier to the set of declared
+// return types of the in-scope same-named declarations. The receiver call's
+// arguments are not recorded, so overloads cannot be told apart here — the
+// caller narrows by which of these types actually declares the method
+// (ConfigManager.getProtocol returns ProtocolConfig or Optional<…> by
+// overload; only ProtocolConfig has getTriple). An unparseable return on any
+// declaration yields nil: the set would be incomplete, and a partial set
+// binds the wrong overload's type with the same confidence as a full one.
+func javaCallResultTypes(idx *edgeIndex, qualifier string, scope map[string]struct{}) map[string]bool {
 	name := strings.TrimSuffix(qualifier, "()")
-	ret := ""
+	var rets map[string]bool
 	for _, cand := range idx.byName[strings.ToLower(name)] {
 		if cand.Name != name {
 			continue
@@ -513,15 +519,45 @@ func javaCallResultType(idx *edgeIndex, qualifier string, scope map[string]struc
 		}
 		r := javaReturnType(cand)
 		if r == "" {
-			return ""
+			return nil
 		}
-		if ret == "" {
-			ret = r
-		} else if ret != r {
-			return ""
+		if rets == nil {
+			rets = map[string]bool{}
+		}
+		rets[r] = true
+	}
+	return rets
+}
+
+// javaMethodsOfTypes finds the methods named name declared on any of the
+// given types (or, when none declares it, on their base classes), ignoring
+// the import scope. A call-result receiver's type never has to be imported
+// by the calling file — `ConfigManager.getProtocol(url).getTriple()` names
+// ConfigManager and TripleConfig but not ProtocolConfig — so the scope walk
+// that bounds every other resolution has no way to reach the target.
+func javaMethodsOfTypes(idx *edgeIndex, types map[string]bool, name string, dir string) []*core.SymbolRecord {
+	var cands []*core.SymbolRecord
+	for _, cand := range idx.byName[strings.ToLower(name)] {
+		if cand.Name == name && cand.Kind == core.KindMethod {
+			cands = append(cands, cand)
 		}
 	}
-	return ret
+	level := types
+	for depth := 0; depth < 4 && len(level) > 0; depth++ {
+		var out []*core.SymbolRecord
+		next := map[string]bool{}
+		for t := range level {
+			out = append(out, filterByParent(cands, t)...)
+			for _, b := range baseClassesFor(idx, "java", t, dir) {
+				next[b] = true
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
+		level = next
+	}
+	return nil
 }
 
 // javaReturnType parses the declared return type token from a method

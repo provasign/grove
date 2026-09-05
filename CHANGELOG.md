@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.43.1 - 2026-09-05
+
+Java: chained call-result receivers resolve outside the caller's import
+scope. `javaCallResultTypes` now returns the SET of an overloaded call's
+return types instead of requiring all overloads to agree (previously any
+disagreement dropped the type entirely); `javaMethodsOfTypes` looks up the
+callee on those types without the import-scope filter — a call-result
+receiver's type is never required to be imported by the calling file
+(`ConfigManager.getProtocol(url).getTriple()` names `ConfigManager` and
+`TripleConfig` but never `ProtocolConfig`). Found via a wide-bed autopsy:
+`ProtocolConfig.getTriple` had 0 resolved callers against 4 real call
+sites. commons-lang P .8466 -> .8478, R .8927 -> .9039.
+
 ## v0.43.0 - 2026-09-05
 
 Engine-ceiling program, measured against compiler/runtime oracles
