@@ -1935,6 +1935,19 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					// Not a method on the caller's own class: inheritance
 					// reaches files import scope never sees.
 					if inherited := inheritedTargets(idx, &symbol, calleeName, false); len(inherited) > 0 {
+						// A monorepo declares `Transport` in both the client
+						// and the server package; the caller's base class is
+						// the one its import scope reaches. Prefer in-scope
+						// ancestors, fall back to all when none is.
+						var inScope []*core.SymbolRecord
+						for _, cand := range inherited {
+							if _, ok := scope[cand.FilePath]; ok {
+								inScope = append(inScope, cand)
+							}
+						}
+						if len(inScope) > 0 {
+							inherited = inScope
+						}
 						for _, cand := range inherited {
 							addEdge(symbol.ID, cand.ID, 0.85, core.EvidenceSourceHeuristic, core.ReasonInheritance)
 						}
