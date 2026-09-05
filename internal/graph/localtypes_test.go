@@ -3,6 +3,7 @@
 package graph
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/provasign/grove/internal/core"
@@ -266,6 +267,322 @@ func TestJavaOverloadNarrowing(t *testing.T) {
 	}
 	if got[threeArg.ID] {
 		t.Error("three-arg overload conflicts with argc 2")
+	}
+}
+
+// A primitive-array argument never binds a type-variable or Object array
+// parameter, and an overload matching every known argument type exactly
+// beats the wildcard-compatible siblings (javac's no-boxing phase).
+func TestJavaOverloadNarrowing_ExactBeatsWildcard(t *testing.T) {
+	caller := core.SymbolRecord{
+		ID: "A.java::Utils.addAll@1", FilePath: "A.java", BlobSHA: "1",
+		Language: "java", Kind: core.KindMethod,
+		Name: "addAll", QualifiedName: "Utils.addAll", ParentSymbol: "Utils",
+		RawText:   "public static float[] addAll(final float[] array1, final float... array2) {\n    return clone(array1);\n}",
+		CallSites: []core.CallSite{{Callee: "clone", Line: 2, Argc: 1, Args: []string{"array1"}}},
+	}
+	floatClone := core.SymbolRecord{
+		ID: "A.java::Utils.clone.float@10", FilePath: "A.java", BlobSHA: "1",
+		Language: "java", Kind: core.KindMethod,
+		Name: "clone", QualifiedName: "Utils.clone", ParentSymbol: "Utils",
+		Signature: "public static float[] clone(final float[] array)",
+	}
+	genericClone := core.SymbolRecord{
+		ID: "A.java::Utils.clone.T@20", FilePath: "A.java", BlobSHA: "1",
+		Language: "java", Kind: core.KindMethod,
+		Name: "clone", QualifiedName: "Utils.clone", ParentSymbol: "Utils",
+		Signature: "public static <T> T[] clone(final T[] array)", TypeParameters: []string{"T"},
+	}
+	objectIndex := core.SymbolRecord{
+		ID: "A.java::Utils.clone.obj@30", FilePath: "A.java", BlobSHA: "1",
+		Language: "java", Kind: core.KindMethod,
+		Name: "clone", QualifiedName: "Utils.clone", ParentSymbol: "Utils",
+		Signature: "public static Object[] clone(final Object[] array)",
+	}
+	edges := BuildEdges([]core.SymbolRecord{caller, floatClone, genericClone, objectIndex})
+	got := map[string]bool{}
+	for _, e := range edges {
+		if e.Type == core.EdgeCalls && e.From == caller.ID {
+			got[e.To] = true
+		}
+	}
+	if !got[floatClone.ID] {
+		t.Error("expected edge to the float[] overload")
+	}
+	if got[genericClone.ID] {
+		t.Error("float[] cannot instantiate T[]")
+	}
+	if got[objectIndex.ID] {
+		t.Error("float[] is not an Object[]")
+	}
+
+	// Scalar primitive with an exact overload: boxing-compatible Object
+	// sibling loses; without the exact overload it stays.
+	caller.RawText = "public void put(final String name, final boolean value) {\n    append(name, value);\n}"
+	caller.CallSites = []core.CallSite{{Callee: "append", Line: 2, Argc: 2, Args: []string{"name", "value"}}}
+	boolAppend := core.SymbolRecord{
+		ID: "A.java::Utils.append.bool@40", FilePath: "A.java", BlobSHA: "1",
+		Language: "java", Kind: core.KindMethod,
+		Name: "append", QualifiedName: "Utils.append", ParentSymbol: "Utils",
+		Signature: "public Utils append(final String fieldName, final boolean value)",
+	}
+	objAppend := core.SymbolRecord{
+		ID: "A.java::Utils.append.obj@50", FilePath: "A.java", BlobSHA: "1",
+		Language: "java", Kind: core.KindMethod,
+		Name: "append", QualifiedName: "Utils.append", ParentSymbol: "Utils",
+		Signature: "public Utils append(final String fieldName, final Object value)",
+	}
+	has := func(syms []core.SymbolRecord, id string) bool {
+		for _, e := range BuildEdges(syms) {
+			if e.Type == core.EdgeCalls && e.From == caller.ID && e.To == id {
+				return true
+			}
+		}
+		return false
+	}
+	if has([]core.SymbolRecord{caller, boolAppend, objAppend}, objAppend.ID) {
+		t.Error("append(String, Object) loses to the exact append(String, boolean)")
+	}
+	if !has([]core.SymbolRecord{caller, objAppend}, objAppend.ID) {
+		t.Error("with no exact overload, boxing keeps append(String, Object)")
+	}
+}
+
+// `with` items run __enter__/__exit__ with no call syntax; the item's class
+// comes from a constructor call, a typed local, or a call whose return
+// annotation names it. The same annotation types `ctx = self.app_context()`
+// and the `self.app_context().push()` receiver.
+func TestPyWithProtocolAndReturnAnnotation(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "ctx.py::AppContext@1", FilePath: "ctx.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindClass, Name: "AppContext", QualifiedName: "AppContext",
+			RawText: "class AppContext:\n    pass\n"},
+		{ID: "ctx.py::AppContext.__enter__@3", FilePath: "ctx.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindMethod, Name: "__enter__", QualifiedName: "AppContext.__enter__", ParentSymbol: "AppContext",
+			RawText: "def __enter__(self):\n    return self\n"},
+		{ID: "ctx.py::AppContext.__exit__@5", FilePath: "ctx.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindMethod, Name: "__exit__", QualifiedName: "AppContext.__exit__", ParentSymbol: "AppContext",
+			RawText: "def __exit__(self, *a):\n    pass\n"},
+		{ID: "ctx.py::AppContext.push@7", FilePath: "ctx.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindMethod, Name: "push", QualifiedName: "AppContext.push", ParentSymbol: "AppContext",
+			RawText: "def push(self):\n    pass\n"},
+		{ID: "other.py::Other.push@1", FilePath: "other.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindMethod, Name: "push", QualifiedName: "Other.push", ParentSymbol: "Other",
+			RawText: "def push(self):\n    pass\n"},
+		{ID: "other.py::Other.__enter__@3", FilePath: "other.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindMethod, Name: "__enter__", QualifiedName: "Other.__enter__", ParentSymbol: "Other",
+			RawText: "def __enter__(self):\n    return self\n"},
+		{ID: "app.py::App.app_context@1", FilePath: "app.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindMethod, Name: "app_context", QualifiedName: "App.app_context", ParentSymbol: "App",
+			RawText: "def app_context(\n    self,\n) -> AppContext:\n    return AppContext()\n",
+			Imports: []string{"ctx"}},
+		{ID: "app.py::App.wsgi@5", FilePath: "app.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindMethod, Name: "wsgi", QualifiedName: "App.wsgi", ParentSymbol: "App",
+			RawText: "def wsgi(self):\n    ctx = self.app_context()\n    ctx.push()\n    with self.app_context() as c:\n        pass\n    self.app_context().push()\n",
+			Imports: []string{"ctx", "other"},
+			CallSites: []core.CallSite{
+				{Callee: "app_context", Line: 2},
+				{Callee: "ctx.push", Line: 3},
+				{Callee: "app_context", Line: 4},
+				{Callee: "app_context().push", Line: 6},
+			}},
+	}
+	caller := "app.py::App.wsgi@5"
+	got := map[string]bool{}
+	for _, e := range BuildEdges(syms) {
+		if e.Type == core.EdgeCalls && e.From == caller {
+			got[e.To] = true
+		}
+	}
+	for _, want := range []string{"ctx.py::AppContext.__enter__@3", "ctx.py::AppContext.__exit__@5", "ctx.py::AppContext.push@7"} {
+		if !got[want] {
+			t.Errorf("missing edge to %s", want)
+		}
+	}
+	for _, bad := range []string{"other.py::Other.push@1", "other.py::Other.__enter__@3"} {
+		if got[bad] {
+			t.Errorf("unexpected edge to %s (return annotation says AppContext)", bad)
+		}
+	}
+	if rt := pyReturnType(&syms[6]); rt != "AppContext" {
+		t.Errorf("pyReturnType = %q, want AppContext", rt)
+	}
+}
+
+// self.m() inside a base class dispatches to subclass overrides of m.
+func TestPyTemplateMethodDispatch(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "tag.py::JSONTag@1", FilePath: "tag.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindClass, Name: "JSONTag", QualifiedName: "JSONTag", Signature: "class JSONTag:",
+			RawText: "class JSONTag:\n    pass\n"},
+		{ID: "tag.py::JSONTag.to_json@2", FilePath: "tag.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindMethod, Name: "to_json", QualifiedName: "JSONTag.to_json", ParentSymbol: "JSONTag",
+			RawText: "def to_json(self, value):\n    raise NotImplementedError\n"},
+		{ID: "tag.py::JSONTag.tag@4", FilePath: "tag.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindMethod, Name: "tag", QualifiedName: "JSONTag.tag", ParentSymbol: "JSONTag",
+			RawText:   "def tag(self, value):\n    return {self.key: self.to_json(value)}\n",
+			CallSites: []core.CallSite{{Callee: "self.to_json", Line: 2, Argc: 1}}},
+		{ID: "tag.py::TagDict@6", FilePath: "tag.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindClass, Name: "TagDict", QualifiedName: "TagDict", Signature: "class TagDict(JSONTag):",
+			RawText: "class TagDict(JSONTag):\n    pass\n"},
+		{ID: "tag.py::TagDict.to_json@7", FilePath: "tag.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindMethod, Name: "to_json", QualifiedName: "TagDict.to_json", ParentSymbol: "TagDict",
+			RawText: "def to_json(self, value):\n    return value\n"},
+		{ID: "other.py::Unrelated.to_json@1", FilePath: "other.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindMethod, Name: "to_json", QualifiedName: "Unrelated.to_json", ParentSymbol: "Unrelated",
+			RawText: "def to_json(self, value):\n    return value\n"},
+	}
+	got := map[string]bool{}
+	for _, e := range BuildEdges(syms) {
+		if e.Type == core.EdgeCalls && e.From == "tag.py::JSONTag.tag@4" {
+			got[e.To] = true
+		}
+	}
+	if !got["tag.py::JSONTag.to_json@2"] {
+		t.Error("own-class to_json edge missing")
+	}
+	if !got["tag.py::TagDict.to_json@7"] {
+		t.Error("subclass override TagDict.to_json not reached by dispatch")
+	}
+	if got["other.py::Unrelated.to_json@1"] {
+		t.Error("unrelated to_json must not be a dispatch target")
+	}
+}
+
+// A bare call to a function declared inside the caller's own body binds
+// that closure; it must not resolve to a same-named method elsewhere.
+func TestLocalFunctionShadowsBareCall(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "socket.ts::Socket.run@1", FilePath: "socket.ts", BlobSHA: "1", Language: "typescript",
+			Kind: core.KindMethod, Name: "run", QualifiedName: "Socket.run", ParentSymbol: "Socket",
+			RawText:   "run(event, fn) {\n    function run(i) {\n      run(i + 1);\n    }\n    run(0);\n}",
+			CallSites: []core.CallSite{{Callee: "run", Line: 3}, {Callee: "run", Line: 5}},
+			Imports:   []string{"./namespace"}},
+		{ID: "namespace.ts::Namespace.run@1", FilePath: "namespace.ts", BlobSHA: "1", Language: "typescript",
+			Kind: core.KindMethod, Name: "run", QualifiedName: "Namespace.run", ParentSymbol: "Namespace",
+			RawText: "run(socket, fn) {\n    fn();\n}"},
+		{ID: "mod.py::outer@1", FilePath: "mod.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindFunction, Name: "outer", QualifiedName: "outer",
+			RawText:   "def outer():\n    def helper():\n        pass\n    helper()\n",
+			CallSites: []core.CallSite{{Callee: "helper", Line: 4}}},
+		{ID: "util.py::helper@1", FilePath: "util.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindFunction, Name: "helper", QualifiedName: "helper",
+			RawText: "def helper():\n    pass\n"},
+	}
+	for _, e := range BuildEdges(syms) {
+		if e.Type != core.EdgeCalls {
+			continue
+		}
+		if e.From == "socket.ts::Socket.run@1" && e.To == "namespace.ts::Namespace.run@1" {
+			t.Error("nested function run(i) shadowed: must not resolve to Namespace.run")
+		}
+		if e.From == "mod.py::outer@1" && e.To == "util.py::helper@1" {
+			t.Error("nested def helper shadowed: must not resolve to util.helper")
+		}
+	}
+}
+
+// A leading annotation's parens are not the parameter list.
+func TestJavaDeclSource_SkipsAnnotations(t *testing.T) {
+	s := &core.SymbolRecord{Language: "java",
+		Signature: `@SuppressWarnings("unchecked")`,
+		RawText:   "/** Removes (shifts) the element.\n * @param array may be {@code null} (any type) */\n@SuppressWarnings(\"unchecked\") // trailing note (ignored)\n@Deprecated public static <T> T[] remove(final T[] array, final int index) {\n    return null;\n}"}
+	if got := javaParamTypes(s); len(got) != 2 || got[0] != "T[]" || got[1] != "int" {
+		t.Fatalf("javaParamTypes = %v, want [T[] int]", got)
+	}
+	if got := javaReturnType(s); got != "T[]" {
+		t.Fatalf("javaReturnType = %q, want T[]", got)
+	}
+	if n, variadic, ok := declParamCount(s); !ok || n != 2 || variadic {
+		t.Fatalf("declParamCount = %d %v %v", n, variadic, ok)
+	}
+}
+
+// Shape rules: String[] cannot bind Collection; (Object) x cannot bind T[];
+// a lambda cannot bind an int slot.
+func TestJavaOverloadNarrowing_ShapeMismatch(t *testing.T) {
+	mk := func(id, sig string, tps ...string) core.SymbolRecord {
+		return core.SymbolRecord{ID: id, FilePath: "A.java", BlobSHA: "1", Language: "java", Kind: core.KindMethod,
+			Name:          strings.TrimSpace(sig[strings.LastIndex(sig[:strings.Index(sig, "(")], " ")+1 : strings.Index(sig, "(")]),
+			QualifiedName: "Utils.x", ParentSymbol: "Utils", Signature: sig, TypeParameters: tps}
+	}
+	caller := core.SymbolRecord{
+		ID: "A.java::Utils.caller@1", FilePath: "A.java", BlobSHA: "1", Language: "java", Kind: core.KindMethod,
+		Name: "caller", QualifiedName: "Utils.caller", ParentSymbol: "Utils",
+		RawText: "void caller(final String... keys, final Object array, final int[] src) {\n    of(keys);\n    removeAll(array, 1);\n    copy(src, 0, () -> 1);\n}",
+		CallSites: []core.CallSite{
+			{Callee: "of", Line: 2, Argc: 1, Args: []string{"keys"}},
+			{Callee: "removeAll", Line: 3, Argc: 2, Args: []string{"array", "#int"}},
+			{Callee: "copy", Line: 4, Argc: 3, Args: []string{"src", "#int", "#lambda"}},
+		},
+	}
+	ofColl := mk("A.java::Utils.of.coll@10", "public static <E> Stream<E> of(final Collection<E> collection)", "E")
+	ofArr := mk("A.java::Utils.of.arr@11", "public static <T> Stream<T> of(final T... values)", "T")
+	rmT := mk("A.java::Utils.removeAll.T@20", "public static <T> T[] removeAll(final T[] array, final int index)", "T")
+	rmObj := mk("A.java::Utils.removeAll.obj@21", "static Object removeAll(final Object array, final int index)")
+	copyInt := mk("A.java::Utils.copy.int@30", "public static int[] copy(final int[] src, final int pos, final int len)")
+	copySup := mk("A.java::Utils.copy.sup@31", "public static <T> T copy(final T src, final int pos, final Supplier<T> s)", "T")
+	got := map[string]bool{}
+	for _, e := range BuildEdges([]core.SymbolRecord{caller, ofColl, ofArr, rmT, rmObj, copyInt, copySup}) {
+		if e.Type == core.EdgeCalls && e.From == caller.ID {
+			got[e.To] = true
+		}
+	}
+	for _, bad := range []string{ofColl.ID, rmT.ID, copyInt.ID} {
+		if got[bad] {
+			t.Errorf("shape-incompatible overload kept: %s", bad)
+		}
+	}
+	for _, want := range []string{ofArr.ID, rmObj.ID, copySup.ID} {
+		if !got[want] {
+			t.Errorf("compatible overload lost: %s", want)
+		}
+	}
+}
+
+// C# `class X : Base` inheritance: base.M(v) binds the base overload that
+// matches v's type; a JValue argument binds a JToken parameter.
+func TestCSharpBaseAndAssignability(t *testing.T) {
+	mk := func(id, name, parent, sig string) core.SymbolRecord {
+		return core.SymbolRecord{ID: id, FilePath: parent + ".cs", BlobSHA: "1", Language: "csharp", Kind: core.KindMethod,
+			Name: name, QualifiedName: parent + "." + name, ParentSymbol: parent, Signature: sig, RawText: sig + "\n{\n}"}
+	}
+	cls := func(name, sig string) core.SymbolRecord {
+		return core.SymbolRecord{ID: name + ".cs::" + name + "@1", FilePath: name + ".cs", BlobSHA: "1", Language: "csharp", Kind: core.KindClass,
+			Name: name, QualifiedName: name, Signature: sig, RawText: sig + "\n{\n}"}
+	}
+	syms := []core.SymbolRecord{
+		cls("JsonWriter", "public abstract class JsonWriter : IDisposable"),
+		cls("BsonWriter", "public class BsonWriter : JsonWriter"),
+		cls("JToken", "public abstract class JToken"),
+		cls("JValue", "public class JValue : JToken"),
+		cls("JArray", "public class JArray : JContainer"),
+		mk("JsonWriter.cs::JsonWriter.WriteValue.int@30", "WriteValue", "JsonWriter", "public virtual void WriteValue(int value)"),
+		mk("JsonWriter.cs::JsonWriter.WriteValue.obj@40", "WriteValue", "JsonWriter", "public virtual void WriteValue(object value)"),
+		mk("BsonWriter.cs::BsonWriter.WriteValue.obj@20", "WriteValue", "BsonWriter", "public override void WriteValue(object value)"),
+		mk("JArray.cs::JArray.IndexOf.tok@5", "IndexOf", "JArray", "public int IndexOf(JToken item)"),
+		mk("JArray.cs::JArray.IndexOf.str@6", "IndexOf", "JArray", "public int IndexOf(string item)"),
+	}
+	caller := mk("BsonWriter.cs::BsonWriter.WriteValue.int@10", "WriteValue", "BsonWriter", "public override void WriteValue(int value)")
+	caller.RawText = "public override void WriteValue(int value)\n{\n    base.WriteValue(value);\n    JValue v1 = new JValue(1);\n    JArray j = new JArray();\n    j.IndexOf(v1);\n}"
+	caller.CallSites = []core.CallSite{{Callee: "base.WriteValue", Line: 3, Argc: 1, Args: []string{"value"}}, {Callee: "j.IndexOf", Line: 6, Argc: 1, Args: []string{"v1"}}}
+	caller.Imports = []string{"JsonWriter", "JArray", "JValue"}
+	got := map[string]bool{}
+	for _, e := range BuildEdges(append(syms, caller)) {
+		if e.Type == core.EdgeCalls && e.From == caller.ID {
+			got[e.To] = true
+		}
+	}
+	if !got["JsonWriter.cs::JsonWriter.WriteValue.int@30"] {
+		t.Errorf("base.WriteValue(int) missing: %v", got)
+	}
+	for _, bad := range []string{"JsonWriter.cs::JsonWriter.WriteValue.obj@40", "BsonWriter.cs::BsonWriter.WriteValue.obj@20", "JArray.cs::JArray.IndexOf.str@6"} {
+		if got[bad] {
+			t.Errorf("unexpected edge %s", bad)
+		}
+	}
+	if !got["JArray.cs::JArray.IndexOf.tok@5"] {
+		t.Errorf("JValue argument must bind IndexOf(JToken): %v", got)
 	}
 }
 

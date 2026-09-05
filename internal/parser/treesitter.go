@@ -168,6 +168,22 @@ func extractImportsFromAST(language string, src []byte) ([]string, bool) {
 		seen[imp.Path] = true
 		imports = append(imports, imp.Path)
 	}
+	if key == astkit.LangPython {
+		// From-import members as "module#name" candidates: a member that
+		// resolves to a file is a submodule import (`from . import cli`),
+		// which the edge index rewrites into a plain module path; the rest
+		// are dropped there. The "#" form never reaches consumers.
+		for _, imp := range akImports {
+			for _, name := range imp.Names {
+				cand := imp.Path + "#" + name
+				if imp.Path == "" || seen[cand] {
+					continue
+				}
+				seen[cand] = true
+				imports = append(imports, cand)
+			}
+		}
+	}
 	return imports, true
 }
 

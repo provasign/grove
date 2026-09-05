@@ -105,29 +105,34 @@ function declInfo(sym) {
   if (!sf || !name || name === '__function') return undefined;
   const r = rel(sf.fileName);
   if (r.startsWith('..') || path.isAbsolute(r)) return undefined;
-  return {file: r, name};
+  const line = sf.getLineAndCharacterOfPosition(decl.getStart(sf)).line + 1;
+  return {file: r, name, line};
 }
-function currentName(stack) {
+function currentName(sf, stack) {
   for (let i = stack.length - 1; i >= 0; i--) {
     const n = stack[i];
-    if ((ts.isFunctionDeclaration(n) || ts.isClassDeclaration(n) || ts.isInterfaceDeclaration(n) || ts.isTypeAliasDeclaration(n)) && n.name) return n.name.text;
-    if (ts.isMethodDeclaration(n) && n.name && ts.isIdentifier(n.name)) return n.name.text;
-    if (ts.isVariableDeclaration(n) && n.name && ts.isIdentifier(n.name)) return n.name.text;
+    let name = undefined;
+    if ((ts.isFunctionDeclaration(n) || ts.isClassDeclaration(n) || ts.isInterfaceDeclaration(n) || ts.isTypeAliasDeclaration(n)) && n.name) name = n.name.text;
+    else if (ts.isMethodDeclaration(n) && n.name && ts.isIdentifier(n.name)) name = n.name.text;
+    else if (ts.isVariableDeclaration(n) && n.name && ts.isIdentifier(n.name)) name = n.name.text;
+    if (name) return {name, line: sf.getLineAndCharacterOfPosition(n.getStart(sf)).line + 1};
   }
   return undefined;
 }
 function visit(sf, node, stack) {
-  const fromName = currentName(stack);
+  const enclosing = currentName(sf, stack);
+  const fromName = enclosing && enclosing.name;
+  const fromLine = enclosing && enclosing.line;
   if (fromName && ts.isCallExpression(node)) {
     const expr = ts.isPropertyAccessExpression(node.expression) ? node.expression.name : node.expression;
     const target = declInfo(checker.getSymbolAtLocation(expr));
-    if (target) calls.push({from: rel(sf.fileName), fromName, to: target.file, toName: target.name});
+    if (target) calls.push({from: rel(sf.fileName), fromName, fromLine, to: target.file, toName: target.name, toLine: target.line});
   }
   if (fromName && (ts.isTypeReferenceNode(node) || ts.isExpressionWithTypeArguments(node))) {
     const typeNode = ts.isTypeReferenceNode(node) ? node.typeName : node.expression;
     const nameNode = ts.isQualifiedName(typeNode) ? typeNode.right : typeNode;
     const target = declInfo(checker.getSymbolAtLocation(nameNode));
-    if (target) types.push({from: rel(sf.fileName), fromName, to: target.file, toName: target.name});
+    if (target) types.push({from: rel(sf.fileName), fromName, fromLine, to: target.file, toName: target.name, toLine: target.line});
   }
   const next = stack.concat(node);
   ts.forEachChild(node, child => visit(sf, child, next));
@@ -180,21 +185,25 @@ console.log(JSON.stringify({files: parsed.fileNames.length, config: cfg, edges, 
 		Calls []struct {
 			From     string `json:"from"`
 			FromName string `json:"fromName"`
+			FromLine int    `json:"fromLine"`
 			To       string `json:"to"`
 			ToName   string `json:"toName"`
+			ToLine   int    `json:"toLine"`
 		} `json:"calls"`
 		Types []struct {
 			From     string `json:"from"`
 			FromName string `json:"fromName"`
+			FromLine int    `json:"fromLine"`
 			To       string `json:"to"`
 			ToName   string `json:"toName"`
+			ToLine   int    `json:"toLine"`
 		} `json:"types"`
 	}
 	if err := unmarshalJSON(out, &payload); err != nil {
 		return Result{Diagnostics: []string{"typescript resolver JSON decode failed: " + err.Error()}}
 	}
 	fileScope := fileSet(req.Files)
-	symbols := symbolByFileAndName(req.Symbols, map[string]bool{"javascript": true, "typescript": true, "tsx": true})
+	symbols := newSymbolLocator(req.Symbols, map[string]bool{"javascript": true, "typescript": true, "tsx": true})
 	edges := make([]core.Edge, 0, len(payload.Edges)+len(payload.Calls)+len(payload.Types))
 	for _, edge := range payload.Edges {
 		from := strings.TrimSpace(edge.From)
@@ -205,15 +214,15 @@ console.log(JSON.stringify({files: parsed.fileNames.length, config: cfg, edges, 
 		edges = append(edges, nativeImportEdge(from, to, 0.97))
 	}
 	for _, edge := range payload.Calls {
-		from, okFrom := symbols[edge.From+"\x00"+edge.FromName]
-		to, okTo := symbols[edge.To+"\x00"+edge.ToName]
+		from, okFrom := symbols.at(edge.From, edge.FromName, edge.FromLine)
+		to, okTo := symbols.at(edge.To, edge.ToName, edge.ToLine)
 		if okFrom && okTo && from.ID != to.ID {
 			edges = append(edges, symbolEdge(from, to, core.EdgeCalls, 0.98))
 		}
 	}
 	for _, edge := range payload.Types {
-		from, okFrom := symbols[edge.From+"\x00"+edge.FromName]
-		to, okTo := symbols[edge.To+"\x00"+edge.ToName]
+		from, okFrom := symbols.at(edge.From, edge.FromName, edge.FromLine)
+		to, okTo := symbols.at(edge.To, edge.ToName, edge.ToLine)
 		if okFrom && okTo && from.ID != to.ID {
 			edges = append(edges, symbolEdge(from, to, core.EdgeUsesType, 0.96))
 		}

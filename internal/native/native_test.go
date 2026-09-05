@@ -201,6 +201,31 @@ func TestSymbolByFileAndName(t *testing.T) {
 	}
 }
 
+// Same name declared twice in one file (a method and the function nested in
+// it): the name map must pick deterministically regardless of input order,
+// and the line-aware locator must pick by containing span.
+func TestSymbolLocator_SameNameTwice(t *testing.T) {
+	method := core.SymbolRecord{ID: "socket.ts::Socket.run@871", FilePath: "socket.ts", Name: "run", ParentSymbol: "Socket", Language: "typescript", Span: core.LineRange{Start: 871, End: 890}}
+	nested := core.SymbolRecord{ID: "socket.ts::run@876", FilePath: "socket.ts", Name: "run", Language: "typescript", Span: core.LineRange{Start: 876, End: 887}}
+	langs := map[string]bool{"typescript": true}
+	for _, order := range [][]core.SymbolRecord{{method, nested}, {nested, method}} {
+		m := symbolByFileAndName(order, langs)
+		if got := m["socket.ts\x00run"].ID; got != method.ID {
+			t.Fatalf("name map order-dependent: got %s", got)
+		}
+		loc := newSymbolLocator(order, langs)
+		if s, ok := loc.at("socket.ts", "run", 876); !ok || s.ID != nested.ID {
+			t.Fatalf("line 876 should be the nested run, got %v %v", s.ID, ok)
+		}
+		if s, ok := loc.at("socket.ts", "run", 871); !ok || s.ID != method.ID {
+			t.Fatalf("line 871 should be Socket.run, got %v %v", s.ID, ok)
+		}
+		if s, ok := loc.at("socket.ts", "run", 0); !ok || s.ID != method.ID {
+			t.Fatalf("line 0 falls back to the name map, got %v %v", s.ID, ok)
+		}
+	}
+}
+
 func TestGlobAndFilesWithExt(t *testing.T) {
 	root := t.TempDir()
 	_ = os.WriteFile(filepath.Join(root, "main.go"), []byte(""), 0o644)

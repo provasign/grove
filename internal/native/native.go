@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -344,16 +345,86 @@ func nativeImportEdge(from, to string, confidence float64) core.Edge {
 
 func symbolByFileAndName(symbols []core.SymbolRecord, languages map[string]bool) map[string]core.SymbolRecord {
 	out := map[string]core.SymbolRecord{}
+	// A (file, name) key can collide — a method and a same-named function
+	// nested in its body (socket.io's Socket.run / function run). The
+	// winner must not depend on input order (symbols arrive from the store
+	// in no fixed order; this flipped 3 edges run-to-run on socket.io): the
+	// earliest span wins, ties by ID.
+	better := func(a, b core.SymbolRecord) bool {
+		if a.Span.Start != b.Span.Start {
+			return a.Span.Start < b.Span.Start
+		}
+		return a.ID < b.ID
+	}
+	put := func(key string, symbol core.SymbolRecord) {
+		if cur, ok := out[key]; !ok || better(symbol, cur) {
+			out[key] = symbol
+		}
+	}
 	for _, symbol := range symbols {
 		if !languages[symbol.Language] {
 			continue
 		}
-		out[symbol.FilePath+"\x00"+symbol.Name] = symbol
+		put(symbol.FilePath+"\x00"+symbol.Name, symbol)
 		if symbol.ParentSymbol != "" {
-			out[symbol.FilePath+"\x00"+symbol.ParentSymbol+"."+symbol.Name] = symbol
+			put(symbol.FilePath+"\x00"+symbol.ParentSymbol+"."+symbol.Name, symbol)
 		}
 	}
 	return out
+}
+
+// symbolLocator resolves a native analyzer's (file, name, line) reference to
+// the indexed symbol whose span contains the line — the only correct answer
+// when a file declares the same name twice (Socket.run and the `function
+// run` nested inside it). Falls back to the name map when no span matches
+// (line 0 from an older script, or a span the extractor did not record).
+type symbolLocator struct {
+	byName map[string]core.SymbolRecord
+	byFile map[string][]core.SymbolRecord
+}
+
+func newSymbolLocator(symbols []core.SymbolRecord, languages map[string]bool) symbolLocator {
+	loc := symbolLocator{
+		byName: symbolByFileAndName(symbols, languages),
+		byFile: map[string][]core.SymbolRecord{},
+	}
+	for _, symbol := range symbols {
+		if languages[symbol.Language] {
+			loc.byFile[symbol.FilePath] = append(loc.byFile[symbol.FilePath], symbol)
+		}
+	}
+	for f := range loc.byFile {
+		syms := loc.byFile[f]
+		sort.Slice(syms, func(i, j int) bool {
+			if syms[i].Span.Start != syms[j].Span.Start {
+				return syms[i].Span.Start < syms[j].Span.Start
+			}
+			return syms[i].ID < syms[j].ID
+		})
+	}
+	return loc
+}
+
+// at returns the tightest symbol named name in file whose span contains
+// line; with line <= 0, or no containing span, the name map answers.
+func (loc symbolLocator) at(file, name string, line int) (core.SymbolRecord, bool) {
+	if line > 0 {
+		var best core.SymbolRecord
+		found := false
+		for _, s := range loc.byFile[file] {
+			if s.Name != name || s.Span.Start > line || (s.Span.End > 0 && s.Span.End < line) {
+				continue
+			}
+			if !found || (s.Span.End-s.Span.Start) < (best.Span.End-best.Span.Start) {
+				best, found = s, true
+			}
+		}
+		if found {
+			return best, true
+		}
+	}
+	s, ok := loc.byName[file+"\x00"+name]
+	return s, ok
 }
 
 func symbolEdge(from, to core.SymbolRecord, edgeType core.EdgeType, confidence float64) core.Edge {

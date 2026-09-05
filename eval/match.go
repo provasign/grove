@@ -3,6 +3,7 @@ package eval
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/provasign/grove/internal/core"
@@ -58,7 +59,26 @@ func matchDecls(symbols []core.SymbolRecord, refs map[string]FuncRef) declMatch 
 		byFile[file] = append(byFile[file], groveSym{id: s.ID, name: s.Name, span: s.Span})
 	}
 	m := declMatch{idToKey: map[string]string{}, keyToID: map[string]string{}, groveCallable: callable}
-	for key, ref := range refs {
+	// Two oracle declarations can land on ONE grove symbol: a method and a
+	// same-named function nested in its body (socket.io's Socket.run and
+	// `function run` at 876 inside it) both sit in Socket.run's span with
+	// an agreeing name. Iterating refs in map order let whichever came
+	// last claim the symbol, and the scorecard moved by 3 edges run to
+	// run. Resolve the claim deterministically: the declaration ON the
+	// span's first line owns the symbol; otherwise the earliest line.
+	keys := make([]string, 0, len(refs))
+	for key := range refs {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	spanStart := map[string]int{}
+	for _, syms := range byFile {
+		for _, cand := range syms {
+			spanStart[cand.id] = cand.span.Start
+		}
+	}
+	for _, key := range keys {
+		ref := refs[key]
 		base := ref.Name
 		if i := strings.LastIndex(base, "."); i >= 0 {
 			base = base[i+1:]
@@ -77,10 +97,20 @@ func matchDecls(symbols []core.SymbolRecord, refs map[string]FuncRef) declMatch 
 				best = cand.id
 			}
 		}
-		if best != "" {
-			m.idToKey[best] = key
-			m.keyToID[key] = best
+		if best == "" {
+			continue
 		}
+		if prevKey, claimed := m.idToKey[best]; claimed {
+			prev := refs[prevKey]
+			prevExact := prev.Line == spanStart[best]
+			curExact := ref.Line == spanStart[best]
+			if prevExact || (!curExact && prev.Line <= ref.Line) {
+				continue // the earlier claim stands; this decl goes unmatched
+			}
+			delete(m.keyToID, prevKey)
+		}
+		m.idToKey[best] = key
+		m.keyToID[key] = best
 	}
 	return m
 }

@@ -3,13 +3,24 @@ package eval
 import (
 	"context"
 	"fmt"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/provasign/grove/internal/core"
 )
 
-const maxExamples = 20
+const defaultMaxExamples = 20
+
+// maxExamples caps the FP/FN examples written to the scorecard; set
+// GROVE_EVAL_MAX_EXAMPLES to raise it when classifying every miss.
+func maxExamplesN() int {
+	if v, err := strconv.Atoi(os.Getenv("GROVE_EVAL_MAX_EXAMPLES")); err == nil && v > 0 {
+		return v
+	}
+	return defaultMaxExamples
+}
 
 // funcKey is the toolchain-independent identity used to compare edges.
 func (r FuncRef) funcKey() string {
@@ -86,13 +97,13 @@ func ScoreCalls(ctx context.Context, repoRoot string, header TruthFile, truth []
 		}
 		fpBySource[src]++
 		fpByReason[reason]++
-		if len(falsePos) < maxExamples {
+		if len(falsePos) < maxExamplesN() {
 			falsePos = append(falsePos, exampleFromKeys(pair, truthFuncs))
 		}
 	}
 	for pair, e := range truthSet {
 		if _, ok := groveSet[pair]; !ok {
-			if len(falseNeg) < maxExamples {
+			if len(falseNeg) < maxExamplesN() {
 				falseNeg = append(falseNeg, EdgeExample{Caller: e.Caller.String(), Callee: e.Callee.String()})
 			}
 		}

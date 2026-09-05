@@ -2,6 +2,7 @@ package graph
 
 import (
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/provasign/grove/internal/core"
@@ -20,7 +21,9 @@ var (
 	// x: Type = ... (annotated assignment in a body)
 	pyAnnAssignRe = regexp.MustCompile(`(?m)^\s*(\w+)\s*:\s*([^=\n]+?)\s*=`)
 	// x = Type(...) (constructor call; verified against indexed types)
-	pyCtorAssignRe = regexp.MustCompile(`(?m)\b(\w+)\s*=\s*(?:\w+\.)?([A-Z]\w*)\(`)
+	pyCtorAssignRe = regexp.MustCompile(`(?m)\b(\w+)\s*=\s*(?:\w+\.)?(_*[A-Z]\w*)\(`)
+	// x = self.attr — the local aliases a typed attribute (cls = self.test_client_class)
+	pySelfAliasRe = regexp.MustCompile(`(?m)^\s*(\w+)\s*=\s*self\.(\w+)\s*$`)
 	// self.x = Type(...) inside __init__
 	pySelfCtorRe = regexp.MustCompile(`self\.(\w+)\s*=\s*(?:\w+\.)?([A-Z]\w*)\(`)
 	// self.x: Type = ... inside __init__
@@ -29,6 +32,11 @@ var (
 	pyClassAnnRe = regexp.MustCompile(`(?m)^\s+(\w+)\s*:\s*([^=\n]+?)\s*(?:=|$)`)
 	// class-body attribute holding a class reference: "name = SomeClass"
 	pyClassRefRe = regexp.MustCompile(`(?m)^\s+(\w+)\s*=\s*(?:\w+\.)?([A-Z]\w*)\s*$`)
+	// x = [await] [self.|mod.]func(...) — typed through func's return
+	// annotation (ctx = self.app_context() → AppContext)
+	pyCallAssignRe = regexp.MustCompile(`(?m)^\s*(\w+)\s*=\s*(?:await\s+)?(?:\w+\.)?([a-z_]\w*)\(`)
+	// with [async] item[, item]: — the items run __enter__/__exit__
+	pyWithRe = regexp.MustCompile(`(?m)^\s*(async\s+)?with\s+(.+?):\s*$`)
 )
 
 // pyBareType reduces a Python annotation to one indexable class name.
@@ -441,6 +449,19 @@ func pyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 			}
 			classes = next
 		}
+		// Class attributes are keyed by bare name because call sites keep
+		// only the last receiver segment ("self.cli.foo()" arrives as
+		// "cli.foo"). A bare name the body never reaches through self/cls
+		// is a module, parameter, or local instead (Flask.run's `cli.
+		// show_server_banner()` is the imported cli module, not the
+		// AppGroup in self.cli) — drop the attribute reading for it.
+		if symbol.RawText != "" {
+			for name := range out {
+				if !strings.Contains(symbol.RawText, "self."+name) && !strings.Contains(symbol.RawText, "cls."+name) {
+					delete(out, name)
+				}
+			}
+		}
 	}
 
 	// Parameter annotations.
@@ -474,9 +495,30 @@ func pyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 				out[m[1]] = m[2]
 			}
 		}
+		for _, m := range pyCallAssignRe.FindAllStringSubmatch(body, -1) {
+			if _, done := out[m[1]]; done {
+				continue // annotation / constructor evidence wins
+			}
+			if t := pyCallResultType(idx, m[2], symbol); t != "" {
+				out[m[1]] = t
+			}
+		}
+		aliased := map[string]bool{}
+		for _, m := range pySelfAliasRe.FindAllStringSubmatch(body, -1) {
+			if t, ok := out[m[2]]; ok && m[1] != m[2] {
+				out[m[1]] = t
+				aliased[m[1]] = true
+			}
+		}
+		// A body-assigned `cls` (cls = self.test_client_class) is a
+		// local holding a class, not the classmethod parameter.
+		if !aliased["cls"] {
+			delete(out, "cls")
+		}
+	} else {
+		delete(out, "cls")
 	}
 	delete(out, "self")
-	delete(out, "cls")
 	delete(out, "_")
 	return out
 }
@@ -626,4 +668,259 @@ func narrowBySuper(idx *edgeIndex, symbol *core.SymbolRecord, cands []*core.Symb
 		bases = next
 	}
 	return nil
+}
+
+// pyReturnType reads a def's "-> Ann" return annotation from its raw text
+// (multi-line signatures make the first-line Signature unusable) and
+// reduces it to one indexable class name, or "".
+func pyReturnType(s *core.SymbolRecord) string {
+	raw := s.RawText
+	i := strings.Index(raw, "def ")
+	if i < 0 {
+		return ""
+	}
+	j := strings.IndexByte(raw[i:], '(')
+	if j < 0 {
+		return ""
+	}
+	depth := 0
+	var quote byte
+	end := -1
+	for k := i + j; k < len(raw); k++ {
+		c := raw[k]
+		if quote != 0 {
+			if c == '\\' {
+				k++
+			} else if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch c {
+		case '\'', '"':
+			quote = c
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			depth--
+			if depth == 0 {
+				end = k
+			}
+		}
+		if end >= 0 {
+			break
+		}
+	}
+	if end < 0 {
+		return ""
+	}
+	rest := raw[end+1:]
+	colon := strings.IndexByte(rest, ':')
+	if colon < 0 {
+		return ""
+	}
+	head := rest[:colon]
+	arrow := strings.Index(head, "->")
+	if arrow < 0 {
+		return ""
+	}
+	return pyBareType(head[arrow+2:])
+}
+
+// pyCallResultType types the result of calling `name` from symbol's body:
+// an indexed class name constructs that class; a function or method with a
+// return annotation yields it when every in-scope declaration agrees. A
+// method on the caller's own class (or its ancestors) wins over same-named
+// functions elsewhere — self.app_context() is the own-class one.
+func pyCallResultType(idx *edgeIndex, name string, symbol *core.SymbolRecord) string {
+	if name == "" {
+		return ""
+	}
+	if bare := strings.TrimLeft(name, "_"); bare != "" && bare[0] >= 'A' && bare[0] <= 'Z' && typeSymbolExists(idx, name) {
+		return name
+	}
+	scope := idx.importedFiles(symbol.FilePath)
+	own := map[string]bool{}
+	if symbol.ParentSymbol != "" {
+		own[symbol.ParentSymbol] = true
+		classes := []string{symbol.ParentSymbol}
+		for level := 0; level < 4 && len(classes) > 0; level++ {
+			var next []string
+			for _, c := range classes {
+				for _, b := range pyBaseClasses(idx, c, dirOf(symbol.FilePath)) {
+					if !own[b] {
+						own[b] = true
+						next = append(next, b)
+					}
+				}
+			}
+			classes = next
+		}
+	}
+	ret, ownRet := "", ""
+	agree, ownAgree := true, true
+	for _, cand := range idx.byName[strings.ToLower(name)] {
+		if cand.Name != name || (cand.Kind != core.KindFunction && cand.Kind != core.KindMethod) {
+			continue
+		}
+		if _, ok := scope[cand.FilePath]; !ok && !own[cand.ParentSymbol] {
+			continue
+		}
+		r := pyReturnType(cand)
+		if own[cand.ParentSymbol] {
+			if r == "" {
+				ownAgree = false
+			} else if ownRet == "" {
+				ownRet = r
+			} else if ownRet != r {
+				ownAgree = false
+			}
+			continue
+		}
+		if r == "" {
+			agree = false
+		} else if ret == "" {
+			ret = r
+		} else if ret != r {
+			agree = false
+		}
+	}
+	if ownRet != "" && ownAgree {
+		return ownRet
+	}
+	if ownRet != "" || !ownAgree {
+		return "" // own-class method exists but is untyped/ambiguous
+	}
+	if agree {
+		return ret
+	}
+	return ""
+}
+
+// pyWithTargets resolves `with expr [as x]:` items in symbol's body to the
+// __enter__/__exit__ (async: __aenter__/__aexit__) methods of the item's
+// class. Like attribute assignment, the protocol calls have no call syntax
+// for astkit to extract; the item's type comes from a constructor call
+// (with Lock():), a typed local or self attribute (with self._lock:), or a
+// call whose return annotation names the class (with self.app_context():).
+func pyWithTargets(idx *edgeIndex, symbol *core.SymbolRecord, localTypes map[string]string, selfVars map[string]struct{}) []*core.SymbolRecord {
+	if symbol.RawText == "" {
+		return nil
+	}
+	body := stripCommentsAndStrings(symbol.RawText)
+	preferDir := dirOf(symbol.FilePath)
+	seen := map[string]bool{}
+	var out []*core.SymbolRecord
+	for _, m := range pyWithRe.FindAllStringSubmatch(body, -1) {
+		enter, exit := "__enter__", "__exit__"
+		if m[1] != "" {
+			enter, exit = "__aenter__", "__aexit__"
+		}
+		for _, item := range splitTopLevel(m[2], ',') {
+			item = strings.TrimSpace(item)
+			if i := strings.Index(item, " as "); i >= 0 {
+				item = strings.TrimSpace(item[:i])
+			}
+			item = strings.TrimPrefix(item, "await ")
+			className := pyExprType(idx, item, symbol, localTypes, selfVars)
+			if className == "" {
+				continue
+			}
+			for _, d := range []string{enter, exit} {
+				for _, cand := range pyDunderTargets(idx, className, d, preferDir) {
+					if !seen[cand.ID] {
+						seen[cand.ID] = true
+						out = append(out, cand)
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
+// pyExprType types a simple receiver expression: Name(...) constructs Name;
+// a call result goes through pyCallResultType; self.attr and bare names go
+// through the inferred local/attribute types.
+func pyExprType(idx *edgeIndex, expr string, symbol *core.SymbolRecord, localTypes map[string]string, selfVars map[string]struct{}) string {
+	if i := strings.IndexByte(expr, '('); i >= 0 {
+		callee := expr[:i]
+		if j := strings.LastIndexByte(callee, '.'); j >= 0 {
+			callee = callee[j+1:]
+		}
+		callee = strings.TrimSpace(callee)
+		if callee == "" || strings.ContainsAny(callee, " \t[]") {
+			return ""
+		}
+		if t, ok := localTypes[callee]; ok && strings.HasPrefix(t, "class:") {
+			return strings.TrimPrefix(t, "class:") // with self.lock_class():
+		}
+		return pyCallResultType(idx, callee, symbol)
+	}
+	if strings.ContainsAny(expr, " \t[]") {
+		return ""
+	}
+	name := expr
+	if j := strings.LastIndexByte(expr, '.'); j >= 0 {
+		head := expr[:j]
+		name = expr[j+1:]
+		if _, isSelf := selfVars[head]; !isSelf {
+			return ""
+		}
+	}
+	if t, ok := localTypes[name]; ok {
+		return strings.TrimPrefix(t, "class:")
+	}
+	return ""
+}
+
+// pySubclassOverrides returns the methods named calleeName declared on
+// subclasses of className (transitively, four levels), the dispatch targets
+// of a self.calleeName() call inside className.
+func pySubclassOverrides(idx *edgeIndex, className, calleeName, preferDir string) []*core.SymbolRecord {
+	idx.pySubclassesOnce.Do(func() {
+		idx.pySubclasses = map[string][]string{}
+		seen := map[string]bool{}
+		for _, cands := range idx.byName {
+			for _, c := range cands {
+				if c.Language != "python" || c.Kind != core.KindClass || seen[c.ID] {
+					continue
+				}
+				seen[c.ID] = true
+				for _, base := range pyBaseClasses(idx, c.Name, dirOf(c.FilePath)) {
+					idx.pySubclasses[base] = append(idx.pySubclasses[base], c.Name)
+				}
+			}
+		}
+		for base := range idx.pySubclasses {
+			sort.Strings(idx.pySubclasses[base])
+		}
+	})
+	var methods []*core.SymbolRecord
+	for _, cand := range idx.byName[strings.ToLower(calleeName)] {
+		if cand.Name == calleeName && cand.Kind == core.KindMethod && cand.Language == "python" {
+			methods = append(methods, cand)
+		}
+	}
+	if len(methods) == 0 {
+		return nil
+	}
+	var out []*core.SymbolRecord
+	visited := map[string]bool{className: true}
+	frontier := []string{className}
+	for level := 0; level < 4 && len(frontier) > 0; level++ {
+		var next []string
+		for _, cls := range frontier {
+			for _, sub := range idx.pySubclasses[cls] {
+				if visited[sub] {
+					continue
+				}
+				visited[sub] = true
+				next = append(next, sub)
+				out = append(out, filterByParent(methods, sub)...)
+			}
+		}
+		frontier = next
+	}
+	return out
 }

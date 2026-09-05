@@ -72,6 +72,12 @@ type edgeIndex struct {
 	// dropped). Empty when the indexer predates module-var extraction, so the
 	// resolution paths that consult it are no-ops on older indexes.
 	pyModuleGlobals map[string]string
+
+	// pySubclasses is the inverse of pyBaseClasses over every indexed
+	// Python class (base name → direct subclass names), built lazily for
+	// template-method dispatch.
+	pySubclasses     map[string][]string
+	pySubclassesOnce sync.Once
 }
 
 func newEdgeIndex(symbols []core.SymbolRecord) *edgeIndex {
@@ -96,8 +102,23 @@ func newEdgeIndex(symbols []core.SymbolRecord) *edgeIndex {
 			idx.fileImports[s.FilePath] = make(map[string]struct{})
 		}
 		for _, imp := range s.Imports {
+			if strings.Contains(imp, "#") {
+				continue // Python from-import member: validated below
+			}
 			idx.fileImports[s.FilePath][imp] = struct{}{}
 		}
+	}
+	// Candidate order is resolution order: first-match rules, fan-out caps
+	// and native (file, name) lookups all read byName/byFile slices in
+	// sequence, and the indexer hands symbols over in no fixed order (a
+	// parallel walk). Sort every slice by (file, span, ID) so the graph is a
+	// function of the code, not of scheduling — socket.io's Socket.run vs
+	// nested `function run` flipped 3 edges run-to-run before this.
+	for _, syms := range idx.byName {
+		sortSymbolRecords(syms)
+	}
+	for _, syms := range idx.byFile {
+		sortSymbolRecords(syms)
 	}
 	// Build dirToFiles after byFile is populated so each directory maps to
 	// all its files in one pass (O(n) total, vs O(n) per-file scan later).
@@ -116,7 +137,75 @@ func newEdgeIndex(symbols []core.SymbolRecord) *edgeIndex {
 	}
 	idx.buildRustCrates()
 	idx.buildPyModuleGlobals(symbols)
+	idx.bindPySubmoduleImports(symbols)
 	return idx
+}
+
+// bindPySubmoduleImports turns "module#name" from-import members into plain
+// module imports when the member is an in-repo submodule (`from . import
+// cli` → ".cli"). A member that resolves to no file is a class/function
+// binding and is dropped: recording it would make its bare name look like
+// an import whose files are empty, and narrowByImport would then drop every
+// call qualified by it.
+func (idx *edgeIndex) bindPySubmoduleImports(symbols []core.SymbolRecord) {
+	done := map[string]bool{}
+	for i := range symbols {
+		s := &symbols[i]
+		if s.Language != "python" {
+			continue
+		}
+		for _, imp := range s.Imports {
+			mod, name, ok := strings.Cut(imp, "#")
+			if !ok {
+				continue
+			}
+			key := s.FilePath + "\x00" + imp
+			if done[key] {
+				continue
+			}
+			done[key] = true
+			path := mod + "." + name
+			if strings.HasSuffix(mod, ".") {
+				path = mod + name
+			}
+			if len(idx.pyModuleFiles(s.FilePath, path)) > 0 {
+				idx.fileImports[s.FilePath][path] = struct{}{}
+			}
+		}
+	}
+}
+
+// pyModuleFiles resolves a Python module path ("flask.cli", ".cli",
+// "..sansio.app") from fromFile to its indexed files: the module file or
+// the package directory's files. Relative paths anchor on fromFile's
+// directory; absolute ones match any file whose path ends with the module
+// segments.
+func (idx *edgeIndex) pyModuleFiles(fromFile, modPath string) []string {
+	dots := 0
+	for dots < len(modPath) && modPath[dots] == '.' {
+		dots++
+	}
+	segs := strings.Split(modPath[dots:], ".")
+	if len(segs) == 1 && segs[0] == "" {
+		return nil
+	}
+	if dots > 0 {
+		// One dot is the current package; each further dot climbs one.
+		return idx.resolveRelativeImport(fromFile, strings.Repeat("../", dots-1)+strings.Join(segs, "/"))
+	}
+	joined := strings.ToLower(strings.Join(segs, "/"))
+	var out []string
+	for pathKey, files := range idx.importPathToFiles {
+		if pathKey == joined || strings.HasSuffix(pathKey, "/"+joined) {
+			out = append(out, files...)
+		}
+	}
+	for dir, files := range idx.dirFilesLower {
+		if dir == joined || strings.HasSuffix(dir, "/"+joined) {
+			out = append(out, files...)
+		}
+	}
+	return out
 }
 
 // buildPyModuleGlobals collects the name→class-type map from Python
@@ -148,6 +237,93 @@ func (idx *edgeIndex) buildPyModuleGlobals(symbols []core.SymbolRecord) {
 		delete(globals, name)
 	}
 	idx.pyModuleGlobals = globals
+}
+
+// creationSite reports whether the call site's source line instantiates
+// the callee (`new Name(` / `new Name<`), for the languages whose
+// extractors emit the type name as the callee of an object creation.
+func creationSite(symbol *core.SymbolRecord, cs core.CallSite) bool {
+	switch symbol.Language {
+	case "java", "csharp", "typescript", "tsx", "javascript", "php":
+	default:
+		return false
+	}
+	if cs.Callee == "" || strings.ContainsAny(cs.Callee, ".") || cs.Line <= 0 || symbol.Span.Start <= 0 {
+		return false
+	}
+	off := cs.Line - symbol.Span.Start
+	if off < 0 {
+		return false
+	}
+	lines := strings.Split(symbol.RawText, "\n")
+	if off >= len(lines) {
+		return false
+	}
+	return localFnRes.get(`\bnew\s+(?:[\w.]+\.)?` + regexp.QuoteMeta(cs.Callee) + `\s*[(<{]`).MatchString(lines[off])
+}
+
+// declaresLocalFunction reports whether the caller's body declares a nested
+// function named name: JS/TS `function name(`, Python `def name(`, Go
+// `name := func`, Rust `fn name(`. The declaration line of the caller
+// itself (which also matches `def name(` when the caller IS name) is
+// excluded by requiring the match to start after the first line.
+func declaresLocalFunction(symbol *core.SymbolRecord, name string) bool {
+	body := symbol.RawText
+	if body == "" || name == "" {
+		return false
+	}
+	nl := strings.IndexByte(body, '\n')
+	if nl < 0 {
+		return false
+	}
+	body = body[nl+1:]
+	var pat string
+	switch symbol.Language {
+	case "javascript", "typescript", "tsx":
+		pat = `(?m)^\s*(?:async\s+)?function\*?\s+` + regexp.QuoteMeta(name) + `\s*\(`
+	case "python":
+		pat = `(?m)^\s*(?:async\s+)?def\s+` + regexp.QuoteMeta(name) + `\s*\(`
+	case "go":
+		pat = `(?m)^\s*` + regexp.QuoteMeta(name) + `\s*:=\s*func\b`
+	case "rust":
+		pat = `(?m)^\s*fn\s+` + regexp.QuoteMeta(name) + `\s*[(<]`
+	default:
+		return false
+	}
+	re := localFnRes.get(pat)
+	return re.MatchString(body)
+}
+
+// localFnRes caches the per-name regexps declaresLocalFunction builds.
+var localFnRes = &regexpCache{m: map[string]*regexp.Regexp{}}
+
+type regexpCache struct {
+	mu sync.Mutex
+	m  map[string]*regexp.Regexp
+}
+
+func (c *regexpCache) get(pat string) *regexp.Regexp {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if re, ok := c.m[pat]; ok {
+		return re
+	}
+	re := regexp.MustCompile(pat)
+	c.m[pat] = re
+	return re
+}
+
+// sortSymbolRecords orders a candidate slice by (file, span start, ID).
+func sortSymbolRecords(syms []*core.SymbolRecord) {
+	sort.SliceStable(syms, func(i, j int) bool {
+		if syms[i].FilePath != syms[j].FilePath {
+			return syms[i].FilePath < syms[j].FilePath
+		}
+		if syms[i].Span.Start != syms[j].Span.Start {
+			return syms[i].Span.Start < syms[j].Span.Start
+		}
+		return syms[i].ID < syms[j].ID
+	})
 }
 
 // sortedKeys returns a set-map's keys in lexicographic order — any loop
@@ -679,6 +855,9 @@ func buildDefinesAndImports(symbols []core.SymbolRecord) []core.Edge {
 		}
 		seenFiles[symbol.FilePath] = true
 		for _, imp := range symbol.Imports {
+			if strings.Contains(imp, "#") {
+				continue // Python from-import member candidate, not a module
+			}
 			key := fileNode + "::import:" + imp
 			if seenImports[key] {
 				continue
@@ -1112,6 +1291,9 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 		for _, cand := range pySetattrTargets(idx, &symbol, dunderLocalTypes, dunderSelfVars) {
 			addEdge(symbol.ID, cand.ID, 0.7, core.EvidenceSourceHeuristic, core.ReasonImplicitDunder)
 		}
+		for _, cand := range pyWithTargets(idx, &symbol, dunderLocalTypes, dunderSelfVars) {
+			addEdge(symbol.ID, cand.ID, 0.7, core.EvidenceSourceHeuristic, core.ReasonImplicitDunder)
+		}
 	}
 
 	// ── High-confidence path: AST-extracted CallSites ───────────────────
@@ -1139,6 +1321,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			localTypes = cFamilyLocalTypes(idx, &symbol)
 		}
 		var javaArgTypeCache map[string]string
+		var csArgTypeCache map[string]string
 		for _, cs := range symbol.CallSites {
 			calleeName := cs.Callee
 			// Split receiver prefix (e.g. "user.save" → qualifier "user",
@@ -1171,6 +1354,14 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// constructor in scope.
 				continue
 			}
+			if qualifier == "" && declaresLocalFunction(&symbol, calleeName) {
+				// A function declared inside the caller's own body
+				// (`function run(i)` nested in Socket.run, a nested `def`)
+				// is not indexed as a symbol; the bare call binds that
+				// closure, so any same-named function elsewhere is a
+				// fabricated target. Emit nothing.
+				continue
+			}
 			if symbol.Language == "python" && qualifier == "" && pyParams[calleeName] {
 				if _, typed := localTypes[calleeName]; !typed {
 					// Bare call through a parameter name (`loads(value)`
@@ -1197,6 +1388,11 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			// and the typed-receiver narrowing below pins (or precisely
 			// drops) the widened candidate set.
 			sameFileWins := true
+			if qualifier == "super" || qualifier == "super()" || (symbol.Language == "csharp" && qualifier == "base") {
+				// The target lives in the base class's file; a same-file
+				// override must not shadow it.
+				sameFileWins = false
+			}
 			if symbol.Language == "java" && qualifier != "" && qualifier != "this" && qualifier != "super" {
 				if _, isSelf := selfVars[qualifier]; !isSelf {
 					sameFileWins = false
@@ -1234,6 +1430,27 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// non-generic one. Roslyn's 5-overload JsonConvert fanout
 				// was the dominant C# false-positive source.
 				cands = filterByGeneric(cands, cs.Generic)
+				if len(cands) > 1 && len(cs.Args) > 0 {
+					// Then argument types, as for Java: 71% of the
+					// remaining C# false edges were same-arity overloads
+					// (new BsonWriter(stream) → BsonWriter(BinaryWriter)).
+					if csArgTypeCache == nil {
+						csArgTypeCache = csharpArgTypes(idx, &symbol)
+					}
+					cands = csNarrowOverloads(idx, cands, cs.Args, csArgTypeCache)
+				}
+			}
+			if creationSite(&symbol, cs) {
+				// `new X(...)`: only a constructor can be the target. A
+				// same-named method elsewhere (a test named List() for
+				// `new List<Animal>()`) is never it.
+				var ctorsOnly []*core.SymbolRecord
+				for _, cand := range cands {
+					if cand.Kind == core.KindConstructor {
+						ctorsOnly = append(ctorsOnly, cand)
+					}
+				}
+				cands = ctorsOnly
 			}
 			if symbol.Language == "java" {
 				// Overload disambiguation: arity first, then exact
@@ -1242,7 +1459,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				cands = filterByArgc(cands, cs.Argc)
 				if len(cands) > 1 && len(cs.Args) > 0 {
 					if javaArgTypeCache == nil {
-						javaArgTypeCache = javaArgTypes(&symbol)
+						javaArgTypeCache = javaArgTypes(idx, &symbol)
 					}
 					javaResolveCallReturnTypes(idx, cs.Args, scope, javaArgTypeCache)
 					cands = narrowOverloadsByArgTypes(cands, cs.Args, javaArgTypeCache)
@@ -1281,6 +1498,19 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// Prelude mem::drop: a bare drop(x) never targets an
 				// in-repo Drop impl by name.
 				continue
+			}
+			if symbol.Language == "python" && strings.HasSuffix(qualifier, "()") && len(cands) > 0 {
+				// Call-result receiver (self.app_context().push()): the
+				// called def's return annotation names the class. An
+				// unannotated result keeps the unnarrowed set — Python's
+				// typing is optional, so silence is not evidence.
+				if ret := pyCallResultType(idx, strings.TrimSuffix(qualifier, "()"), &symbol); ret != "" {
+					if byType := filterByParent(cands, ret); len(byType) > 0 {
+						cands = byType
+					} else {
+						cands = nil
+					}
+				}
 			}
 			if symbol.Language == "php" && strings.HasSuffix(qualifier, "()") && len(cands) > 0 {
 				// Fluent-chain receiver ($builder->make()->addStmt()): resolve
@@ -1385,7 +1615,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			}
 			// super().method() / super.method() resolves on the caller's
 			// base classes; bare super() invokes the base constructor.
-			if qualifier == "super()" || qualifier == "super" {
+			if qualifier == "super()" || qualifier == "super" || (symbol.Language == "csharp" && qualifier == "base") {
 				for _, cand := range narrowBySuper(idx, &symbol, cands) {
 					addEdge(symbol.ID, cand.ID, 0.85, core.EvidenceSourceHeuristic, core.ReasonInheritance)
 				}
@@ -1443,6 +1673,17 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 						}
 						continue
 					}
+				} else if symbol.Language == "python" {
+					// Template method: self.to_json() inside the base class
+					// runs whichever subclass override the instance carries
+					// (flask's JSONTag.tag → TagDict.to_json and friends).
+					// The own-class edge stays; the overrides join as
+					// dispatch so change-impact on the base call sees them.
+					for _, m := range pySubclassOverrides(idx, symbol.ParentSymbol, calleeName, dirOf(symbol.FilePath)) {
+						if m.ID != symbol.ID {
+							addEdge(symbol.ID, m.ID, 0.7, core.EvidenceSourceHeuristic, core.ReasonDispatch)
+						}
+					}
 				}
 			}
 			if len(narrowed) == len(cands) {
@@ -1490,19 +1731,28 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			// the held class.
 			if len(narrowed) == 0 && !capped {
 				ctorName := calleeName
-				if calleeName == "cls" && symbol.ParentSymbol != "" {
-					ctorName = symbol.ParentSymbol
-				} else if held, ok := localTypes[calleeName]; ok && strings.HasPrefix(held, "class:") {
+				if held, ok := localTypes[calleeName]; ok && strings.HasPrefix(held, "class:") {
 					ctorName = strings.TrimPrefix(held, "class:")
+				} else if calleeName == "cls" && symbol.ParentSymbol != "" {
+					ctorName = symbol.ParentSymbol
 				}
 				ctors := constructorTargets(idx, ctorName, scope)
 				if symbol.Language == "java" {
 					ctors = filterByArgc(ctors, cs.Argc)
 					if len(ctors) > 1 && len(cs.Args) > 0 {
 						if javaArgTypeCache == nil {
-							javaArgTypeCache = javaArgTypes(&symbol)
+							javaArgTypeCache = javaArgTypes(idx, &symbol)
 						}
 						ctors = narrowOverloadsByArgTypes(ctors, cs.Args, javaArgTypeCache)
+					}
+				}
+				if symbol.Language == "csharp" {
+					ctors = filterByArgc(ctors, cs.Argc)
+					if len(ctors) > 1 && len(cs.Args) > 0 {
+						if csArgTypeCache == nil {
+							csArgTypeCache = csharpArgTypes(idx, &symbol)
+						}
+						ctors = csNarrowOverloads(idx, ctors, cs.Args, csArgTypeCache)
 					}
 				}
 				for _, ctor := range ctors {
@@ -1756,6 +2006,9 @@ func declParamCount(s *core.SymbolRecord) (int, bool, bool) {
 	if !strings.Contains(src, ")") {
 		src = s.RawText
 	}
+	if s.Language == "java" {
+		src = javaDeclSource(s)
+	}
 	params := tsDeclParams(src)
 	if params == "" {
 		if strings.Contains(src, "()") {
@@ -1770,9 +2023,12 @@ func declParamCount(s *core.SymbolRecord) (int, bool, bool) {
 		if strings.TrimSpace(g) == "" {
 			continue
 		}
+		if s.Language == "csharp" && strings.HasPrefix(strings.TrimSpace(g), "this ") {
+			continue // extension-method receiver is not an argument
+		}
 		n++
-		if strings.Contains(g, "...") {
-			variadic = true
+		if strings.Contains(g, "...") || strings.HasPrefix(strings.TrimSpace(g), "params ") {
+			variadic = true // Java `T...` / C# `params T[]`
 		}
 	}
 	return n, variadic, true
@@ -1921,6 +2177,22 @@ func (idx *edgeIndex) computeImportFilesForQualifier(fromFile, qualifier string)
 			continue
 		}
 		found = true
+		if strings.HasSuffix(fromFile, ".py") {
+			// Python module paths: a relative ".cli" anchors on the
+			// importing file's package (the generic resolver below reads
+			// the leading dot as a JS "./" and never finds it); an
+			// absolute "flask.cli" matches by trailing segments.
+			hit := false
+			for _, f := range idx.pyModuleFiles(fromFile, strings.Trim(imp, "\"' ;")) {
+				if f != fromFile {
+					out[f] = struct{}{}
+					hit = true
+				}
+			}
+			if hit {
+				continue
+			}
+		}
 		impNorm := strings.ToLower(strings.Trim(imp, "\"' ;"))
 		impNorm = strings.TrimPrefix(impNorm, "./")
 		// Java/Kotlin imports are dot-separated paths; the precise

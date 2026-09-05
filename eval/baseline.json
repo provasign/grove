@@ -1,65 +1,65 @@
 {
-  "gin": {
-    "commit": "d75fcd4",
-    "precision": 0.9339,
-    "recall": 0.9488,
-    "tolerance": 0.005,
-    "minUniverse": 0.99
-  },
-  "flask": {
-    "commit": "36e4a824",
-    "precision": 0.8298,
-    "recall": 0.646,
-    "tolerance": 0.005,
-    "minUniverse": 0.97
-  },
-  "socket.io": {
-    "commit": "3ad4e1f2",
-    "precision": 0.8476,
-    "recall": 0.9599,
-    "tolerance": 0.005,
-    "minUniverse": 0.98
-  },
-  "express": {
-    "commit": "dae209ae",
-    "precision": 0.75,
-    "recall": 0.7143,
-    "tolerance": 0.02,
-    "minUniverse": 0.88
-  },
-  "commons-lang": {
-    "commit": "44298fe",
-    "precision": 0.6935,
-    "recall": 0.8479,
-    "minUniverse": 0.96,
-    "tolerance": 0.005
-  },
-  "ripgrep": {
-    "commit": "82313cf",
-    "precision": 0.8514,
-    "recall": 0.5967,
-    "tolerance": 0.005,
-    "minUniverse": 0.98
-  },
-  "newtonsoft": {
-    "commit": "0a2e291",
-    "precision": 0.6617,
-    "recall": 0.7021,
-    "tolerance": 0.005,
-    "minUniverse": 0.99
-  },
-  "php-parser": {
-    "commit": "8eea230",
-    "precision": 0.7701,
-    "recall": 0.5357,
-    "tolerance": 0.005,
-    "minUniverse": 0.99
-  },
-  "jansson": {
-    "commit": "684e18c",
-    "precision": 0.8793,
-    "recall": 0.5642,
-    "tolerance": 0.005,
-    "minUniverse": 0.96
-  }
+ "gin": {
+  "commit": "d75fcd4",
+  "precision": 0.9339,
+  "recall": 0.9488,
+  "tolerance": 0.005,
+  "minUniverse": 0.99
+ },
+ "flask": {
+  "commit": "36e4a824",
+  "precision": 0.8289,
+  "recall": 0.7019,
+  "tolerance": 0.005,
+  "minUniverse": 0.97
+ },
+ "socket.io": {
+  "commit": "3ad4e1f2",
+  "precision": 0.8521,
+  "recall": 0.9737,
+  "tolerance": 0.005,
+  "minUniverse": 0.98
+ },
+ "express": {
+  "commit": "dae209ae",
+  "precision": 0.75,
+  "recall": 0.7143,
+  "tolerance": 0.02,
+  "minUniverse": 0.88
+ },
+ "commons-lang": {
+  "commit": "44298fe",
+  "precision": 0.8439,
+  "recall": 0.8927,
+  "minUniverse": 0.96,
+  "tolerance": 0.005
+ },
+ "ripgrep": {
+  "commit": "82313cf",
+  "precision": 0.853,
+  "recall": 0.5967,
+  "tolerance": 0.005,
+  "minUniverse": 0.98
+ },
+ "newtonsoft": {
+  "commit": "0a2e291",
+  "precision": 0.7799,
+  "recall": 0.7346,
+  "tolerance": 0.005,
+  "minUniverse": 0.99
+ },
+ "php-parser": {
+  "commit": "8eea230",
+  "precision": 0.7701,
+  "recall": 0.5357,
+  "tolerance": 0.005,
+  "minUniverse": 0.99
+ },
+ "jansson": {
+  "commit": "684e18c",
+  "precision": 0.8793,
+  "recall": 0.5642,
+  "tolerance": 0.005,
+  "minUniverse": 0.96
+ }
 }

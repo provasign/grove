@@ -23,13 +23,16 @@ var (
 	javaTypedLocalRe = regexp.MustCompile(`(?m)(?:^|[;{)]\s*)\s*(?:final\s+)?((?:boolean|byte|char|short|int|long|float|double|[A-Z][\w.]*)(?:<[^<>]*>)?(?:\[\])?)\s+(\w+)\s*=`)
 	// field declaration line in a class body
 	javaFieldRe = regexp.MustCompile(`(?m)^\s+(?:(?:public|private|protected|static|final|transient|volatile)\s+)*([A-Z]\w*)(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?(?:\[\])?\s+(\w+)\s*[;=]`)
+	// field declaration line, primitives included, raw type token kept —
+	// for overload matching (AT_SIGN is a char; javaFieldRe skips it)
+	javaFieldArgRe = regexp.MustCompile(`(?m)^\s+(?:(?:public|private|protected|static|final|transient|volatile)\s+)*((?:boolean|byte|char|short|int|long|float|double|[A-Z]\w*)(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?(?:\[\])?)\s+(\w+)\s*[;=]`)
 )
 
 // javaArgTypes infers identifier → raw type token (primitives and arrays
 // preserved: "long[]", "int") for overload matching, from parameters and
 // typed locals. Distinct from javaLocalTypes, which normalizes to indexable
 // class names for receiver narrowing.
-func javaArgTypes(symbol *core.SymbolRecord) map[string]string {
+func javaArgTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 	out := map[string]string{}
 	record := func(typ, name string) {
 		typ = strings.TrimSpace(typ)
@@ -48,7 +51,7 @@ func javaArgTypes(symbol *core.SymbolRecord) map[string]string {
 			out[name] = typ
 		}
 	}
-	if params := tsDeclParams(symbol.RawText); params != "" {
+	if params := tsDeclParams(javaDeclSource(symbol)); params != "" {
 		for _, g := range splitTopLevel(params, ',') {
 			fields := strings.Fields(strings.TrimSpace(g))
 			for len(fields) > 2 || (len(fields) == 2 && (fields[0] == "final" || strings.HasPrefix(fields[0], "@"))) {
@@ -68,15 +71,134 @@ func javaArgTypes(symbol *core.SymbolRecord) map[string]string {
 			record(m[1], m[2])
 		}
 	}
+	// Fields of the enclosing class (then its ancestors), lowest
+	// precedence: `.append(AT_SIGN)` where `private static final char
+	// AT_SIGN` picks append(char) over the other dozen overloads.
+	if idx != nil && symbol.ParentSymbol != "" {
+		seen := map[string]bool{}
+		classes := []string{symbol.ParentSymbol}
+		for level := 0; level < 4 && len(classes) > 0; level++ {
+			var next []string
+			for _, className := range classes {
+				if className == "" || seen[className] {
+					continue
+				}
+				seen[className] = true
+				for _, cls := range idx.byName[strings.ToLower(className)] {
+					if cls.Name != className {
+						continue
+					}
+					switch cls.Kind {
+					case core.KindClass, core.KindEnum, core.KindInterface:
+					default:
+						continue
+					}
+					// Indexed field symbols, not a regex over the class
+					// text: that also matched method locals and typed a
+					// caller's `ctor` from an unrelated method's local.
+					for _, f := range idx.byFile[cls.FilePath] {
+						if f.Kind != core.KindField || f.ParentSymbol != className {
+							continue
+						}
+						if _, exists := out[f.Name]; exists {
+							continue
+						}
+						if m := javaFieldArgRe.FindStringSubmatch(" " + strings.TrimSpace(f.RawText)); m != nil && m[2] == f.Name {
+							record(m[1], m[2])
+						}
+					}
+					break
+				}
+				next = append(next, tsBaseClasses(idx, className, dirOf(symbol.FilePath))...)
+			}
+			classes = next
+		}
+	}
 	return out
+}
+
+// javaDeclSource returns the text to parse a Java declaration's head from,
+// with leading annotations removed. `@SuppressWarnings("unchecked")` on the
+// line before the method made the annotation's parens the "parameter
+// list" (and the Signature — the first line — was the annotation alone),
+// so every such method parsed as ("unchecked") and slipped through
+// overload narrowing as neutral. Prefers the raw text; falls back to the
+// signature when the raw text is absent.
+func javaDeclSource(s *core.SymbolRecord) string {
+	src := s.RawText
+	if src == "" {
+		src = s.Signature
+	}
+	for {
+		trimmed := strings.TrimLeft(src, " \t\r\n")
+		// Leading comments (a Javadoc "(may be {@code null})" has parens
+		// too) go the same way as annotations.
+		if strings.HasPrefix(trimmed, "/*") {
+			end := strings.Index(trimmed, "*/")
+			if end < 0 {
+				return trimmed
+			}
+			src = trimmed[end+2:]
+			continue
+		}
+		if strings.HasPrefix(trimmed, "//") {
+			nl := strings.IndexByte(trimmed, '\n')
+			if nl < 0 {
+				return trimmed
+			}
+			src = trimmed[nl+1:]
+			continue
+		}
+		if !strings.HasPrefix(trimmed, "@") {
+			return trimmed
+		}
+		i := 1
+		for i < len(trimmed) && (trimmed[i] == '.' || trimmed[i] == '_' || trimmed[i] == '$' ||
+			(trimmed[i] >= 'a' && trimmed[i] <= 'z') || (trimmed[i] >= 'A' && trimmed[i] <= 'Z') || (trimmed[i] >= '0' && trimmed[i] <= '9')) {
+			i++
+		}
+		j := i
+		for j < len(trimmed) && (trimmed[j] == ' ' || trimmed[j] == '\t') {
+			j++
+		}
+		if j < len(trimmed) && trimmed[j] == '(' {
+			depth := 0
+			var quote byte
+			k := j
+			for ; k < len(trimmed); k++ {
+				c := trimmed[k]
+				if quote != 0 {
+					if c == '\\' {
+						k++
+					} else if c == quote {
+						quote = 0
+					}
+					continue
+				}
+				switch c {
+				case '"', '\'':
+					quote = c
+				case '(':
+					depth++
+				case ')':
+					depth--
+				}
+				if depth == 0 && c == ')' {
+					break
+				}
+			}
+			if k >= len(trimmed) {
+				return trimmed
+			}
+			i = k + 1
+		}
+		src = trimmed[i:]
+	}
 }
 
 // javaParamTypes parses a candidate's declared parameter type tokens.
 func javaParamTypes(s *core.SymbolRecord) []string {
-	src := s.Signature
-	if !strings.Contains(src, ")") {
-		src = s.RawText
-	}
+	src := javaDeclSource(s)
 	params := tsDeclParams(src)
 	if params == "" {
 		return nil
@@ -117,16 +239,28 @@ func narrowOverloadsByArgTypes(cands []*core.SymbolRecord, args []string, argTyp
 	if len(cands) < 2 || len(args) == 0 || len(argTypes) == 0 {
 		return cands
 	}
-	var kept []*core.SymbolRecord
+	var kept, exact, unparsed []*core.SymbolRecord
 	for _, cand := range cands {
 		paramTypes := javaParamTypes(cand)
-		if paramTypes == nil || len(paramTypes) != len(args) {
-			kept = append(kept, cand) // varargs or unparseable: neutral
+		if paramTypes == nil {
+			kept = append(kept, cand) // unparseable: neutral
+			unparsed = append(unparsed, cand)
+			continue
+		}
+		variadic := javaVariadic(cand)
+		if len(paramTypes) != len(args) && !(variadic && len(args) >= len(paramTypes)-1) {
+			kept = append(kept, cand) // arity mismatch only argc lets through: neutral
 			continue
 		}
 		conflict := false
+		allExact := !variadic // javac binds varargs last (phase 3): never "exact"
 		for i, argName := range args {
+			pi := i
+			if pi >= len(paramTypes) {
+				pi = len(paramTypes) - 1 // extra varargs elements bind the last param
+			}
 			if argName == "" {
+				allExact = false
 				continue
 			}
 			var argType string
@@ -135,30 +269,154 @@ func narrowOverloadsByArgTypes(cands []*core.SymbolRecord, args []string, argTyp
 			} else if strings.HasPrefix(argName, "call:") {
 				t, known := argTypes[argName] // pre-resolved return type
 				if !known {
+					allExact = false
 					continue
 				}
 				argType = t
 			} else {
 				t, known := argTypes[argName]
 				if !known {
+					allExact = false
 					continue
 				}
 				argType = t
 			}
-			if paramTypes[i] != argType && !javaWildcardParam(paramTypes[i], cand) &&
-				!javaLiteralCompatible(argType, paramTypes[i], argName[0] == '#') {
+			if paramTypes[pi] == argType {
+				continue
+			}
+			if javaBoxingPair(argType, paramTypes[pi]) {
+				allExact = false // Integer → int binds, but only after phase 1
+				continue
+			}
+			if variadic && pi == len(paramTypes)-1 && paramTypes[pi] == argType+"[]" {
+				// insert(0, array, element) binds insert(int, byte[], byte...):
+				// a lone element is a legal varargs call, not a conflict.
+				continue
+			}
+			allExact = false
+			if javaShapeMismatch(argType, paramTypes[pi], cand) ||
+				(argType != "lambda" && !javaWildcardParam(paramTypes[pi], cand) &&
+					!javaLiteralCompatible(argType, paramTypes[pi], argName[0] == '#')) {
 				conflict = true
 				break
 			}
 		}
 		if !conflict {
 			kept = append(kept, cand)
+			if allExact {
+				exact = append(exact, cand)
+			}
 		}
 	}
 	if len(kept) == 0 {
 		return cands
 	}
-	return kept
+	// javac's first applicability phase (no boxing, no varargs) wins when it
+	// finds a match: an overload whose every parameter equals the known
+	// argument types beats the wildcard/boxing-compatible siblings ON THE
+	// SAME TYPE (clone(float[]) over clone(T[]); append(String, boolean)
+	// over append(String, Object)). Overloads live per declaring type and
+	// receiver narrowing runs after this, so an exact match on Strings must
+	// not evict StringUtils.isEmpty(CharSequence). Unparseable candidates
+	// ride along — they might be the exact one.
+	if len(exact) == 0 {
+		return kept
+	}
+	exactOn := map[string]bool{}
+	for _, c := range exact {
+		exactOn[c.ParentSymbol] = true
+	}
+	isExact := map[*core.SymbolRecord]bool{}
+	for _, c := range exact {
+		isExact[c] = true
+	}
+	isUnparsed := map[*core.SymbolRecord]bool{}
+	for _, c := range unparsed {
+		isUnparsed[c] = true
+	}
+	var out []*core.SymbolRecord
+	for _, c := range kept {
+		if isExact[c] || isUnparsed[c] || !exactOn[c.ParentSymbol] {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// javaPrimitiveArrayMismatch reports the one widening that never happens:
+// a primitive array (int[]) is not an Object[] and cannot instantiate a
+// type-variable array (T[]), so it conflicts with any reference-array
+// parameter — the wildcard rule would otherwise let clone(T[]) and
+// indexOf(Object[], Object) absorb every primitive-array call.
+// javaVariadic reports whether the callable's last parameter is declared
+// with "..."; javaParamTypes flattens it to "[]" for comparison.
+func javaVariadic(s *core.SymbolRecord) bool {
+	return strings.Contains(tsDeclParams(javaDeclSource(s)), "...")
+}
+
+// javaShapeMismatch reports bindings the wildcard rule must not rescue:
+// an array argument binds only an array, Object, or a type variable (never
+// Collection/Iterable/CharSequence — String[] is not a Collection); a
+// known non-array reference (Object, String, Set) never binds an array
+// parameter; a lambda binds only a functional interface — no primitive,
+// array, or String slot.
+func javaShapeMismatch(argType, paramType string, cand *core.SymbolRecord) bool {
+	if javaPrimitiveArrayMismatch(argType, paramType) {
+		return true
+	}
+	argArr := strings.HasSuffix(argType, "[]")
+	parArr := strings.HasSuffix(paramType, "[]")
+	if argType == "lambda" {
+		return parArr || javaIsPrimitive(paramType) || paramType == "String"
+	}
+	if argArr && !parArr {
+		return paramType != "Object" && !javaTypeVariable(paramType, cand)
+	}
+	if !argArr && parArr && !javaIsPrimitive(argType) {
+		return !javaTypeVariable(argType, cand) // a T argument may itself be an array
+	}
+	return false
+}
+
+// javaBoxingPair reports a primitive/wrapper pair (int/Integer) in either
+// direction — legal through boxing, so never a conflict; not exact either.
+func javaBoxingPair(a, b string) bool {
+	box := map[string]string{"int": "Integer", "long": "Long", "short": "Short", "byte": "Byte",
+		"char": "Character", "float": "Float", "double": "Double", "boolean": "Boolean"}
+	return box[a] == b || box[b] == a
+}
+
+// javaTypeVariable reports whether t is a type variable: declared on the
+// candidate, or a bare single capital by convention.
+func javaTypeVariable(t string, cand *core.SymbolRecord) bool {
+	bare := strings.TrimSuffix(t, "[]")
+	if len(bare) == 1 && bare[0] >= 'A' && bare[0] <= 'Z' {
+		return true
+	}
+	for _, tp := range cand.TypeParameters {
+		if tp == bare {
+			return true
+		}
+	}
+	return false
+}
+
+func javaPrimitiveArrayMismatch(argType, paramType string) bool {
+	if !strings.HasSuffix(argType, "[]") || !strings.HasSuffix(paramType, "[]") {
+		return false
+	}
+	if !javaIsPrimitive(strings.TrimSuffix(argType, "[]")) {
+		return false
+	}
+	return !javaIsPrimitive(strings.TrimSuffix(paramType, "[]"))
+}
+
+func javaIsPrimitive(t string) bool {
+	switch t {
+	case "int", "long", "short", "byte", "char", "float", "double", "boolean":
+		return true
+	}
+	return false
 }
 
 // javaNormalizeTypeToken reduces a cast/declared type token to the bare
@@ -249,10 +507,7 @@ func javaCallResultType(idx *edgeIndex, qualifier string, scope map[string]struc
 // javaReturnType parses the declared return type token from a method
 // signature ("public static boolean[] clone(final boolean[] array)").
 func javaReturnType(s *core.SymbolRecord) string {
-	src := s.Signature
-	if !strings.Contains(src, "(") {
-		src = s.RawText
-	}
+	src := javaDeclSource(s)
 	head := src
 	if i := strings.IndexByte(head, '('); i >= 0 {
 		head = head[:i]
@@ -382,7 +637,7 @@ func javaLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string
 	}
 
 	// Parameters: "Type name" pairs from the declaration's paren group.
-	if params := tsDeclParams(symbol.RawText); params != "" {
+	if params := tsDeclParams(javaDeclSource(symbol)); params != "" {
 		for _, g := range splitTopLevel(params, ',') {
 			fields := strings.Fields(strings.TrimSpace(g))
 			// Drop modifiers and annotations: "final @Nullable CharSequence seq"
