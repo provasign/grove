@@ -179,7 +179,10 @@ func rustCallResultTypes(idx *edgeIndex, qualifier string, symbol *core.SymbolRe
 			r = cand.ParentSymbol
 		}
 		if r == "" {
-			return nil
+			// One `new` returning Result<Self, E> (unparseable here) used
+			// to void the whole set — every `Builder::new().x()` chain in
+			// scope dropped. Skip the candidate; the parsed ones decide.
+			continue
 		}
 		all = append(all, r)
 		if cand.ParentSymbol == "" || rustMentionsType(symbol.RawText, cand.ParentSymbol) {

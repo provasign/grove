@@ -143,6 +143,9 @@ func newEdgeIndex(symbols []core.SymbolRecord) *edgeIndex {
 		idx.baseToFiles[strings.ToLower(baseNameNoExt(f))] = append(idx.baseToFiles[strings.ToLower(baseNameNoExt(f))], f)
 	}
 	idx.buildRustCrates()
+	if traceCalls && len(idx.rustCrateByName) > 0 {
+		fmt.Fprintf(os.Stderr, "grove-trace rust-crates %v\n", idx.rustCrateByName)
+	}
 	idx.buildRustInlineRefs(symbols)
 	idx.buildPyModuleGlobals(symbols)
 	idx.bindPySubmoduleImports(symbols)
@@ -608,6 +611,9 @@ func (idx *edgeIndex) importedFiles(fromFile string) map[string]struct{} {
 					imps = append(imps, idx.rustInlineRefs[f]...)
 				}
 				sort.Strings(imps)
+				if traceCalls && f == fromFile {
+					fmt.Fprintf(os.Stderr, "grove-trace rust-scope %s ownRoot=%q root=%q heads=%v\n", fromFile, ownRoot, root, imps)
+				}
 				for _, imp := range imps {
 					if root != ownRoot && !strings.HasPrefix(imp, "pub ") {
 						// Any own-crate import is dependency evidence (the
@@ -632,6 +638,14 @@ func (idx *edgeIndex) importedFiles(fromFile string) map[string]struct{} {
 					}
 				}
 			}
+		}
+		if traceCalls {
+			roots := make([]string, 0, len(visited))
+			for r := range visited {
+				roots = append(roots, r)
+			}
+			sort.Strings(roots)
+			fmt.Fprintf(os.Stderr, "grove-trace rust-scope-done %s files=%d roots=%v\n", fromFile, len(out), roots)
 		}
 		idx.importedFilesCache[fromFile] = out
 		return out
@@ -1489,14 +1503,27 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// override must not shadow it.
 				sameFileWins = false
 			}
-			if symbol.Language == "java" && qualifier != "" && qualifier != "this" && qualifier != "super" {
+			if (symbol.Language == "java" || symbol.Language == "rust" || symbol.Language == "csharp") &&
+				qualifier != "" && qualifier != "this" && qualifier != "super" && qualifier != "self" && qualifier != "Self" && qualifier != "base" {
+				// Statically typed receiver or type path: the target is the
+				// named type's, wherever it lives. Same-file-wins bound a
+				// printer test's `SearcherBuilder::new()` to the printer
+				// file's own `new`s and the typed narrowing never saw the
+				// searcher crate's.
 				if _, isSelf := selfVars[qualifier]; !isSelf {
 					sameFileWins = false
 				}
 			}
 			cands, capped := resolveCallees(idx, &symbol, calleeName, scope, true, sameFileWins)
 			if traceCalls {
-				fmt.Fprintf(os.Stderr, "grove-trace %s: callee=%q qual=%q cands=%d capped=%v scope=%d\n", symbol.QualifiedName, cs.Callee, qualifier, len(cands), capped, len(scope))
+				ids := make([]string, 0, 4)
+				for i, c := range cands {
+					if i == 4 {
+						break
+					}
+					ids = append(ids, c.ID)
+				}
+				fmt.Fprintf(os.Stderr, "grove-trace %s: callee=%q qual=%q cands=%d capped=%v scope=%d first=%v\n", symbol.QualifiedName, cs.Callee, qualifier, len(cands), capped, len(scope), ids)
 			}
 			if capped && symbol.Language != "java" && symbol.Language != "rust" {
 				// Only narrowing with real evidence may keep very large

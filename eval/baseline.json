@@ -36,15 +36,15 @@
  },
  "ripgrep": {
   "commit": "82313cf",
-  "precision": 0.8862,
-  "recall": 0.6738,
+  "precision": 0.8791,
+  "recall": 0.8729,
   "tolerance": 0.005,
   "minUniverse": 0.98
  },
  "newtonsoft": {
   "commit": "0a2e291",
-  "precision": 0.7749,
-  "recall": 0.7826,
+  "precision": 0.7947,
+  "recall": 0.8089,
   "tolerance": 0.005,
   "minUniverse": 0.99
  },
