@@ -530,11 +530,24 @@ func mergeSymbolsByShape(astSyms, regexSyms []core.SymbolRecord) []core.SymbolRe
 		return astSyms
 	}
 	seen := make(map[string]bool, len(astSyms))
+	callable := make(map[string]bool, len(astSyms))
 	for _, s := range astSyms {
 		seen[symbolShapeKey(s)] = true
+		if isCallableKind(s.Kind) {
+			callable[s.Name+"\x00"+s.ParentSymbol] = true
+		}
 	}
 	merged := append([]core.SymbolRecord(nil), astSyms...)
 	for _, s := range regexSyms {
+		// A regex-found callable whose name the AST already declared in
+		// this file is the same function seen through a prototype, a
+		// macro-wrapped line, or a call statement mis-read as a
+		// declaration — never a second function. jansson's do_dump got
+		// three 1-line twins this way, and span-based matching then
+		// attributed the real body's 64 calls to none of them.
+		if isCallableKind(s.Kind) && callable[s.Name+"\x00"+s.ParentSymbol] {
+			continue
+		}
 		key := symbolShapeKey(s)
 		if !seen[key] {
 			seen[key] = true
@@ -542,6 +555,10 @@ func mergeSymbolsByShape(astSyms, regexSyms []core.SymbolRecord) []core.SymbolRe
 		}
 	}
 	return merged
+}
+
+func isCallableKind(k core.SymbolKind) bool {
+	return k == core.KindFunction || k == core.KindMethod || k == core.KindConstructor
 }
 
 func symbolShapeKey(s core.SymbolRecord) string {
