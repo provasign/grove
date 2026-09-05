@@ -219,6 +219,71 @@ func (idx *edgeIndex) pyModuleFiles(fromFile, modPath string) []string {
 	return out
 }
 
+// rustPinByPath disambiguates same-named Rust types across crates for a
+// type-path call: `grep::pcre2::RegexMatcherBuilder::new()` keeps the
+// candidates whose file lies under the last module segment before the
+// type (pcre2). Without a path nothing is preferred — an own-crate
+// preference was tried and lost 143 real cross-crate edges on ripgrep.
+func rustPinByPath(idx *edgeIndex, symbol *core.SymbolRecord, cs core.CallSite, qualifier string, cands []*core.SymbolRecord) []*core.SymbolRecord {
+	if qualifier == "" || qualifier[0] < 'A' || qualifier[0] > 'Z' || cs.Line <= 0 || symbol.Span.Start <= 0 {
+		return cands
+	}
+	name := cs.Callee
+	if i := strings.LastIndexByte(name, '.'); i >= 0 {
+		name = name[i+1:]
+	}
+	mod := ""
+	off := cs.Line - symbol.Span.Start
+	lines := strings.Split(symbol.RawText, "\n")
+	if off >= 0 && off < len(lines) {
+		re := localFnRes.get(`((?:[a-z_][a-z0-9_]*::)+)` + regexp.QuoteMeta(qualifier) + `::` + regexp.QuoteMeta(name) + `\b`)
+		if m := re.FindStringSubmatch(lines[off]); m != nil {
+			segs := strings.Split(strings.TrimSuffix(m[1], "::"), "::")
+			mod = segs[len(segs)-1]
+		}
+	}
+	if mod == "" {
+		// A bare `RegexMatcherBuilder::new()` is disambiguated by the
+		// `use grep::regex::RegexMatcherBuilder;` that brought it in.
+		// Plain `grep_regex::RegexMatcher` or grouped
+		// `grep_regex::{RegexMatcher, RegexMatcherBuilder}`.
+		re := localFnRes.get(`([a-z_][a-z0-9_]*)::(?:\{[^}]*\b)?` + regexp.QuoteMeta(qualifier) + `\b`)
+		imps := make([]string, 0, len(idx.fileImports[symbol.FilePath]))
+		for imp := range idx.fileImports[symbol.FilePath] {
+			imps = append(imps, imp)
+		}
+		sort.Strings(imps)
+		for _, imp := range imps {
+			if m := re.FindStringSubmatch(imp); m != nil {
+				mod = m[1]
+				break
+			}
+		}
+	}
+	switch mod {
+	case "", "crate", "self", "super":
+		return cands
+	}
+	// Package names commonly prefix the directory (grep_regex →
+	// crates/regex): try the module name, then its last underscore token.
+	names := []string{mod}
+	if i := strings.LastIndexByte(mod, '_'); i >= 0 && i+1 < len(mod) {
+		names = append(names, mod[i+1:])
+	}
+	for _, n := range names {
+		var out []*core.SymbolRecord
+		for _, c := range cands {
+			if strings.Contains(c.FilePath, "/"+n+"/") || strings.HasSuffix(c.FilePath, "/"+n+".rs") || strings.Contains(c.FilePath, "/"+n+"-") {
+				out = append(out, c)
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	return cands
+}
+
 // rustImportHeads returns the crate-name heads of one `use` statement:
 // "grep::regex::X" → [grep]; "pub use grep_printer as printer" →
 // [grep_printer]; the 2018 grouped form "{grep::matcher::Matcher,
@@ -1677,6 +1742,9 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				} else if !typeSymbolExists(idx, qualifier) {
 					cands = nil
 				}
+			}
+			if symbol.Language == "rust" && qualifier != "" && len(cands) > 1 {
+				cands = rustPinByPath(idx, &symbol, cs, qualifier, cands)
 			}
 			if symbol.Language == "rust" && qualifier != "" && len(cands) > 0 {
 				// Static typing, Rust edition of the Java rule. An
