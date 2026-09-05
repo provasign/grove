@@ -798,7 +798,11 @@ func (g *CodeGraph) containedMethods(typeIDs []string, methodName string) []core
 			if !ok || s.Name != methodName {
 				continue
 			}
-			if s.Kind == core.KindMethod || s.Kind == core.KindFunction {
+			// Constructors count: Rust's Type::new and C#/Java constructors
+			// are KindConstructor, and "GlobSetBuilder.new declares no
+			// method new" while listing new among its members was the
+			// symptom of leaving them out.
+			if s.Kind == core.KindMethod || s.Kind == core.KindFunction || s.Kind == core.KindConstructor {
 				out = append(out, s)
 			}
 		}

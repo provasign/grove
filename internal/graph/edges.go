@@ -1,6 +1,8 @@
 package graph
 
 import (
+	"fmt"
+	"os"
 	"path"
 	"regexp"
 	"runtime"
@@ -64,6 +66,11 @@ type edgeIndex struct {
 	rustCrateOfFile map[string]string   // .rs file → crate root dir
 	rustCrateFiles  map[string][]string // crate root dir → files under it
 	rustCrateByName map[string]string   // normalized crate name → root dir
+	// rustInlineRefs lists, per .rs file, the leading path segments of
+	// inline paths in its bodies (`grep::regex::X::new()` → grep): a crate
+	// used only through fully qualified paths has no `use` line, and its
+	// files were out of scope (ripgrep's hiargs.rs never imports grep).
+	rustInlineRefs map[string][]string
 
 	// pyModuleGlobals maps a Python module-level global's name to its declared
 	// class type ("g" → "_AppCtxGlobalsProxy"), built from KindVariable symbols
@@ -136,6 +143,7 @@ func newEdgeIndex(symbols []core.SymbolRecord) *edgeIndex {
 		idx.baseToFiles[strings.ToLower(baseNameNoExt(f))] = append(idx.baseToFiles[strings.ToLower(baseNameNoExt(f))], f)
 	}
 	idx.buildRustCrates()
+	idx.buildRustInlineRefs(symbols)
 	idx.buildPyModuleGlobals(symbols)
 	idx.bindPySubmoduleImports(symbols)
 	return idx
@@ -206,6 +214,46 @@ func (idx *edgeIndex) pyModuleFiles(fromFile, modPath string) []string {
 		}
 	}
 	return out
+}
+
+// rustInlinePathRe matches the leading segment of an inline path
+// (`grep::regex::`), excluding `::` continuations of a longer path.
+var rustInlinePathRe = regexp.MustCompile(`(?:^|[^\w:])([a-z][a-z0-9_]*)::`)
+
+// buildRustInlineRefs records, per Rust file, the distinct leading path
+// segments used inline in its symbols' bodies, restricted to names that
+// are workspace crates (the only ones scope can act on).
+func (idx *edgeIndex) buildRustInlineRefs(symbols []core.SymbolRecord) {
+	if len(idx.rustCrateByName) == 0 {
+		return
+	}
+	idx.rustInlineRefs = map[string][]string{}
+	seen := map[string]map[string]bool{}
+	for i := range symbols {
+		s := &symbols[i]
+		if s.Language != "rust" || s.RawText == "" {
+			continue
+		}
+		for _, m := range rustInlinePathRe.FindAllStringSubmatch(s.RawText, -1) {
+			seg := m[1]
+			switch seg {
+			case "crate", "super", "self", "std", "core", "alloc":
+				continue
+			}
+			if _, ok := idx.rustCrateByName[seg]; !ok {
+				if i := strings.LastIndexByte(seg, '_'); i < 0 || idx.rustCrateByName[seg[i+1:]] == "" {
+					continue
+				}
+			}
+			if seen[s.FilePath] == nil {
+				seen[s.FilePath] = map[string]bool{}
+			}
+			if !seen[s.FilePath][seg] {
+				seen[s.FilePath][seg] = true
+				idx.rustInlineRefs[s.FilePath] = append(idx.rustInlineRefs[s.FilePath], seg)
+			}
+		}
+	}
 }
 
 // buildPyModuleGlobals collects the name→class-type map from Python
@@ -312,6 +360,11 @@ func (c *regexpCache) get(pat string) *regexp.Regexp {
 	c.m[pat] = re
 	return re
 }
+
+// traceCalls (GROVE_TRACE_CALLS=1) prints each call site's candidate set
+// to stderr — the first question in every resolution bug is "did the
+// callee even reach the candidate stage".
+var traceCalls = os.Getenv("GROVE_TRACE_CALLS") != ""
 
 // sortSymbolRecords orders a candidate slice by (file, span start, ID).
 func sortSymbolRecords(syms []*core.SymbolRecord) {
@@ -511,7 +564,15 @@ func (idx *edgeIndex) importedFiles(fromFile string) map[string]struct{} {
 				if f != fromFile {
 					out[f] = struct{}{}
 				}
+				imps := make([]string, 0, len(idx.fileImports[f])+len(idx.rustInlineRefs[f]))
 				for imp := range idx.fileImports[f] {
+					imps = append(imps, imp)
+				}
+				if root == ownRoot {
+					imps = append(imps, idx.rustInlineRefs[f]...)
+				}
+				sort.Strings(imps)
+				for _, imp := range imps {
 					if root != ownRoot && !strings.HasPrefix(imp, "pub ") {
 						// Any own-crate import is dependency evidence (the
 						// extern prelude names deps crate-wide), but other
@@ -1399,6 +1460,9 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				}
 			}
 			cands, capped := resolveCallees(idx, &symbol, calleeName, scope, true, sameFileWins)
+			if traceCalls {
+				fmt.Fprintf(os.Stderr, "grove-trace %s: callee=%q qual=%q cands=%d capped=%v scope=%d\n", symbol.QualifiedName, cs.Callee, qualifier, len(cands), capped, len(scope))
+			}
 			if capped && symbol.Language != "java" && symbol.Language != "rust" {
 				// Only narrowing with real evidence may keep very large
 				// same-name sets: Java (arity, arg types) and Rust
@@ -1745,6 +1809,9 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 						}
 						ctors = narrowOverloadsByArgTypes(ctors, cs.Args, javaArgTypeCache)
 					}
+				}
+				if symbol.Language == "php" {
+					ctors = phpNarrowNewByNamespace(idx, &symbol, cs, ctorName, ctors)
 				}
 				if symbol.Language == "csharp" {
 					ctors = filterByArgc(ctors, cs.Argc)

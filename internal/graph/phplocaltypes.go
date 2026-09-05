@@ -70,7 +70,10 @@ func phpLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string 
 		out[name] = typ
 	}
 
-	// Body locals (highest precedence): $x = new Foo().
+	// Body locals (highest precedence): $x = new Foo(), then
+	// $x = Class::m() / $this->m() / $y->m() typed by m's return type
+	// ($stmt = BuilderHelpers::normalizeNode($stmt) → Node). A `new` or
+	// declared type already recorded wins.
 	if symbol.RawText != "" {
 		body := stripCommentsAndStrings(symbol.RawText)
 		for _, m := range phpNewLocalRe.FindAllStringSubmatch(body, -1) {
@@ -78,10 +81,27 @@ func phpLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string 
 				out[m[1]] = t
 			}
 		}
+		if idx != nil {
+			var scope map[string]struct{}
+			for _, m := range phpCallLocalRe.FindAllStringSubmatch(body, -1) {
+				if _, done := out[m[1]]; done {
+					continue
+				}
+				if scope == nil {
+					scope = idx.importedFiles(symbol.FilePath)
+				}
+				if t := phpCallResultType(idx, m[2]+"()", scope); t != "" {
+					out[m[1]] = t
+				}
+			}
+		}
 	}
 	delete(out, "this")
 	return out
 }
+
+// $x = [Class::|$this->|$y->]method(
+var phpCallLocalRe = regexp.MustCompile(`\$(\w+)\s*=\s*(?:\\?[\w\\]+::|\$\w+->)?(\w+)\(`)
 
 // phpCallResultType resolves the class produced by a call-result receiver in a
 // fluent chain ("createInterfaceBuilder()" → Interface_) by inferring the
@@ -225,4 +245,78 @@ func phpBareType(t string) string {
 		}
 	}
 	return t
+}
+
+// phpNewQualifiedRe finds the class expression of a `new` at a call line:
+// `new Stmt\ClassConst(`, `new \Foo\Bar(`, `new Const_(`.
+var phpNewQualifiedRe = regexp.MustCompile(`\bnew\s+(\\?[A-Za-z_][\w\\]*)\s*[(;,)]`)
+
+// phpNarrowNewByNamespace keeps the constructors whose file matches the
+// namespace the `new` expression names. astkit emits only the last segment
+// (`ClassConst`), and php-parser has Builder\ClassConst AND
+// Node\Stmt\ClassConst: `new Stmt\ClassConst(` resolved to both. The
+// qualified name resolves PHP-style — a leading backslash is absolute, a
+// first segment matching a `use` import continues that import, anything
+// else is relative to the caller's namespace (its directory under PSR-4)
+// — and is matched as a path suffix. No match keeps every candidate.
+func phpNarrowNewByNamespace(idx *edgeIndex, symbol *core.SymbolRecord, cs core.CallSite, name string, ctors []*core.SymbolRecord) []*core.SymbolRecord {
+	if len(ctors) < 2 || cs.Line <= 0 || symbol.Span.Start <= 0 {
+		return ctors
+	}
+	off := cs.Line - symbol.Span.Start
+	lines := strings.Split(symbol.RawText, "\n")
+	if off < 0 || off >= len(lines) {
+		return ctors
+	}
+	var expr string
+	for _, m := range phpNewQualifiedRe.FindAllStringSubmatch(lines[off], -1) {
+		if segs := strings.Split(strings.TrimPrefix(m[1], "\\"), "\\"); segs[len(segs)-1] == name {
+			expr = m[1]
+			break
+		}
+	}
+	if expr == "" {
+		return ctors
+	}
+	var fqn string
+	switch {
+	case strings.HasPrefix(expr, "\\"):
+		fqn = strings.TrimPrefix(expr, "\\")
+	default:
+		segs := strings.Split(expr, "\\")
+		for imp := range idx.fileImports[symbol.FilePath] {
+			if strings.HasSuffix(imp, "\\"+segs[0]) || imp == segs[0] {
+				fqn = imp
+				if len(segs) > 1 {
+					fqn += "\\" + strings.Join(segs[1:], "\\")
+				}
+				break
+			}
+		}
+		if fqn == "" {
+			// Same namespace as the caller: its directory, PSR-4.
+			want := strings.ToLower(dirOf(symbol.FilePath) + "/" + strings.ReplaceAll(expr, "\\", "/") + ".php")
+			var out []*core.SymbolRecord
+			for _, c := range ctors {
+				if strings.ToLower(c.FilePath) == want {
+					out = append(out, c)
+				}
+			}
+			if len(out) > 0 {
+				return out
+			}
+			return ctors
+		}
+	}
+	suffix := strings.ToLower("/" + strings.ReplaceAll(fqn, "\\", "/") + ".php")
+	var out []*core.SymbolRecord
+	for _, c := range ctors {
+		if strings.HasSuffix(strings.ToLower(c.FilePath), suffix) {
+			out = append(out, c)
+		}
+	}
+	if len(out) > 0 {
+		return out
+	}
+	return ctors
 }

@@ -586,6 +586,40 @@ func TestCSharpBaseAndAssignability(t *testing.T) {
 	}
 }
 
+// PHP `new Stmt\ClassConst(` names a namespace astkit drops; the
+// constructor must come from the file that namespace maps to, not from
+// every class called ClassConst.
+func TestPhpNewNarrowsByNamespace(t *testing.T) {
+	ctor := func(path string) core.SymbolRecord {
+		return core.SymbolRecord{ID: path + "::ClassConst.__construct@1", FilePath: path, BlobSHA: "1", Language: "php",
+			Kind: core.KindConstructor, Name: "__construct", QualifiedName: "ClassConst.__construct", ParentSymbol: "ClassConst",
+			RawText: "public function __construct($name) {\n}"}
+	}
+	cls := func(path string) core.SymbolRecord {
+		return core.SymbolRecord{ID: path + "::ClassConst@1", FilePath: path, BlobSHA: "1", Language: "php",
+			Kind: core.KindClass, Name: "ClassConst", QualifiedName: "ClassConst", Signature: "class ClassConst", RawText: "class ClassConst {\n}"}
+	}
+	caller := core.SymbolRecord{ID: "lib/PhpParser/Builder/ClassConst.php::ClassConst.getNode@10", FilePath: "lib/PhpParser/Builder/ClassConst.php", BlobSHA: "1", Language: "php",
+		Kind: core.KindMethod, Name: "getNode", QualifiedName: "ClassConst.getNode", ParentSymbol: "ClassConst", Span: core.LineRange{Start: 10, End: 14},
+		RawText:   "public function getNode(): Node {\n    return new Stmt\\ClassConst(\n        $this->name\n    );\n}",
+		Imports:   []string{"PhpParser\\Node\\Stmt"},
+		CallSites: []core.CallSite{{Callee: "ClassConst", Line: 11, Argc: 1}}}
+	syms := []core.SymbolRecord{cls("lib/PhpParser/Builder/ClassConst.php"), ctor("lib/PhpParser/Builder/ClassConst.php"),
+		cls("lib/PhpParser/Node/Stmt/ClassConst.php"), ctor("lib/PhpParser/Node/Stmt/ClassConst.php"), caller}
+	got := map[string]bool{}
+	for _, e := range BuildEdges(syms) {
+		if e.Type == core.EdgeCalls && e.From == caller.ID {
+			got[e.To] = true
+		}
+	}
+	if !got["lib/PhpParser/Node/Stmt/ClassConst.php::ClassConst.__construct@1"] {
+		t.Errorf("Stmt\\ClassConst constructor missing: %v", got)
+	}
+	if got["lib/PhpParser/Builder/ClassConst.php::ClassConst.__construct@1"] {
+		t.Errorf("Builder\\ClassConst constructor must not match Stmt\\ClassConst")
+	}
+}
+
 // tsResolveClassFile must pick the class the referencing file imports, not
 // whichever same-named class sorts first — else a receiver chain
 // (this.connection.driver.escape) misattributes to an unrelated class.

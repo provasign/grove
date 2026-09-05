@@ -37,6 +37,16 @@ var goIfaceMethodRe = regexp.MustCompile(`(?m)^\s*([A-Za-z_]\w*)\s*\(`)
 // '(' and don't match.
 var tsIfaceMethodRe = regexp.MustCompile(`(?m)^\s*([A-Za-z_$][\w$]*)\??\s*(?:<(?:[^<>\n]|<[^<>\n]*>)*>)?\s*\(`)
 
+// phpIfaceMethodRe matches a PHP interface method ("public function
+// getType(): string;", optionally static/by-ref).
+var phpIfaceMethodRe = regexp.MustCompile(`(?m)^\s*(?:(?:public|static)\s+)*function\s+&?([A-Za-z_]\w*)\s*\(`)
+
+// csIfaceMethodRe matches a C# interface member with a parameter list
+// ("string GetType();", "void Write<T>(T value);", "Task<int> ReadAsync(");
+// the name is the identifier immediately before the paren, after a
+// return type.
+var csIfaceMethodRe = regexp.MustCompile(`(?m)^\s*(?:[\w.<>\[\],?]+\s+)+([A-Za-z_]\w*)\s*(?:<[^<>\n]*>)?\s*\(`)
+
 // interfaceMethodNames extracts the method names an interface declares.
 // Child method symbols (parent set to the interface) win when present —
 // some languages' parsers emit them; Go's does not, so Go falls back to
@@ -62,6 +72,10 @@ func interfaceMethodNames(iface *core.SymbolRecord, idx *edgeIndex) []string {
 		re = goIfaceMethodRe
 	case "typescript", "tsx", "javascript":
 		re = tsIfaceMethodRe
+	case "php":
+		re = phpIfaceMethodRe
+	case "csharp":
+		re = csIfaceMethodRe
 	default:
 		return nil
 	}
@@ -149,7 +163,7 @@ func interfaceMemberSignatures(iface *core.SymbolRecord, methodName string) []st
 // structural.
 func nominalInterfaceLang(language string) bool {
 	switch language {
-	case "java", "typescript", "tsx", "javascript", "python":
+	case "java", "typescript", "tsx", "javascript", "python", "php", "csharp":
 		return true
 	}
 	return false

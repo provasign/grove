@@ -36,8 +36,8 @@
  },
  "ripgrep": {
   "commit": "82313cf",
-  "precision": 0.853,
-  "recall": 0.5967,
+  "precision": 0.8949,
+  "recall": 0.6623,
   "tolerance": 0.005,
   "minUniverse": 0.98
  },
@@ -50,8 +50,8 @@
  },
  "php-parser": {
   "commit": "8eea230",
-  "precision": 0.7701,
-  "recall": 0.5357,
+  "precision": 0.8254,
+  "recall": 0.5362,
   "tolerance": 0.005,
   "minUniverse": 0.99
  },
