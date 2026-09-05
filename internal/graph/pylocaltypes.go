@@ -34,7 +34,7 @@ var (
 	pyClassRefRe = regexp.MustCompile(`(?m)^\s+(\w+)\s*=\s*(?:\w+\.)?([A-Z]\w*)\s*$`)
 	// x = [await] [self.|mod.]func(...) — typed through func's return
 	// annotation (ctx = self.app_context() → AppContext)
-	pyCallAssignRe = regexp.MustCompile(`(?m)^\s*(\w+)\s*=\s*(?:await\s+)?(?:\w+\.)?([a-z_]\w*)\(`)
+	pyCallAssignRe = regexp.MustCompile(`(?m)^\s*(\w+)\s*=\s*(?:await\s+)?(?:((?:\w+\.)*\w+)\.)?([a-z_]\w*)\(`)
 	// with [async] item[, item]: — the items run __enter__/__exit__
 	pyWithRe = regexp.MustCompile(`(?m)^\s*(async\s+)?with\s+(.+?):\s*$`)
 )
@@ -495,19 +495,28 @@ func pyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 				out[m[1]] = m[2]
 			}
 		}
-		for _, m := range pyCallAssignRe.FindAllStringSubmatch(body, -1) {
-			if _, done := out[m[1]]; done {
-				continue // annotation / constructor evidence wins
-			}
-			if t := pyCallResultType(idx, m[2], symbol); t != "" {
-				out[m[1]] = t
-			}
-		}
 		aliased := map[string]bool{}
 		for _, m := range pySelfAliasRe.FindAllStringSubmatch(body, -1) {
 			if t, ok := out[m[2]]; ok && m[1] != m[2] {
 				out[m[1]] = t
 				aliased[m[1]] = true
+			}
+		}
+		for _, m := range pyCallAssignRe.FindAllStringSubmatch(body, -1) {
+			if _, done := out[m[1]]; done {
+				continue // annotation / constructor evidence wins
+			}
+			if q := m[2]; q != "" && q != "self" && q != "cls" && !strings.HasPrefix(q, "self.") && !strings.HasPrefix(q, "cls.") {
+				// ctx = _cv_app.get(None): the receiver is a module-level
+				// ContextVar, not anything indexed — its `get` is not the
+				// repo's `get`. Only an own-object chain, a typed local, or
+				// a bare call is typed.
+				if _, typed := out[q]; !typed {
+					continue
+				}
+			}
+			if t := pyCallResultType(idx, m[3], symbol); t != "" {
+				out[m[1]] = t
 			}
 		}
 		// A body-assigned `cls` (cls = self.test_client_class) is a
@@ -517,6 +526,30 @@ func pyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 		}
 	} else {
 		delete(out, "cls")
+	}
+	// Imported module globals with a declared class type (flask's
+	// `current_app: FlaskProxy`, imported as `from .globals import
+	// current_app`), unless a parameter or local rebinding shadows the
+	// name. Lowest precedence: nothing above is overwritten.
+	if idx != nil && len(idx.pyModuleGlobals) > 0 {
+		shadowed := pyParamNames(symbol.RawText)
+		if symbol.RawText != "" {
+			for _, m := range pyLocalRebindRe.FindAllStringSubmatch(stripCommentsAndStrings(symbol.RawText), -1) {
+				shadowed[m[1]] = true
+			}
+		}
+		for _, imp := range symbol.Imports {
+			_, name, ok := strings.Cut(imp, "#")
+			if !ok || shadowed[name] {
+				continue
+			}
+			if _, done := out[name]; done {
+				continue
+			}
+			if t, ok := idx.pyModuleGlobals[name]; ok {
+				out[name] = t
+			}
+		}
 	}
 	delete(out, "self")
 	delete(out, "_")

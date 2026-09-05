@@ -1316,6 +1316,10 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 	// CallSites: a function may only read properties.
 	if len(symbol.AttrSites) > 0 {
 		attrSelfVars := callerSelfQualifiers(&symbol)
+		var attrLocalTypes map[string]string
+		if symbol.Language == "python" {
+			attrLocalTypes = pyLocalTypes(idx, &symbol)
+		}
 		for _, as := range symbol.AttrSites {
 			name := as.Callee
 			qualifier := ""
@@ -1331,6 +1335,14 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			}
 			cands := resolvePropertyTargets(idx, &symbol, name, scope)
 			cands = narrowByReceiver(cands, &symbol, qualifier, attrSelfVars)
+			if _, isSelf := attrSelfVars[qualifier]; !isSelf && qualifier != "" && len(cands) > 0 {
+				// ctx.request with ctx typed AppContext reads that class's
+				// property (or an ancestor's), not every `request` property
+				// in scope; an untyped receiver keeps the set as before.
+				if kept, dispatch, decided := narrowByLocalType(idx, nil, attrLocalTypes, qualifier, name, cands, scope); decided && len(kept)+len(dispatch) > 0 {
+					cands = append(kept, dispatch...)
+				}
+			}
 			if _, isSelf := attrSelfVars[qualifier]; isSelf && classLanguage(symbol.Language) && len(filterByParent(cands, symbol.ParentSymbol)) == 0 {
 				if inherited := inheritedTargets(idx, &symbol, name, true); len(inherited) > 0 {
 					cands = inherited

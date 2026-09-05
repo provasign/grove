@@ -15,8 +15,8 @@
  },
  "socket.io": {
   "commit": "3ad4e1f2",
-  "precision": 0.8521,
-  "recall": 0.9737,
+  "precision": 0.8525,
+  "recall": 0.9765,
   "tolerance": 0.005,
   "minUniverse": 0.98
  },

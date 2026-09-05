@@ -397,6 +397,20 @@ func narrowByLocalType(idx *edgeIndex, sat *interfaceSatisfaction, localTypes ma
 	if len(targets) > maxDispatchFanout {
 		targets = nil
 	}
+	if len(byType) == 0 {
+		// The method may be inherited: a receiver typed FlaskProxy (a stub
+		// subclass of Flask) calling make_response runs Flask's. Walk the
+		// base classes; the nearest declaring ancestor wins.
+		bases := baseClassesFor(idx, lang, typ, "")
+		for level := 0; level < 4 && len(bases) > 0 && len(byType) == 0; level++ {
+			var next []string
+			for _, b := range bases {
+				byType = append(byType, filterByParent(cands, b)...)
+				next = append(next, baseClassesFor(idx, lang, b, "")...)
+			}
+			bases = next
+		}
+	}
 	if len(byType) > 0 || len(targets) > 0 {
 		return byType, targets, true
 	}
