@@ -1783,7 +1783,20 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// $logger->info) whose method isn't ours — a same-name
 				// match is noise: drop. A resolvable type narrows by parent.
 				if held, ok := localTypes[qualifier]; ok {
-					if byType := filterByParent(cands, held); len(byType) > 0 {
+					byType := filterByParent(cands, held)
+					// Inherited: `BsonReader reader; reader.ReadAsBytes()`
+					// runs JsonReader's. Walk the declared type's bases
+					// before concluding the method is not ours.
+					bases := baseClassesFor(idx, symbol.Language, held, dirOf(symbol.FilePath))
+					for level := 0; level < 4 && len(bases) > 0 && len(byType) == 0; level++ {
+						var next []string
+						for _, b := range bases {
+							byType = append(byType, filterByParent(cands, b)...)
+							next = append(next, baseClassesFor(idx, symbol.Language, b, dirOf(symbol.FilePath))...)
+						}
+						bases = next
+					}
+					if len(byType) > 0 {
 						cands = byType
 					} else {
 						cands = nil
