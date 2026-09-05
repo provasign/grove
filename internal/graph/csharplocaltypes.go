@@ -426,7 +426,21 @@ func csLiteralCompatible(lit, param string) bool {
 // (Roslyn's better-conversion rule, approximated). Mirrors
 // narrowOverloadsByArgTypes; never zeroes the set.
 func csNarrowOverloads(idx *edgeIndex, cands []*core.SymbolRecord, args []string, argTypes map[string]string) []*core.SymbolRecord {
-	if len(cands) < 2 || len(args) == 0 {
+	if len(cands) < 2 {
+		return cands
+	}
+	if len(args) == 0 {
+		// `new JObject()`: the parameterless overload is the normal form
+		// and beats a `params` sibling applied with zero elements.
+		var plain []*core.SymbolRecord
+		for _, c := range cands {
+			if pt, v := csParamTypes(c); !v && len(pt) == 0 {
+				plain = append(plain, c)
+			}
+		}
+		if len(plain) > 0 {
+			return plain
+		}
 		return cands
 	}
 	var kept, exact, unparsed []*core.SymbolRecord
@@ -633,6 +647,9 @@ func csLiteralRank(lit, param string) int {
 // bind a parameter of type paramType through inheritance (JValue → JToken):
 // walks the argument class's base list up to four levels.
 func csAssignable(idx *edgeIndex, argType, paramType string) bool {
+	if csBclAssignable(argType, paramType) {
+		return true
+	}
 	if idx == nil {
 		return false
 	}
@@ -687,7 +704,10 @@ func csBaseClasses(idx *edgeIndex, className, preferDir string) []string {
 	if chosen == nil {
 		return nil
 	}
-	sig := chosen.Signature
+	// The stored signature may begin with attributes ([Obsolete("...")]
+	// spanning lines, with colons of its own) — parse the declaration
+	// head after them.
+	sig := csDeclSource(chosen)
 	if i := strings.IndexByte(sig, '{'); i >= 0 {
 		sig = sig[:i]
 	}
@@ -708,4 +728,36 @@ func csBaseClasses(idx *edgeIndex, className, preferDir string) []string {
 		}
 	}
 	return bases
+}
+
+// csBclBases lists base types of common BCL classes the index cannot see
+// (new BsonWriter(memoryStream) binds BsonWriter(Stream), not
+// BsonWriter(BinaryWriter)).
+var csBclBases = map[string][]string{
+	"MemoryStream":              {"Stream"},
+	"FileStream":                {"Stream"},
+	"BufferedStream":            {"Stream"},
+	"StreamWriter":              {"TextWriter"},
+	"StringWriter":              {"TextWriter"},
+	"StreamReader":              {"TextReader"},
+	"StringReader":              {"TextReader"},
+	"BinaryWriter":              {"IDisposable"},
+	"BinaryReader":              {"IDisposable"},
+	"List":                      {"IList", "ICollection", "IEnumerable"},
+	"Dictionary":                {"IDictionary", "ICollection", "IEnumerable"},
+	"HashSet":                   {"ISet", "ICollection", "IEnumerable"},
+	"StringBuilder":             {"object"},
+	"ArgumentException":         {"Exception"},
+	"InvalidOperationException": {"Exception"},
+	"JsonException":             {"Exception"},
+}
+
+func csBclAssignable(argType, paramType string) bool {
+	a, p := strings.TrimSuffix(argType, "[]"), strings.TrimSuffix(paramType, "[]")
+	for _, b := range csBclBases[a] {
+		if b == p {
+			return true
+		}
+	}
+	return false
 }

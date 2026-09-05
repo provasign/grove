@@ -1880,6 +1880,9 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			// super().method() / super.method() resolves on the caller's
 			// base classes; bare super() invokes the base constructor.
 			if qualifier == "super()" || qualifier == "super" || (symbol.Language == "csharp" && qualifier == "base") {
+				if traceCalls {
+					fmt.Fprintf(os.Stderr, "grove-trace %s: super bases=%v matched=%d\n", symbol.QualifiedName, baseClassesFor(idx, symbol.Language, symbol.ParentSymbol, dirOf(symbol.FilePath)), len(narrowBySuper(idx, &symbol, cands)))
+				}
 				for _, cand := range narrowBySuper(idx, &symbol, cands) {
 					addEdge(symbol.ID, cand.ID, 0.85, core.EvidenceSourceHeuristic, core.ReasonInheritance)
 				}
