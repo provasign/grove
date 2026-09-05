@@ -10,8 +10,10 @@
 package parser
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	sitter "github.com/smacker/go-tree-sitter"
 	"sync"
 	"time"
 
@@ -125,6 +127,25 @@ func extractSymbolsFromAST(language, filePath, blobSHA string, src []byte, fileI
 	} else {
 		defer tree.Close()
 		hasErrors = tree.RootNode().HasError()
+		if hasErrors && preprocessedLanguage(language) {
+			// `#if A ... else ... #else ... else ... #endif` hands the
+			// grammar two else branches; tree-sitter recovers with ERROR
+			// nodes that swallow call sites. Re-parse with the directives
+			// blanked and every #else/#elif branch blanked (the #if branch
+			// is kept, line numbers untouched); keep it only when it
+			// parses cleaner.
+			if alt := blankPreprocessorBranches(src); alt != nil {
+				if altTree, err := eng.Parse(ctx, key, alt); err == nil && altTree != nil {
+					if altErrs := countErrorNodes(altTree.RootNode()); altErrs < countErrorNodes(tree.RootNode()) {
+						tree.Close()
+						tree, src = altTree, alt
+						hasErrors = altErrs > 0
+					} else {
+						altTree.Close()
+					}
+				}
+			}
+		}
 	}
 	akSyms, err := reg.Extract(key, tree, src)
 	if err != nil {
@@ -236,4 +257,68 @@ func projectCallSites(in []astkit.CallSite) []core.CallSite {
 
 func symID(filePath, qualifiedName, blobSHA string) string {
 	return fmt.Sprintf("%s::%s@%s", filePath, qualifiedName, blobSHA)
+}
+
+func preprocessedLanguage(language string) bool {
+	return language == "csharp" || language == "c" || language == "cpp"
+}
+
+// blankPreprocessorBranches returns src with every preprocessor directive
+// line and every #else/#elif branch replaced by blank lines (byte offsets
+// change, line numbers do not), or nil when src has no #if.
+func blankPreprocessorBranches(src []byte) []byte {
+	if !bytes.Contains(src, []byte("#if")) {
+		return nil
+	}
+	lines := bytes.Split(src, []byte("\n"))
+	out := make([][]byte, len(lines))
+	var skipping []bool // per nesting level: are we inside a skipped branch
+	for i, line := range lines {
+		t := bytes.TrimSpace(line)
+		switch {
+		case bytes.HasPrefix(t, []byte("#if")):
+			skipping = append(skipping, false)
+			out[i] = nil
+			continue
+		case bytes.HasPrefix(t, []byte("#elif")), bytes.HasPrefix(t, []byte("#else")):
+			if len(skipping) > 0 {
+				skipping[len(skipping)-1] = true
+			}
+			out[i] = nil
+			continue
+		case bytes.HasPrefix(t, []byte("#endif")):
+			if len(skipping) > 0 {
+				skipping = skipping[:len(skipping)-1]
+			}
+			out[i] = nil
+			continue
+		}
+		skip := false
+		for _, s := range skipping {
+			if s {
+				skip = true
+				break
+			}
+		}
+		if skip {
+			out[i] = nil
+		} else {
+			out[i] = line
+		}
+	}
+	return bytes.Join(out, []byte("\n"))
+}
+
+func countErrorNodes(n *sitter.Node) int {
+	if n == nil {
+		return 0
+	}
+	c := 0
+	if n.Type() == "ERROR" || n.IsMissing() {
+		c++
+	}
+	for i := 0; i < int(n.ChildCount()); i++ {
+		c += countErrorNodes(n.Child(i))
+	}
+	return c
 }
