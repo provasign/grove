@@ -83,8 +83,8 @@ type edgeIndex struct {
 	// pySubclasses is the inverse of pyBaseClasses over every indexed
 	// Python class (base name → direct subclass names), built lazily for
 	// template-method dispatch.
-	pySubclasses     map[string][]string
-	pySubclassesOnce sync.Once
+	subclasses     map[string]map[string][]string // language → base name → direct subclass names
+	subclassesOnce sync.Once
 }
 
 func newEdgeIndex(symbols []core.SymbolRecord) *edgeIndex {
@@ -1737,13 +1737,13 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 						}
 						continue
 					}
-				} else if symbol.Language == "python" {
+				} else {
 					// Template method: self.to_json() inside the base class
 					// runs whichever subclass override the instance carries
 					// (flask's JSONTag.tag → TagDict.to_json and friends).
 					// The own-class edge stays; the overrides join as
 					// dispatch so change-impact on the base call sees them.
-					for _, m := range pySubclassOverrides(idx, symbol.ParentSymbol, calleeName, dirOf(symbol.FilePath)) {
+					for _, m := range subclassOverrides(idx, symbol.Language, symbol.ParentSymbol, calleeName, dirOf(symbol.FilePath)) {
 						if m.ID != symbol.ID {
 							addEdge(symbol.ID, m.ID, 0.7, core.EvidenceSourceHeuristic, core.ReasonDispatch)
 						}

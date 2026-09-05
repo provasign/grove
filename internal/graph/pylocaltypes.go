@@ -874,31 +874,49 @@ func pyExprType(idx *edgeIndex, expr string, symbol *core.SymbolRecord, localTyp
 	return ""
 }
 
-// pySubclassOverrides returns the methods named calleeName declared on
-// subclasses of className (transitively, four levels), the dispatch targets
-// of a self.calleeName() call inside className.
-func pySubclassOverrides(idx *edgeIndex, className, calleeName, preferDir string) []*core.SymbolRecord {
-	idx.pySubclassesOnce.Do(func() {
-		idx.pySubclasses = map[string][]string{}
+// subclassOverrides returns the methods named calleeName declared on
+// subclasses of className (transitively, four levels) in the caller's
+// language — the class-hierarchy dispatch targets of a call that binds
+// className's method: self.to_json() inside the base, or $stmt->getType()
+// with $stmt typed by the abstract Node.
+func subclassOverrides(idx *edgeIndex, language, className, calleeName, preferDir string) []*core.SymbolRecord {
+	idx.subclassesOnce.Do(func() {
+		idx.subclasses = map[string]map[string][]string{}
 		seen := map[string]bool{}
 		for _, cands := range idx.byName {
 			for _, c := range cands {
-				if c.Language != "python" || c.Kind != core.KindClass || seen[c.ID] {
+				if !classLanguage(c.Language) || seen[c.ID] {
+					continue
+				}
+				switch c.Kind {
+				case core.KindClass, core.KindStruct, core.KindInterface:
+				default:
 					continue
 				}
 				seen[c.ID] = true
-				for _, base := range pyBaseClasses(idx, c.Name, dirOf(c.FilePath)) {
-					idx.pySubclasses[base] = append(idx.pySubclasses[base], c.Name)
+				byLang := idx.subclasses[c.Language]
+				if byLang == nil {
+					byLang = map[string][]string{}
+					idx.subclasses[c.Language] = byLang
+				}
+				for _, base := range baseClassesFor(idx, c.Language, c.Name, dirOf(c.FilePath)) {
+					byLang[base] = append(byLang[base], c.Name)
 				}
 			}
 		}
-		for base := range idx.pySubclasses {
-			sort.Strings(idx.pySubclasses[base])
+		for _, byLang := range idx.subclasses {
+			for base := range byLang {
+				sort.Strings(byLang[base])
+			}
 		}
 	})
+	subs := idx.subclasses[language]
+	if subs == nil {
+		return nil
+	}
 	var methods []*core.SymbolRecord
 	for _, cand := range idx.byName[strings.ToLower(calleeName)] {
-		if cand.Name == calleeName && cand.Kind == core.KindMethod && cand.Language == "python" {
+		if cand.Name == calleeName && cand.Kind == core.KindMethod && cand.Language == language {
 			methods = append(methods, cand)
 		}
 	}
@@ -911,7 +929,7 @@ func pySubclassOverrides(idx *edgeIndex, className, calleeName, preferDir string
 	for level := 0; level < 4 && len(frontier) > 0; level++ {
 		var next []string
 		for _, cls := range frontier {
-			for _, sub := range idx.pySubclasses[cls] {
+			for _, sub := range subs[cls] {
 				if visited[sub] {
 					continue
 				}

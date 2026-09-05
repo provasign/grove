@@ -472,8 +472,28 @@ func javaResolveCallReturnTypes(idx *edgeIndex, args []string, scope map[string]
 		}
 		if agree && ret != "" {
 			argTypes[a] = ret
+		} else if ret == "" && agree {
+			// No in-repo declaration: a handful of JDK methods have one
+			// return type everywhere (getName/toString → String, size →
+			// int, invoke/get → Object). Only names whose type is the same
+			// on every JDK class are listed.
+			if t, ok := jdkReturnTypes[name]; ok {
+				argTypes[a] = t
+			}
 		}
 	}
+}
+
+var jdkReturnTypes = map[string]string{
+	"getName": "String", "toString": "String", "getSimpleName": "String", "getMessage": "String",
+	"toLowerCase": "String", "toUpperCase": "String", "trim": "String", "substring": "String",
+	"name": "String", "getClass": "Class", "size": "int", "length": "int", "hashCode": "int",
+	"indexOf": "int", "ordinal": "int", "invoke": "Object", "getKey": "Object", "getValue": "Object",
+	"isEmpty": "boolean", "equals": "boolean", "contains": "boolean", "startsWith": "boolean",
+	"endsWith": "boolean", "matches": "boolean", "hasNext": "boolean", "charAt": "char",
+	"intValue": "int", "longValue": "long", "doubleValue": "double", "booleanValue": "boolean",
+	"getBytes": "byte[]", "toCharArray": "char[]", "getType": "Class", "getReturnType": "Class",
+	"getParameterTypes": "Class[]", "getDeclaringClass": "Class", "getModifiers": "int",
 }
 
 // javaCallResultType resolves a "name()" qualifier to the named function's

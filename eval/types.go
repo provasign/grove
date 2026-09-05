@@ -57,6 +57,9 @@ type Scorecard struct {
 	// ast-narrowed overload, regex fallback, …) is leaking precision.
 	FPBySource map[string]int `json:"fpBySource,omitempty"`
 	FPByReason map[string]int `json:"fpByReason,omitempty"`
+	// IgnoredDispatch counts reason=dispatch edges skipped under a static
+	// declaration-binding oracle (neither TP nor FP there).
+	IgnoredDispatch int `json:"ignoredDispatch,omitempty"`
 
 	// Tests-edge scoring only: function-level coverage signal quality.
 	FunctionsCovered int     `json:"functionsCovered,omitempty"`

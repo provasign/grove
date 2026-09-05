@@ -361,18 +361,49 @@ func narrowByLocalType(idx *edgeIndex, sat *interfaceSatisfaction, localTypes ma
 	// A variable holding a class still narrows method calls to that class
 	// (classmethods, attribute access through the class object).
 	typ = strings.TrimPrefix(typ, "class:")
-	if byType := filterByParent(cands, typ); len(byType) > 0 {
-		return byType, nil, true
+	byType := filterByParent(cands, typ)
+	// Class-hierarchy dispatch: a receiver typed by a class or interface
+	// runs whichever subtype's override the instance carries. The declared
+	// method (byType) stays; the overrides and implementors join as
+	// dispatch edges. Static declaration-binding oracles (javac, tsc,
+	// Roslyn) cannot see these; the scorer skips reason=dispatch for
+	// them, dynamic oracles (pytest, xdebug) count them.
+	var lang string
+	for _, c := range cands {
+		lang = c.Language
+		break
+	}
+	var targets []*core.SymbolRecord
+	seenD := map[string]bool{}
+	for _, m := range subclassOverrides(idx, lang, typ, calleeName, "") {
+		if !seenD[m.ID] {
+			seenD[m.ID] = true
+			targets = append(targets, m)
+		}
 	}
 	if sat != nil {
 		for _, iface := range idx.byName[strings.ToLower(typ)] {
 			if iface.Kind != core.KindInterface || iface.Name != typ {
 				continue
 			}
-			if impls := sat.implementorsFor(iface, calleeName); len(impls) > 0 {
-				return nil, impls, true
+			for _, m := range sat.implementorsFor(iface, calleeName) {
+				if !seenD[m.ID] {
+					seenD[m.ID] = true
+					targets = append(targets, m)
+				}
 			}
 		}
 	}
+	if len(targets) > maxDispatchFanout {
+		targets = nil
+	}
+	if len(byType) > 0 || len(targets) > 0 {
+		return byType, targets, true
+	}
 	return nil, nil, true
 }
+
+// maxDispatchFanout bounds class-hierarchy dispatch through one typed
+// receiver; beyond it the hierarchy is a framework root (every visitor,
+// every node) and the edges say nothing about this call.
+const maxDispatchFanout = 64

@@ -64,8 +64,18 @@ func ScoreCalls(ctx context.Context, repoRoot string, header TruthFile, truth []
 
 	// Grove calls-edge set over the matched universe.
 	groveSet := map[[2]string]core.Edge{}
+	staticOracle := staticGenerator(header.Generator)
+	ignoredDispatch := 0
 	for _, e := range edges {
 		if e.Type != core.EdgeCalls {
+			continue
+		}
+		if staticOracle && e.Reason == core.ReasonDispatch {
+			// A declaration-binding oracle records the declared target,
+			// never the overrides a call may reach; class-hierarchy
+			// dispatch edges are unscorable against it (neither TP nor
+			// FP) and are reported separately.
+			ignoredDispatch++
 			continue
 		}
 		fromKey, okFrom := groveIDToKey[e.From]
@@ -115,6 +125,7 @@ func ScoreCalls(ctx context.Context, repoRoot string, header TruthFile, truth []
 		Repo:            header.Repo,
 		Commit:          header.Commit,
 		Generator:       header.Generator,
+		IgnoredDispatch: ignoredDispatch,
 		EdgeType:        string(core.EdgeCalls),
 		TruthFunctions:  len(truthFuncs),
 		GroveFunctions:  groveCallable,
@@ -225,4 +236,15 @@ func writeExamples(b *strings.Builder, title string, ex []EdgeExample) {
 	for _, e := range ex {
 		fmt.Fprintf(b, "- `%s` → `%s`\n", e.Caller, e.Callee)
 	}
+}
+
+// staticGenerator reports whether a truth generator binds declarations
+// (javac, tsc, Roslyn, rust-analyzer, clang) rather than observing or
+// computing reachable targets (pytest/xdebug traces, Go's VTA callgraph).
+func staticGenerator(g string) bool {
+	switch g {
+	case "javac-javap", "ts-compiler-api", "roslyn", "rust-analyzer-scip", "scip-clang":
+		return true
+	}
+	return false
 }
