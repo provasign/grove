@@ -484,13 +484,24 @@ func csNarrowOverloads(idx *edgeIndex, cands []*core.SymbolRecord, args []string
 			if p == argType {
 				continue
 			}
+			// A `#Name` marker for a nested `new Name(...)` is a typed
+			// object, not a literal: it binds like a typed identifier.
+			if isLit && len(argType) > 0 && argType[0] >= 'A' && argType[0] <= 'Z' && !csIsPrimitive(argType) {
+				isLit = false
+			}
 			if isLit {
 				cost[cand] += csLiteralRank(argType, p)
 			} else {
 				cost[cand]++ // a typed argument binding a wider parameter (int → object, JValue → JToken)
 			}
-			if variadic && pi == len(paramTypes)-1 && p == argType+"[]" {
-				continue
+			if variadic && pi == len(paramTypes)-1 && strings.HasSuffix(p, "[]") {
+				// A lone element binds the params slot by exact type or
+				// assignability (new BinaryConverter() into params
+				// JsonConverter[]).
+				if elem := strings.TrimSuffix(p, "[]"); elem == argType || csAssignable(idx, argType, elem) || csWildcardParam(elem, cand) || (isLit && csLiteralCompatible(argType, elem)) {
+					allExact = false
+					continue
+				}
 			}
 			allExact = false
 			argArr := strings.HasSuffix(argType, "[]")

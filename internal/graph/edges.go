@@ -1639,7 +1639,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					}
 					ids = append(ids, c.ID)
 				}
-				fmt.Fprintf(os.Stderr, "grove-trace %s: callee=%q qual=%q cands=%d capped=%v scope=%d first=%v\n", symbol.QualifiedName, cs.Callee, qualifier, len(cands), capped, len(scope), ids)
+				fmt.Fprintf(os.Stderr, "grove-trace %s: callee=%q qual=%q args=%v cands=%d capped=%v scope=%d first=%v\n", symbol.QualifiedName, cs.Callee, qualifier, cs.Args, len(cands), capped, len(scope), ids)
 			}
 			if capped && symbol.Language != "java" && symbol.Language != "rust" {
 				// Only narrowing with real evidence may keep very large
@@ -1984,6 +1984,13 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				capped = true
 			} else if len(narrowed) > 0 {
 				capped = false
+			}
+			if traceCalls && len(narrowed) > 0 {
+				ids := make([]string, 0, len(narrowed))
+				for _, c := range narrowed {
+					ids = append(ids, c.ID)
+				}
+				fmt.Fprintf(os.Stderr, "grove-trace %s: callee=%q narrowed=%v\n", symbol.QualifiedName, cs.Callee, ids)
 			}
 			for _, cand := range narrowed {
 				addEdge(symbol.ID, cand.ID, 0.95, core.EvidenceSourceASTKit, core.ReasonASTNarrowed)
