@@ -1,6 +1,7 @@
 package graph
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/provasign/grove/internal/core"
@@ -185,7 +186,9 @@ func TestTsClassBodyFieldTypes(t *testing.T) {
 }`
 	got := map[string]string{}
 	tsClassBodyFieldTypes(raw, func(n, ty string) {
-		if ty != "" {
+		// "extern:number" marks a declared non-class type (so a call
+		// through it drops instead of fanning out); it is not a field type.
+		if ty != "" && !strings.HasPrefix(ty, "extern:") {
 			got[n] = ty
 		}
 	})

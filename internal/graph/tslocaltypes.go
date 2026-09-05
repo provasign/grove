@@ -34,10 +34,11 @@ var (
 // Arrays, generics with arguments, unions, and primitives return "".
 func tsBareType(ann string) string {
 	ann = strings.TrimSpace(ann)
-	// Strip a generic argument list: Map<K,V> narrows nothing, but
-	// Transport<...> would still be a Transport — keep the head only when
-	// the whole annotation is one generic application.
-	if i := strings.IndexByte(ann, '<'); i > 0 && strings.HasSuffix(ann, ">") {
+	// Strip a generic argument list: Namespace<A, B> is still a
+	// Namespace. The list may continue on later lines (a multi-line
+	// field annotation reaches here as "Namespace<"), so the head is
+	// taken whenever it is a plain identifier followed by '<'.
+	if i := strings.IndexByte(ann, '<'); i > 0 && !strings.ContainsAny(ann[:i], "<>[]|&(){}, ") {
 		ann = ann[:i]
 	}
 	if strings.ContainsAny(ann, "<>[]|&(){}, ") {
@@ -45,6 +46,13 @@ func tsBareType(ann string) string {
 	}
 	if i := strings.LastIndexByte(ann, '.'); i >= 0 {
 		ann = ann[i+1:]
+	}
+	switch ann {
+	case "any", "unknown", "object", "string", "number", "boolean", "void", "never", "symbol", "bigint":
+		// Declared as a non-class: a call through it can never reach an
+		// indexed method. The marker lets narrowing DROP instead of
+		// fanning out to every same-named method.
+		return "extern:" + ann
 	}
 	if ann == "" || ann[0] < 'A' || ann[0] > 'Z' {
 		return ""
@@ -88,7 +96,7 @@ func tsBaseClasses(idx *edgeIndex, className, preferDir string) []string {
 		}
 	}
 	base := tsBareType(rest)
-	if base == "" {
+	if base == "" || strings.HasPrefix(base, "extern:") {
 		return nil
 	}
 	return []string{base}

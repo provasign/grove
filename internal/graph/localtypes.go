@@ -361,6 +361,10 @@ func narrowByLocalType(idx *edgeIndex, sat *interfaceSatisfaction, localTypes ma
 	// A variable holding a class still narrows method calls to that class
 	// (classmethods, attribute access through the class object).
 	typ = strings.TrimPrefix(typ, "class:")
+	if strings.HasPrefix(typ, "extern:") {
+		// `private _xhr: any` — nothing of ours runs through it.
+		return nil, nil, true
+	}
 	byType := filterByParent(cands, typ)
 	// Class-hierarchy dispatch: a receiver typed by a class or interface
 	// runs whichever subtype's override the instance carries. The declared
