@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.43.2 - 2026-09-06
+
+Go: interface contracts resolve through method sets, across packages.
+The native pass type-checks sibling packages from source
+(`goProjectImporter`; `importer.Default` could not load an unbuilt
+package in the same module, so cross-package interface information was
+dropped and change-impact on an imported interface method failed
+outright). Interface methods become `<iface>#method` contract nodes:
+`contains` from the interface, `implements`/`overrides` from every local
+type whose method set satisfies it (`types.Implements` on `*T`, so
+promotion and embedding are handled), and `calls` from each call through
+an interface-typed receiver to the contract node and to every local
+implementation (`ReasonMethodSet`, native evidence). Interfaces with
+type parameters are skipped (design question, not narrowed unsafely).
+Signatures containing Invalid after a best-effort check never count as
+compatible. Cross-package change-impact on an imported Go interface goes
+from a hard failure to the exact site set; wrong-signature decoys are
+excluded. gin P .9339 -> .9406, R .9488 -> .9505; indexing cost neutral
+(0.601s -> 0.598s over six alternating trials).
+
 ## v0.43.1 - 2026-09-05
 
 Java: chained call-result receivers resolve outside the caller's import
