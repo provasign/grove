@@ -114,7 +114,7 @@ func (g *CodeGraph) MissingImplementations(query string) (*MissingImplementation
 		// symbols — synthesize, as ChangeImpact does.
 		for _, tid := range typeIDs {
 			t, ok := g.symbols[tid]
-			if !ok || !typeDeclaresMember(&t, methodName) {
+			if !ok || !g.typeDeclaresMember(&t, methodName) {
 				continue
 			}
 			contract = append(contract, core.SymbolRecord{
@@ -265,7 +265,7 @@ func (g *CodeGraph) implementationCoverage(typeID, methodName string, declParams
 		// languages a supertype interface declares the obligation, never
 		// satisfies it.
 		if node != typeID && t.Language == "go" && t.Kind == core.KindInterface &&
-			typeDeclaresMember(&t, methodName) {
+			g.typeDeclaresMember(&t, methodName) {
 			return true, false
 		}
 		// Python bases all grant implementation inheritance; for Java/TS/JS

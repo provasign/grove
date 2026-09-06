@@ -220,7 +220,7 @@ func (g *CodeGraph) ChangeImpactScoped(query, file string) (*ChangeImpactResult,
 	if len(decls) == 0 {
 		for _, tid := range typeIDs {
 			t, ok := g.symbols[tid]
-			if !ok || !typeDeclaresMember(&t, methodName) {
+			if !ok || !g.typeDeclaresMember(&t, methodName) {
 				continue
 			}
 			decls = append(decls, synthesizeMemberDecl(&t, methodName))
@@ -371,7 +371,7 @@ func (g *CodeGraph) ChangeImpactScoped(query, file string) (*ChangeImpactResult,
 		// a real member symbol are skipped — nothing to synthesize.
 		for _, tid := range contractIDs {
 			t, ok := g.symbols[tid]
-			if !ok || !typeDeclaresMember(&t, methodName) {
+			if !ok || !g.typeDeclaresMember(&t, methodName) {
 				continue
 			}
 			if _, dup := declaringTypes[t.ID]; dup {
@@ -756,10 +756,9 @@ func set(names ...string) map[string]bool {
 	return m
 }
 
-// typeDeclaresMember reports whether a type's body text declares a member
-// method of the given name — for languages whose parsers do not emit those
-// members as symbols (TS/JS interfaces, Go interface specs).
-func typeDeclaresMember(t *core.SymbolRecord, method string) bool {
+// typeDeclaresMember reports whether source text or native override evidence
+// establishes a member on a type whose parser does not emit member symbols.
+func (g *CodeGraph) typeDeclaresMember(t *core.SymbolRecord, method string) bool {
 	if t.RawText == "" {
 		return false
 	}
@@ -778,6 +777,17 @@ func typeDeclaresMember(t *core.SymbolRecord, method string) bool {
 	}
 	for _, m := range re.FindAllStringSubmatch(body, -1) {
 		if m[1] == method {
+			return true
+		}
+	}
+	// Native analyzers can prove members inherited through embedded external
+	// interfaces even when the member text is absent from this declaration.
+	for _, ei := range g.inbound[t.ID] {
+		edge := g.edges[ei]
+		if edge.Type != core.EdgeOverrides || edge.Source != core.EvidenceSourceNative {
+			continue
+		}
+		if source, ok := g.symbols[edge.From]; ok && source.Kind == core.KindMethod && source.Name == method {
 			return true
 		}
 	}

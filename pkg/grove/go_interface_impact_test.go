@@ -55,14 +55,17 @@ func TestGoInterfaceImpactEmbeddedExternal(t *testing.T) {
 	}
 	t.Logf("native: %v", indexed.Native)
 	for _, tc := range []struct {
-		query string
-		want  []string
+		query      string
+		want       []string
+		wantFamily []string
+		wantSupers []string
 	}{
-		{"writer.CloseNotify", []string{"Stream", "Promoted", "External", "Concrete"}},
-		{"other.CloseNotify", []string{"Stream", "External"}},
-		{"wrongReturn.CloseNotify", nil},
-		{"wrongParam.CloseNotify", nil},
-		{"wrongCase.Closenotify", nil},
+		{"Writer.CloseNotify", []string{"Stream", "Promoted", "External", "Concrete"}, []string{"other.CloseNotify", "writer.CloseNotify"}, nil},
+		{"writer.CloseNotify", []string{"Stream", "Promoted", "External", "Concrete"}, nil, []string{"Writer.CloseNotify"}},
+		{"other.CloseNotify", []string{"Stream", "External"}, nil, []string{"Writer.CloseNotify"}},
+		{"wrongReturn.CloseNotify", nil, nil, nil},
+		{"wrongParam.CloseNotify", nil, nil, nil},
+		{"wrongCase.Closenotify", nil, nil, nil},
 	} {
 		t.Run(tc.query, func(t *testing.T) {
 			impact, err := eng.ChangeImpactScoped(ctx, tc.query, "writer.go")
@@ -80,6 +83,22 @@ func TestGoInterfaceImpactEmbeddedExternal(t *testing.T) {
 			}
 			if len(got) != len(tc.want) {
 				t.Errorf("caller set: got %v, want %v", got, tc.want)
+			}
+			var family []string
+			for _, member := range impact.Family {
+				family = append(family, member.QualifiedName)
+			}
+			sort.Strings(family)
+			if !reflect.DeepEqual(family, tc.wantFamily) {
+				t.Errorf("family: got %v, want %v", family, tc.wantFamily)
+			}
+			var supers []string
+			for _, member := range impact.Supers {
+				supers = append(supers, member.QualifiedName)
+			}
+			sort.Strings(supers)
+			if !reflect.DeepEqual(supers, tc.wantSupers) {
+				t.Errorf("supers: got %v, want %v", supers, tc.wantSupers)
 			}
 		})
 	}
