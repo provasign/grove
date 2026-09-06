@@ -473,7 +473,8 @@ func goSemanticPackageEdges(root, dir string, files []string, symbolIdx goSymbol
 		Importer: importer.Default(),
 		Error:    func(error) {},
 	}
-	_, _ = conf.Check(dir, fset, parsed, info)
+	pkg, _ := conf.Check(dir, fset, parsed, info)
+	dispatch := newGoInterfaceDispatch(pkg, root, dir, fset, symbolIdx)
 
 	var edges []core.Edge
 	seen := map[string]bool{}
@@ -500,6 +501,12 @@ func goSemanticPackageEdges(root, dir string, files []string, symbolIdx goSymbol
 			ast.Inspect(fn.Body, func(inner ast.Node) bool {
 				switch n := inner.(type) {
 				case *ast.CallExpr:
+					for _, callee := range dispatch.targets(n.Fun, info) {
+						if callee.ID != caller.ID {
+							add(core.Edge{From: caller.ID, To: callee.ID, Type: core.EdgeCalls,
+								Confidence: 0.99, Source: core.EvidenceSourceNative, Reason: core.ReasonMethodSet})
+						}
+					}
 					if callee, ok := goResolveCall(dir, n.Fun, info, symbolIdx, pkgDirsByImport); ok && callee.ID != caller.ID {
 						add(core.Edge{
 							From:       caller.ID,
