@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"go/ast"
-	"go/importer"
 	"go/parser"
 	"go/token"
 	"go/types"
@@ -388,9 +387,11 @@ func goCallableKey(dir, recv, name string) string {
 func goSemanticEdges(ctx context.Context, root string, files []string, symbols []core.SymbolRecord, pkgs []goListPackage) ([]core.Edge, []string) {
 	symbolIdx := newGoSymbolIndex(symbols)
 	pkgDirsByImport := map[string][]string{}
+	importPathByDir := map[string]string{}
 	for _, pkg := range pkgs {
 		if rel, ok := relFile(root, pkg.Dir); ok {
 			pkgDirsByImport[pkg.ImportPath] = append(pkgDirsByImport[pkg.ImportPath], rel)
+			importPathByDir[rel] = pkg.ImportPath
 		}
 	}
 
@@ -406,6 +407,22 @@ func goSemanticEdges(ctx context.Context, root string, files []string, symbols [
 		dirs = append(dirs, d)
 	}
 	sort.Strings(dirs)
+	projectImporter := newGoProjectImporter(pkgs)
+	var analyzedImports []string
+	interfacePackages := map[string]bool{}
+	for _, dir := range dirs {
+		if path := importPathByDir[dir]; path != "" {
+			analyzedImports = append(analyzedImports, path)
+		}
+	}
+	for _, symbol := range symbols {
+		if symbol.Language == "go" && symbol.Kind == core.KindInterface {
+			if path := importPathByDir[packageDir(symbol.FilePath)]; path != "" {
+				interfacePackages[path] = true
+			}
+		}
+	}
+	diagnostics = append(diagnostics, projectImporter.preloadInterfaceImports(analyzedImports, interfacePackages)...)
 	// Per-package type-checks are independent and symbolIdx/pkgDirsByImport
 	// are read-only here; results land by index so output order (and thus
 	// the built graph) is identical to the sequential loop.
@@ -431,7 +448,11 @@ func goSemanticEdges(ctx context.Context, root string, files []string, symbols [
 					outcomes[di] = dirOutcome{err: err}
 					continue
 				}
-				e, err := goSemanticPackageEdges(root, dirs[di], filesByDir[dirs[di]], symbolIdx, pkgDirsByImport)
+				pkgPath := importPathByDir[dirs[di]]
+				if pkgPath == "" {
+					pkgPath = dirs[di]
+				}
+				e, err := goSemanticPackageEdges(root, pkgPath, dirs[di], filesByDir[dirs[di]], symbolIdx, pkgDirsByImport, projectImporter)
 				outcomes[di] = dirOutcome{edges: e, err: err}
 			}
 		}()
@@ -453,7 +474,7 @@ func goSemanticEdges(ctx context.Context, root string, files []string, symbols [
 	return edges, diagnostics
 }
 
-func goSemanticPackageEdges(root, dir string, files []string, symbolIdx goSymbolIndex, pkgDirsByImport map[string][]string) ([]core.Edge, error) {
+func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx goSymbolIndex, pkgDirsByImport map[string][]string, projectImporter types.Importer) ([]core.Edge, error) {
 	fset := token.NewFileSet()
 	parsed := make([]*ast.File, 0, len(files))
 	for _, file := range files {
@@ -470,11 +491,11 @@ func goSemanticPackageEdges(root, dir string, files []string, symbolIdx goSymbol
 		Selections: map[*ast.SelectorExpr]*types.Selection{},
 	}
 	conf := types.Config{
-		Importer: importer.Default(),
+		Importer: projectImporter,
 		Error:    func(error) {},
 	}
-	pkg, _ := conf.Check(dir, fset, parsed, info)
-	dispatch := newGoInterfaceDispatch(pkg, root, dir, fset, symbolIdx)
+	pkg, _ := conf.Check(pkgPath, fset, parsed, info)
+	dispatch := newGoInterfaceDispatch(pkg, root, dir, fset, symbolIdx, pkgDirsByImport)
 
 	var edges []core.Edge
 	seen := map[string]bool{}

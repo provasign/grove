@@ -142,7 +142,7 @@ func goDispatchFixture(t *testing.T, src string, wantTypeError bool, extra ...co
 				ParentSymbol: recv, FilePath: "fixture.go", Kind: core.KindMethod, Language: "go"})
 		}
 	}
-	dispatch := newGoInterfaceDispatch(pkg, ".", ".", fset, newGoSymbolIndex(append(symbols, extra...)))
+	dispatch := newGoInterfaceDispatch(pkg, ".", ".", fset, newGoSymbolIndex(append(symbols, extra...)), nil)
 	got := map[string][]string{}
 	for _, decl := range file.Decls {
 		fn, ok := decl.(*ast.FuncDecl)

@@ -34,13 +34,18 @@ type goInterfaceDispatch struct {
 	cache           map[*types.Interface]map[string][]core.SymbolRecord
 }
 
-func newGoInterfaceDispatch(pkg *types.Package, root, dir string, fset *token.FileSet, index goSymbolIndex) *goInterfaceDispatch {
+func newGoInterfaceDispatch(pkg *types.Package, root, dir string, fset *token.FileSet, index goSymbolIndex, pkgDirsByImport map[string][]string) *goInterfaceDispatch {
 	d := &goInterfaceDispatch{pkg: pkg, root: root, dir: dir, fset: fset, index: index,
 		interfaceByType: map[*types.Interface]core.SymbolRecord{}, cache: map[*types.Interface]map[string][]core.SymbolRecord{}}
 	if pkg == nil {
 		return d
 	}
 	d.addInterfaces(pkg, dir)
+	for _, imported := range pkg.Imports() {
+		for _, importedDir := range pkgDirsByImport[imported.Path()] {
+			d.addInterfaces(imported, importedDir)
+		}
+	}
 	for _, name := range pkg.Scope().Names() {
 		obj, ok := pkg.Scope().Lookup(name).(*types.TypeName)
 		if !ok || obj.IsAlias() {
@@ -124,6 +129,9 @@ func (d *goInterfaceDispatch) contractEdges() []core.Edge {
 	for _, iface := range d.interfaces {
 		if !goDispatchTypeValid(iface.typ, map[types.Type]bool{}) {
 			continue
+		}
+		for i := 0; i < iface.typ.NumMethods(); i++ {
+			add(iface.symbol.ID, iface.symbol.ID+"#"+iface.typ.Method(i).Name(), core.EdgeContains)
 		}
 		for _, candidate := range d.candidates {
 			if !types.Implements(candidate.typ, iface.typ) {

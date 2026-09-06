@@ -780,6 +780,12 @@ func (g *CodeGraph) typeDeclaresMember(t *core.SymbolRecord, method string) bool
 			return true
 		}
 	}
+	for _, ei := range g.outbound[t.ID] {
+		edge := g.edges[ei]
+		if edge.Type == core.EdgeContains && edge.Source == core.EvidenceSourceNative && edge.To == t.ID+"#"+method {
+			return true
+		}
+	}
 	// Native analyzers can prove members inherited through embedded external
 	// interfaces even when the member text is absent from this declaration.
 	for _, ei := range g.inbound[t.ID] {

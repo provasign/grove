@@ -567,6 +567,11 @@ func carriedNativeEdges(stored []core.Edge, symbols []core.SymbolRecord, skipped
 		if l, ok := symLang[node]; ok {
 			return l, true
 		}
+		if base, _, synthetic := strings.Cut(node, "#"); synthetic {
+			if l, ok := symLang[base]; ok {
+				return l, true
+			}
+		}
 		if rest, ok := strings.CutPrefix(node, "file:"); ok {
 			if l, ok2 := fileLang[rest]; ok2 {
 				return l, true
@@ -616,6 +621,11 @@ func carriedPartialEdges(stored []core.Edge, symbols []core.SymbolRecord, partia
 	nodeInfo := func(node string) (lang, file string, ok bool) {
 		if s, found := symInfo[node]; found {
 			return s.Language, s.FilePath, true
+		}
+		if base, _, synthetic := strings.Cut(node, "#"); synthetic {
+			if s, found := symInfo[base]; found {
+				return s.Language, s.FilePath, true
+			}
 		}
 		if rest, found := strings.CutPrefix(node, "file:"); found {
 			if l, ok2 := fileLang[rest]; ok2 {

@@ -12,9 +12,13 @@ import (
 
 const goInterfaceImpactSource = `package coverage
 
-import "net/http"
+import (
+	"hash"
+	"net/http"
+)
 
 type Writer interface { http.CloseNotifier }
+type Lonely interface { hash.Hash }
 type writer struct { http.ResponseWriter }
 func (w *writer) CloseNotify() <-chan bool { return nil }
 type promoted struct { *writer }
@@ -61,6 +65,7 @@ func TestGoInterfaceImpactEmbeddedExternal(t *testing.T) {
 		wantSupers []string
 	}{
 		{"Writer.CloseNotify", []string{"Stream", "Promoted", "External", "Concrete"}, []string{"other.CloseNotify", "writer.CloseNotify"}, nil},
+		{"Lonely.Reset", nil, nil, nil},
 		{"writer.CloseNotify", []string{"Stream", "Promoted", "External", "Concrete"}, nil, []string{"Writer.CloseNotify"}},
 		{"other.CloseNotify", []string{"Stream", "External"}, nil, []string{"Writer.CloseNotify"}},
 		{"wrongReturn.CloseNotify", nil, nil, nil},
@@ -162,5 +167,131 @@ func TestGoInterfaceImpactIncrementalRemovesStaleDispatch(t *testing.T) {
 	}
 	if len(snapshots) == 2 && !reflect.DeepEqual(snapshots[0], snapshots[1]) {
 		t.Fatal("full and incremental edge sets differ")
+	}
+}
+
+func TestGoInterfaceImpactCrossPackageContract(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	files := map[string]string{
+		"go.mod": "module example.com/cross\n\ngo 1.22\n",
+		"api/api.go": `package api
+import "net/http"
+type Writer interface { http.CloseNotifier }
+func Stream(w Writer) { <-w.CloseNotify() }
+`,
+		"impl/impl.go": `package impl
+import (
+	"example.com/cross/api"
+	"example.com/cross/util"
+)
+type Writer struct{}
+func (*Writer) CloseNotify() <-chan bool { return nil }
+var _ api.Writer = (*Writer)(nil)
+var _ = util.Marker
+type Wrong struct{}
+func (*Wrong) CloseNotify() chan bool { return nil }
+`,
+		"util/util.go": `package util
+const Marker = true
+`,
+	}
+	for path, body := range files {
+		abs := filepath.Join(root, path)
+		if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(abs, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	enabled := true
+	eng, err := Open(ctx, Config{RepoRoot: root, NativeAnalyzers: &enabled})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	if _, err := eng.Index(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	impact, err := eng.ChangeImpactScoped(ctx, "Writer.CloseNotify", "api/api.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(impact.Family) != 1 || impact.Family[0].QualifiedName != "Writer.CloseNotify" || impact.Family[0].FilePath != "impl/impl.go" {
+		t.Fatalf("cross-package family = %#v", impact.Family)
+	}
+	if len(impact.Callers) != 1 || impact.Callers[0].QualifiedName != "Stream" || impact.Callers[0].FilePath != "api/api.go" {
+		t.Fatalf("cross-package callers = %#v", impact.Callers)
+	}
+}
+
+func TestGoInterfaceImpactCrossPackageIncrementalRemovesStaleContract(t *testing.T) {
+	var snapshots [][]string
+	for _, incremental := range []bool{false, true} {
+		t.Run(map[bool]string{false: "full", true: "incremental"}[incremental], func(t *testing.T) {
+			if incremental {
+				t.Setenv("GROVE_INCREMENTAL", "1")
+			} else {
+				t.Setenv("GROVE_INCREMENTAL", "")
+			}
+			root := t.TempDir()
+			files := map[string]string{
+				"go.mod": "module example.com/cross\n\ngo 1.22\n",
+				"api/api.go": `package api
+import "net/http"
+type Writer interface { http.CloseNotifier }
+func Stream(w Writer) { <-w.CloseNotify() }
+`,
+				"impl/impl.go": `package impl
+import "example.com/cross/api"
+type Writer struct{}
+func (*Writer) CloseNotify() <-chan bool { return nil }
+var _ api.Writer = (*Writer)(nil)
+`,
+			}
+			for path, body := range files {
+				abs := filepath.Join(root, path)
+				if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(abs, []byte(body), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ctx := context.Background()
+			enabled := true
+			eng, err := Open(ctx, Config{RepoRoot: root, NativeAnalyzers: &enabled})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer eng.Close()
+			if _, err := eng.Index(ctx, ""); err != nil {
+				t.Fatal(err)
+			}
+			before, err := eng.ChangeImpactScoped(ctx, "Writer.CloseNotify", "api/api.go")
+			if err != nil || len(before.Family) != 1 {
+				t.Fatalf("before edit: %#v, %v", before, err)
+			}
+			edited := strings.Replace(files["impl/impl.go"], "() <-chan bool", "() chan bool", 1)
+			edited = strings.Replace(edited, "var _ api.Writer = (*Writer)(nil)", "var _ = api.Stream", 1)
+			if err := os.WriteFile(filepath.Join(root, "impl/impl.go"), []byte(edited), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := eng.Index(ctx, ""); err != nil {
+				t.Fatal(err)
+			}
+			after, err := eng.ChangeImpactScoped(ctx, "Writer.CloseNotify", "api/api.go")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(after.Declarations) != 1 || len(after.Family) != 0 || len(after.Callers) != 1 || after.Callers[0].QualifiedName != "Stream" {
+				t.Fatalf("stale cross-package contract after incompatible return: %#v", after)
+			}
+			snapshots = append(snapshots, storedEdgeDump(t, root))
+		})
+	}
+	if len(snapshots) == 2 && !reflect.DeepEqual(snapshots[0], snapshots[1]) {
+		t.Fatal("full and incremental cross-package edge sets differ")
 	}
 }
