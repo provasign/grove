@@ -1,0 +1,10 @@
+{
+  "enabledMcpjsonServers": [
+    "prism"
+  ],
+  "permissions": {
+    "allow": [
+      "mcp__prism"
+    ]
+  }
+}
