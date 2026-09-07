@@ -7,8 +7,8 @@ import (
 	"github.com/provasign/grove/internal/core"
 )
 
-// Mainframe call resolution, kept apart from the modern-language path on
-// purpose (docs/mainframe-build-plan.md): resolveCallEdges dispatches here
+// Mainframe call resolution is kept apart from the modern-language path:
+// resolveCallEdges dispatches here
 // for cobol/jcl symbols and the modern machinery never sees them.
 //
 // Semantics differ from modern languages in two ways:

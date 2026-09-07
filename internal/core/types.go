@@ -78,7 +78,7 @@ const (
 	// interface satisfaction is implicit.
 	EdgeOverrides EdgeType = "overrides"
 
-	// Mainframe data-flow vocabulary (docs/mainframe-build-plan.md).
+	// Mainframe data-flow vocabulary.
 	EdgeReads     EdgeType = "reads"         // symbol reads a data item
 	EdgeWrites    EdgeType = "writes"        // symbol writes a data item
 	EdgeRedefines EdgeType = "redefines"     // alternate view over the same storage

@@ -7,8 +7,8 @@ import (
 	"strings"
 )
 
-// Content-based detection for mainframe artifacts (docs/mainframe-build-plan.md,
-// phase 0.2). Estate exports are routinely extensionless — PDS members land as
+// Content-based detection for mainframe artifacts. Estate exports are routinely
+// extensionless — PDS members land as
 // bare "CUSTUPD" files — so extension dispatch alone renders a whole corpus
 // invisible. The rules here are deliberately narrow:
 //

@@ -229,7 +229,7 @@ discipline for the MCP surface.
   (callers of the old name break); a pure file move is not.
 
 Accuracy, performance, and trust fixes from the 2026-06-11 assessment
-(`docs/grove-assessment-2026-06-11.md`).
+(recorded in the 2026-06-11 repository assessment).
 
 ### Fixed — correctness
 - **Symbol-ID collisions (critical):** same-named members in one file (two

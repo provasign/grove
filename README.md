@@ -1,403 +1,149 @@
 # Grove
 
-> **Your codebase's persistent long-term memory — queryable by any AI agent.**
+**A local, multilingual code graph for impact analysis.** Grove parses a repository, stores symbols and typed relationships in SQLite, and answers deterministic questions about callers, implementations, dependencies, tests, and change impact.
 
-> **Embedded mode (current):** Grove is the shared semantic graph engine at `github.com/provasign/grove/pkg/grove`. Prism embeds it and opens the on-disk index in-process. There is no `grove serve` daemon, no port (7777/7778), and no `.grove/.token`. Tool builders can also use the Go API, CLI (`grove index .`, `grove symbols main`), or stdio MCP (`grove mcp`) directly.
+Grove is the graph engine embedded by [Prism](https://github.com/provasign/prism). Tool builders can also use it directly through the CLI, MCP server, or Go package.
 
----
+## What it provides
 
-Grep answers "does this string appear somewhere?" A language server answers "where is this symbol defined?" Grove answers the harder questions AI agents actually need:
+- Tree-sitter extraction across ten languages, with native semantic enrichment when the local toolchain is available
+- Type-resolved calls, imports, inheritance, implementation, type-use, and test relationships
+- Incremental indexing by content hash
+- Deterministic change-impact, rename, missing-implementation, and dead-code operations
+- A local SQLite store with no network service or account
+- An embeddable Go API and stdio MCP server
 
-- *What does changing this function break — across the entire codebase?*
-- *What is the full dependency chain from this file?*
+Grove reports evidence and capability tiers. Language support means the file can be parsed and indexed; it does not imply identical semantic precision in every language or repository configuration.
 
-The difference is a graph. Grove indexes your source files into a persistent SQLite graph — 11 languages, 8 core edge types (plus 4 mainframe data-flow kinds), BFS traversal — and keeps it live with delta indexing (files whose content hash hasn't changed are never re-parsed). The graph is queryable through the embedded Go API, CLI, and MCP stdio.
+## Install
 
-Grove is infrastructure, not another setup step in the public product line.
-Prism embeds it to power change intelligence; tool builders can use it directly
-when they need the underlying graph primitives without Prism's task-shaped
-operations and context delivery.
-
-Grove also exposes a conservative certification report for unified diffs. This mode is additive: consumers see no change unless they explicitly opt into the report. The report labels heuristic evidence, returns `manual_review` for unsupported or unmapped changes, and only returns `allow` when changed code maps cleanly to indexed symbols with required test evidence.
-
----
-
-## Architecture
-
-```
-Source files
-     │
-     ▼
-┌─────────────────────────────────────────────────────────┐
-│  internal/parser/                                       │
-│  Tree-sitter AST walkers (11 languages)                 │
-│  Regex fallback for syntax-error recovery               │
-│  Native semantic analyzers for Go, Python, Java,       │
-│  Rust, C, C++, C#, PHP, JS, and TS                      │
-│  All CGO is isolated to this package                    │
-└────────────────────────┬────────────────────────────────┘
-                         │ []SymbolRecord
-                         ▼
-┌─────────────────────────────────────────────────────────┐
-│  internal/store/                                        │
-│  SQLite WAL                                             │
-│  Delta indexing by content SHA                          │
-│  Stale-file pruning                                     │
-└────────────────────────┬────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────┐
-│  internal/graph/                                        │
-│  In-memory CodeGraph                                    │
-│  8 core edge types                                           │
-│  BFS traversal                                          │
-└──────┬─────────────────┬───────────────────────────────┘
-       │
-       ├───────────────────────┐
-       ▼                       ▼
-┌────────────┐        ┌────────────────────┐
-│ internal/  │        │ pkg/grove          │
-│ mcp/       │        │ Embedded Go API    │
-│ 9 tools    │        │ Query / impact /   │
-│ JSON-RPC   │        │ deps / impact / ICR │
-│ stdio      │        │ / certify / diff   │
-└────────────┘        └────────────────────┘
-```
-
----
-
-## Design Decisions
-
-**Single binary, zero runtime dependencies.** SQLite is embedded via `modernc.org/sqlite` — a pure-Go port — which avoids a CGO linker conflict with tree-sitter. Tree-sitter itself (in `internal/parser/`) is the only CGO dependency.
-
-**Delta indexing by content hash.** Grove hashes each file before parsing. If the stored hash matches, the file is skipped entirely. Indexing a 5000-file repo after a one-line change touches one file, not 5000.
-
-**AST-first with native enrichment.** Tree-sitter produces a complete AST even for files with syntax errors, but marks broken subtrees as `ERROR` nodes. When `root.HasError()` is true, Grove runs both the AST extractor and the regex fallback, then merges the results with AST taking precedence. On top of that, language-native analyzers add type-use, inheritance, and import edges when the local toolchain is available. (Call edges are owned by the call-site resolver in `internal/graph/`, which narrows by inferred receiver type — text-matching call edges in the native pass exploded fan-out on overload- and same-name-heavy code, so they were retired in favor of the narrowed graph-layer resolution.) Files that are actively being edited mid-keystroke are still indexed usefully, and the graph gets richer when the repository can be resolved with native tooling.
-
-**Scoped edges prevent false positives.** `calls` and `uses-type` edges are only created between symbols in the same file or in files connected by an `imports` edge. Without this constraint, a function named `parse` in one package would appear to call a `parse` function in an unrelated package, producing roughly 5× the false-positive edges.
-
-**Symbol ID format.** Every symbol has a canonical ID: `{filePath}::{qualifiedName}@{contentSHA}` (SHA-1 of the file content). Qualified names include the parent — `Service.Login`, `User.__init__` — so same-named members on different receivers or classes in one file stay distinct; any residual collision is disambiguated deterministically. The content-SHA component means that if you rename a function, the old symbol ID disappears and a new one is created — stale references in the graph don't survive a reindex.
-
----
-
-## Language Support
-
-| Language | Extension(s) | Extraction |
-|----------|-------------|-----------|
-| Go | `.go` | AST walker + native semantic enrichment |
-| TypeScript | `.ts` | AST walker + native semantic enrichment |
-| TSX | `.tsx` | AST walker + native semantic enrichment |
-| JavaScript | `.js .jsx .mjs .cjs` | AST walker + native semantic enrichment |
-| Python | `.py` | AST walker + native semantic enrichment |
-| Java | `.java` | AST walker + native semantic enrichment |
-| Rust | `.rs` | AST walker + native semantic enrichment |
-| C | `.c .h` | AST walker + native semantic enrichment |
-| C++ | `.cc .cpp .cxx .hh .hpp` | AST walker + native semantic enrichment |
-| C# | `.cs` | AST walker + native semantic enrichment |
-| PHP | `.php .phtml` | AST walker + native semantic enrichment |
-
-Non-code files (`.md`, `.yaml`, `.json`, `.xml`, `.sh`, `.toml`, `.proto`, `.sql`, `Makefile`, `Dockerfile`, and more) are indexed as `document` symbols whose content feeds the lexical search index. Agents can query them alongside code symbols.
-
-Language support is not a claim that every operation has identical semantic
-quality. `grove doctor [dir]` emits the versioned, machine-readable capability
-manifest with `precise`, `measured`, `structural`, `heuristic`, and
-`unsupported` tiers, current index status, and operation caveats. Native
-analyzer availability can raise the evidence ceiling, but a timeout or missing
-tool must not be interpreted as compiler-resolved coverage.
-
----
-
-## Measured Accuracy
-
-Grove's edges are scored against typed-toolchain ground truth on pinned
-real-world repos, and CI fails any change that regresses below the recorded
-floors (see [eval/README.md](eval/README.md) for methodology, oracles, and
-the full progression history). Calls-edge accuracy across **ten languages**,
-2026-06-13:
-
-| Repo (pin) | Language | Oracle | Precision | Recall | F1 |
-|---|---|---|---|---|---|
-| gin | Go | go/ssa + VTA callgraph | 0.93 | 0.95 | **0.94** |
-| socket.io | TypeScript | TypeScript compiler API | 0.85 | 0.96 | **0.90** |
-| commons-lang | Java | javac + javap bytecode | 0.69 | 0.84 | **0.76** |
-| express | JavaScript (CJS) | TypeScript compiler API (checkJs) | 0.75 | 0.71 | **0.73** |
-| flask | Python | dynamic (pytest runtime trace) | 0.85 | 0.61 | **0.71** |
-| ripgrep | Rust | rust-analyzer SCIP index | 0.85 | 0.60 | **0.70** |
-| jansson | C / C++ | scip-clang SCIP index | 0.88 | 0.56 | **0.69** |
-| Newtonsoft.Json | C# | Roslyn semantic model | 0.66 | 0.70 | **0.68** |
-| PHP-Parser | PHP | dynamic (xdebug runtime trace) | 0.77 | 0.54 | **0.63** |
-
-Notes on reading these honestly:
-
-- Oracles match each ecosystem: typed static analysis where the language has
-  it (Go SSA/VTA, the TypeScript checker, Roslyn, rust-analyzer and
-  scip-clang SCIP, Java bytecode), and **runtime execution** for the
-  dynamically-dispatched languages (Python and PHP test-suite traces).
-- A runtime oracle records edges no static tool can see (registry dispatch,
-  dunder/magic protocols, proxies, virtual dispatch), so for Python and PHP
-  recall against it is a conservative lower bound and precision is the lever
-  that matters. The static-oracle languages are the inverse — precision is
-  the lower bound where a true edge runs through an untested or dynamically
-  dispatched path the structural graph can't pin to one target.
-- Heuristic test-coverage edges were REMOVED (v0.34-era measurement:
-  4-12% recall against real runtime coverage — an unreliable signal is
-  worse than none). A test that exercises code has a resolved `calls`
-  edge to it; covering-test questions answer over the calls graph.
-  Blast radius (depth-2 reverse reachability on gin) scores F1 0.88.
-- Every number above is a CI gate (`.github/workflows/eval.yml`), including
-  a universe-match floor that catches tree-sitter grammar drift when new
-  language syntax ships.
-
-Ground truths are tool-agnostic JSONL — score your own code graph against
-them.
-
----
-
-## Graph Edge Types
-
-| Edge | Meaning |
-|------|---------|
-| `defines` | File defines this symbol |
-| `contains` | Class/namespace contains this member |
-| `imports` | File imports another file |
-| `extends` | Class extends/embeds another |
-| `implements` | Class implements an interface |
-| `calls` | Function calls another function (scoped) |
-| `uses-type` | Function/field uses a type (scoped) |
-| `overrides` | Concrete method implements an interface/abstract declaration |
-
----
-
-## Performance
-
-Measured on real repositories (macOS, Apple Silicon, 2026-06-12), parallel
-parsing and native analyzers enabled:
-
-| Repo | Files indexed | Symbols | Edges | Cold index | One-file change | No-change reindex (CLI) |
-|------|--------------:|--------:|------:|-----------:|----------------:|------------------------:|
-| [prometheus](https://github.com/prometheus/prometheus) | 1,476 | 14k | 259k | 12.2 s | — | 0.7 s |
-| [django](https://github.com/django/django) | 3,792 | 39.5k | 425k | 18.5 s | — | 1.5 s |
-| [grafana](https://github.com/grafana/grafana) | 18,979 | 98.5k | 1.16M | 56.6 s | 18.7 s | 9.5 s |
-
-How to read these:
-
-- **Cold index** includes tree-sitter parsing of everything, native
-  analyzers (the TypeScript program check dominates polyglot repos), full
-  edge construction, and persistence.
-- **One-file change** re-parses one file, runs native analyzers only for
-  the changed file's language (untouched languages' edges are carried
-  forward), rebuilds the graph, and diff-syncs the edge table (only changed
-  rows are written). The remaining cost on huge repos is the full
-  in-memory edge rebuild — per-file incremental edge maintenance is the
-  known next step.
-- **No-change reindex (CLI)** is dominated by per-process graph
-  rehydration from SQLite — a long-lived embedded engine (Prism MCP, Fuse)
-  pays it once at open, after which a no-change `Index()` is milliseconds
-  and queries run against the in-memory graph (BFS depth-3 over 50k nodes
-  ≈ 4.5 ms, ranked search ≈ 15 ms at 50k symbols).
-- Native analyzer timeouts default to 5 s per analyzer; very large repos
-  may need `GROVE_NATIVE_TIMEOUT=60s` for `go list`/`tsc` to finish (skips
-  degrade gracefully and are reported in the index diagnostics).
-- **Incremental edge construction** (v0.24.0, on by default;
-  `GROVE_INCREMENTAL=0` opts out): delta reindexes in a resident session
-  recompute only the edges an edit can affect, with an automatic
-  full-rebuild fallback and a byte-identical-output guarantee — a
-  single-file edit on a kubernetes-scale monorepo (160k symbols, 6.3M
-  edges) dropped ~95s → ~33s. Design, invariants, and verification gates:
-  [docs/INCREMENTAL_INDEXING.md](docs/INCREMENTAL_INDEXING.md).
-
----
-
-## Tool and IDE Integration
-
-Grove is the graph backend for the toolchain. Prism and Fuse consume the embedded Go API directly. Direct AI agent integration is available through MCP stdio.
-
-| Integration | How | Use case |
-|-------------|-----|---------|
-| Claude Code CLI | `grove mcp .` → MCP stdio | Direct agent integration without Prism |
-| Cursor, Windsurf, Zed | `grove mcp .` → MCP stdio | Same |
-| VS Code (Copilot Agent) | Prism extension → embedded Grove | Grove-backed context through Prism |
-| Prism (all IDEs) | Embedded Go API | Token-optimized context delivery |
-| Fuse (git merge) | Embedded Go API | Blast radius + conflict hints |
-| Shale (planned) | Embedded Go API | Intent-to-diff conformance |
-| Custom automation | `pkg/grove` | In-process Go integration |
-
-For most AI agent use cases, running Grove directly is only necessary for custom integrations. The normal path is `prism init` in your project — Prism embeds Grove in-process and opens the index itself; nothing is started, installed, or configured separately.
-
----
-
-## Installation
-
-**Binary install (fastest):**
-
-```bash
-# macOS / Linux
+```sh
+# macOS or Linux
 curl -fsSL https://raw.githubusercontent.com/provasign/grove/main/install.sh | bash
 
-# Windows (PowerShell)
+# Windows PowerShell
 irm https://raw.githubusercontent.com/provasign/grove/main/install.ps1 | iex
 
-# Pin a specific version
-VERSION=v0.5.0 curl -fsSL https://raw.githubusercontent.com/provasign/grove/main/install.sh | bash
+# Pin the current release
+VERSION=v0.43.2 curl -fsSL https://raw.githubusercontent.com/provasign/grove/main/install.sh | bash
 ```
 
-Installs to `~/bin` by default. Set `INSTALL_DIR=/usr/local/bin` to override.
+The installer writes to `~/bin` by default. Set `INSTALL_DIR` to choose another location.
 
-**Build from source:**
+Build from source:
 
-```bash
-make build    # compile ./bin/grove
-make install  # install to $GOPATH/bin
-make test     # run all tests
+```sh
+make build
+make test
+make install
 ```
 
----
+## Quick start
 
-## CLI Reference
+```sh
+grove init .
+grove index .
+grove status .
 
-```bash
-# Set up a project (creates .grove/ directory and config)
-grove init [dir]
-
-# Index or reindex (skips unchanged files via delta SHA; reuses the stored
-# graph outright when nothing changed — --force re-runs analyzers anyway)
-grove index [dir] [--force]
-
-# Show persisted index status without refreshing
-grove status [dir] [--refresh]
-
-# Symbol search
-grove symbols <query> [dir] [--refresh]
-
-# Blast radius: what would break if this symbol changed?
-grove impact <symbol> [dir] [--refresh]
-
-# Type-resolved change-set for a method signature change: declaration +
-# override/implementation family (subtype closure) + all resolved callers,
-# in one deterministic call
-grove change-impact 'Type.method(ParamType, ...)' [dir]
-# Same-named types in different packages? Scope to a declaring file via the
-# Go API: Engine.ChangeImpactScoped(ctx, query, file). Java package scope
-# spans Maven/Gradle source roots (src/test/java/com/x sees src/main/java/
-# com/x without an import), so same-package test callers are in the set.
-
-# Rename a method: the change-impact set converted into concrete edit
-# lines (file, line, before/after), review-and-apply
-grove rename-plan 'Type.method' NewName [dir]
-
-# Interface evolution: every type claiming the contract that does NOT
-# implement the member (missing / abstract / unverifiable buckets); under
-# a default body, "missing" = inherits the default, breaks if made required
-grove missing-implementations 'Type.method' [dir]
-
-# Unreachable production functions/methods. Precision-first: unreachable
-# AND non-exported AND name-unreferenced; caveats are part of the answer
-grove dead-code [dir] [--roots a,b]
-
-
-# Conservative structural certification for a unified diff.
-# Exit codes: 0 allow, 2 manual_review, 3 block, 1 runtime error.
-grove certify <diff-file-or-> [dir]
-
-# Start MCP stdio server (primary AI agent integration)
-grove mcp [dir]
-
+grove symbols QueryData .
+grove change-impact 'QueryDataHandler.QueryData' .
+grove deps internal/service/query.go .
 ```
 
-## Graph Diff
+Grove stores the index in `.grove/grove.db`. Re-running `grove index` hashes the working tree and updates changed files and affected packages. See [incremental indexing](docs/INCREMENTAL_INDEXING.md) for the invariants and verification strategy.
 
-`pkg/grove` exposes the primitive behind cross-agent drift detection:
+## Task-shaped operations
 
-```go
-before := eng.SnapshotSymbols(ctx)   // capture
-// ... merge lands / files change ...
-eng.Index(ctx, "")                   // reindex
-diff := eng.DiffSince(ctx, before)   // structural delta
-```
+| Question | Command |
+|---|---|
+| Which symbols match this name? | `grove symbols <query>` |
+| What depends on this file or symbol? | `grove impact <query>` |
+| What must change with this method signature? | `grove change-impact 'Type.method(Params)'` |
+| Which types lack an interface member? | `grove missing-implementations 'Type.method'` |
+| Which exact lines participate in a rename? | `grove rename-plan 'Type.method' NewName` |
+| Which affected code lacks test evidence? | `grove untested-surface 'Type.method'` |
+| Which production symbols appear unreachable? | `grove dead-code` |
+| Can a structural diff be certified? | `grove certify <diff-file-or->` |
 
-`GraphDiff` reports added, removed, and changed symbols plus
-`BreakingChanges` (exported symbols removed or with a changed signature).
-Symbols are matched by stable identity — file path + qualified name + kind —
-so line shifts and content-SHA churn don't register; only symbols whose
-signature or body actually changed appear. Fuse can diff the graph across a
-merge and intersect the result with another agent's working set to deliver
-"the ground shifted under you" notifications with a minimal context patch.
+`change-impact` returns the declaration, override and implementation family, super-declarations, and resolved callers. For Go, it can identify local methods satisfying a compatible external interface method even when that interface is declared in a dependency.
 
-## Certification Mode
+These operations are conservative about uncertainty. Runtime dispatch, reflection, dependency injection, generated code, and missing toolchains can limit static evidence; callers should inspect the returned completeness and caveat fields.
 
-`grove certify` and `pkg/grove.Engine.CertifyDiff` map unified diff hunks to indexed symbols and emit a JSON report containing changed files, changed symbols, impacted symbols, related tests, unknowns, findings, and a verdict.
+Run `grove --help` for the current command and flag list.
 
-Verdicts are intentionally conservative:
+## MCP
 
-| Verdict | Meaning |
-|---------|---------|
-| `allow` | Grove mapped the diff to indexed symbols and found required evidence. |
-| `manual_review` | Grove could not prove enough structurally, for example unsupported files, ignored/sensitive paths, deleted/binary files, unmapped hunks, a stale index (file on disk no longer matches the indexed content), or missing test evidence. |
-| `block` | Grove could not process the diff deterministically, for example malformed diff input. |
+Start the stdio server in a repository:
 
-Certification mode is not a compiler or language-server resolver. Tree-sitter, astkit, and the native analyzers provide structural facts; the report still stays conservative and falls back to `manual_review` whenever evidence is incomplete.
-
----
-
-## HTTP API
-
-There is no HTTP or gRPC daemon in the current embedded mode. Use `pkg/grove` for in-process integration, the CLI for local commands, or `grove mcp` for stdio MCP.
-
----
-
-## MCP Tools
-
-Grove exposes eight tools over JSON-RPC 2.0 stdio, accessible to any MCP-capable AI agent. Every tool publishes a full JSON schema with per-parameter descriptions, so agents can discover arguments without guessing:
-
-| Tool | Purpose |
-|------|---------|
-| `grove_index` | Index or reindex a directory (`force` re-runs analyzers) |
-| `grove_symbols` | Lexical symbol search, ranked by match quality |
-| `grove_query` | Semantic search: ranked context for a free-text intent |
-| `grove_impact` | Blast radius for a symbol or file |
-| `grove_deps` | Dependency edges for a file |
-| `grove_icr` | Isolated Change Region for an intent |
-| `grove_conflicts` | Overlap check between two ICRs |
-| `grove_certify` | Conservative certification report for a unified diff |
-
-Start the MCP server:
-
-```bash
+```sh
 grove mcp .
 ```
 
-## Storage
+The MCP surface exposes indexing, symbol search, semantic query, impact, dependency, isolated-change-region, conflict, and diff-certification operations. [Prism](https://github.com/provasign/prism) is the recommended agent-facing layer when you want token-budgeted source delivery, complete method change sets, and diff verification in a focused six-tool surface.
 
-Grove stores everything in `.grove/grove.db` (SQLite, WAL mode). The database is a single file — back it up, copy it, or delete it to force a full reindex. Schema migrations are applied when the store opens.
+## Go API
 
-Key SQLite settings:
-- WAL mode for concurrent reads during indexing
-- `busy_timeout = 30s` to handle contention without immediate errors
+```go
+import "github.com/provasign/grove/pkg/grove"
 
----
+eng, err := grove.Open(ctx, grove.Config{RepoRoot: "/path/to/repo"})
+if err != nil {
+    return err
+}
+defer eng.Close()
 
-## Security
+if _, err := eng.Index(ctx, ""); err != nil {
+    return err
+}
 
-Grove does not expose a network listener in embedded mode. Indexing skips dependency/build/cache directories, honors `.groveignore` and `.gitignore`, and avoids common secret-bearing filenames and credential/key extensions.
-
----
-
-## Testing
-
-```bash
-make test                                          # all packages
-go test ./internal/parser/... -run TestGoExtractor # single extractor
-go test ./internal/parser/... -v                   # verbose parser tests
+result, err := eng.ChangeImpact(ctx, "QueryDataHandler.QueryData")
 ```
 
-Key test areas: language extractors (fixture-based), BFS traversal on known graph topologies, delta indexing, ignore/secret-safe indexing, MCP stdio framing, and FTS5 query ranking.
+The package also exposes snapshots and structural diffs for integrations that need to detect graph changes across edits or merges.
 
-**Regression gate — run before committing/releasing graph changes.** CI runs
-these on push (`.github/workflows/ci.yml`, `.github/workflows/eval.yml`):
+## Language support
 
-- `make test` / `go test ./...` — unit suite; must be green.
-- Edge-accuracy eval vs the Go SSA/VTA oracle: build `./cmd/grove-eval`, then
-  `truth` + `score` against `eval/baseline.json` (see `.github/workflows/eval.yml`).
-  `calls`-edge resolution must not regress below the committed baseline — that
-  is the accuracy number the whole toolchain depends on. Do not tag a release
-  with either red.
+| Language | Extensions |
+|---|---|
+| Go | `.go` |
+| TypeScript / TSX | `.ts`, `.tsx` |
+| JavaScript / JSX | `.js`, `.jsx`, `.mjs`, `.cjs` |
+| Python | `.py` |
+| Java | `.java` |
+| Rust | `.rs` |
+| C / C++ | `.c`, `.h`, `.cc`, `.cpp`, `.cxx`, `.hh`, `.hpp` |
+| C# | `.cs` |
+| PHP | `.php`, `.phtml` |
+
+Common non-code files are indexed as document symbols for lexical retrieval. Native analyzers can enrich the graph when the relevant language tooling is available.
+
+## Accuracy and testing
+
+Grove's graph operations are scored against independent or typed-toolchain ground truth on pinned repositories. CI runs unit tests and the committed accuracy gates. Method-level impact results used by Prism are also evaluated in [provasign/research](https://github.com/provasign/research), including exact task definitions, oracles, and raw agent transcripts.
+
+```sh
+make test
+go test ./internal/parser/... -v
+```
+
+See [eval/README.md](eval/README.md) for Grove's engine evaluation and progression history.
+
+## Storage and security
+
+The SQLite database uses WAL mode for concurrent reads. Indexing honors `.gitignore` and `.groveignore`, skips dependency, build, and cache directories, and excludes common credential and key files. Grove does not open a network listener.
+
+See [SECURITY.md](SECURITY.md) and [THREAT_MODEL.md](THREAT_MODEL.md) for reporting and trust boundaries.
+
+## Related projects
+
+- [Prism](https://github.com/provasign/prism) — agent-facing context and change verification
+- [Shale](https://github.com/provasign/shale) — local agent-session evidence for pull requests
+- [Research](https://github.com/provasign/research) — reproducible evaluations and raw results
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md), [GOVERNANCE.md](GOVERNANCE.md), and [SUPPORT.md](SUPPORT.md).
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).

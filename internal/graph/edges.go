@@ -1439,7 +1439,7 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSatisfaction) []core.Edge {
 	if symbol.Language == "cobol" || symbol.Language == "jcl" {
 		// Mainframe semantics live in their own resolver; the machinery
-		// below never sees these symbols (docs/mainframe-build-plan.md).
+		// below never sees these symbols.
 		return resolveMainframeCallEdges(idx, symbol)
 	}
 	var edges []core.Edge
