@@ -579,6 +579,146 @@ class Auth:
 	}
 }
 
+func TestPythonUnionAndSubscriptAnnotationsProduceTypeEdges(t *testing.T) {
+	if firstExistingExecutable("python3", "python") == "" {
+		t.Skip("python3/python not available")
+	}
+	root := t.TempDir()
+	_ = os.WriteFile(filepath.Join(root, "requirements.txt"), []byte(""), 0o644)
+	// PEP 604 unions and parameterized generics are the ordinary way modern
+	// Python spells an optional/contained type. Before type_names() walked
+	// BinOp and Subscript slices, every one of these annotations resolved to
+	// nothing (union) or to the container name (generic), so a widely used
+	// type reported only its own declaration under change-impact.
+	_ = os.WriteFile(filepath.Join(root, "conn.py"), []byte(`
+import typing
+
+class ProxyConfig(typing.NamedTuple):
+    host: str
+
+def takes_union(cfg: ProxyConfig | None = None) -> None:
+    print(cfg)
+
+def takes_generic(cfgs: list[ProxyConfig]) -> None:
+    print(cfgs)
+
+def takes_forward_ref(cfg: "ProxyConfig") -> None:
+    print(cfg)
+`), 0o644)
+
+	symbols := []core.SymbolRecord{
+		{ID: "conn.py::ProxyConfig@1", FilePath: "conn.py", Language: "python", Kind: core.KindClass, Name: "ProxyConfig"},
+		{ID: "conn.py::takes_union@1", FilePath: "conn.py", Language: "python", Kind: core.KindFunction, Name: "takes_union"},
+		{ID: "conn.py::takes_generic@1", FilePath: "conn.py", Language: "python", Kind: core.KindFunction, Name: "takes_generic"},
+		{ID: "conn.py::takes_forward_ref@1", FilePath: "conn.py", Language: "python", Kind: core.KindFunction, Name: "takes_forward_ref"},
+	}
+	a := pythonAnalyzer{}
+	result := a.Analyze(context.Background(), Request{
+		Root:    root,
+		Files:   []string{"conn.py"},
+		Symbols: symbols,
+	})
+	for _, from := range []string{"conn.py::takes_union@1", "conn.py::takes_generic@1", "conn.py::takes_forward_ref@1"} {
+		assertNativeEdge(t, result.Edges, from, "conn.py::ProxyConfig@1", core.EdgeUsesType)
+	}
+}
+
+func TestPythonImportedUnionAnnotationProducesCrossFileTypeEdge(t *testing.T) {
+	if firstExistingExecutable("python3", "python") == "" {
+		t.Skip("python3/python not available")
+	}
+	root := t.TempDir()
+	_ = os.WriteFile(filepath.Join(root, "requirements.txt"), []byte(""), 0o644)
+	_ = os.WriteFile(filepath.Join(root, "types.py"), []byte(`
+class ProxyConfig:
+    pass
+`), 0o644)
+	_ = os.WriteFile(filepath.Join(root, "consumer.py"), []byte(`
+from types import ProxyConfig as Config
+
+def connect(config: Config | None = None) -> None:
+    print(config)
+`), 0o644)
+
+	symbols := []core.SymbolRecord{
+		{ID: "types.py::ProxyConfig@1", FilePath: "types.py", Language: "python", Kind: core.KindClass, Name: "ProxyConfig", Span: core.LineRange{Start: 2, End: 3}},
+		{ID: "consumer.py::connect@1", FilePath: "consumer.py", Language: "python", Kind: core.KindFunction, Name: "connect", Span: core.LineRange{Start: 4, End: 5}},
+	}
+	a := pythonAnalyzer{}
+	result := a.Analyze(context.Background(), Request{
+		Root: root, Files: []string{"types.py", "consumer.py"}, Symbols: symbols,
+	})
+	assertNativeEdge(t, result.Edges, "consumer.py::connect@1", "types.py::ProxyConfig@1", core.EdgeUsesType)
+}
+
+func TestPythonExternalImportedAnnotationDoesNotBindUnrelatedLocalType(t *testing.T) {
+	if firstExistingExecutable("python3", "python") == "" {
+		t.Skip("python3/python not available")
+	}
+	root := t.TempDir()
+	_ = os.WriteFile(filepath.Join(root, "requirements.txt"), []byte(""), 0o644)
+	_ = os.WriteFile(filepath.Join(root, "models.py"), []byte("class User: pass\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(root, "consumer.py"), []byte(`
+from third_party import User
+
+def load(user: User | None = None) -> None:
+    print(user)
+`), 0o644)
+
+	symbols := []core.SymbolRecord{
+		{ID: "models.py::User@1", FilePath: "models.py", Language: "python", Kind: core.KindClass, Name: "User", Span: core.LineRange{Start: 1, End: 1}},
+		{ID: "consumer.py::load@1", FilePath: "consumer.py", Language: "python", Kind: core.KindFunction, Name: "load", Span: core.LineRange{Start: 4, End: 5}},
+	}
+	result := (pythonAnalyzer{}).Analyze(context.Background(), Request{
+		Root: root, Files: []string{"models.py", "consumer.py"}, Symbols: symbols,
+	})
+	for _, edge := range result.Edges {
+		if edge.From == "consumer.py::load@1" && edge.To == "models.py::User@1" && edge.Type == core.EdgeUsesType {
+			t.Fatalf("external User import bound to unrelated local User: %#v", edge)
+		}
+	}
+}
+
+func TestPythonTypeEdgesResolveSameNamedMethodsBySpan(t *testing.T) {
+	if firstExistingExecutable("python3", "python") == "" {
+		t.Skip("python3/python not available")
+	}
+	root := t.TempDir()
+	_ = os.WriteFile(filepath.Join(root, "requirements.txt"), []byte(""), 0o644)
+	// Two __init__ in one file: only the SECOND references Rule. Keying
+	// edges by (file, name) attributed it to the first (werkzeug
+	// routing/rules.py has six __init__; the real RuleTemplate site was
+	// reported as Subdomain, 82 lines away).
+	_ = os.WriteFile(filepath.Join(root, "rules.py"), []byte(`
+import typing as t
+
+class Rule:
+    pass
+
+class Subdomain:
+    def __init__(self, subdomain: str) -> None:
+        self.subdomain = subdomain
+
+class RuleTemplate:
+    def __init__(self, rules: t.Iterable[Rule]) -> None:
+        self.rules = rules
+`), 0o644)
+
+	symbols := []core.SymbolRecord{
+		{ID: "rules.py::Rule@1", FilePath: "rules.py", Language: "python", Kind: core.KindClass, Name: "Rule", Span: core.LineRange{Start: 4, End: 5}},
+		{ID: "rules.py::Subdomain.__init__@1", FilePath: "rules.py", Language: "python", Kind: core.KindMethod, Name: "__init__", ParentSymbol: "Subdomain", Span: core.LineRange{Start: 8, End: 9}},
+		{ID: "rules.py::RuleTemplate.__init__@1", FilePath: "rules.py", Language: "python", Kind: core.KindMethod, Name: "__init__", ParentSymbol: "RuleTemplate", Span: core.LineRange{Start: 12, End: 13}},
+	}
+	a := pythonAnalyzer{}
+	result := a.Analyze(context.Background(), Request{Root: root, Files: []string{"rules.py"}, Symbols: symbols})
+	assertNativeEdge(t, result.Edges, "rules.py::RuleTemplate.__init__@1", "rules.py::Rule@1", core.EdgeUsesType)
+	for _, edge := range result.Edges {
+		if edge.From == "rules.py::Subdomain.__init__@1" && edge.To == "rules.py::Rule@1" {
+			t.Fatalf("Rule attributed to Subdomain.__init__, which never mentions it: %#v", edge)
+		}
+	}
+}
+
 func TestRustAvailableWithCargoToml(t *testing.T) {
 	root := t.TempDir()
 	a := rustAnalyzer{}
