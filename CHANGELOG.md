@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.43.3 - 2026-09-08
+
+Python: type-use edges now cover modern annotations and resolve them to the
+correct symbol. PEP 604 unions, parameterized generics, and quoted forward
+references are traversed instead of dropping their contained types. Repeated
+method names in one file are attributed by source span, and annotations that
+refer to locally imported or re-exported types resolve across files without
+binding third-party imports to unrelated local declarations. On the pinned
+urllib3 benchmark source, change-impact for `ProxyConfig` improves from its
+declaration alone to the declaration plus all eight annotated function and
+method sites across five additional files.
+
 ## v0.43.2 - 2026-09-06
 
 Go: interface contracts resolve through method sets, across packages.
