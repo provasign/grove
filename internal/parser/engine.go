@@ -291,7 +291,7 @@ func extractGoImports(content string) []string {
 // starting from startIdx (0-indexed into lines).
 func extractBody(lines []string, startIdx int, language string) (endLine int, body string) {
 	switch language {
-	case "go", "typescript", "tsx", "javascript", "java", "rust":
+	case "go", "typescript", "tsx", "javascript", "java", "rust", "c", "cpp":
 		return extractBraceBody(lines, startIdx)
 	case "python":
 		return extractIndentBody(lines, startIdx)
@@ -445,6 +445,8 @@ func symbolPatterns(language string) []symbolPattern {
 		}
 	case "c", "cpp":
 		return []symbolPattern{
+			// Global operator declaration in a header.
+			{regexp.MustCompile(`^\s*(?:[\w*&:<>]+\s+)+(` + cppCallableNamePattern + `)\s*\([^;{}]*\)\s*;`), core.KindFunction, "", false},
 			// Free function: return-type name(  — anchored to avoid matching variable decls
 			{regexp.MustCompile(`^(?:[\w*&:<>\s]+\s+)+\*?([A-Za-z_][A-Za-z0-9_:]*)\s*\([^;]*$`), core.KindFunction, "", false},
 			{regexp.MustCompile(`^\s*(?:typedef\s+)?struct\s+([A-Za-z_][A-Za-z0-9_]*)\s*[{;]`), core.KindStruct, "", false},
@@ -519,7 +521,29 @@ func extractSymbols(language, filePath, blobSHA, content string, fileImports []s
 	return merged
 }
 
-var cppQualifiedCallableRe = regexp.MustCompile(`([A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*)::([~A-Za-z_][A-Za-z0-9_]*)\s*\(`)
+const cppCallableNamePattern = `(?:operator\s*(?:\[\]|\(\)|new(?:\[\])?|delete(?:\[\])?|[+*/%<>=!&|^~-]+)|~?[A-Za-z_][A-Za-z0-9_]*)`
+
+var cppQualifiedCallableRe = regexp.MustCompile(`([A-Za-z_][A-Za-z0-9_]*(?:<[^;{}()]+>)?(?:::[A-Za-z_][A-Za-z0-9_]*(?:<[^;{}()]+>)?)*)::(` + cppCallableNamePattern + `)\s*\(`)
+
+func cppStripTemplateArgs(name string) string {
+	var out strings.Builder
+	depth := 0
+	for _, r := range name {
+		switch r {
+		case '<':
+			depth++
+		case '>':
+			if depth > 0 {
+				depth--
+			}
+		default:
+			if depth == 0 {
+				out.WriteRune(r)
+			}
+		}
+	}
+	return strings.TrimSpace(out.String())
+}
 
 func enrichCppNamespaces(symbols []core.SymbolRecord, content string) []core.SymbolRecord {
 	type scope struct {
@@ -536,30 +560,49 @@ func enrichCppNamespaces(symbols []core.SymbolRecord, content string) []core.Sym
 	for i := range scopes {
 		child := symbols[scopes[i].index]
 		bestWidth := int(^uint(0) >> 1)
+		bestRawWidth := int(^uint(0) >> 1)
 		for j := range scopes {
 			if i == j {
 				continue
 			}
 			parent := symbols[scopes[j].index]
-			if parent.Span.Start <= child.Span.Start && parent.Span.End >= child.Span.End {
-				width := parent.Span.End - parent.Span.Start
-				if width < bestWidth {
-					bestWidth = width
-					scopes[i].parent = j
-				}
+			if parent.Span.Start > child.Span.Start || parent.Span.End < child.Span.End {
+				continue
+			}
+			width := parent.Span.End - parent.Span.Start
+			rawWidth := len(parent.RawText)
+			strictlyContains := width > child.Span.End-child.Span.Start ||
+				(rawWidth > len(child.RawText) && strings.Contains(parent.RawText, child.RawText))
+			if !strictlyContains {
+				continue
+			}
+			if width < bestWidth || (width == bestWidth && rawWidth < bestRawWidth) {
+				bestWidth = width
+				bestRawWidth = rawWidth
+				scopes[i].parent = j
 			}
 		}
 	}
+	state := make([]uint8, len(scopes))
 	var scopePath func(int) string
 	scopePath = func(i int) string {
 		if scopes[i].path != "" {
 			return scopes[i].path
 		}
+		if state[i] == 1 {
+			// Span metadata from fallback extractors can be coarse. Never let a
+			// malformed containment cycle turn one valid file into a process-wide
+			// stack overflow and an empty repository index.
+			scopes[i].parent = -1
+			return symbols[scopes[i].index].Name
+		}
+		state[i] = 1
 		name := symbols[scopes[i].index].Name
 		if scopes[i].parent >= 0 {
 			name = scopePath(scopes[i].parent) + "::" + name
 		}
 		scopes[i].path = name
+		state[i] = 2
 		return name
 	}
 	for i := range scopes {
@@ -575,18 +618,21 @@ func enrichCppNamespaces(symbols []core.SymbolRecord, content string) []core.Sym
 		}
 		namespace := ""
 		bestWidth := int(^uint(0) >> 1)
+		bestRawWidth := int(^uint(0) >> 1)
 		for j := range scopes {
 			ns := symbols[scopes[j].index]
 			if ns.Span.Start <= symbol.Span.Start && ns.Span.End >= symbol.Span.End {
-				if width := ns.Span.End - ns.Span.Start; width < bestWidth {
+				width, rawWidth := ns.Span.End-ns.Span.Start, len(ns.RawText)
+				if width < bestWidth || (width == bestWidth && rawWidth < bestRawWidth) {
 					bestWidth = width
+					bestRawWidth = rawWidth
 					namespace = scopePath(j)
 				}
 			}
 		}
 		owner, name := symbol.ParentSymbol, symbol.Name
 		if match := cppQualifiedCallableRe.FindStringSubmatch(symbol.Signature); len(match) == 3 {
-			owner, name = match[1], match[2]
+			owner, name = cppStripTemplateArgs(match[1]), strings.ReplaceAll(match[2], " ", "")
 		} else if split := strings.LastIndex(symbol.Name, "::"); split >= 0 {
 			owner, name = symbol.Name[:split], symbol.Name[split+2:]
 		}
@@ -735,6 +781,7 @@ func mergeSymbolsByShape(astSyms, regexSyms []core.SymbolRecord) []core.SymbolRe
 	}
 	seen := make(map[string]bool, len(astSyms))
 	callable := make(map[string]bool, len(astSyms))
+	callableAt := make(map[string]bool, len(astSyms))
 	type locationKey struct {
 		name, parent string
 		kind         core.SymbolKind
@@ -746,17 +793,32 @@ func mergeSymbolsByShape(astSyms, regexSyms []core.SymbolRecord) []core.SymbolRe
 		locations[locationKey{s.Name, s.ParentSymbol, s.Kind, s.Span.Start, s.Span.End}] = true
 		if isCallableKind(s.Kind) {
 			callable[s.Name+"\x00"+s.ParentSymbol] = true
+			callableAt[s.Name+"\x00"+fmt.Sprint(s.Span.Start)+"\x00"+fmt.Sprint(s.Span.End)] = true
 		}
 	}
 	merged := append([]core.SymbolRecord(nil), astSyms...)
 	for _, s := range regexSyms {
+		cppDeclaration := false
+		for _, annotation := range s.Annotations {
+			if annotation == "declaration" {
+				cppDeclaration = true
+				break
+			}
+		}
 		// A regex-found callable whose name the AST already declared in
 		// this file is the same function seen through a prototype, a
 		// macro-wrapped line, or a call statement mis-read as a
 		// declaration — never a second function. jansson's do_dump got
 		// three 1-line twins this way, and span-based matching then
 		// attributed the real body's 64 calls to none of them.
-		if isCallableKind(s.Kind) && callable[s.Name+"\x00"+s.ParentSymbol] {
+		if isCallableKind(s.Kind) && callable[s.Name+"\x00"+s.ParentSymbol] && !cppDeclaration {
+			continue
+		}
+		// Tree-sitter knows an inline method's class owner; the fallback regex
+		// can see the same line as a parentless free function. Matching callable
+		// name and exact span is sufficient to suppress that phantom twin while
+		// retaining real overload declarations on distinct lines.
+		if isCallableKind(s.Kind) && callableAt[s.Name+"\x00"+fmt.Sprint(s.Span.Start)+"\x00"+fmt.Sprint(s.Span.End)] {
 			continue
 		}
 		if locations[locationKey{s.Name, s.ParentSymbol, s.Kind, s.Span.Start, s.Span.End}] {
@@ -913,7 +975,8 @@ func extractSymbolsRegex(language, filePath, blobSHA, content string, fileImport
 	lines := strings.Split(content, "\n")
 	var symbols []core.SymbolRecord
 
-	for i, line := range lines {
+	for i := 0; i < len(lines); i++ {
+		line := lines[i]
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" || strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "#") {
 			continue
@@ -969,7 +1032,8 @@ func extractCFamilySymbols(language, filePath, blobSHA, content string, fileImpo
 	lines := strings.Split(content, "\n")
 	var symbols []core.SymbolRecord
 
-	for i, line := range lines {
+	for i := 0; i < len(lines); i++ {
+		line := lines[i]
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" || strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "#") {
 			continue
@@ -982,6 +1046,9 @@ func extractCFamilySymbols(language, filePath, blobSHA, content string, fileImpo
 			}
 
 			name, parentSymbol := extractNameAndParent(matches, pattern)
+			if language == "cpp" && strings.HasPrefix(name, "operator") {
+				name = strings.ReplaceAll(name, " ", "")
+			}
 			if name == "" {
 				continue
 			}
@@ -1008,13 +1075,16 @@ func extractCFamilySymbols(language, filePath, blobSHA, content string, fileImpo
 			if language == "cpp" && pattern.kind == core.KindClass {
 				symbols = append(symbols, extractCPPClassMembers(filePath, blobSHA, name, lines, i+1, endLine-1, fileImports)...)
 			}
+			if (pattern.kind == core.KindClass || pattern.kind == core.KindStruct) && endLine > i+1 {
+				i = endLine - 1
+			}
 			break
 		}
 	}
 	return symbols
 }
 
-var cppMemberPattern = regexp.MustCompile(`^\s*(?:(?:virtual|static|inline|constexpr|explicit|friend)\s+)*(?:(?:[\w:<>,~*&]+\s+)+)?(~?[A-Za-z_][A-Za-z0-9_]*)\s*\([^;{}]*\)\s*(?:const\s*)?(?:=\s*0\s*)?[;{]`)
+var cppMemberPattern = regexp.MustCompile(`^\s*(?:(?:virtual|static|inline|constexpr|consteval|constinit|explicit|friend)\s+)*(?:(?:[\w:<>,~*&]+\s+)+)?(` + cppCallableNamePattern + `)\s*\([^;{}]*\)\s*(?:(?:const|volatile|override|final|noexcept(?:\s*\([^)]*\))?|&&?)\s*)*(?:->\s*[\w:<>,~*&\s]+\s*)?(?:=\s*(?:0|default|delete)\s*)?[;{]`)
 
 func extractCPPClassMembers(filePath, blobSHA, className string, lines []string, start, end int, fileImports []string) []core.SymbolRecord {
 	var symbols []core.SymbolRecord
@@ -1029,7 +1099,8 @@ func extractCPPClassMembers(filePath, blobSHA, className string, lines []string,
 			continue
 		}
 		name := matches[1]
-		if name == "" || strings.HasPrefix(name, "~") {
+		name = strings.ReplaceAll(name, " ", "")
+		if name == "" {
 			continue
 		}
 		kind := core.KindMethod
@@ -1058,6 +1129,9 @@ func extractCPPClassMembers(filePath, blobSHA, className string, lines []string,
 			Imports:       fileImports,
 			TokenEstimate: estimateTokens(body),
 		})
+		if !strings.Contains(line, "{") {
+			symbols[len(symbols)-1].Annotations = []string{"declaration"}
+		}
 	}
 	return symbols
 }

@@ -64,3 +64,39 @@ func TestDeadCodeBuckets(t *testing.T) {
 		t.Errorf("counters: considered=%d roots=%d", r.Considered, r.RootCount)
 	}
 }
+
+func TestDeadCodeExcludesInlineRustTestsAndTheirMentions(t *testing.T) {
+	g := New()
+	g.Replace([]core.SymbolRecord{
+		{ID: "src/lib.rs::dead_one", FilePath: "src/lib.rs", Language: "rust", Kind: core.KindFunction, Name: "dead_one", QualifiedName: "dead_one", RawText: "fn dead_one() {}"},
+		{ID: "src/lib.rs::t_dead_one", FilePath: "src/lib.rs", Language: "rust", Kind: core.KindFunction, Name: "t_dead_one", QualifiedName: "tests.t_dead_one", RawText: "#[test]\nfn t_dead_one() { dead_one(); }", Annotations: []string{"test"}, CallSites: []core.CallSite{{Callee: "dead_one", Line: 3}}},
+	}, 1)
+	dead := names(g.DeadCode(nil).Dead)
+	if dead["t_dead_one"] {
+		t.Fatal("#[test] function reported as dead production code")
+	}
+	if !dead["dead_one"] {
+		t.Fatal("a reference only from an inline Rust test kept production code alive")
+	}
+}
+
+func TestDeadCodeIgnoresDuplicatedEnclosingClassText(t *testing.T) {
+	class := core.SymbolRecord{ID: "widget.cpp::Widget", FilePath: "widget.cpp", Language: "cpp", Kind: core.KindClass, Name: "Widget", QualifiedName: "Widget", RawText: "class Widget { void unused(); };"}
+	method := core.SymbolRecord{ID: "widget.cpp::Widget.unused", FilePath: "widget.cpp", Language: "cpp", Kind: core.KindMethod, Name: "unused", QualifiedName: "Widget.unused", ParentSymbol: "Widget", RawText: "void Widget::unused() {}"}
+	g := New()
+	g.Replace([]core.SymbolRecord{class, method}, 1)
+	if !names(g.DeadCode(nil).Dead)["unused"] {
+		t.Fatal("enclosing class RawText must not keep its unreferenced method alive")
+	}
+}
+
+func TestDeadCodeIgnoresDuplicatedTransitiveNamespaceText(t *testing.T) {
+	namespace := core.SymbolRecord{ID: "widget.cpp::app", FilePath: "widget.cpp", Language: "cpp", Kind: core.KindNamespace, Name: "app", QualifiedName: "app", RawText: "namespace app { class Widget { void unused(); }; }"}
+	class := core.SymbolRecord{ID: "widget.cpp::app.Widget", FilePath: "widget.cpp", Language: "cpp", Kind: core.KindClass, Name: "Widget", QualifiedName: "app::Widget", ParentSymbol: "app", RawText: "class Widget { void unused(); };"}
+	method := core.SymbolRecord{ID: "widget.cpp::app.Widget.unused", FilePath: "widget.cpp", Language: "cpp", Kind: core.KindMethod, Name: "unused", QualifiedName: "app::Widget::unused", ParentSymbol: "app::Widget", RawText: "void unused() {}"}
+	g := New()
+	g.Replace([]core.SymbolRecord{namespace, class, method}, 1)
+	if !names(g.DeadCode(nil).Dead)["unused"] {
+		t.Fatal("transitive namespace RawText must not keep its unreferenced method alive")
+	}
+}

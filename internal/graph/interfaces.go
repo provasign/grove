@@ -52,44 +52,71 @@ var csIfaceMethodRe = regexp.MustCompile(`(?m)^\s*(?:[\w.<>\[\],?]+\s+)+([A-Za-z
 // some languages' parsers emit them; Go's does not, so Go falls back to
 // parsing the interface body text.
 func interfaceMethodNames(iface *core.SymbolRecord, idx *edgeIndex) []string {
+	return interfaceMethodNamesSeen(iface, idx, map[string]bool{})
+}
+
+func interfaceMethodNamesSeen(iface *core.SymbolRecord, idx *edgeIndex, visited map[string]bool) []string {
+	if iface == nil || visited[iface.ID] {
+		return nil
+	}
+	visited[iface.ID] = true
 	var names []string
+	seen := map[string]bool{}
 	for _, cand := range idx.byFile[iface.FilePath] {
 		if cand.Kind == core.KindMethod && cand.ParentSymbol == iface.Name {
-			names = append(names, cand.Name)
+			if !seen[cand.Name] {
+				seen[cand.Name] = true
+				names = append(names, cand.Name)
+			}
 		}
 	}
-	if len(names) > 0 {
-		return names
+	if len(names) == 0 && iface.RawText != "" {
+		// Body-text fallback for languages whose parsers do not emit interface
+		// members as symbols: Go (method specs) and TS/JS (method signatures).
+		var re *regexp.Regexp
+		switch iface.Language {
+		case "go":
+			re = goIfaceMethodRe
+		case "typescript", "tsx", "javascript":
+			re = tsIfaceMethodRe
+		case "php":
+			re = phpIfaceMethodRe
+		case "csharp":
+			re = csIfaceMethodRe
+		}
+		if re != nil {
+			body := stripCommentsAndStrings(iface.RawText)
+			// Drop the declaration line so "type Render interface {" can't
+			// contribute "interface(" style artifacts on unusual formatting.
+			if i := strings.IndexByte(body, '{'); i >= 0 {
+				body = body[i+1:]
+			}
+			for _, m := range re.FindAllStringSubmatch(body, -1) {
+				if !seen[m[1]] {
+					seen[m[1]] = true
+					names = append(names, m[1])
+				}
+			}
+		}
 	}
-	if iface.RawText == "" {
-		return nil
-	}
-	// Body-text fallback for languages whose parsers do not emit interface
-	// members as symbols: Go (method specs) and TS/JS (method signatures).
-	var re *regexp.Regexp
-	switch iface.Language {
-	case "go":
-		re = goIfaceMethodRe
-	case "typescript", "tsx", "javascript":
-		re = tsIfaceMethodRe
-	case "php":
-		re = phpIfaceMethodRe
-	case "csharp":
-		re = csIfaceMethodRe
-	default:
-		return nil
-	}
-	body := stripCommentsAndStrings(iface.RawText)
-	// Drop the declaration line so "type Render interface {" can't
-	// contribute "interface(" style artifacts on unusual formatting.
-	if i := strings.IndexByte(body, '{'); i >= 0 {
-		body = body[i+1:]
-	}
-	seen := map[string]bool{}
-	for _, m := range re.FindAllStringSubmatch(body, -1) {
-		if !seen[m[1]] {
-			seen[m[1]] = true
-			names = append(names, m[1])
+	// TypeScript interfaces inherit their ancestors' callable contract. Those
+	// members are not separate symbols, so fold the ancestor method set into
+	// the child before computing structural satisfaction and dispatch.
+	if iface.Language == "typescript" || iface.Language == "tsx" || iface.Language == "javascript" {
+		for _, base := range baseClassesFor(idx, iface.Language, iface.Name, dirOf(iface.FilePath)) {
+			baseFile := tsResolveClassFile(idx, base, iface.FilePath)
+			for _, cand := range idx.byName[strings.ToLower(base)] {
+				if cand.Kind != core.KindInterface || cand.Name != base || (baseFile != "" && cand.FilePath != baseFile) {
+					continue
+				}
+				for _, inherited := range interfaceMethodNamesSeen(cand, idx, visited) {
+					if !seen[inherited] {
+						seen[inherited] = true
+						names = append(names, inherited)
+					}
+				}
+				break
+			}
 		}
 	}
 	return names
@@ -307,6 +334,14 @@ func buildInterfaceSatisfaction(idx *edgeIndex, symbols []core.SymbolRecord) (*i
 			// here we skip structural EDGE emission for them and keep the
 			// structural index only for call-dispatch over-approximation.
 			nominal := nominalInterfaceLang(iface.Language)
+			if iface.Language == "python" {
+				for _, base := range pyBaseClasses(idx, iface.Name, dirOf(iface.FilePath)) {
+					if base == "Protocol" {
+						nominal = false
+						break
+					}
+				}
+			}
 			for _, n := range lower {
 				m := chosen[n]
 				sat.implementors[iface.ID][n] = append(sat.implementors[iface.ID][n], m)
@@ -323,6 +358,89 @@ func buildInterfaceSatisfaction(idx *edgeIndex, symbols []core.SymbolRecord) (*i
 		}
 	}
 	return sat, edges
+}
+
+// buildJavaOverrideEdges links a Java method to each ancestor type whose
+// matching declaration it overrides. It consumes the already-resolved
+// extends/implements edges, preserving package/import disambiguation instead
+// of repeating inheritance name lookup here. EdgeOverrides targets a type
+// symbol by contract (the same shape used for interface satisfaction).
+func buildJavaOverrideEdges(idx *edgeIndex, symbols []core.SymbolRecord, inheritance []core.Edge) []core.Edge {
+	parents := make(map[string][]string)
+	for _, edge := range inheritance {
+		if edge.Type == core.EdgeExtends || edge.Type == core.EdgeImplements {
+			parents[edge.From] = append(parents[edge.From], edge.To)
+		}
+	}
+	ownerType := func(method *core.SymbolRecord) *core.SymbolRecord {
+		for _, candidate := range idx.byFile[method.FilePath] {
+			if candidate.Language != "java" {
+				continue
+			}
+			switch candidate.Kind {
+			case core.KindClass, core.KindInterface, core.KindEnum:
+			default:
+				continue
+			}
+			if candidate.Name == method.ParentSymbol || candidate.QualifiedName == method.ParentSymbol {
+				return candidate
+			}
+		}
+		return nil
+	}
+	declares := func(ancestor *core.SymbolRecord, method *core.SymbolRecord) bool {
+		for _, candidate := range idx.byFile[ancestor.FilePath] {
+			if candidate.Kind != core.KindMethod || candidate.Name != method.Name {
+				continue
+			}
+			if candidate.ParentSymbol != ancestor.Name && candidate.ParentSymbol != ancestor.QualifiedName {
+				continue
+			}
+			if signatureCompatible(paramTypesOf(candidate), paramTypesOf(method), nil) {
+				return true
+			}
+		}
+		return false
+	}
+
+	var out []core.Edge
+	seen := map[string]bool{}
+	for i := range symbols {
+		method := &symbols[i]
+		if method.Language != "java" || method.Kind != core.KindMethod || method.ParentSymbol == "" {
+			continue
+		}
+		owner := ownerType(method)
+		if owner == nil {
+			continue
+		}
+		visited := map[string]bool{}
+		queue := append([]string(nil), parents[owner.ID]...)
+		for len(queue) > 0 {
+			ancestorID := queue[0]
+			queue = queue[1:]
+			if visited[ancestorID] {
+				continue
+			}
+			visited[ancestorID] = true
+			ancestor := idx.byID[ancestorID]
+			if ancestor == nil {
+				continue
+			}
+			if declares(ancestor, method) {
+				key := method.ID + "\x00" + ancestor.ID
+				if !seen[key] {
+					seen[key] = true
+					out = append(out, core.Edge{
+						From: method.ID, To: ancestor.ID, Type: core.EdgeOverrides,
+						Confidence: 0.85, Source: core.EvidenceSourceHeuristic, Reason: core.ReasonInheritance,
+					})
+				}
+			}
+			queue = append(queue, parents[ancestorID]...)
+		}
+	}
+	return out
 }
 
 // implementorsFor returns the methods implementing calleeName for one

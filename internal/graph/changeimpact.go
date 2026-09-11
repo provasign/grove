@@ -923,6 +923,20 @@ func (g *CodeGraph) resolveLooseQueryScopedLocked(query, file string) (string, e
 	if head == "" {
 		return "", fmt.Errorf("change-impact: empty query")
 	}
+	var queryParams []string
+	hasParamList := false
+	if open := strings.IndexByte(q, '('); open >= 0 {
+		if !strings.HasSuffix(q, ")") {
+			return "", fmt.Errorf("change-impact: unbalanced parameter list in %q", query)
+		}
+		hasParamList = true
+		inner := strings.TrimSpace(q[open+1 : len(q)-1])
+		if inner != "" {
+			for _, p := range splitTopLevel(inner, ',') {
+				queryParams = append(queryParams, bareTypeToken(p))
+			}
+		}
+	}
 
 	// Bare member name: collect every function/method symbol with that name.
 	type cand struct {
@@ -942,6 +956,22 @@ func (g *CodeGraph) resolveLooseQueryScopedLocked(query, file string) (string, e
 			}
 		}
 		sym := s
+		if hasParamList {
+			actual := paramTypesOf(&sym)
+			if len(actual) != len(queryParams) {
+				continue
+			}
+			matched := true
+			for i := range actual {
+				if !strings.EqualFold(actual[i], queryParams[i]) {
+					matched = false
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
+		}
 		matches = append(matches, cand{sym: &sym})
 	}
 	if len(matches) == 0 {

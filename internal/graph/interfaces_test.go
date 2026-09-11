@@ -65,6 +65,29 @@ func TestInterfaceSatisfaction_MethodSetInclusion(t *testing.T) {
 	}
 }
 
+func TestJavaOverrideEdgesFollowResolvedInheritance(t *testing.T) {
+	iface := core.SymbolRecord{ID: "I.java::I", FilePath: "I.java", Language: "java", Kind: core.KindInterface, Name: "I", QualifiedName: "I", Signature: "interface I"}
+	ifaceRun := core.SymbolRecord{ID: "I.java::I.run", FilePath: "I.java", Language: "java", Kind: core.KindMethod, Name: "run", QualifiedName: "I.run", ParentSymbol: "I", Signature: "void run(int value)"}
+	base := core.SymbolRecord{ID: "Base.java::Base", FilePath: "Base.java", Language: "java", Kind: core.KindClass, Name: "Base", QualifiedName: "Base", Signature: "class Base implements I"}
+	baseRun := core.SymbolRecord{ID: "Base.java::Base.run", FilePath: "Base.java", Language: "java", Kind: core.KindMethod, Name: "run", QualifiedName: "Base.run", ParentSymbol: "Base", Signature: "public void run(int value)"}
+	child := core.SymbolRecord{ID: "Child.java::Child", FilePath: "Child.java", Language: "java", Kind: core.KindClass, Name: "Child", QualifiedName: "Child", Signature: "class Child extends Base"}
+	childRun := core.SymbolRecord{ID: "Child.java::Child.run", FilePath: "Child.java", Language: "java", Kind: core.KindMethod, Name: "run", QualifiedName: "Child.run", ParentSymbol: "Child", Signature: "public void run(int value)"}
+
+	edges := BuildEdges([]core.SymbolRecord{iface, ifaceRun, base, baseRun, child, childRun})
+	var baseToIface, childToBase, childToIface bool
+	for _, edge := range edges {
+		if edge.Type != core.EdgeOverrides {
+			continue
+		}
+		baseToIface = baseToIface || edge.From == baseRun.ID && edge.To == iface.ID
+		childToBase = childToBase || edge.From == childRun.ID && edge.To == base.ID
+		childToIface = childToIface || edge.From == childRun.ID && edge.To == iface.ID
+	}
+	if !baseToIface || !childToBase || !childToIface {
+		t.Fatalf("missing Java override closure: base→iface=%v child→base=%v child→iface=%v edges=%+v", baseToIface, childToBase, childToIface, edges)
+	}
+}
+
 func TestInterfaceSatisfaction_DoesNotRequireDirectImport(t *testing.T) {
 	iface := core.SymbolRecord{
 		ID: "contracts/runner.go::Runner@1", FilePath: "contracts/runner.go", BlobSHA: "1",
@@ -168,5 +191,21 @@ func TestBuildCalls_CappedFanoutWithoutInterfaceStaysDropped(t *testing.T) {
 		if e.Type == core.EdgeCalls && e.From == "context.go::Context.Render@1" {
 			t.Fatalf("capped fan-out without a declaring interface must stay dropped, got %+v", e)
 		}
+	}
+}
+
+func TestPythonProtocolUsesStructuralSatisfaction(t *testing.T) {
+	protocol := core.SymbolRecord{ID: "proto.py::Reader", FilePath: "proto.py", Language: "python", Kind: core.KindInterface, Name: "Reader", QualifiedName: "Reader", Signature: "class Reader(Protocol):"}
+	contract := core.SymbolRecord{ID: "proto.py::Reader.read", FilePath: "proto.py", Language: "python", Kind: core.KindMethod, Name: "read", QualifiedName: "Reader.read", ParentSymbol: "Reader", Signature: "def read(self) -> str:"}
+	impl := core.SymbolRecord{ID: "file.py::FileReader", FilePath: "file.py", Language: "python", Kind: core.KindClass, Name: "FileReader", QualifiedName: "FileReader"}
+	method := core.SymbolRecord{ID: "file.py::FileReader.read", FilePath: "file.py", Language: "python", Kind: core.KindMethod, Name: "read", QualifiedName: "FileReader.read", ParentSymbol: "FileReader", Signature: "def read(self) -> str:"}
+
+	var implements, overrides bool
+	for _, edge := range BuildEdges([]core.SymbolRecord{protocol, contract, impl, method}) {
+		implements = implements || edge.Type == core.EdgeImplements && edge.From == impl.ID && edge.To == protocol.ID
+		overrides = overrides || edge.Type == core.EdgeOverrides && edge.From == method.ID && edge.To == protocol.ID
+	}
+	if !implements || !overrides {
+		t.Fatalf("Protocol structural edges missing: implements=%v overrides=%v", implements, overrides)
 	}
 }

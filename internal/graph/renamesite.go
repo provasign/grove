@@ -128,6 +128,9 @@ func resolveReceiverType(idx *edgeIndex, caller *core.SymbolRecord, localTypes m
 	if chain == "" || localTypes == nil {
 		return ""
 	}
+	if !strings.Contains(chain, ".") && isUpperIdent(chain) && typeSymbolExists(idx, chain) {
+		return chain
+	}
 	switch caller.Language {
 	case "go":
 		return goResolveReceiverChain(idx, localTypes, chain)

@@ -110,6 +110,9 @@ func tsBaseClasses(idx *edgeIndex, className, preferDir string) []string {
 	if chosen.Language == "rust" {
 		return rustBaseClasses(chosen)
 	}
+	if chosen.Language == "go" {
+		return goEmbeddedTypes(chosen.RawText)
+	}
 	var out []string
 	out = append(out, inheritanceClauseTypes(sig, "extends", "implements")...)
 	out = append(out, inheritanceClauseTypes(sig, "implements")...)
@@ -118,8 +121,9 @@ func tsBaseClasses(idx *edgeIndex, className, preferDir string) []string {
 
 func rustBaseClasses(chosen *core.SymbolRecord) []string {
 	if chosen.Kind == core.KindTrait {
-		if i := strings.IndexByte(chosen.Signature, ':'); i >= 0 {
-			rest := chosen.Signature[i+1:]
+		sig := stripLeadingGenericParams(chosen.Signature)
+		if i := strings.IndexByte(sig, ':'); i >= 0 {
+			rest := sig[i+1:]
 			for _, stop := range []string{" where ", "{"} {
 				if j := strings.Index(rest, stop); j >= 0 {
 					rest = rest[:j]
@@ -136,6 +140,13 @@ func rustBaseClasses(chosen *core.SymbolRecord) []string {
 		return nil
 	}
 	var out []string
+	for _, annotation := range chosen.Annotations {
+		if trait := strings.TrimPrefix(annotation, "implements:"); trait != annotation {
+			if trait = rustBareType(trait); trait != "" {
+				out = append(out, trait)
+			}
+		}
+	}
 	for _, match := range rustImplForRe.FindAllStringSubmatch(chosen.RawText, -1) {
 		if len(match) == 3 && rustBareType(match[2]) == chosen.Name {
 			if trait := rustBareType(match[1]); trait != "" {
@@ -307,7 +318,7 @@ func baseClassesFor(idx *edgeIndex, language, className, preferDir string) []str
 	switch language {
 	case "python":
 		return pyBaseClasses(idx, className, preferDir)
-	case "typescript", "tsx", "javascript", "java", "php", "cpp", "rust":
+	case "typescript", "tsx", "javascript", "java", "php", "cpp", "rust", "go":
 		return tsBaseClasses(idx, className, preferDir)
 	case "csharp":
 		return csBaseClasses(idx, className, preferDir)

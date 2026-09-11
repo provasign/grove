@@ -37,6 +37,10 @@ type CallSite struct {
 	Argc    int      `json:"argc,omitempty"`    // argument count; advisory (0 = none or unknown)
 	Args    []string `json:"args,omitempty"`    // bare-identifier argument names ("" for complex exprs)
 	Generic bool     `json:"generic,omitempty"` // call supplies explicit type args (Foo<T>()); splits generic vs non-generic overloads
+	Write   bool     `json:"write,omitempty"`   // attribute site is an assignment target
+	// ReferenceOnly is a callable reference, not an execution at this site.
+	// It participates in rename/reference analysis but never becomes a calls edge.
+	ReferenceOnly bool `json:"reference_only,omitempty"`
 }
 
 type SymbolRecord struct {
@@ -98,6 +102,15 @@ type Edge struct {
 	// bucket into receiver-self / local-type / call-result / import-qualified /
 	// overload sub-reasons.
 	Reason EdgeReason `json:"reason,omitempty"`
+}
+
+// EdgeWinsMerge reports whether candidate should replace an edge with the same
+// identity. Confidence is primary; on an exact tie native evidence wins so
+// policy filters and explanations retain the strongest available provenance.
+func EdgeWinsMerge(candidate, existing Edge) bool {
+	return candidate.Confidence > existing.Confidence ||
+		(candidate.Confidence == existing.Confidence &&
+			candidate.Source == EvidenceSourceNative && existing.Source != EvidenceSourceNative)
 }
 
 type Status struct {

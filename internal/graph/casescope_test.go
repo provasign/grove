@@ -368,6 +368,23 @@ func TestBuildEdges_GoInterfaceEmbedsInterface(t *testing.T) {
 	}
 }
 
+func TestBuildEdges_GoGenericEmbeddedType(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "x.go::Base@1", FilePath: "x.go", BlobSHA: "1", Language: "go",
+			Kind: core.KindStruct, Name: "Base", QualifiedName: "Base",
+			RawText: "type Base[T any] struct{}"},
+		{ID: "x.go::Child@2", FilePath: "x.go", BlobSHA: "1", Language: "go",
+			Kind: core.KindStruct, Name: "Child", QualifiedName: "Child",
+			RawText: "type Child struct {\n\tBase[int]\n}"},
+	}
+	for _, edge := range BuildEdges(syms) {
+		if edge.Type == core.EdgeExtends && edge.From == syms[1].ID && edge.To == syms[0].ID {
+			return
+		}
+	}
+	t.Fatal("Child embedding Base[int] must produce an extends edge")
+}
+
 // C# uses `class X : Base, IFoo` (colon syntax). Without a graph-layer parse,
 // C# inheritance edges existed only when the native roslyn analyzer ran; a
 // bare source tree got zero edges and an empty change-impact closure.

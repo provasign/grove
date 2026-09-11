@@ -162,6 +162,23 @@ func extractSymbolsFromAST(language, filePath, blobSHA string, src []byte, fileI
 		}
 		syms = append(syms, projected)
 	}
+	if len(syms) == 0 && len(fileImports) > 0 &&
+		(key == astkit.LangJavaScript || key == astkit.LangTypeScript || key == astkit.LangTSX) {
+		// A pure barrel (`export * from './x'`) or side-effect-only module has
+		// no declaration for Astkit to return. Keep a lightweight module record
+		// so the file-level import survives projection into the graph.
+		const moduleName = "<module>"
+		syms = append(syms, core.SymbolRecord{
+			ID:            symID(filePath, moduleName, blobSHA),
+			FilePath:      filePath,
+			BlobSHA:       blobSHA,
+			Language:      language,
+			Kind:          core.KindModule,
+			Name:          moduleName,
+			QualifiedName: moduleName,
+			Imports:       append([]string(nil), fileImports...),
+		})
+	}
 	return syms, true, hasErrors
 }
 
@@ -190,18 +207,22 @@ func extractImportsFromAST(language string, src []byte) ([]string, bool) {
 	seen := make(map[string]bool, len(akImports))
 	imports := make([]string, 0, len(akImports))
 	for _, imp := range akImports {
-		if imp.Path == "" || seen[imp.Path] {
+		if imp.Path == "" {
 			continue
 		}
-		seen[imp.Path] = true
-		imports = append(imports, imp.Path)
 		if key == astkit.LangGo && imp.Alias != "" && imp.Alias != "_" && imp.Alias != "." {
 			alias := core.GoImportAlias(imp.Alias, imp.Path)
 			if !seen[alias] {
 				seen[alias] = true
 				imports = append(imports, alias)
 			}
+			continue
 		}
+		if seen[imp.Path] {
+			continue
+		}
+		seen[imp.Path] = true
+		imports = append(imports, imp.Path)
 	}
 	if key == astkit.LangPython {
 		// From-import members as "module#name" candidates: a member that
@@ -218,19 +239,10 @@ func extractImportsFromAST(language string, src []byte) ([]string, bool) {
 				if local == "" {
 					local = strings.Split(imp.Path, ".")[0]
 				}
-				bindings := []string{local}
-				if last := strings.TrimPrefix(lastDottedSegment(imp.Path), "."); last != "" && last != local {
-					// astkit currently retains the last receiver segment of
-					// a.b.call(), so preserve both Python's actual a binding
-					// and the segment carried by the call site.
-					bindings = append(bindings, last)
-				}
-				for _, name := range bindings {
-					encoded := core.PythonImportBinding(imp.Line, name, imp.Path)
-					if !seen[encoded] {
-						seen[encoded] = true
-						imports = append(imports, encoded)
-					}
+				encoded := core.PythonImportBinding(imp.Line, local, imp.Path)
+				if !seen[encoded] {
+					seen[encoded] = true
+					imports = append(imports, encoded)
 				}
 			}
 			for _, name := range imp.Names {
@@ -254,6 +266,13 @@ func extractImportsFromAST(language string, src []byte) ([]string, bool) {
 	}
 	if key == astkit.LangJavaScript || key == astkit.LangTypeScript || key == astkit.LangTSX {
 		for _, imp := range akImports {
+			if strings.HasPrefix(strings.TrimSpace(imp.Raw), "export ") {
+				encoded := core.JSImportReExport(imp.Path)
+				if !seen[encoded] {
+					seen[encoded] = true
+					imports = append(imports, encoded)
+				}
+			}
 			if match := jsDefaultImportRE.FindStringSubmatch(imp.Raw); len(match) == 2 {
 				encoded := core.JSImportAlias(match[1], imp.Path+"#default")
 				if !seen[encoded] {
@@ -293,7 +312,7 @@ func extractImportsFromAST(language string, src []byte) ([]string, bool) {
 var pythonAliasedImportRE = regexp.MustCompile(`([A-Za-z_][A-Za-z0-9_\.]*)\s+as\s+([A-Za-z_][A-Za-z0-9_]*)`)
 var jsNamespaceImportRE = regexp.MustCompile(`\*\s+as\s+([A-Za-z_$][A-Za-z0-9_$]*)`)
 var jsNamedImportRE = regexp.MustCompile(`(?s)\{([^}]*)\}`)
-var jsDefaultImportRE = regexp.MustCompile(`^\s*import\s+([A-Za-z_$][A-Za-z0-9_$]*)\s+from\b`)
+var jsDefaultImportRE = regexp.MustCompile(`(?s)^\s*import\s+([A-Za-z_$][A-Za-z0-9_$]*)(?:\s*,.*?)?\s+from\b`)
 
 func lastDottedSegment(value string) string {
 	if i := strings.LastIndexByte(value, '.'); i >= 0 {
@@ -366,7 +385,7 @@ func projectCallSites(in []astkit.CallSite) []core.CallSite {
 	}
 	out := make([]core.CallSite, len(in))
 	for i, c := range in {
-		out[i] = core.CallSite{Callee: c.Callee, Line: c.Line, Argc: c.Argc, Args: c.Args, Generic: c.Generic}
+		out[i] = core.CallSite{Callee: c.Callee, Line: c.Line, Argc: c.Argc, Args: c.Args, Generic: c.Generic, Write: c.Write, ReferenceOnly: c.ReferenceOnly}
 	}
 	return out
 }

@@ -60,6 +60,41 @@ func names(recs []core.SymbolRecord) map[string]bool {
 	return out
 }
 
+func TestTypeScriptInterfaceMethodNamesIncludeAncestors(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "driver.ts::Driver", FilePath: "driver.ts", Language: "typescript", Kind: core.KindInterface, Name: "Driver", Signature: "interface Driver", RawText: "interface Driver { escape(value: string): string }"},
+		{ID: "extended.ts::DriverEx", FilePath: "extended.ts", Language: "typescript", Kind: core.KindInterface, Name: "DriverEx", Signature: "interface DriverEx extends Driver", RawText: "interface DriverEx extends Driver { quote(value: string): string }", Imports: []string{"./driver"}},
+	}
+	got := map[string]bool{}
+	for _, name := range interfaceMethodNames(&syms[1], newEdgeIndex(syms)) {
+		got[name] = true
+	}
+	if !got["quote"] || !got["escape"] {
+		t.Fatalf("DriverEx method set = %v, want own and inherited methods", got)
+	}
+}
+
+func TestPythonAbstractmethodEllipsisIsNotDefault(t *testing.T) {
+	contract := []core.SymbolRecord{{Language: "python", Kind: core.KindMethod, RawText: "def run(self):\n    ...", Annotations: []string{"abc.abstractmethod"}}}
+	if contractProvidesBody(contract, map[string]core.SymbolKind{"Runner": core.KindClass}) {
+		t.Fatal("@abstractmethod ellipsis stub was counted as a provided default")
+	}
+	if providesImplementation(&contract[0]) {
+		t.Fatal("@abstractmethod ellipsis stub was counted as an implementation")
+	}
+}
+
+func TestCSharpInterfaceExpressionBodyIsDefault(t *testing.T) {
+	contract := []core.SymbolRecord{{Language: "csharp", Kind: core.KindMethod, RawText: "double Area() => 0;", Signature: "double Area()"}}
+	if !contractProvidesBody(contract, map[string]core.SymbolKind{"Shape": core.KindInterface}) {
+		t.Fatal("C# interface expression body was not counted as a provided default")
+	}
+	contract[0].RawText = "double Area();"
+	if contractProvidesBody(contract, map[string]core.SymbolKind{"Shape": core.KindInterface}) {
+		t.Fatal("body-less C# interface member was counted as a provided default")
+	}
+}
+
 func TestMissingImplementationsBuckets(t *testing.T) {
 	g := missingImplFixture()
 	r, err := g.MissingImplementations("Codec.encode")

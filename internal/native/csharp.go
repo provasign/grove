@@ -265,7 +265,7 @@ func csharpBaseList(text string) string {
 			if depth > 0 {
 				depth--
 			}
-		case '{', '\n', '\r':
+		case '{', ';', '\n', '\r':
 			if depth == 0 {
 				end = i
 				i = len(tail)

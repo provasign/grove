@@ -238,14 +238,23 @@ func phpSemanticEdges(symbols []core.SymbolRecord, psr4 map[string][]string, fil
 func phpUseAliases(symbols []core.SymbolRecord) map[string]map[string]string {
 	out := map[string]map[string]string{}
 	for _, symbol := range symbols {
-		if symbol.Language != "php" || symbol.RawText == "" {
+		if symbol.Language != "php" {
 			continue
 		}
 		if _, ok := out[symbol.FilePath]; !ok {
 			out[symbol.FilePath] = map[string]string{}
 		}
-		for _, ref := range phpUseRefs(symbol.RawText) {
-			out[symbol.FilePath][ref.Alias] = ref.Name
+		for _, imp := range symbol.Imports {
+			clause := strings.TrimSpace(imp)
+			if !strings.HasPrefix(strings.ToLower(clause), "use ") {
+				clause = "use " + clause
+			}
+			if !strings.HasSuffix(clause, ";") {
+				clause += ";"
+			}
+			for _, ref := range phpUseRefs(clause) {
+				out[symbol.FilePath][ref.Alias] = ref.Name
+			}
 		}
 	}
 	return out
@@ -310,10 +319,11 @@ var phpTraitUsePattern = regexp.MustCompile(`\buse[ \t]+([^;{\n]+)(?:;|\{)`)
 
 func phpInheritanceRefs(rawText string) []phpInheritanceRef {
 	var refs []phpInheritanceRef
-	for _, name := range inheritanceClause(rawText, "extends", "implements") {
+	declaration := phpTopLevelHeaders(rawText)
+	for _, name := range inheritanceClause(declaration, "extends", "implements") {
 		refs = append(refs, phpInheritanceRef{Name: strings.Trim(name, "\\"), EdgeType: core.EdgeExtends})
 	}
-	for _, name := range inheritanceClause(rawText, "implements") {
+	for _, name := range inheritanceClause(declaration, "implements") {
 		refs = append(refs, phpInheritanceRef{Name: strings.Trim(name, "\\"), EdgeType: core.EdgeImplements})
 	}
 	for _, match := range phpTraitUsePattern.FindAllStringSubmatch(rawText, -1) {
@@ -327,6 +337,32 @@ func phpInheritanceRefs(rawText string) []phpInheritanceRef {
 		}
 	}
 	return refs
+}
+
+func phpTopLevelHeaders(rawText string) string {
+	var out strings.Builder
+	depth := 0
+	for _, r := range rawText {
+		switch r {
+		case '{':
+			if depth == 0 {
+				out.WriteByte('\n')
+			}
+			depth++
+		case '}':
+			if depth > 0 {
+				depth--
+			}
+			if depth == 0 {
+				out.WriteByte('\n')
+			}
+		default:
+			if depth == 0 {
+				out.WriteRune(r)
+			}
+		}
+	}
+	return out.String()
 }
 
 type phpStaticCall struct {

@@ -7,6 +7,131 @@ import (
 	"github.com/provasign/grove/internal/core"
 )
 
+var (
+	phpTraitUseRe     = regexp.MustCompile(`(?s)\buse[ \t]+([^;{\n]+)(?:;|\{([^}]*)\})`)
+	phpTraitInsteadRe = regexp.MustCompile(`(?i)^\s*([\\\w]+)::(\w+)\s+insteadof\s+(.+?)\s*$`)
+	phpTraitAliasRe   = regexp.MustCompile(`(?i)^\s*(?:([\\\w]+)::)?(\w+)\s+as\s+(?:(?:public|protected|private)\s+)?(\w+)?\s*$`)
+)
+
+type phpTraitAlias struct {
+	trait  string
+	method string
+}
+
+type phpTraitRules struct {
+	used      map[string]bool
+	preferred map[string]string
+	excluded  map[string]map[string]bool
+	aliases   map[string]phpTraitAlias
+	traits    []string
+}
+
+func phpTraitRulesFor(rawText string) phpTraitRules {
+	rules := phpTraitRules{
+		used:      map[string]bool{},
+		preferred: map[string]string{},
+		excluded:  map[string]map[string]bool{},
+		aliases:   map[string]phpTraitAlias{},
+	}
+	for _, match := range phpTraitUseRe.FindAllStringSubmatch(rawText, -1) {
+		if len(match) < 2 || strings.ContainsAny(match[1], "($") {
+			continue // closure `use ($x) { ... }`, not trait composition
+		}
+		var traits []string
+		for _, raw := range strings.Split(match[1], ",") {
+			name := phpSimpleTypeName(raw)
+			if name == "" {
+				continue
+			}
+			key := strings.ToLower(name)
+			if !rules.used[key] {
+				rules.traits = append(rules.traits, name)
+			}
+			rules.used[key] = true
+			traits = append(traits, name)
+		}
+		if len(match) < 3 || match[2] == "" {
+			continue
+		}
+		for _, statement := range strings.Split(match[2], ";") {
+			if parts := phpTraitInsteadRe.FindStringSubmatch(statement); len(parts) == 4 {
+				method := strings.ToLower(parts[2])
+				rules.preferred[method] = strings.ToLower(phpSimpleTypeName(parts[1]))
+				if rules.excluded[method] == nil {
+					rules.excluded[method] = map[string]bool{}
+				}
+				for _, loser := range strings.Split(parts[3], ",") {
+					rules.excluded[method][strings.ToLower(phpSimpleTypeName(loser))] = true
+				}
+				continue
+			}
+			if parts := phpTraitAliasRe.FindStringSubmatch(statement); len(parts) == 4 && parts[3] != "" {
+				trait := phpSimpleTypeName(parts[1])
+				if trait == "" && len(traits) == 1 {
+					trait = traits[0]
+				}
+				rules.aliases[strings.ToLower(parts[3])] = phpTraitAlias{
+					trait: strings.ToLower(trait), method: parts[2],
+				}
+			}
+		}
+	}
+	return rules
+}
+
+func phpSimpleTypeName(raw string) string {
+	raw = strings.Trim(strings.TrimSpace(raw), "\\")
+	if i := strings.LastIndexByte(raw, '\\'); i >= 0 {
+		raw = raw[i+1:]
+	}
+	return strings.TrimSpace(raw)
+}
+
+// phpTraitCallTargets applies PHP's trait adaptation block to a self call.
+// It reports decided only when the enclosing class composes a trait method or
+// alias with this name; callers can then bypass unrelated inheritance fanout.
+func phpTraitCallTargets(idx *edgeIndex, caller *core.SymbolRecord, name string, initial []*core.SymbolRecord) ([]*core.SymbolRecord, bool) {
+	var class *core.SymbolRecord
+	for _, candidate := range namedSymbols(idx, caller.ParentSymbol) {
+		if candidate.FilePath == caller.FilePath && candidate.Kind == core.KindClass {
+			class = candidate
+			break
+		}
+	}
+	if class == nil {
+		return initial, false
+	}
+	rules := phpTraitRulesFor(class.RawText)
+	lookupName := name
+	wantedTrait := ""
+	aliased := false
+	if alias, ok := rules.aliases[strings.ToLower(name)]; ok {
+		lookupName = alias.method
+		wantedTrait = alias.trait
+		initial = namedSymbols(idx, lookupName)
+		aliased = true
+	}
+	methodKey := strings.ToLower(lookupName)
+	if wantedTrait == "" {
+		wantedTrait = rules.preferred[methodKey]
+	}
+	var out []*core.SymbolRecord
+	for _, candidate := range initial {
+		traitKey := strings.ToLower(candidate.ParentSymbol)
+		if candidate.Kind != core.KindMethod || !strings.EqualFold(candidate.Name, lookupName) || !rules.used[traitKey] {
+			continue
+		}
+		if wantedTrait != "" && traitKey != wantedTrait {
+			continue
+		}
+		if !aliased && rules.excluded[methodKey][traitKey] {
+			continue
+		}
+		out = append(out, candidate)
+	}
+	return out, len(out) > 0
+}
+
 // PHP local type inference, same shallow altitude as the C#/Java passes.
 // Modern PHP declares types on parameters (`Foo $x`), properties
 // (`private Bar $y;`), constructor-promoted properties
@@ -141,7 +266,12 @@ func phpReturnType(s *core.SymbolRecord) string {
 	if i := strings.LastIndexByte(s.Signature, ')'); i >= 0 {
 		tail := s.Signature[i+1:]
 		if c := strings.IndexByte(tail, ':'); c >= 0 {
-			if t := phpBareType(strings.TrimSpace(tail[c+1:])); t != "" {
+			declared := strings.TrimSpace(tail[c+1:])
+			declared = strings.TrimRight(declared, "{; ")
+			if (declared == "self" || declared == "static") && s.ParentSymbol != "" {
+				return s.ParentSymbol
+			}
+			if t := phpBareType(declared); t != "" {
 				return t
 			}
 			// `: self`/`: static` reduce to "" in phpBareType → fall through to
@@ -319,4 +449,40 @@ func phpNarrowNewByNamespace(idx *edgeIndex, symbol *core.SymbolRecord, cs core.
 		return out
 	}
 	return ctors
+}
+
+// phpNarrowMethodsByImport disambiguates same-named classes through a file's
+// use declarations. PHP graph scope is library-wide, so ParentSymbol alone
+// cannot distinguish A\User::save from B\User::save.
+func phpNarrowMethodsByImport(idx *edgeIndex, symbol *core.SymbolRecord, typ string, methods []*core.SymbolRecord) []*core.SymbolRecord {
+	if len(methods) < 2 || symbol == nil {
+		return methods
+	}
+	for imp := range idx.fileImports[symbol.FilePath] {
+		clause := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(imp, "use "), ";"))
+		target := clause
+		alias := ""
+		if i := strings.LastIndex(strings.ToLower(clause), " as "); i >= 0 {
+			target = strings.TrimSpace(clause[:i])
+			alias = strings.TrimSpace(clause[i+4:])
+		}
+		leaf := target
+		if i := strings.LastIndexByte(leaf, '\\'); i >= 0 {
+			leaf = leaf[i+1:]
+		}
+		if alias != typ && (alias != "" || leaf != typ) {
+			continue
+		}
+		suffix := strings.ToLower("/" + strings.ReplaceAll(strings.Trim(target, "\\"), "\\", "/") + ".php")
+		var out []*core.SymbolRecord
+		for _, method := range methods {
+			if strings.HasSuffix(strings.ToLower("/"+method.FilePath), suffix) {
+				out = append(out, method)
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	return methods
 }

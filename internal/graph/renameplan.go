@@ -53,9 +53,11 @@ func (g *CodeGraph) RenamePlan(query, newName string) (*RenamePlanResult, error)
 	// input: with lenient resolution the two can differ ("Render" ->
 	// "Render.Render"), and re-parsing the raw form would either fail or
 	// recover a method name the plan was not computed for.
-	_, methodName, _, err := parseChangeImpactQuery(ci.Query)
-	if err != nil {
-		return nil, err
+	methodName := strings.TrimSpace(ci.Query)
+	if _, memberName, _, parseErr := parseChangeImpactQuery(ci.Query); parseErr == nil {
+		methodName = memberName
+	} else if strings.ContainsAny(methodName, ".(") {
+		return nil, parseErr
 	}
 	if newName == "" || newName == methodName {
 		return nil, fmt.Errorf("new name must be non-empty and different from %q", methodName)
@@ -90,12 +92,32 @@ func (g *CodeGraph) RenamePlan(query, newName string) (*RenamePlanResult, error)
 		family[s.ID] = true
 	}
 
+	// A simple Java owner name is not a globally unique type identity. If the
+	// resolved seed contains declarations on same-named owners in distinct
+	// packages, the query itself is ambiguous (`Leaf.work` can mean
+	// com.ex.a.Leaf or com.ex.b.Leaf). Keep every prospective edit reviewable;
+	// never return a confidently apply-able cross-package rewrite.
+	javaSeedOwners := map[string]bool{}
+	for _, s := range ci.Declarations {
+		if s.Language != "java" || s.ParentSymbol == "" {
+			continue
+		}
+		pkg := dirOf(s.FilePath)
+		if suffix, ok := javaPackageSuffix(pkg); ok {
+			pkg = suffix
+		}
+		javaSeedOwners[s.ParentSymbol+"\x00"+pkg] = true
+	}
+	ambiguousSeed := len(javaSeedOwners) > 1
+
 	// identifier in call/declaration position
 	pat := regexp.MustCompile(`\b` + regexp.QuoteMeta(methodName) + `\b(\s*\()`)
+	refPat := regexp.MustCompile(`(\b[A-Za-z_$][A-Za-z0-9_$]*(?:::\s*|\.\s*))` + regexp.QuoteMeta(methodName) + `\b`)
 	// ReplaceAllString treats $ in the replacement as a template variable —
 	// escape it so a $-bearing newName substitutes literally.
 	replacement := strings.ReplaceAll(newName, "$", "$$") + "$1"
-	editLine := func(s core.SymbolRecord, line int, confirmed bool) {
+	refReplacement := "${1}" + strings.ReplaceAll(newName, "$", "$$")
+	editWithPattern := func(s core.SymbolRecord, line int, confirmed bool, pattern *regexp.Regexp, replace string) {
 		if s.RawText == "" || line < s.Span.Start {
 			return
 		}
@@ -105,12 +127,12 @@ func (g *CodeGraph) RenamePlan(query, newName string) (*RenamePlanResult, error)
 			return
 		}
 		before := lines[idx]
-		rawN := len(pat.FindAllStringIndex(before, -1))
-		strippedN := len(pat.FindAllStringIndex(stripCommentsAndStrings(before), -1))
+		rawN := len(pattern.FindAllStringIndex(before, -1))
+		strippedN := len(pattern.FindAllStringIndex(stripCommentsAndStrings(before), -1))
 		if strippedN == 0 {
 			return // only comment/string-literal occurrences on this line
 		}
-		after := pat.ReplaceAllString(before, replacement)
+		after := pattern.ReplaceAllString(before, replace)
 		if after == before {
 			return // name not on this line in call position
 		}
@@ -126,11 +148,14 @@ func (g *CodeGraph) RenamePlan(query, newName string) (*RenamePlanResult, error)
 			Before: strings.TrimRight(before, "\r"), After: strings.TrimRight(after, "\r"),
 			SiteID: s.ID, Site: s.FilePath + ":" + s.Name,
 		}
-		if confirmed {
+		if confirmed && !ambiguousSeed {
 			res.Edits = append(res.Edits, e)
 		} else {
 			res.Ambiguous = append(res.Ambiguous, e)
 		}
+	}
+	editLine := func(s core.SymbolRecord, line int, confirmed bool) {
+		editWithPattern(s, line, confirmed, pat, replacement)
 	}
 
 	// Per-site receiver classification (renamesite.go): resolve each call
@@ -276,6 +301,34 @@ func (g *CodeGraph) RenamePlan(query, newName string) (*RenamePlanResult, error)
 				// not a site: the receiver is the OTHER same-named contract.
 			default:
 				editLine(c, cs.Line, !ambiguousCaller)
+			}
+		}
+	}
+
+	// Reference-only sites intentionally have no calls edge, so ChangeImpact
+	// cannot place their owners in ci.Callers. Scan the indexed site metadata
+	// explicitly for rename purposes while preserving receiver classification.
+	for _, c := range symbolsSlice {
+		seen := map[int]bool{}
+		for _, cs := range c.CallSites {
+			if !cs.ReferenceOnly || seen[cs.Line] {
+				continue
+			}
+			bare := cs.Callee
+			if i := strings.LastIndex(bare, "."); i >= 0 {
+				bare = bare[i+1:]
+			}
+			if bare != methodName {
+				continue
+			}
+			seen[cs.Line] = true
+			switch siteVerdictFor(c, cs) {
+			case siteConfirm:
+				editWithPattern(c, cs.Line, true, refPat, refReplacement)
+			case siteExclude:
+				// Reference belongs to another same-named declaration.
+			default:
+				editWithPattern(c, cs.Line, false, refPat, refReplacement)
 			}
 		}
 	}

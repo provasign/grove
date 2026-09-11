@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"go/ast"
+	"go/token"
 	"go/types"
 	"os"
 	"os/exec"
@@ -513,6 +514,10 @@ func TestCSharpModernInheritanceAndGenericConstructionParsing(t *testing.T) {
 	if len(refs) != 2 || refs[0].Name != "Entity" || refs[1].Name != "IPerson" {
 		t.Fatalf("C# primary-constructor bases: %#v", refs)
 	}
+	refs = csharpInheritanceRefs("public record Plain(string Name) : IPerson;", core.KindClass)
+	if len(refs) != 1 || refs[0].Name != "IPerson" {
+		t.Fatalf("C# semicolon record bases: %#v", refs)
+	}
 	got := csharpConstructedTypes("new Repository<User>(); new Dictionary<string, List<User>>();")
 	if !reflect.DeepEqual(got, []string{"Repository", "Dictionary"}) {
 		t.Fatalf("C# generic constructions: %v", got)
@@ -575,23 +580,27 @@ func TestJsTSAnalyzeCommonJSAndDynamicImports(t *testing.T) {
 		t.Skipf("cannot link temporary TypeScript toolchain: %v", err)
 	}
 	for name, content := range map[string]string{
-		"tsconfig.json": `{"compilerOptions":{"module":"commonjs"},"files":["main.ts","common.ts","dynamic.ts","overload.ts"]}`,
+		"tsconfig.json": `{"compilerOptions":{"module":"commonjs"},"files":["main.ts","common.ts","dynamic.ts","overload.ts","arrow.ts"]}`,
 		"main.ts":       `const common = require('./common'); async function load() { return import('./dynamic'); }`,
 		"common.ts":     `export const value = 1;`,
 		"dynamic.ts":    `export const value = 2;`,
 		"overload.ts":   "export function pick(x: string): string;\nexport function pick(x: number): number;\nexport function pick(x: unknown) { return x; }\nexport function call() { return pick('x'); }\n",
+		"arrow.ts":      "function helper() {}\nclass Widget {\n  field = () => helper();\n}\n",
 	} {
 		if err := os.WriteFile(filepath.Join(root, name), []byte(content), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
 	result := (jsTSAnalyzer{}).Analyze(context.Background(), Request{
-		Root: root, Files: []string{"main.ts", "common.ts", "dynamic.ts", "overload.ts"},
+		Root: root, Files: []string{"main.ts", "common.ts", "dynamic.ts", "overload.ts", "arrow.ts"},
 		Symbols: []core.SymbolRecord{
 			{ID: "pick-decl-1", FilePath: "overload.ts", Language: "typescript", Kind: core.KindFunction, Name: "pick", Span: core.LineRange{Start: 1, End: 1}},
 			{ID: "pick-decl-2", FilePath: "overload.ts", Language: "typescript", Kind: core.KindFunction, Name: "pick", Span: core.LineRange{Start: 2, End: 2}},
 			{ID: "pick-implementation", FilePath: "overload.ts", Language: "typescript", Kind: core.KindFunction, Name: "pick", Span: core.LineRange{Start: 3, End: 3}},
 			{ID: "call", FilePath: "overload.ts", Language: "typescript", Kind: core.KindFunction, Name: "call", Span: core.LineRange{Start: 4, End: 4}},
+			{ID: "helper", FilePath: "arrow.ts", Language: "typescript", Kind: core.KindFunction, Name: "helper", Span: core.LineRange{Start: 1, End: 1}},
+			{ID: "widget", FilePath: "arrow.ts", Language: "typescript", Kind: core.KindClass, Name: "Widget", Span: core.LineRange{Start: 2, End: 4}},
+			{ID: "field", FilePath: "arrow.ts", Language: "typescript", Kind: core.KindField, Name: "field", ParentSymbol: "Widget", Span: core.LineRange{Start: 3, End: 3}},
 		},
 	})
 	want := map[string]bool{"common.ts": false, "dynamic.ts": false}
@@ -606,6 +615,12 @@ func TestJsTSAnalyzeCommonJSAndDynamicImports(t *testing.T) {
 		}
 	}
 	assertNativeEdge(t, result.Edges, "call", "pick-implementation", core.EdgeCalls)
+	assertNativeEdge(t, result.Edges, "field", "helper", core.EdgeCalls)
+	for _, edge := range result.Edges {
+		if edge.From == "widget" && edge.To == "helper" && edge.Type == core.EdgeCalls {
+			t.Fatalf("arrow-field call was attributed to class: %#v", edge)
+		}
+	}
 }
 
 func TestPHPAvailableChecksComposerJSON(t *testing.T) {
@@ -776,6 +791,112 @@ func TestPythonRelativeAndModuleAliasImportsResolveLocally(t *testing.T) {
 	assertNativeEdge(t, result.Edges, "file:pkg/consumer.py", "file:pkg/other.py", core.EdgeImports)
 	assertNativeEdge(t, result.Edges, "use_thing", "thing", core.EdgeUsesType)
 	assertNativeEdge(t, result.Edges, "use_other", "other", core.EdgeUsesType)
+}
+
+func TestPythonQuotedQualifiedAnnotationKeepsModuleBinding(t *testing.T) {
+	if firstExistingExecutable("python3", "python") == "" {
+		t.Skip("python3/python not available")
+	}
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "lib"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "app"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, src := range map[string]string{
+		"requirements.txt": "",
+		"lib/conf.py":      "class Conf: pass\n",
+		"app/shadow.py":    "import lib.conf as pc\nclass Conf: pass\ndef takes(value: \"pc.Conf\"): pass\n",
+	} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	syms := []core.SymbolRecord{
+		{ID: "lib-conf", FilePath: "lib/conf.py", Language: "python", Kind: core.KindClass, Name: "Conf", Span: core.LineRange{Start: 1, End: 1}},
+		{ID: "local-conf", FilePath: "app/shadow.py", Language: "python", Kind: core.KindClass, Name: "Conf", Span: core.LineRange{Start: 2, End: 2}},
+		{ID: "takes", FilePath: "app/shadow.py", Language: "python", Kind: core.KindFunction, Name: "takes", Span: core.LineRange{Start: 3, End: 3}},
+	}
+	result := (pythonAnalyzer{}).Analyze(context.Background(), Request{
+		Root: root, Files: []string{"lib/conf.py", "app/shadow.py"}, Symbols: syms,
+	})
+	assertNativeEdge(t, result.Edges, "takes", "lib-conf", core.EdgeUsesType)
+	for _, edge := range result.Edges {
+		if edge.From == "takes" && edge.To == "local-conf" && edge.Type == core.EdgeUsesType {
+			t.Fatalf("quoted pc.Conf bound to local homonym: %#v", edge)
+		}
+	}
+}
+
+func TestPythonSiblingDottedImportsDoNotCollide(t *testing.T) {
+	if firstExistingExecutable("python3", "python") == "" {
+		t.Skip("python3/python not available")
+	}
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "lib"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, src := range map[string]string{
+		"requirements.txt": "",
+		"lib/engine.py":    "class Engine: pass\n",
+		"lib/conf.py":      "class Conf: pass\n",
+		"consumer.py":      "import lib.engine\nimport lib.conf\ndef use(a: lib.engine.Engine, b: lib.conf.Conf): pass\n",
+	} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	syms := []core.SymbolRecord{
+		{ID: "engine", FilePath: "lib/engine.py", Language: "python", Kind: core.KindClass, Name: "Engine", Span: core.LineRange{Start: 1, End: 1}},
+		{ID: "conf", FilePath: "lib/conf.py", Language: "python", Kind: core.KindClass, Name: "Conf", Span: core.LineRange{Start: 1, End: 1}},
+		{ID: "use", FilePath: "consumer.py", Language: "python", Kind: core.KindFunction, Name: "use", Span: core.LineRange{Start: 3, End: 3}},
+	}
+	result := (pythonAnalyzer{}).Analyze(context.Background(), Request{
+		Root: root, Files: []string{"lib/engine.py", "lib/conf.py", "consumer.py"}, Symbols: syms,
+	})
+	assertNativeEdge(t, result.Edges, "use", "engine", core.EdgeUsesType)
+	assertNativeEdge(t, result.Edges, "use", "conf", core.EdgeUsesType)
+}
+
+func TestFilesByLanguageIncludesSymbolLessFiles(t *testing.T) {
+	got := filesByLanguage([]core.SymbolRecord{
+		{FilePath: "src/driver.ts", Language: "typescript"},
+	}, []string{"src/driver.ts", "src/index.ts", "src/plain.js"})
+	if !reflect.DeepEqual(got["typescript"], []string{"src/driver.ts", "src/index.ts"}) {
+		t.Fatalf("typescript files = %v", got["typescript"])
+	}
+	if !reflect.DeepEqual(got["javascript"], []string{"src/plain.js"}) {
+		t.Fatalf("javascript files = %v", got["javascript"])
+	}
+}
+
+func TestPythonRelativeImportFallsBackToPackageInitType(t *testing.T) {
+	if firstExistingExecutable("python3", "python") == "" {
+		t.Skip("python3/python not available")
+	}
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "pkg", "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, src := range map[string]string{
+		"requirements.txt":    "",
+		"pkg/__init__.py":     "class Marker: pass\n",
+		"pkg/sub/__init__.py": "",
+		"pkg/sub/consumer.py": "from .. import Marker\ndef use(value: Marker): pass\n",
+	} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	symbols := []core.SymbolRecord{
+		{ID: "marker", FilePath: "pkg/__init__.py", Language: "python", Kind: core.KindClass, Name: "Marker", Span: core.LineRange{Start: 1, End: 1}},
+		{ID: "use", FilePath: "pkg/sub/consumer.py", Language: "python", Kind: core.KindFunction, Name: "use", Span: core.LineRange{Start: 2, End: 2}},
+	}
+	files := []string{"pkg/__init__.py", "pkg/sub/__init__.py", "pkg/sub/consumer.py"}
+	result := (pythonAnalyzer{}).Analyze(context.Background(), Request{Root: root, Files: files, Symbols: symbols})
+	assertNativeEdge(t, result.Edges, "file:pkg/sub/consumer.py", "file:pkg/__init__.py", core.EdgeImports)
+	assertNativeEdge(t, result.Edges, "use", "marker", core.EdgeUsesType)
 }
 
 func TestPythonExternalImportedAnnotationDoesNotBindUnrelatedLocalType(t *testing.T) {
@@ -984,9 +1105,10 @@ func TestGoCallSiteEdgesResolveImportedCalls(t *testing.T) {
 		ID: "auth/auth.go::User@1", FilePath: "auth/auth.go",
 		Language: "go", Kind: core.KindStruct, Name: "User",
 	}
-	edges := goCallSiteEdges([]core.SymbolRecord{caller, callee, user}, []core.SymbolRecord{caller, callee, user})
+	pkgDirs := map[string][]string{"example.com/app/auth": {"auth"}}
+	edges := goCallSiteEdges([]core.SymbolRecord{caller, callee, user}, []core.SymbolRecord{caller, callee, user}, pkgDirs)
 	assertNativeEdge(t, edges, caller.ID, callee.ID, core.EdgeCalls)
-	typeEdges := goTypeUseEdges(context.Background(), []core.SymbolRecord{caller, callee, user}, []core.SymbolRecord{caller, callee, user})
+	typeEdges := goTypeUseEdges(context.Background(), []core.SymbolRecord{caller, callee, user}, []core.SymbolRecord{caller, callee, user}, pkgDirs)
 	assertNativeEdge(t, typeEdges, caller.ID, user.ID, core.EdgeUsesType)
 }
 
@@ -1005,7 +1127,11 @@ func TestGoCallSiteEdgesPreferExactImportedPackage(t *testing.T) {
 		ID: "other/auth.go::Login@1", FilePath: "other/auth.go",
 		Language: "go", Kind: core.KindFunction, Name: "Login",
 	}
-	edges := goCallSiteEdges([]core.SymbolRecord{caller, authLogin, otherLogin}, []core.SymbolRecord{caller, authLogin, otherLogin})
+	pkgDirs := map[string][]string{
+		"example.com/app/auth":  {"auth"},
+		"example.com/app/other": {"other"},
+	}
+	edges := goCallSiteEdges([]core.SymbolRecord{caller, authLogin, otherLogin}, []core.SymbolRecord{caller, authLogin, otherLogin}, pkgDirs)
 	if len(edges) != 1 {
 		t.Fatalf("expected one edge, got %#v", edges)
 	}
@@ -1022,8 +1148,9 @@ func TestGoCallSiteEdgesHonorImportAliasMetadata(t *testing.T) {
 	login := core.SymbolRecord{ID: "auth/login.go::Login@1", FilePath: "auth/login.go", Language: "go", Kind: core.KindFunction, Name: "Login"}
 	user := core.SymbolRecord{ID: "auth/user.go::User@1", FilePath: "auth/user.go", Language: "go", Kind: core.KindStruct, Name: "User"}
 	all := []core.SymbolRecord{caller, login, user}
-	assertNativeEdge(t, goCallSiteEdges([]core.SymbolRecord{caller}, all), caller.ID, login.ID, core.EdgeCalls)
-	assertNativeEdge(t, goTypeUseEdges(context.Background(), []core.SymbolRecord{caller}, all), caller.ID, user.ID, core.EdgeUsesType)
+	pkgDirs := map[string][]string{"example.com/app/auth": {"auth"}}
+	assertNativeEdge(t, goCallSiteEdges([]core.SymbolRecord{caller}, all, pkgDirs), caller.ID, login.ID, core.EdgeCalls)
+	assertNativeEdge(t, goTypeUseEdges(context.Background(), []core.SymbolRecord{caller}, all, pkgDirs), caller.ID, user.ID, core.EdgeUsesType)
 }
 
 func TestGoTypeUseEdgesPreferExactImportedPackage(t *testing.T) {
@@ -1041,11 +1168,36 @@ func TestGoTypeUseEdgesPreferExactImportedPackage(t *testing.T) {
 		ID: "bar/models/user.go::User@1", FilePath: "bar/models/user.go",
 		Language: "go", Kind: core.KindStruct, Name: "User",
 	}
-	edges := goTypeUseEdges(context.Background(), []core.SymbolRecord{caller}, []core.SymbolRecord{caller, wanted, wrong})
+	pkgDirs := map[string][]string{"example.com/app/foo/models": {"foo/models"}}
+	edges := goTypeUseEdges(context.Background(), []core.SymbolRecord{caller}, []core.SymbolRecord{caller, wanted, wrong}, pkgDirs)
 	if len(edges) != 1 {
 		t.Fatalf("expected one exact-package type edge, got %#v", edges)
 	}
 	assertNativeEdge(t, edges, caller.ID, wanted.ID, core.EdgeUsesType)
+}
+
+func TestGoSymbolForMethodNeverFallsBackToPackageFunction(t *testing.T) {
+	pkg := types.NewPackage("example.com/app/g", "g")
+	named := types.NewNamed(types.NewTypeName(token.NoPos, pkg, "Job", nil), types.NewStruct(nil, nil), nil)
+	recv := types.NewVar(token.NoPos, pkg, "j", named)
+	sig := types.NewSignature(recv, types.NewTuple(), types.NewTuple(), false)
+	method := types.NewFunc(token.NoPos, pkg, "Run", sig)
+	free := core.SymbolRecord{ID: "g.go::Run@1", FilePath: "g.go", Language: "go", Kind: core.KindFunction, Name: "Run"}
+	idx := newGoSymbolIndex([]core.SymbolRecord{free})
+
+	if got, ok := goSymbolForFunc(".", method, idx, map[string][]string{pkg.Path(): {"."}}); ok {
+		t.Fatalf("method resolved to receiver-less package function: %+v", got)
+	}
+}
+
+func TestGoDirMatchesImportRequiresExactGoListMapping(t *testing.T) {
+	dirs := map[string][]string{"github.com/acme/project/recv": {"recv"}}
+	if !goDirMatchesImport("recv", "github.com/acme/project/recv", dirs) {
+		t.Fatal("exact local package mapping did not match")
+	}
+	if goDirMatchesImport("recv", "github.com/other/project/recv", dirs) {
+		t.Fatal("foreign module matched a local directory by suffix")
+	}
 }
 
 func TestRustModuleNames(t *testing.T) {
@@ -1071,15 +1223,37 @@ func TestRustGenericImplAndLifetimeTypes(t *testing.T) {
 	}
 }
 
+func TestRustImplRefsNestedGenericsAndReferenceReceiver(t *testing.T) {
+	refs := rustImplRefs("impl<'a, T, E> crate::Convert<Result<Vec<T>, E>> for &'a mut crate::Wrapper<Result<T, E>> where T: Clone {}")
+	if len(refs) != 1 || refs[0].TraitName != "Convert" || refs[0].TypeName != "Wrapper" {
+		t.Fatalf("nested/reference impl refs = %+v", refs)
+	}
+}
+
 func TestPHPUseAndInheritanceParsing(t *testing.T) {
 	uses := phpUseRefs("use Foo\\Bar as Baz;\nuse Vendor\\Pkg\\{One, Two as Second, function helper, const VALUE};")
 	wantUses := []phpUseRef{{Name: "Foo\\Bar", Alias: "Baz"}, {Name: "Vendor\\Pkg\\One", Alias: "One"}, {Name: "Vendor\\Pkg\\Two", Alias: "Second"}}
 	if !reflect.DeepEqual(uses, wantUses) {
 		t.Fatalf("PHP use refs: got %#v, want %#v", uses, wantUses)
 	}
+	aliases := phpUseAliases([]core.SymbolRecord{{
+		FilePath: "src/App.php", Language: "php", Imports: []string{"Foo\\Bar as Baz"},
+	}})
+	if aliases["src/App.php"]["Baz"] != "Foo\\Bar" {
+		t.Fatalf("PHP aliases from symbol imports: %#v", aliases)
+	}
 	refs := phpInheritanceRefs("interface Child\n extends A, B {}\nclass C implements X, Y {\n use TOne, TTwo { TOne::run insteadof TTwo; }\n}")
 	if len(refs) != 6 {
 		t.Fatalf("PHP inheritance refs: %#v", refs)
+	}
+}
+
+func TestPHPInheritanceIgnoresNestedAnonymousClass(t *testing.T) {
+	refs := phpInheritanceRefs("class Svc { function make() { return new class extends Model {}; } }")
+	for _, ref := range refs {
+		if ref.Name == "Model" {
+			t.Fatalf("outer class inherited anonymous class base: %+v", refs)
+		}
 	}
 }
 

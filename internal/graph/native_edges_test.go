@@ -43,3 +43,22 @@ func TestMergeEdgesKeepsBaselineWhenNativeIsWeaker(t *testing.T) {
 		t.Fatalf("baseline edge should remain: %#v", merged[0])
 	}
 }
+
+func TestMergeEdgesPrefersNativeOnEqualConfidence(t *testing.T) {
+	base := []core.Edge{{
+		From: "a", To: "b", Type: core.EdgeCalls,
+		Confidence: 0.8, Source: core.EvidenceSourceHeuristic, Reason: core.ReasonDispatch,
+	}}
+	enriched := []core.Edge{{
+		From: "a", To: "b", Type: core.EdgeCalls,
+		Confidence: 0.8, Source: core.EvidenceSourceNative, Reason: core.ReasonASTNarrowed,
+	}}
+
+	merged := mergeEdges(base, enriched)
+	if len(merged) != 1 {
+		t.Fatalf("got %d edges, want 1", len(merged))
+	}
+	if merged[0].Source != core.EvidenceSourceNative || merged[0].Reason != core.ReasonASTNarrowed {
+		t.Fatalf("equal-confidence native edge did not win: %#v", merged[0])
+	}
+}

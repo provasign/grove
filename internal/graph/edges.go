@@ -82,6 +82,7 @@ type edgeIndex struct {
 	pyModuleGlobals  map[string]string
 	pyImportBindings map[string]map[string][]pyImportBinding
 	jsImportAliases  map[string]map[string]string
+	jsReExports      map[string]map[string]struct{}
 	goImportAliases  map[string]map[string]string
 
 	// pySubclasses is the inverse of pyBaseClasses over every indexed
@@ -105,6 +106,7 @@ func newEdgeIndex(symbols []core.SymbolRecord) *edgeIndex {
 		importedFilesCache: make(map[string]map[string]struct{}),
 		pyImportBindings:   make(map[string]map[string][]pyImportBinding),
 		jsImportAliases:    make(map[string]map[string]string),
+		jsReExports:        make(map[string]map[string]struct{}),
 		goImportAliases:    make(map[string]map[string]string),
 	}
 	seenPyBinding := map[string]bool{}
@@ -148,11 +150,21 @@ func newEdgeIndex(symbols []core.SymbolRecord) *edgeIndex {
 				idx.jsImportAliases[s.FilePath][local] = target
 				continue
 			}
+			if target, reexport := core.ParseJSImportReExport(imp); reexport {
+				if idx.jsReExports[s.FilePath] == nil {
+					idx.jsReExports[s.FilePath] = map[string]struct{}{}
+				}
+				idx.jsReExports[s.FilePath][target] = struct{}{}
+				continue
+			}
 			if local, target, alias := core.ParseGoImportAlias(imp); alias {
 				if idx.goImportAliases[s.FilePath] == nil {
 					idx.goImportAliases[s.FilePath] = map[string]string{}
 				}
 				idx.goImportAliases[s.FilePath][local] = target
+				// The target still belongs to ordinary import scope; the alias
+				// map only supplies the stricter qualifier-to-target binding.
+				idx.fileImports[s.FilePath][target] = struct{}{}
 				continue
 			}
 			if strings.Contains(imp, "#") {
@@ -381,7 +393,7 @@ func rustImportedExternal(idx *edgeIndex, symbol *core.SymbolRecord, name string
 	// followed by a delimiter — never a module segment of a longer path.
 	re := localFnRes.get(`(?:::|\{|,\s*)` + regexp.QuoteMeta(name) + `(?:\s*[,}]|\s+as\s|\s*$)`)
 	for imp := range idx.fileImports[symbol.FilePath] {
-		imp = strings.TrimSpace(strings.TrimPrefix(imp, "pub "))
+		imp = stripRustUsePrefix(imp)
 		if !re.MatchString(imp) {
 			continue
 		}
@@ -413,6 +425,55 @@ func rustImportedExternal(idx *edgeIndex, symbol *core.SymbolRecord, name string
 	return false
 }
 
+func rustPinBareImport(idx *edgeIndex, symbol *core.SymbolRecord, name string, cands []*core.SymbolRecord) []*core.SymbolRecord {
+	if name == "" || len(cands) == 0 || anyInFile(cands, symbol.FilePath) {
+		return cands
+	}
+	for _, raw := range sortedKeys(idx.fileImports[symbol.FilePath]) {
+		imp := stripRustUsePrefix(raw)
+		bound := ""
+		if before, alias, ok := strings.Cut(imp, " as "); ok {
+			imp, bound = strings.TrimSpace(before), strings.TrimSpace(alias)
+		}
+		module := ""
+		if open := strings.IndexByte(imp, '{'); open >= 0 {
+			if !localFnRes.get(`\b` + regexp.QuoteMeta(name) + `\b`).MatchString(imp[open:]) {
+				continue
+			}
+			prefix := strings.TrimSuffix(strings.TrimSpace(imp[:open]), "::")
+			if i := strings.LastIndex(prefix, "::"); i >= 0 {
+				module = prefix[i+2:]
+			}
+		} else {
+			parts := strings.Split(imp, "::")
+			if len(parts) < 2 {
+				continue
+			}
+			member := strings.TrimSpace(parts[len(parts)-1])
+			if bound == "" {
+				bound = member
+			}
+			if bound != name {
+				continue
+			}
+			module = strings.TrimSpace(parts[len(parts)-2])
+		}
+		if module == "" {
+			continue
+		}
+		var pinned []*core.SymbolRecord
+		for _, candidate := range cands {
+			if baseNameNoExt(candidate.FilePath) == module || baseOf(dirOf(candidate.FilePath)) == module {
+				pinned = append(pinned, candidate)
+			}
+		}
+		if len(pinned) > 0 {
+			return pinned
+		}
+	}
+	return cands
+}
+
 // rustImportHeads returns the crate-name heads of one `use` statement:
 // "grep::regex::X" → [grep]; "pub use grep_printer as printer" →
 // [grep_printer]; the 2018 grouped form "{grep::matcher::Matcher,
@@ -420,8 +481,7 @@ func rustImportedExternal(idx *edgeIndex, symbol *core.SymbolRecord, name string
 // crate "{grep" and ripgrep's grouped imports never joined scope).
 // crate/self/super/std/core/alloc are dropped.
 func rustImportHeads(imp string) []string {
-	seg := strings.TrimPrefix(imp, "pub ")
-	seg = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(seg), "use "))
+	seg := stripRustUsePrefix(imp)
 	var parts []string
 	if strings.HasPrefix(seg, "{") {
 		inner := strings.TrimSuffix(strings.TrimPrefix(seg, "{"), "}")
@@ -447,6 +507,18 @@ func rustImportHeads(imp string) []string {
 		out = append(out, p)
 	}
 	return out
+}
+
+func stripRustUsePrefix(imp string) string {
+	imp = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(imp), ";"))
+	if strings.HasPrefix(imp, "pub(") {
+		if end := strings.IndexByte(imp, ')'); end >= 0 {
+			imp = strings.TrimSpace(imp[end+1:])
+		}
+	} else {
+		imp = strings.TrimSpace(strings.TrimPrefix(imp, "pub "))
+	}
+	return strings.TrimSpace(strings.TrimPrefix(imp, "use "))
 }
 
 // rustInlinePathRe matches the leading segment of an inline path
@@ -851,6 +923,9 @@ func (idx *edgeIndex) importedFiles(fromFile string) map[string]struct{} {
 		return out
 	}
 	for _, imp := range sortedKeys(imports) {
+		if _, reexport := core.ParseJSImportReExport(imp); reexport {
+			continue
+		}
 		// Strip an `as <alias>` binding: the alias is a local name, not part
 		// of the module path, and left in place it broke resolution of the
 		// whole import (Python `import driver.dbapi as Database`, JS
@@ -860,6 +935,20 @@ func (idx *edgeIndex) importedFiles(fromFile string) map[string]struct{} {
 			imp = imp[:i]
 		}
 		raw := strings.Trim(imp, "\"' ;")
+		if lang == "python" {
+			// Python relative imports are package-relative identities, not
+			// basename searches. Resolving `.models` generically admitted every
+			// models.py in a monorepo and produced confident cross-package calls.
+			if hash := strings.IndexByte(raw, '#'); hash >= 0 {
+				raw = raw[:hash]
+			}
+			for _, f := range idx.pyModuleFiles(fromFile, raw) {
+				if f != fromFile {
+					out[f] = struct{}{}
+				}
+			}
+			continue
+		}
 		// Relative imports name one specific file or directory: resolve them
 		// against the importing file's location and skip fuzzy matching —
 		// basename fallback would pull every same-named file in a monorepo
@@ -970,6 +1059,36 @@ func (idx *edgeIndex) importedFiles(fromFile string) map[string]struct{} {
 				strings.HasSuffix(lower, "/"+segLower+".java") ||
 				strings.HasSuffix(lower, "/"+segLower+".rs") {
 				out[c] = struct{}{}
+			}
+		}
+	}
+	if tsFamilyLang(lang) {
+		// A consumer of a barrel sees symbols re-exported by that barrel, but
+		// not arbitrary implementation imports. Follow only explicitly marked
+		// export-from dependencies, with a cycle guard for barrel chains.
+		visited := map[string]bool{fromFile: true}
+		queue := make([]string, 0, len(out))
+		for file := range out {
+			if file != fromFile {
+				queue = append(queue, file)
+			}
+		}
+		for len(queue) > 0 {
+			file := queue[0]
+			queue = queue[1:]
+			if visited[file] {
+				continue
+			}
+			visited[file] = true
+			for module := range idx.jsReExports[file] {
+				for _, target := range idx.resolveRelativeImport(file, module) {
+					if target != fromFile {
+						out[target] = struct{}{}
+					}
+					if !visited[target] {
+						queue = append(queue, target)
+					}
+				}
 			}
 		}
 	}
@@ -1100,13 +1219,77 @@ func stripCommentsAndStrings(src string) string {
 			}
 			continue
 		}
-		// String literal — preserve newlines so call matching keeps line layout.
-		if ch == '"' || ch == '\'' || ch == '`' {
-			quote := ch
+		// A slash after an expression opener is a JavaScript/TypeScript regex
+		// literal. Skip it as one unit so quotes inside /["']/ do not open a
+		// fake string that consumes the rest of the source.
+		if ch == '/' && looksLikeRegexLiteral(src, i) {
 			out.WriteByte(' ')
 			i++
-			for i < n && src[i] != quote {
+			inClass := false
+			for i < n {
 				if src[i] == '\\' && i+1 < n {
+					i += 2
+					continue
+				}
+				if src[i] == '[' {
+					inClass = true
+				} else if src[i] == ']' {
+					inClass = false
+				} else if src[i] == '/' && !inClass {
+					i++
+					for i < n && isASCIIAlpha(src[i]) {
+						i++
+					}
+					break
+				}
+				if src[i] == '\n' {
+					out.WriteByte('\n')
+				}
+				i++
+			}
+			continue
+		}
+		// Rust lifetimes ('a, 'static) are identifiers, not character strings.
+		if ch == '\'' && rustLifetimeAt(src, i) {
+			out.WriteByte(ch)
+			i++
+			continue
+		}
+		// String literal — preserve newlines and executable interpolation holes.
+		if ch == '"' || ch == '\'' || ch == '`' {
+			quote := ch
+			prefix := literalPrefix(src, i)
+			raw := strings.Contains(prefix, "@") || strings.ContainsAny(prefix, "rR")
+			interpolated := quote == '`' || strings.Contains(prefix, "$") || strings.ContainsAny(prefix, "fF")
+			out.WriteByte(' ')
+			i++
+			for i < n {
+				if interpolated {
+					open := -1
+					if quote == '`' && src[i] == '$' && i+1 < n && src[i+1] == '{' {
+						open = i + 1
+					} else if quote != '`' && src[i] == '{' && (i+1 >= n || src[i+1] != '{') {
+						open = i
+					}
+					if open >= 0 {
+						if end := matchingBrace(src, open); end >= 0 {
+							out.WriteByte(' ')
+							out.WriteString(stripCommentsAndStrings(src[open+1 : end]))
+							out.WriteByte(' ')
+							i = end + 1
+							continue
+						}
+					}
+				}
+				if src[i] == quote {
+					if raw && i+1 < n && src[i+1] == quote {
+						i += 2 // C# verbatim doubled quote
+						continue
+					}
+					i++
+					break
+				}
+				if !raw && src[i] == '\\' && i+1 < n {
 					i += 2
 					continue
 				}
@@ -1115,15 +1298,81 @@ func stripCommentsAndStrings(src string) string {
 				}
 				i++
 			}
-			if i < n {
-				i++ // closing quote
-			}
 			continue
 		}
 		out.WriteByte(ch)
 		i++
 	}
 	return out.String()
+}
+
+func isASCIIAlpha(ch byte) bool {
+	return ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z'
+}
+
+func rustLifetimeAt(src string, quote int) bool {
+	if quote+1 >= len(src) || !(isASCIIAlpha(src[quote+1]) || src[quote+1] == '_') {
+		return false
+	}
+	i := quote + 2
+	for i < len(src) && (isASCIIAlpha(src[i]) || src[i] == '_' || src[i] >= '0' && src[i] <= '9') {
+		i++
+	}
+	return i >= len(src) || src[i] != '\''
+}
+
+func literalPrefix(src string, quote int) string {
+	i := quote
+	for i > 0 {
+		ch := src[i-1]
+		if ch != '$' && ch != '@' && ch != 'f' && ch != 'F' && ch != 'r' && ch != 'R' {
+			break
+		}
+		i--
+	}
+	return src[i:quote]
+}
+
+func matchingBrace(src string, open int) int {
+	depth := 0
+	for i := open; i < len(src); i++ {
+		switch src[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+func looksLikeRegexLiteral(src string, slash int) bool {
+	prev := byte(0)
+	for i := slash - 1; i >= 0; i-- {
+		if src[i] != ' ' && src[i] != '\t' && src[i] != '\r' && src[i] != '\n' {
+			prev = src[i]
+			break
+		}
+	}
+	if prev != 0 && !strings.ContainsRune("(=,:;!&|?{[", rune(prev)) {
+		return false
+	}
+	for i := slash + 1; i < len(src); i++ {
+		if src[i] == '\\' {
+			i++
+			continue
+		}
+		if src[i] == '\n' {
+			return false
+		}
+		if src[i] == '/' {
+			return true
+		}
+	}
+	return false
 }
 
 // buildDefinesAndImports emits "file → symbol" defines edges and
@@ -1151,6 +1400,9 @@ func buildDefinesAndImports(symbols []core.SymbolRecord) []core.Edge {
 				continue
 			}
 			if _, _, alias := core.ParseJSImportAlias(imp); alias {
+				continue
+			}
+			if _, reexport := core.ParseJSImportReExport(imp); reexport {
 				continue
 			}
 			if strings.Contains(imp, "#") {
@@ -1195,8 +1447,12 @@ func buildContains(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
 				// `func (s *T) M()` may live in any file of T's package.
 				// Same directory ≈ same package (Go enforces one package
 				// per directory).
-				if symbol.Language != "go" || parent.Language != "go" ||
-					path.Dir(parent.FilePath) != path.Dir(symbol.FilePath) {
+				sameGoPackage := symbol.Language == "go" && parent.Language == "go" &&
+					path.Dir(parent.FilePath) == path.Dir(symbol.FilePath)
+				sameRustCrate := symbol.Language == "rust" && parent.Language == "rust" &&
+					idx.rustCrateOfFile[symbol.FilePath] != "" &&
+					idx.rustCrateOfFile[symbol.FilePath] == idx.rustCrateOfFile[parent.FilePath]
+				if !sameGoPackage && !sameRustCrate {
 					continue
 				}
 			}
@@ -1225,11 +1481,12 @@ func buildContains(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
 // extendsRe / implementsRe match the inheritance clauses of class/interface
 // declarations across JS/TS/Java. Python uses parenthesized base classes.
 var (
-	extendsRe       = regexp.MustCompile(`\bextends\s+([A-Za-z_][A-Za-z0-9_.]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_.]*)*)`)
-	implementsRe    = regexp.MustCompile(`\bimplements\s+([A-Za-z_][A-Za-z0-9_.]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_.]*)*)`)
-	pythonClassBase = regexp.MustCompile(`^\s*class\s+[A-Za-z_][A-Za-z0-9_]*\s*\(([^)]+)\)`)
-	rustImplForRe   = regexp.MustCompile(`\bimpl\s+(?:<[^>]+>\s+)?([A-Za-z_][A-Za-z0-9_:]*)(?:<[^{}]+>)?\s+for\s+([A-Za-z_][A-Za-z0-9_:]*)(?:<[^{}]+>)?`)
-	usesTypeIdent   = regexp.MustCompile(`\b([A-Z][A-Za-z0-9_]+)\b`)
+	extendsRe        = regexp.MustCompile(`\bextends\s+([A-Za-z_][A-Za-z0-9_.]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_.]*)*)`)
+	implementsRe     = regexp.MustCompile(`\bimplements\s+([A-Za-z_][A-Za-z0-9_.]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_.]*)*)`)
+	pythonClassBase  = regexp.MustCompile(`^\s*class\s+[A-Za-z_][A-Za-z0-9_]*\s*\(([^)]+)\)`)
+	rustImplForRe    = regexp.MustCompile(`\bimpl(?:\s*<[^>]+>)?\s+([A-Za-z_][A-Za-z0-9_:]*)(?:<[^{}]+>)?\s+for\s+&?\s*([A-Za-z_][A-Za-z0-9_:]*)(?:<[^{}]+>)?`)
+	usesTypeIdent    = regexp.MustCompile(`\b([A-Z][A-Za-z0-9_]+)\b`)
+	goEmbeddedTypeRe = regexp.MustCompile(`^\s*\*?((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)(?:\[[^]\n]+\])?\s*(?://.*)?$`)
 )
 
 // stripAngleBrackets removes balanced `<...>` sections (including nested
@@ -1305,6 +1562,25 @@ func buildExtendsImplements(idx *edgeIndex, symbols []core.SymbolRecord) []core.
 				}
 				edges = append(edges, resolveTypeEdges(idx, symbol, name, edgeType, 0.85)...)
 			}
+		case "php":
+			if symbol.Kind != core.KindClass && symbol.Kind != core.KindInterface && symbol.Kind != core.KindTrait {
+				continue
+			}
+			text := symbol.Signature
+			if text == "" {
+				text = firstLine(symbol.RawText)
+			}
+			for _, name := range inheritanceClauseTypes(text, "extends", "implements") {
+				edges = append(edges, resolveTypeEdges(idx, symbol, name, core.EdgeExtends, 0.85)...)
+			}
+			for _, name := range inheritanceClauseTypes(text, "implements") {
+				edges = append(edges, resolveTypeEdges(idx, symbol, name, core.EdgeImplements, 0.85)...)
+			}
+			if symbol.Kind == core.KindClass {
+				for _, name := range phpTraitRulesFor(symbol.RawText).traits {
+					edges = append(edges, resolveTypeEdges(idx, symbol, name, core.EdgeImplements, 0.85)...)
+				}
+			}
 		case "cpp":
 			if symbol.Kind != core.KindClass && symbol.Kind != core.KindStruct {
 				continue
@@ -1351,6 +1627,11 @@ func buildExtendsImplements(idx *edgeIndex, symbols []core.SymbolRecord) []core.
 			}
 			if symbol.Kind != core.KindStruct && symbol.Kind != core.KindEnum {
 				continue
+			}
+			for _, ann := range symbol.Annotations {
+				if traitName := strings.TrimPrefix(ann, "implements:"); traitName != ann && traitName != "" {
+					edges = append(edges, resolveTypeEdges(idx, symbol, traitName, core.EdgeImplements, 0.95)...)
+				}
 			}
 			body := symbol.RawText
 			matches := rustImplForRe.FindAllStringSubmatch(body, -1)
@@ -1413,17 +1694,47 @@ func buildUsesType(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
 			if candidateName == symbol.Name {
 				continue
 			}
+			var targets []*core.SymbolRecord
 			for _, target := range idx.byName[strings.ToLower(candidateName)] {
-				if target.Language == "python" && target.Kind == core.KindField {
-					// Same scoping as the source-side skip above: 166
-					// django fields named "model" as uses-type TARGETS of
-					// every class signature containing that token is
-					// noise, not typing evidence.
+				if target.ID == symbol.ID || target.Name != candidateName {
+					continue
+				}
+				switch target.Kind {
+				case core.KindClass, core.KindInterface, core.KindStruct, core.KindTrait, core.KindEnum, core.KindType:
+				default:
 					continue
 				}
 				if _, inScope := scope[target.FilePath]; !inScope {
 					continue
 				}
+				targets = append(targets, target)
+			}
+			if symbol.Language == "cpp" && len(targets) > 1 {
+				qualified := localFnRes.get(`\b(?:[A-Za-z_]\w*::)+`+regexp.QuoteMeta(candidateName)+`\b`).FindAllString(symbol.Signature, -1)
+				var pinned []*core.SymbolRecord
+				if len(qualified) > 0 {
+					for _, target := range targets {
+						for _, ref := range qualified {
+							if target.QualifiedName == ref || strings.HasSuffix(target.QualifiedName, "::"+ref) {
+								pinned = append(pinned, target)
+								break
+							}
+						}
+					}
+					targets = pinned
+				} else if split := strings.LastIndex(symbol.QualifiedName, "::"); split >= 0 {
+					namespace := symbol.QualifiedName[:split]
+					for _, target := range targets {
+						if target.QualifiedName == namespace+"::"+candidateName {
+							pinned = append(pinned, target)
+						}
+					}
+					if len(pinned) > 0 {
+						targets = pinned
+					}
+				}
+			}
+			for _, target := range targets {
 				key := symbol.ID + "::uses-type::" + target.ID
 				if seen[key] {
 					continue
@@ -1497,6 +1808,11 @@ func resolveCallees(idx *edgeIndex, symbol *core.SymbolRecord, calleeName string
 }
 
 func graphCallableSymbol(symbol *core.SymbolRecord) bool {
+	for _, annotation := range symbol.Annotations {
+		if annotation == "declaration" {
+			return false
+		}
+	}
 	if symbol.Kind == core.KindFunction || symbol.Kind == core.KindMethod || symbol.Kind == core.KindConstructor {
 		return true
 	}
@@ -1577,7 +1893,8 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 		})
 	}
 
-	if symbol.Kind != core.KindFunction && symbol.Kind != core.KindMethod && symbol.Kind != core.KindConstructor {
+	executableProperty := symbol.Language == "csharp" && symbol.Kind == core.KindField && len(symbol.CallSites) > 0
+	if symbol.Kind != core.KindFunction && symbol.Kind != core.KindMethod && symbol.Kind != core.KindConstructor && !executableProperty {
 		return nil
 	}
 	scope := idx.importedFiles(symbol.FilePath)
@@ -1606,19 +1923,30 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			if name == "" {
 				continue
 			}
-			cands := resolvePropertyTargets(idx, &symbol, name, scope)
+			cands := resolvePropertyTargets(idx, &symbol, name, scope, as.Write)
 			cands = narrowByReceiver(cands, &symbol, qualifier, attrSelfVars)
 			if _, isSelf := attrSelfVars[qualifier]; !isSelf && qualifier != "" && len(cands) > 0 {
 				// ctx.request with ctx typed AppContext reads that class's
 				// property (or an ancestor's), not every `request` property
 				// in scope; an untyped receiver keeps the set as before.
-				if kept, dispatch, decided := narrowByLocalType(idx, nil, attrLocalTypes, qualifier, name, cands, scope); decided && len(kept)+len(dispatch) > 0 {
+				if kept, dispatch, decided := narrowByLocalType(idx, nil, &symbol, attrLocalTypes, qualifier, name, cands, scope); decided && len(kept)+len(dispatch) > 0 {
 					cands = append(kept, dispatch...)
 				}
 			}
 			if _, isSelf := attrSelfVars[qualifier]; isSelf && classLanguage(symbol.Language) && len(filterByParent(cands, symbol.ParentSymbol)) == 0 {
 				if inherited := inheritedTargets(idx, &symbol, name, true); len(inherited) > 0 {
 					cands = inherited
+				}
+			}
+			if symbol.Language == "python" && len(cands) == 0 && qualifier != "" {
+				typ := strings.TrimPrefix(attrLocalTypes[qualifier], "class:")
+				if _, isSelf := attrSelfVars[qualifier]; isSelf {
+					typ = symbol.ParentSymbol
+				}
+				if typ != "" && !pyTypeHasMember(idx, typ, name, dirOf(symbol.FilePath)) {
+					for _, target := range pyDunderTargets(idx, typ, "__getattr__", dirOf(symbol.FilePath)) {
+						addEdge(symbol.ID, target.ID, 0.7, core.EvidenceSourceHeuristic, core.ReasonImplicitDunder)
+					}
 				}
 			}
 			for _, cand := range cands {
@@ -1638,6 +1966,9 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			addEdge(symbol.ID, cand.ID, 0.7, core.EvidenceSourceHeuristic, core.ReasonImplicitDunder)
 		}
 		for _, cand := range pyWithTargets(idx, &symbol, dunderLocalTypes, dunderSelfVars) {
+			addEdge(symbol.ID, cand.ID, 0.7, core.EvidenceSourceHeuristic, core.ReasonImplicitDunder)
+		}
+		for _, cand := range pySubscriptTargets(idx, &symbol, dunderLocalTypes) {
 			addEdge(symbol.ID, cand.ID, 0.7, core.EvidenceSourceHeuristic, core.ReasonImplicitDunder)
 		}
 	}
@@ -1669,6 +2000,9 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 		var javaArgTypeCache map[string]string
 		var csArgTypeCache map[string]string
 		for _, cs := range symbol.CallSites {
+			if cs.ReferenceOnly {
+				continue
+			}
 			calleeName := cs.Callee
 			// Split receiver prefix (e.g. "user.save" → qualifier "user",
 			// name "save"); chains keep only the last segment ("a.b.Get" → "b").
@@ -1711,7 +2045,8 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// constructor in scope.
 				continue
 			}
-			if qualifier == "" && declaresLocalFunction(&symbol, calleeName) {
+			localDefinition := qualifier == "" && symbol.Name != "<top-level>" && declaresLocalFunction(&symbol, calleeName)
+			if localDefinition && (symbol.Language != "python" || len(pythonLexicalChild(idx, &symbol, calleeName)) == 0) {
 				// A function declared inside the caller's own body
 				// (`function run(i)` nested in Socket.run, a nested `def`)
 				// is not indexed as a symbol; the bare call binds that
@@ -1732,6 +2067,16 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					// constructor-narrowing path below — only the
 					// unresolvable case is suppressed here.
 					continue
+				}
+			}
+			if symbol.Language == "python" && qualifier == "" {
+				if typ := strings.TrimPrefix(localTypes[calleeName], "class:"); typ != "" {
+					if targets := pyDunderTargets(idx, typ, "__call__", dirOf(symbol.FilePath)); len(targets) > 0 {
+						for _, target := range targets {
+							addEdge(symbol.ID, target.ID, 0.7, core.EvidenceSourceHeuristic, core.ReasonImplicitDunder)
+						}
+						continue
+					}
 				}
 			}
 			// AST-extracted names are exact by construction: case-insensitive
@@ -1755,7 +2100,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// override must not shadow it.
 				sameFileWins = false
 			}
-			if (symbol.Language == "java" || symbol.Language == "rust" || symbol.Language == "csharp") &&
+			if (symbol.Language == "java" || symbol.Language == "rust" || symbol.Language == "csharp" || tsFamilyLang(symbol.Language)) &&
 				qualifier != "" && qualifier != "this" && qualifier != "super" && qualifier != "self" && qualifier != "Self" && qualifier != "base" {
 				// Statically typed receiver or type path: the target is the
 				// named type's, wherever it lives. Same-file-wins bound a
@@ -1767,8 +2112,35 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				}
 			}
 			cands, capped := resolveCallees(idx, &symbol, calleeName, scope, true, sameFileWins)
-			if symbol.Language == "python" {
-				cands = pyCallCandidates(idx, &symbol, qualifier, pyCallName, calleeName, cands)
+			if localDefinition && symbol.Language == "python" {
+				cands = pythonLexicalChild(idx, &symbol, calleeName)
+				capped = false
+			}
+			phpTraitCall := false
+			if symbol.Language == "php" {
+				if _, isSelf := selfVars[qualifier]; isSelf && len(filterByParent(cands, symbol.ParentSymbol)) == 0 {
+					if targets, decided := phpTraitCallTargets(idx, &symbol, calleeName, cands); decided {
+						cands = targets
+						capped = false
+						phpTraitCall = true
+					}
+				}
+			}
+			if symbol.Language == "python" && !localDefinition {
+				cands = pyCallCandidates(idx, &symbol, qualifier, fullChain, pyCallName, calleeName, cands)
+				capped = len(cands) > maxCalleeFanout
+			}
+			if symbol.Language == "go" && qualifier == "" {
+				// Go never performs implicit method lookup for a bare call:
+				// Close() can only name a package/local function, while a method
+				// requires x.Close() (including inside another method).
+				functions := cands[:0]
+				for _, cand := range cands {
+					if cand.Kind == core.KindFunction {
+						functions = append(functions, cand)
+					}
+				}
+				cands = functions
 				capped = len(cands) > maxCalleeFanout
 			}
 			if traceCalls {
@@ -1781,17 +2153,6 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				}
 				fmt.Fprintf(os.Stderr, "grove-trace %s: callee=%q qual=%q args=%v cands=%d capped=%v scope=%d first=%v\n", symbol.QualifiedName, cs.Callee, qualifier, cs.Args, len(cands), capped, len(scope), ids)
 			}
-			if capped && symbol.Language != "java" && symbol.Language != "rust" && symbol.Language != "python" {
-				// Only narrowing with real evidence may keep very large
-				// same-name sets: Java (arity, arg types) and Rust
-				// (typed receivers/qualifiers — crate-wide scope makes
-				// "new" or "update" routinely exceed the cap before the
-				// type evidence has had its chance). For the rest an
-				// over-cap set stays dropped (dispatch rescue below
-				// still applies); anything Rust's narrowing fails to
-				// pin back down is re-capped after narrowing.
-				cands = nil
-			}
 			if symbol.Language == "csharp" || symbol.Language == "php" ||
 				symbol.Language == "c" || symbol.Language == "cpp" {
 				// Overload disambiguation by arity. C#: JsonConvert has
@@ -1802,6 +2163,12 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// keeps variadic/default-friendly candidates and never
 				// zeroes the set.
 				cands = filterByArgc(cands, cs.Argc)
+			}
+			if phpTraitCall {
+				for _, cand := range cands {
+					addEdge(symbol.ID, cand.ID, 0.95, core.EvidenceSourceASTKit, core.ReasonASTNarrowed)
+				}
+				continue
 			}
 			if symbol.Language == "csharp" && len(cands) > 1 {
 				// Generic split: DeserializeObject<T>(string) and
@@ -1833,6 +2200,9 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					}
 				}
 				cands = ctorsOnly
+				if symbol.Language == "java" {
+					cands = narrowByExplicitImport(idx, &symbol, calleeName, cands)
+				}
 			}
 			if symbol.Language == "java" {
 				// Overload disambiguation: arity first, then exact
@@ -1916,6 +2286,28 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					cands = nil
 				}
 			}
+			if symbol.Language == "csharp" && strings.HasSuffix(qualifier, "()") && len(cands) > 0 {
+				// `new Dog().Move()` is extracted as receiver `Dog()`. When that
+				// name is an indexed type, construction gives us an exact receiver
+				// type; retaining other same-named methods fabricates edges.
+				typ := strings.TrimSuffix(qualifier, "()")
+				if typeSymbolExists(idx, typ) {
+					byType := filterByParent(cands, typ)
+					if len(byType) == 0 {
+						byType = csharpExtensionTargets(cands, typ)
+					}
+					bases := baseClassesFor(idx, symbol.Language, typ, dirOf(symbol.FilePath))
+					for level := 0; level < 4 && len(bases) > 0 && len(byType) == 0; level++ {
+						var next []string
+						for _, base := range bases {
+							byType = append(byType, filterByParent(cands, base)...)
+							next = append(next, baseClassesFor(idx, symbol.Language, base, dirOf(symbol.FilePath))...)
+						}
+						bases = next
+					}
+					cands = byType
+				}
+			}
 			if (symbol.Language == "csharp" || symbol.Language == "php" ||
 				symbol.Language == "c" || symbol.Language == "cpp") &&
 				qualifier != "" && qualifier != "this" && qualifier != "base" &&
@@ -1930,6 +2322,9 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// match is noise: drop. A resolvable type narrows by parent.
 				if held, ok := localTypes[qualifier]; ok {
 					byType := filterByParent(cands, held)
+					if symbol.Language == "csharp" && len(byType) == 0 {
+						byType = csharpExtensionTargets(cands, held)
+					}
 					// Inherited: `BsonReader reader; reader.ReadAsBytes()`
 					// runs JsonReader's. Walk the declared type's bases
 					// before concluding the method is not ours.
@@ -2046,9 +2441,20 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				}
 				continue
 			}
+			if symbol.Language == "rust" && qualifier == "" && len(cands) > 0 {
+				cands = rustPinBareImport(idx, &symbol, calleeName, cands)
+				if symbol.ParentSymbol != "" {
+					if sameModule := filterByParent(cands, symbol.ParentSymbol); len(sameModule) > 0 {
+						cands = sameModule
+					}
+				}
+			}
 			if calleeName == "super()" && symbol.ParentSymbol != "" {
 				for _, base := range baseClassesFor(idx, symbol.Language, symbol.ParentSymbol, dirOf(symbol.FilePath)) {
 					targets := constructorTargets(idx, base, scope)
+					if symbol.Language == "java" || symbol.Language == "csharp" {
+						targets = filterByArgc(targets, cs.Argc)
+					}
 					if len(targets) == 0 {
 						// Inheritance crosses imports — but prefer the twin
 						// in the caller's own package over same-named
@@ -2062,6 +2468,17 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					}
 					for _, ctor := range targets {
 						addEdge(symbol.ID, ctor.ID, 0.85, core.EvidenceSourceHeuristic, core.ReasonConstructor)
+					}
+				}
+				continue
+			}
+			if calleeName == "this()" && symbol.ParentSymbol != "" &&
+				(symbol.Language == "java" || symbol.Language == "csharp") {
+				targets := constructorTargets(idx, symbol.ParentSymbol, scope)
+				targets = filterByArgc(targets, cs.Argc)
+				for _, ctor := range targets {
+					if ctor.ID != symbol.ID {
+						addEdge(symbol.ID, ctor.ID, 0.95, core.EvidenceSourceASTKit, core.ReasonConstructor)
 					}
 				}
 				continue
@@ -2127,7 +2544,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			if len(narrowed) == len(cands) {
 				// Receiver narrowing didn't fire; try the inferred type of
 				// the receiver variable, then import qualification.
-				kept, dispatch, decided := narrowByLocalType(idx, sat, localTypes, qualifier, calleeName, cands, scope)
+				kept, dispatch, decided := narrowByLocalType(idx, sat, &symbol, localTypes, qualifier, calleeName, cands, scope)
 				if !decided && (tsFamilyLang(symbol.Language) || symbol.Language == "java") && strings.Contains(fullChain, ".") {
 					// Multi-hop receiver (`this.connection.driver.escape`):
 					// walk the field-type chain and dispatch to the resolved
@@ -2188,6 +2605,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				}
 				ctors := constructorTargets(idx, ctorName, scope)
 				if symbol.Language == "java" {
+					ctors = narrowByExplicitImport(idx, &symbol, ctorName, ctors)
 					ctors = filterByArgc(ctors, cs.Argc)
 					if len(ctors) > 1 && len(cs.Args) > 0 {
 						if javaArgTypeCache == nil {
@@ -2264,6 +2682,18 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 		}
 	}
 	return edges
+}
+
+func pythonLexicalChild(idx *edgeIndex, caller *core.SymbolRecord, name string) []*core.SymbolRecord {
+	want := caller.QualifiedName + "." + name
+	var out []*core.SymbolRecord
+	for _, candidate := range idx.byName[strings.ToLower(name)] {
+		if candidate.FilePath == caller.FilePath && candidate.Language == "python" &&
+			candidate.Kind == core.KindFunction && candidate.QualifiedName == want {
+			out = append(out, candidate)
+		}
+	}
+	return out
 }
 
 // astCallSiteLanguages lists the languages whose astkit extractors emit
@@ -2367,13 +2797,13 @@ func filterByParent(cands []*core.SymbolRecord, parent string) []*core.SymbolRec
 // resolvePropertyTargets finds in-scope property-annotated methods matching
 // an attribute access name. Same-file candidates win; cross-file fan-out is
 // capped like calls resolution.
-func resolvePropertyTargets(idx *edgeIndex, symbol *core.SymbolRecord, name string, scope map[string]struct{}) []*core.SymbolRecord {
+func resolvePropertyTargets(idx *edgeIndex, symbol *core.SymbolRecord, name string, scope map[string]struct{}, write bool) []*core.SymbolRecord {
 	var sameFile, crossFile []*core.SymbolRecord
 	for _, cand := range idx.byName[strings.ToLower(name)] {
 		if cand.ID == symbol.ID || cand.Name != name || cand.Kind != core.KindMethod {
 			continue
 		}
-		if !hasPropertyAnnotation(cand) {
+		if !propertyAnnotationMatches(cand, write) {
 			continue
 		}
 		if _, ok := scope[cand.FilePath]; !ok {
@@ -2392,6 +2822,21 @@ func resolvePropertyTargets(idx *edgeIndex, symbol *core.SymbolRecord, name stri
 		return nil
 	}
 	return crossFile
+}
+
+func propertyAnnotationMatches(s *core.SymbolRecord, write bool) bool {
+	for _, ann := range s.Annotations {
+		if write {
+			if strings.HasSuffix(ann, ".setter") {
+				return true
+			}
+			continue
+		}
+		if ann == "property" || ann == "cached_property" || strings.HasSuffix(ann, ".getter") {
+			return true
+		}
+	}
+	return false
 }
 
 func hasPropertyAnnotation(s *core.SymbolRecord) bool {
@@ -2465,9 +2910,16 @@ func declParamCount(s *core.SymbolRecord) (int, bool, bool) {
 	if s.Language == "java" {
 		src = javaDeclSource(s)
 	}
-	params := tsDeclParams(src)
+	params := ""
+	parsed := false
+	if s.Language == "go" {
+		params, parsed = goDeclParamsOK(src)
+	} else {
+		params = tsDeclParams(src)
+		parsed = params != "" || strings.Contains(src, "()")
+	}
 	if params == "" {
-		if strings.Contains(src, "()") {
+		if parsed {
 			return 0, false, true
 		}
 		return 0, false, false
@@ -2598,6 +3050,27 @@ func narrowByImport(idx *edgeIndex, symbol *core.SymbolRecord, qualifier string,
 	return out
 }
 
+// narrowByExplicitImport restricts candidates only when qualifier names an
+// actual import. Unlike narrowByImport, absence of an indexed type is not a
+// reason to drop: callers use this after syntax has already established a
+// local variable or constructor type.
+func narrowByExplicitImport(idx *edgeIndex, symbol *core.SymbolRecord, qualifier string, cands []*core.SymbolRecord) []*core.SymbolRecord {
+	if qualifier == "" || len(cands) == 0 {
+		return cands
+	}
+	files, found := idx.importFilesForQualifierForSymbol(symbol, qualifier)
+	if !found {
+		return cands
+	}
+	var out []*core.SymbolRecord
+	for _, candidate := range cands {
+		if _, ok := files[candidate.FilePath]; ok {
+			out = append(out, candidate)
+		}
+	}
+	return out
+}
+
 // importFilesForQualifier resolves the import whose last segment equals the
 // qualifier (case-exact) to its in-repo files, using only the precise
 // resolvers: exact path match and slash-suffix directory match. The fuzzy
@@ -2678,6 +3151,12 @@ func (idx *edgeIndex) computeImportFilesForQualifierForSymbol(symbol *core.Symbo
 			return out, true
 		} else if known {
 			return map[string]struct{}{}, true
+		}
+		if len(idx.pyImportBindings[fromFile]) > 0 {
+			// A current index has an explicit record for every real Python
+			// binding. Falling through to lastImportSegment would make
+			// `import lib.engine` fabricate a local name `engine`.
+			return nil, false
 		}
 	}
 	_, ok := imports, imports != nil
@@ -2825,7 +3304,7 @@ func stripPythonBase(b string) string {
 // comma-separated names after the top-level `:`, stopping at a `where`
 // constraint clause or the body brace. [ \t] (not \s) keeps it on the
 // declaration line even if the signature carries a trailing newline.
-var csharpBaseListRe = regexp.MustCompile(`\b(?:class|struct|record|interface)\s+[A-Za-z_]\w*(?:<[^>{}]+>)?[ \t]*:[ \t]*([A-Za-z_][\w.,<> \t]*?)(?:[ \t]+where\b|[ \t]*\{|$)`)
+var csharpBaseListRe = regexp.MustCompile(`\b(?:class|struct|record|interface)\s+[A-Za-z_]\w*(?:<[^>{}]+>)?(?:\([^)]*\))?[ \t]*:[ \t]*([A-Za-z_][\w.,<> \t]*?)(?:[ \t]+where\b|[ \t]*[;{]|$)`)
 
 // csharpBaseNames extracts the simple base-type names from a C# declaration
 // signature (generic arguments and namespace qualifiers stripped).
@@ -2861,16 +3340,14 @@ func goEmbeddedTypes(body string) []string {
 		body = body[:close]
 	}
 	var out []string
-	// A lone type reference on its own line is an embed: `Foo`, `*Foo`, or a
-	// cross-package `pkg.Foo` (the qualified form never matched before, so a
-	// struct/interface embedding an imported type was invisible). The final
-	// segment must be exported (uppercase) — cross-package embeds always are,
-	// and it avoids matching a bare unexported field-less line. A method spec
-	// (`Read() string`) has a `(` and does not match; a normal field
-	// (`name string`) has two tokens and does not match.
-	embeddedRe := regexp.MustCompile(`^\s*\*?((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Z][A-Za-z0-9_]*)\s*(?://.*)?$`)
+	// A lone type reference on its own line is an embed: `Foo`, `*Foo`,
+	// `pkg.Foo`, or an instantiated type such as `Base[T]`. Capture only the
+	// named type so graph lookup is independent of type arguments. Unexported
+	// same-package types are legal embeds too. A method spec (`Read() string`)
+	// and a normal field (`name string`) both contain extra syntax and do not
+	// match.
 	for _, line := range strings.Split(body, "\n") {
-		if m := embeddedRe.FindStringSubmatch(line); len(m) == 2 {
+		if m := goEmbeddedTypeRe.FindStringSubmatch(line); len(m) == 2 {
 			out = append(out, m[1])
 		}
 	}

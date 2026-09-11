@@ -31,6 +31,95 @@ func TestImplementsEdgeJava(t *testing.T) {
 	}
 }
 
+func TestGoBareCallNeverBindsMethods(t *testing.T) {
+	g := New()
+	g.Replace([]core.SymbolRecord{
+		{ID: "x.go::Alpha.Close@sha", FilePath: "x.go", Language: "go", Kind: core.KindMethod, Name: "Close", ParentSymbol: "Alpha", Signature: "func (a Alpha) Close() error"},
+		{ID: "x.go::Beta.Close@sha", FilePath: "x.go", Language: "go", Kind: core.KindMethod, Name: "Close", ParentSymbol: "Beta", Signature: "func (b Beta) Close() error"},
+		{ID: "x.go::Close@sha", FilePath: "x.go", Language: "go", Kind: core.KindFunction, Name: "Close", Signature: "func Close(n int) error"},
+		{ID: "x.go::useFree@sha", FilePath: "x.go", Language: "go", Kind: core.KindFunction, Name: "useFree",
+			RawText: "func useFree() error { return Close(3) }", Span: core.LineRange{Start: 4, End: 4},
+			CallSites: []core.CallSite{{Callee: "Close", Line: 4, Argc: 1}}},
+	}, 1)
+	if !hasEdge(g, core.EdgeCalls, "x.go::useFree@sha", "x.go::Close@sha") {
+		t.Fatal("bare Go call did not bind package function")
+	}
+	for _, method := range []string{"x.go::Alpha.Close@sha", "x.go::Beta.Close@sha"} {
+		if hasEdge(g, core.EdgeCalls, "x.go::useFree@sha", method) {
+			t.Fatalf("bare Go call bound method %s", method)
+		}
+	}
+}
+
+func TestFanoutCapRunsAfterTypedReceiverNarrowing(t *testing.T) {
+	var symbols []core.SymbolRecord
+	for i := 0; i < 20; i++ {
+		name := "R" + itoa(i)
+		symbols = append(symbols,
+			core.SymbolRecord{ID: name, FilePath: "all.cs", Language: "csharp", Kind: core.KindClass, Name: name},
+			core.SymbolRecord{ID: name + ".Save", FilePath: "all.cs", Language: "csharp", Kind: core.KindMethod, Name: "Save", ParentSymbol: name, Signature: "void Save(int value)"})
+	}
+	symbols = append(symbols, core.SymbolRecord{ID: "Use", FilePath: "all.cs", Language: "csharp", Kind: core.KindMethod,
+		Name: "Use", ParentSymbol: "Program", RawText: "void Use() { R1 r = new R1(); r.Save(1); }", Span: core.LineRange{Start: 1, End: 1},
+		CallSites: []core.CallSite{{Callee: "r.Save", Line: 1, Argc: 1}}})
+	g := New()
+	g.Replace(symbols, 1)
+	if !hasEdge(g, core.EdgeCalls, "Use", "R1.Save") {
+		t.Fatal("typed receiver lost its target above the global fan-out cap")
+	}
+	for i := 0; i < 20; i++ {
+		if i != 1 && hasEdge(g, core.EdgeCalls, "Use", "R"+itoa(i)+".Save") {
+			t.Fatalf("typed receiver retained R%d.Save", i)
+		}
+	}
+}
+
+func TestStripCommentsAndStringsPreservesExecutableSyntax(t *testing.T) {
+	for name, tc := range map[string]struct {
+		input string
+		want  string
+	}{
+		"template interpolation": {"return `value=${g.label()}`;", "g.label()"},
+		"python f-string":        {"return f'value={g.label()}'", "g.label()"},
+		"csharp interpolation":   {"return $\"value={g.Label()}\";", "g.Label()"},
+		"rust lifetime":          {"fn f<'a>(x: &'a str) { target(); }", "target()"},
+		"csharp verbatim":        {"var p = @\"C:\\dir\\\"; target();", "target()"},
+		"javascript regex":       {"s.replace(/[\"']/g, ''); target();", "target()"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := stripCommentsAndStrings(tc.input); !strings.Contains(got, tc.want) {
+				t.Fatalf("stripped = %q, want it to retain %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCSharpSemicolonRecordImplementsEdge(t *testing.T) {
+	g := New()
+	g.Replace([]core.SymbolRecord{
+		{ID: "I.cs::IPerson", FilePath: "I.cs", Language: "csharp", Kind: core.KindInterface, Name: "IPerson", QualifiedName: "IPerson"},
+		{ID: "P.cs::Person", FilePath: "P.cs", Language: "csharp", Kind: core.KindClass, Name: "Person", QualifiedName: "Person", Signature: "public record Person(string Name) : IPerson;"},
+	}, 1)
+	if !hasEdge(g, core.EdgeImplements, "P.cs::Person", "I.cs::IPerson") {
+		t.Fatal("semicolon-terminated positional record lost its base list")
+	}
+}
+
+func TestPHPInheritanceEdgesWithoutNativeAnalyzer(t *testing.T) {
+	g := New()
+	g.Replace([]core.SymbolRecord{
+		{ID: "contracts.php::Runnable", FilePath: "contracts.php", Language: "php", Kind: core.KindInterface, Name: "Runnable", QualifiedName: "Runnable", Signature: "interface Runnable"},
+		{ID: "base.php::Base", FilePath: "base.php", Language: "php", Kind: core.KindClass, Name: "Base", QualifiedName: "Base", Signature: "class Base"},
+		{ID: "worker.php::Worker", FilePath: "worker.php", Language: "php", Kind: core.KindClass, Name: "Worker", QualifiedName: "Worker", Signature: "class Worker extends Base implements Runnable"},
+	}, 1)
+	if !hasEdge(g, core.EdgeExtends, "worker.php::Worker", "base.php::Base") {
+		t.Fatal("missing PHP extends edge without native analysis")
+	}
+	if !hasEdge(g, core.EdgeImplements, "worker.php::Worker", "contracts.php::Runnable") {
+		t.Fatal("missing PHP implements edge without native analysis")
+	}
+}
+
 // Generic bounds must not emit bogus extends edges, and generic arguments in
 // the extends clause must still resolve to the base class (jackson style:
 // `class ValueSer<T extends Number> extends JsonSerializer<T>`).
@@ -71,6 +160,134 @@ func TestRustImplForTrait(t *testing.T) {
 	}, 1)
 	if !hasEdge(g, core.EdgeImplements, "lib.rs::Point@sha", "lib.rs::Display@sha") {
 		t.Fatalf("missing rust implements edge")
+	}
+}
+
+func TestRustImplAnnotationFromAstkitBuildsEdge(t *testing.T) {
+	g := New()
+	g.Replace([]core.SymbolRecord{
+		{ID: "lib.rs::Greet", FilePath: "lib.rs", Language: "rust", Kind: core.KindTrait, Name: "Greet", QualifiedName: "Greet"},
+		{ID: "lib.rs::Fish", FilePath: "lib.rs", Language: "rust", Kind: core.KindStruct, Name: "Fish", QualifiedName: "Fish", RawText: "struct Fish;", Annotations: []string{"implements:Greet"}},
+	}, 1)
+	if !hasEdge(g, core.EdgeImplements, "lib.rs::Fish", "lib.rs::Greet") {
+		t.Fatal("missing Rust implements edge from Astkit type annotation")
+	}
+}
+
+func TestRustPubRestrictedUseDoesNotLookExternal(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "src/lib.rs::crate", FilePath: "src/lib.rs", Language: "rust", Kind: core.KindModule, Name: "crate"},
+		{ID: "src/a.rs::helper", FilePath: "src/a.rs", Language: "rust", Kind: core.KindFunction, Name: "helper", QualifiedName: "helper"},
+		{ID: "src/b.rs::run", FilePath: "src/b.rs", Language: "rust", Kind: core.KindFunction, Name: "run", QualifiedName: "run", Imports: []string{"pub(crate) use crate::a::helper"}, RawText: "fn run() { helper(); }", CallSites: []core.CallSite{{Callee: "helper", Line: 1}}},
+	}
+	g := New()
+	g.Replace(syms, 3)
+	if !hasEdge(g, core.EdgeCalls, "src/b.rs::run", "src/a.rs::helper") {
+		t.Fatal("pub(crate) use was treated as an external import")
+	}
+}
+
+func TestRustContainsCrossFileImplInSameCrate(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "src/lib.rs::crate", FilePath: "src/lib.rs", Language: "rust", Kind: core.KindModule, Name: "crate"},
+		{ID: "src/a.rs::Thing", FilePath: "src/a.rs", Language: "rust", Kind: core.KindStruct, Name: "Thing", QualifiedName: "Thing"},
+		{ID: "src/b.rs::Thing.bump", FilePath: "src/b.rs", Language: "rust", Kind: core.KindMethod, Name: "bump", QualifiedName: "Thing.bump", ParentSymbol: "Thing"},
+	}
+	g := New()
+	g.Replace(syms, 3)
+	if !hasEdge(g, core.EdgeContains, "src/a.rs::Thing", "src/b.rs::Thing.bump") {
+		t.Fatal("cross-file Rust impl method was not attached to its type")
+	}
+}
+
+func TestCSharpExtensionMethodAndBaseConstructorArity(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "Base.cs::Base", FilePath: "Base.cs", Language: "csharp", Kind: core.KindClass, Name: "Base", Signature: "class Base"},
+		{ID: "Base.cs::Base.ctor0", FilePath: "Base.cs", Language: "csharp", Kind: core.KindConstructor, Name: "Base", ParentSymbol: "Base", Signature: "Base()"},
+		{ID: "Base.cs::Base.ctor1", FilePath: "Base.cs", Language: "csharp", Kind: core.KindConstructor, Name: "Base", ParentSymbol: "Base", Signature: "Base(int value)"},
+		{ID: "Child.cs::Child", FilePath: "Child.cs", Language: "csharp", Kind: core.KindClass, Name: "Child", Signature: "class Child : Base"},
+		{ID: "Child.cs::Child.ctor", FilePath: "Child.cs", Language: "csharp", Kind: core.KindConstructor, Name: "Child", ParentSymbol: "Child", Signature: "Child() : base(1)", RawText: "Child() : base(1) {}", CallSites: []core.CallSite{{Callee: "super()", Line: 1, Argc: 1}}},
+		{ID: "User.cs::User", FilePath: "User.cs", Language: "csharp", Kind: core.KindClass, Name: "User"},
+		{ID: "Ext.cs::Ext.Shout", FilePath: "Ext.cs", Language: "csharp", Kind: core.KindMethod, Name: "Shout", ParentSymbol: "Ext", Signature: "public static string Shout(this User user)"},
+		{ID: "Use.cs::Use.Run", FilePath: "Use.cs", Language: "csharp", Kind: core.KindMethod, Name: "Run", ParentSymbol: "Use", Signature: "void Run(User user)", RawText: "void Run(User user) { user.Shout(); }", CallSites: []core.CallSite{{Callee: "user.Shout", Line: 1}}},
+	}
+	if got := csharpLocalTypes(newEdgeIndex(syms), &syms[len(syms)-1])["user"]; got != "User" {
+		t.Fatalf("extension receiver type = %q, want User", got)
+	}
+	g := New()
+	g.Replace(syms, 4)
+	if !hasEdge(g, core.EdgeCalls, "Use.cs::Use.Run", "Ext.cs::Ext.Shout") {
+		t.Fatal("C# extension method receiver did not resolve")
+	}
+	if !hasEdge(g, core.EdgeCalls, "Child.cs::Child.ctor", "Base.cs::Base.ctor1") {
+		t.Fatal("base(1) did not resolve to the one-argument base constructor")
+	}
+	if hasEdge(g, core.EdgeCalls, "Child.cs::Child.ctor", "Base.cs::Base.ctor0") {
+		t.Fatal("base(1) resolved to the zero-argument base constructor")
+	}
+}
+
+func TestCSharpConstructedReceiverExcludesUnrelatedMethod(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "Dog.cs::Dog", FilePath: "Dog.cs", Language: "csharp", Kind: core.KindClass, Name: "Dog", QualifiedName: "Dog"},
+		{ID: "Dog.cs::Dog.Move", FilePath: "Dog.cs", Language: "csharp", Kind: core.KindMethod, Name: "Move", QualifiedName: "Dog.Move", ParentSymbol: "Dog"},
+		{ID: "Other.cs::Other", FilePath: "Other.cs", Language: "csharp", Kind: core.KindClass, Name: "Other", QualifiedName: "Other"},
+		{ID: "Other.cs::Other.Move", FilePath: "Other.cs", Language: "csharp", Kind: core.KindMethod, Name: "Move", QualifiedName: "Other.Move", ParentSymbol: "Other"},
+		{ID: "Svc.cs::Svc.Chain", FilePath: "Svc.cs", Language: "csharp", Kind: core.KindMethod, Name: "Chain", QualifiedName: "Svc.Chain", ParentSymbol: "Svc", RawText: "void Chain() { new Dog().Move(); }", Span: core.LineRange{Start: 1, End: 1}, CallSites: []core.CallSite{{Callee: "Dog().Move", Line: 1}}},
+	}
+	g := New()
+	g.Replace(syms, 1)
+	if !hasEdge(g, core.EdgeCalls, "Svc.cs::Svc.Chain", "Dog.cs::Dog.Move") {
+		t.Fatal("constructed C# receiver did not resolve to its method")
+	}
+	if hasEdge(g, core.EdgeCalls, "Svc.cs::Svc.Chain", "Other.cs::Other.Move") {
+		t.Fatal("constructed C# receiver retained an unrelated same-named method")
+	}
+}
+
+func TestCSharpPropertyBodyEmitsCalls(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "Svc.cs::Svc.Compute", FilePath: "Svc.cs", Language: "csharp", Kind: core.KindMethod, Name: "Compute", QualifiedName: "Svc.Compute", ParentSymbol: "Svc"},
+		{ID: "Svc.cs::Svc.Age", FilePath: "Svc.cs", Language: "csharp", Kind: core.KindField, Name: "Age", QualifiedName: "Svc.Age", ParentSymbol: "Svc", RawText: "public int Age => Compute();", CallSites: []core.CallSite{{Callee: "Compute", Line: 1}}},
+	}
+	g := New()
+	g.Replace(syms, 1)
+	if !hasEdge(g, core.EdgeCalls, "Svc.cs::Svc.Age", "Svc.cs::Svc.Compute") {
+		t.Fatal("C# property body call was not added to the graph")
+	}
+}
+
+func TestPythonRelativeImportScopeDoesNotCrossPackages(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "alpha/models.py::Record", FilePath: "alpha/models.py", Language: "python", Kind: core.KindClass, Name: "Record", QualifiedName: "Record"},
+		{ID: "alpha/models.py::Record.persist", FilePath: "alpha/models.py", Language: "python", Kind: core.KindMethod, Name: "persist", QualifiedName: "Record.persist", ParentSymbol: "Record"},
+		{ID: "beta/models.py::Record", FilePath: "beta/models.py", Language: "python", Kind: core.KindClass, Name: "Record", QualifiedName: "Record"},
+		{ID: "beta/models.py::Record.persist", FilePath: "beta/models.py", Language: "python", Kind: core.KindMethod, Name: "persist", QualifiedName: "Record.persist", ParentSymbol: "Record"},
+		{ID: "alpha/svc.py::save", FilePath: "alpha/svc.py", Language: "python", Kind: core.KindFunction, Name: "save", QualifiedName: "save", Imports: []string{".models"}, RawText: "def save():\n    r = Record()\n    r.persist()", Span: core.LineRange{Start: 1, End: 3}, CallSites: []core.CallSite{{Callee: "Record", Line: 2}, {Callee: "r.persist", Line: 3}}},
+	}
+	g := New()
+	g.Replace(syms, 1)
+	if !hasEdge(g, core.EdgeCalls, "alpha/svc.py::save", "alpha/models.py::Record.persist") {
+		t.Fatal("missing call to the relatively imported Record.persist")
+	}
+	if hasEdge(g, core.EdgeCalls, "alpha/svc.py::save", "beta/models.py::Record.persist") {
+		t.Fatal("relative import leaked to beta/models.py")
+	}
+}
+
+func TestTypeScriptTypedReceiverKeepsBaseBesideSameFileOverride(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "base.ts::A", FilePath: "base.ts", Language: "typescript", Kind: core.KindClass, Name: "A", QualifiedName: "A", RawText: "export class A { m() {} }"},
+		{ID: "base.ts::A.m", FilePath: "base.ts", Language: "typescript", Kind: core.KindMethod, Name: "m", QualifiedName: "A.m", ParentSymbol: "A"},
+		{ID: "consumer.ts::B", FilePath: "consumer.ts", Language: "typescript", Kind: core.KindClass, Name: "B", QualifiedName: "B", Signature: "class B extends A", RawText: "class B extends A { m() {} }", Imports: []string{"./base"}},
+		{ID: "consumer.ts::B.m", FilePath: "consumer.ts", Language: "typescript", Kind: core.KindMethod, Name: "m", QualifiedName: "B.m", ParentSymbol: "B"},
+		{ID: "consumer.ts::User", FilePath: "consumer.ts", Language: "typescript", Kind: core.KindClass, Name: "User", QualifiedName: "User", RawText: "class User { a: A; run() { this.a.m(); } }", Imports: []string{"./base"}},
+		{ID: "consumer.ts::User.run", FilePath: "consumer.ts", Language: "typescript", Kind: core.KindMethod, Name: "run", QualifiedName: "User.run", ParentSymbol: "User", RawText: "run() { this.a.m(); }", Span: core.LineRange{Start: 1, End: 1}, Imports: []string{"./base"}, CallSites: []core.CallSite{{Callee: "a.m", Line: 1}}},
+	}
+	g := New()
+	g.Replace(syms, 1)
+	if !hasEdge(g, core.EdgeCalls, "consumer.ts::User.run", "base.ts::A.m") {
+		t.Fatal("typed A receiver lost the base declaration to same-file B.m")
 	}
 }
 

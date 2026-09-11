@@ -127,6 +127,8 @@ function currentName(sf, stack) {
     let name = undefined;
     if ((ts.isFunctionDeclaration(n) || ts.isClassDeclaration(n) || ts.isInterfaceDeclaration(n) || ts.isTypeAliasDeclaration(n)) && n.name) name = n.name.text;
     else if (ts.isMethodDeclaration(n) && n.name && ts.isIdentifier(n.name)) name = n.name.text;
+    else if (ts.isPropertyDeclaration(n) && n.name && ts.isIdentifier(n.name) && n.initializer &&
+             (ts.isArrowFunction(n.initializer) || ts.isFunctionExpression(n.initializer))) name = n.name.text;
     else if (ts.isVariableDeclaration(n) && n.name && ts.isIdentifier(n.name)) name = n.name.text;
     if (name) return {name, line: sf.getLineAndCharacterOfPosition(n.getStart(sf)).line + 1};
   }

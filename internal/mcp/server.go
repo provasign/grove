@@ -148,6 +148,26 @@ func (s *Server) callTool(name string, args map[string]any) (any, error) {
 			out["note"] = fmt.Sprintf("showing %d of %d impacted symbols", maxImpactNodes, len(nodes))
 		}
 		return out, nil
+	case "grove_change_impact":
+		query := stringArg(args, "query", "")
+		if query == "" {
+			return nil, fmt.Errorf("grove_change_impact: query is required")
+		}
+		return s.currentGraph().ChangeImpact(query)
+	case "grove_missing_implementations":
+		query := stringArg(args, "query", "")
+		if query == "" {
+			return nil, fmt.Errorf("grove_missing_implementations: query is required")
+		}
+		return s.currentGraph().MissingImplementations(query)
+	case "grove_rename_plan":
+		query, newName := stringArg(args, "query", ""), stringArg(args, "newName", "")
+		if query == "" || newName == "" {
+			return nil, fmt.Errorf("grove_rename_plan: query and newName are required")
+		}
+		return s.currentGraph().RenamePlan(query, newName)
+	case "grove_dead_code":
+		return s.currentGraph().DeadCode(stringListArg(args, "roots")), nil
 	case "grove_icr":
 		return s.currentGraph().ComputeICR(stringArg(args, "intent", "")), nil
 	case "grove_conflicts":
@@ -255,6 +275,33 @@ func slimSymbols(symbols []core.SymbolRecord, limit int) []SlimSymbol {
 	return out
 }
 
+func stringListArg(args map[string]any, key string) []string {
+	value, ok := args[key]
+	if !ok {
+		return nil
+	}
+	var out []string
+	switch values := value.(type) {
+	case []string:
+		out = append(out, values...)
+	case []any:
+		for _, item := range values {
+			if s, ok := item.(string); ok {
+				out = append(out, s)
+			}
+		}
+	case string:
+		out = strings.Split(values, ",")
+	}
+	clean := out[:0]
+	for _, item := range out {
+		if item = strings.TrimSpace(item); item != "" {
+			clean = append(clean, item)
+		}
+	}
+	return clean
+}
+
 func (s *Server) currentGraph() *graph.CodeGraph {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -311,6 +358,35 @@ func tools() []map[string]any {
 			"description": "Dependency edges touching a file: its defines/imports edges plus edges in and out of the symbols it defines.",
 			"inputSchema": objectSchema([]string{"file"}, map[string]any{
 				"file": prop("string", "Repo-relative file path, e.g. 'internal/store/store.go'."),
+			}),
+		},
+		{
+			"name":        "grove_change_impact",
+			"description": "Type-resolved signature-change set: declarations, override/implementation family, declaring types, and resolved callers.",
+			"inputSchema": objectSchema([]string{"query"}, map[string]any{
+				"query": prop("string", "Member or free-function query, e.g. 'Store.load(String)' or 'parse'."),
+			}),
+		},
+		{
+			"name":        "grove_missing_implementations",
+			"description": "Find concrete subtypes that do not provide a signature-compatible implementation of a contract member.",
+			"inputSchema": objectSchema([]string{"query"}, map[string]any{
+				"query": prop("string", "Contract member query, e.g. 'Codec.encode(Object)'."),
+			}),
+		},
+		{
+			"name":        "grove_rename_plan",
+			"description": "Build reviewable declaration and caller line edits for a type-resolved member or free-function rename.",
+			"inputSchema": objectSchema([]string{"query", "newName"}, map[string]any{
+				"query":   prop("string", "Member or free-function query to rename."),
+				"newName": prop("string", "Replacement identifier."),
+			}),
+		},
+		{
+			"name":        "grove_dead_code",
+			"description": "Report unreachable private functions/methods and exported symbols with no in-project references.",
+			"inputSchema": objectSchema(nil, map[string]any{
+				"roots": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Additional symbol names or qualified names to treat as roots."},
 			}),
 		},
 		{

@@ -83,3 +83,21 @@ func TestDetectLanguage_UppercaseMainframeExtensions(t *testing.T) {
 		}
 	}
 }
+
+func TestExtractContent_SniffsCppHeader(t *testing.T) {
+	src := []byte("namespace geo { class Shape { public: void area() {} }; }")
+	if got := DetectLanguageContent("include/shape.h", src); got != "cpp" {
+		t.Fatalf("language=%q want cpp", got)
+	}
+	syms, err := NewEngine().ExtractContent("include/shape.h", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, s := range syms {
+		got[s.QualifiedName] = true
+	}
+	if !got["geo::Shape"] || !got["geo::Shape::area"] {
+		t.Fatalf("C++ header symbols=%v", got)
+	}
+}

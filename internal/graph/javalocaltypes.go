@@ -22,11 +22,11 @@ var (
 	// masquerade as declarations
 	javaTypedLocalRe = regexp.MustCompile(`(?m)(?:^|[;{)]\s*)\s*(?:final\s+)?((?:boolean|byte|char|short|int|long|float|double|[A-Z][\w.]*)(?:<[^<>]*>)?(?:\[\])?)\s+(\w+)\s*=`)
 	// field declaration line in a class body
-	javaFieldRe = regexp.MustCompile(`(?m)^\s+(?:(?:public|private|protected|static|final|transient|volatile)\s+)*([A-Z]\w*)(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?(?:\[\])?\s+(\w+)\s*[;=]`)
+	javaFieldRe = regexp.MustCompile(`(?m)^\s+(?:@[\w.]+(?:\([^)]*\))?\s+)*(?:(?:public|private|protected|static|final|transient|volatile)\s+)*([A-Z]\w*)(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?(?:\[\])?\s+(\w+)\s*[;=]`)
 	// field declaration line, primitives included, raw type token kept —
 	// for overload matching (AT_SIGN is a char; javaFieldRe skips it)
-	javaFieldArgRe      = regexp.MustCompile(`(?m)^\s+(?:(?:public|private|protected|static|final|transient|volatile)\s+)*((?:boolean|byte|char|short|int|long|float|double|[A-Z]\w*)(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?(?:\[\])?)\s+(\w+)\s*[;=]`)
-	javaQualifiedCallRe = regexp.MustCompile(`\b([A-Z]\w*)\s*\.\s*([A-Za-z_]\w*)\s*\(`)
+	javaFieldArgRe      = regexp.MustCompile(`(?m)^\s+(?:@[\w.]+(?:\([^)]*\))?\s+)*(?:(?:public|private|protected|static|final|transient|volatile)\s+)*((?:boolean|byte|char|short|int|long|float|double|[A-Z]\w*)(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?(?:\[\])?)\s+(\w+)\s*[;=]`)
+	javaQualifiedCallRe = regexp.MustCompile(`\b([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\s*\(`)
 )
 
 // javaArgTypes infers identifier → raw type token (primitives and arrays
@@ -540,6 +540,30 @@ func javaCallResultOwners(idx *edgeIndex, candidates []*core.SymbolRecord, name 
 	if len(candidates) == 0 || symbol == nil {
 		return nil
 	}
+	if cs.Line <= 0 || symbol.Span.Start <= 0 {
+		return nil
+	}
+	off := cs.Line - symbol.Span.Start
+	lines := strings.Split(symbol.RawText, "\n")
+	if off < 0 || off >= len(lines) {
+		return nil
+	}
+	explicit := map[string]bool{}
+	localTypes := javaLocalTypes(idx, symbol)
+	for _, match := range javaQualifiedCallRe.FindAllStringSubmatch(lines[off], -1) {
+		if match[2] == name {
+			receiver := match[1]
+			if typ := localTypes[receiver]; typ != "" {
+				explicit[typ] = true
+			} else if receiver != "this" && receiver != "super" {
+				explicit[receiver] = true
+			}
+		}
+	}
+	if qualified := javaMethodsOwnedBy(candidates, explicit); len(qualified) > 0 {
+		return qualified
+	}
+
 	owners := map[string]bool{symbol.ParentSymbol: true}
 	level := map[string]bool{symbol.ParentSymbol: true}
 	for depth := 0; depth < 4 && len(level) > 0; depth++ {
@@ -554,25 +578,7 @@ func javaCallResultOwners(idx *edgeIndex, candidates []*core.SymbolRecord, name 
 		}
 		level = next
 	}
-	if own := javaMethodsOwnedBy(candidates, owners); len(own) > 0 {
-		return own
-	}
-
-	if cs.Line <= 0 || symbol.Span.Start <= 0 {
-		return nil
-	}
-	off := cs.Line - symbol.Span.Start
-	lines := strings.Split(symbol.RawText, "\n")
-	if off < 0 || off >= len(lines) {
-		return nil
-	}
-	explicit := map[string]bool{}
-	for _, match := range javaQualifiedCallRe.FindAllStringSubmatch(lines[off], -1) {
-		if match[2] == name {
-			explicit[match[1]] = true
-		}
-	}
-	return javaMethodsOwnedBy(candidates, explicit)
+	return javaMethodsOwnedBy(candidates, owners)
 }
 
 func javaMethodsOwnedBy(candidates []*core.SymbolRecord, owners map[string]bool) []*core.SymbolRecord {

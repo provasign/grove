@@ -112,6 +112,35 @@ func TestBuildCalls_ParamTypeNarrows(t *testing.T) {
 	}
 }
 
+func TestBuildCalls_GoPromotedEmbeddedMethod(t *testing.T) {
+	base := core.SymbolRecord{
+		ID: "x.go::Base@1", FilePath: "x.go", BlobSHA: "1", Language: "go",
+		Kind: core.KindStruct, Name: "Base", QualifiedName: "Base",
+		RawText: "type Base struct{}",
+	}
+	run := core.SymbolRecord{
+		ID: "x.go::Base.Run@2", FilePath: "x.go", BlobSHA: "1", Language: "go",
+		Kind: core.KindMethod, Name: "Run", QualifiedName: "Base.Run", ParentSymbol: "Base",
+	}
+	child := core.SymbolRecord{
+		ID: "x.go::Child@3", FilePath: "x.go", BlobSHA: "1", Language: "go",
+		Kind: core.KindStruct, Name: "Child", QualifiedName: "Child",
+		RawText: "type Child struct {\n\tBase\n}",
+	}
+	caller := core.SymbolRecord{
+		ID: "x.go::Use@4", FilePath: "x.go", BlobSHA: "1", Language: "go",
+		Kind: core.KindFunction, Name: "Use", QualifiedName: "Use",
+		Signature: "func Use(c Child)",
+		CallSites: []core.CallSite{{Callee: "c.Run", Line: 4}},
+	}
+	for _, edge := range BuildEdges([]core.SymbolRecord{base, run, child, caller}) {
+		if edge.Type == core.EdgeCalls && edge.From == caller.ID && edge.To == run.ID {
+			return
+		}
+	}
+	t.Fatal("call through Child must resolve promoted Base.Run")
+}
+
 // Param of an interface type: r.Render() dispatches to implementations at
 // reduced confidence, even when the plain candidate set was small.
 func TestBuildCalls_InterfaceParamDispatches(t *testing.T) {
@@ -429,6 +458,34 @@ func TestPyAnnotationOnlyLocalsAndParenthesizedWith(t *testing.T) {
 	}
 }
 
+func TestPyDictEntryIsNotAnAnnotatedLocal(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "app.py::Gear", FilePath: "app.py", BlobSHA: "1", Language: "python", Kind: core.KindClass, Name: "Gear", QualifiedName: "Gear"},
+		{ID: "app.py::Wheel", FilePath: "app.py", BlobSHA: "1", Language: "python", Kind: core.KindClass, Name: "Wheel", QualifiedName: "Wheel"},
+		{ID: "app.py::run", FilePath: "app.py", BlobSHA: "1", Language: "python", Kind: core.KindFunction, Name: "run", QualifiedName: "run", RawText: "def run():\n    table = {\n        thing: Gear\n    }\n    actual: Wheel\n"},
+	}
+	types := pyLocalTypes(newEdgeIndex(syms), &syms[2])
+	if _, ok := types["thing"]; ok {
+		t.Fatalf("dict entry was misread as an annotation: %v", types)
+	}
+	if types["actual"] != "Wheel" {
+		t.Fatalf("real annotated local missing: %v", types)
+	}
+}
+
+func TestPyClassAttrsDoNotBorrowInitFromSameNamedClass(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "app/engine.py::Engine", FilePath: "app/engine.py", Language: "python", Kind: core.KindClass, Name: "Engine", QualifiedName: "Engine", RawText: "class Engine:\n    pass\n"},
+		{ID: "app/engine.py::Engine.run", FilePath: "app/engine.py", Language: "python", Kind: core.KindMethod, Name: "run", QualifiedName: "Engine.run", ParentSymbol: "Engine", RawText: "def run(self):\n    self.part.tick()\n"},
+		{ID: "lib/engine.py::Engine", FilePath: "lib/engine.py", Language: "python", Kind: core.KindClass, Name: "Engine", QualifiedName: "Engine", RawText: "class Engine:\n    pass\n"},
+		{ID: "lib/engine.py::Engine.__init__", FilePath: "lib/engine.py", Language: "python", Kind: core.KindMethod, Name: "__init__", QualifiedName: "Engine.__init__", ParentSymbol: "Engine", RawText: "def __init__(self):\n    self.part = LibWidget()\n"},
+		{ID: "lib/widget.py::LibWidget", FilePath: "lib/widget.py", Language: "python", Kind: core.KindClass, Name: "LibWidget", QualifiedName: "LibWidget"},
+	}
+	if types := pyLocalTypes(newEdgeIndex(syms), &syms[1]); types["part"] != "" {
+		t.Fatalf("app.Engine borrowed lib.Engine.__init__ attribute type: %v", types)
+	}
+}
+
 func TestModernCppAndTSLocalTypeForms(t *testing.T) {
 	params := cFamilyParamTypes("void run(std::shared_ptr<Foo> foo)", "")
 	if params["foo"] != "Foo" {
@@ -440,6 +497,18 @@ func TestModernCppAndTSLocalTypeForms(t *testing.T) {
 	}
 	if got := tsLocalTypes(newEdgeIndex(syms), &syms[1])["driver"]; got != "MysqlDriver" {
 		t.Fatalf("multi-segment TS construction: got %q", got)
+	}
+}
+
+func TestRustStructLiteralLocalTypes(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "src/lib.rs::crate", FilePath: "src/lib.rs", Language: "rust", Kind: core.KindModule, Name: "crate"},
+		{ID: "src/thing.rs::Thing", FilePath: "src/thing.rs", Language: "rust", Kind: core.KindStruct, Name: "Thing", QualifiedName: "Thing"},
+		{ID: "src/use.rs::run", FilePath: "src/use.rs", Language: "rust", Kind: core.KindFunction, Name: "run", QualifiedName: "run", Imports: []string{"use crate::thing::{Thing as ThingAlias}"}, RawText: "fn run() { let direct = Thing { id: 1 }; let aliased = ThingAlias { id: 2 }; }"},
+	}
+	got := rustLocalTypes(newEdgeIndex(syms), &syms[2])
+	if got["direct"] != "Thing" || got["aliased"] != "Thing" {
+		t.Fatalf("struct literal types = %v", got)
 	}
 }
 
@@ -494,6 +563,25 @@ func TestCSharpPartialAndPrimaryConstructorTypes(t *testing.T) {
 	idx = newEdgeIndex(append(syms, primary))
 	if got := csBaseClasses(idx, "Person", "src"); !reflect.DeepEqual(got, []string{"Base", "IShape"}) {
 		t.Fatalf("primary-constructor bases: %v", got)
+	}
+	semicolon := core.SymbolRecord{ID: "src/Plain.cs::Plain@1", FilePath: "src/Plain.cs", BlobSHA: "1", Language: "csharp", Kind: core.KindClass, Name: "Plain", QualifiedName: "Plain", Signature: "public record Plain(string Name) : IShape;"}
+	idx = newEdgeIndex(append(syms, semicolon))
+	if got := csBaseClasses(idx, "Plain", "src"); !reflect.DeepEqual(got, []string{"IShape"}) {
+		t.Fatalf("semicolon record bases: %v", got)
+	}
+}
+
+func TestCSharpIsPatternAliasAndCrossDirectoryPartialTypes(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "Gen/Host.g.cs::Host", FilePath: "Gen/Host.g.cs", Language: "csharp", Kind: core.KindClass, Name: "Host", Signature: "partial class Host", RawText: "partial class Host { private Engine _engine; }"},
+		{ID: "Src/Host.cs::Host", FilePath: "Src/Host.cs", Language: "csharp", Kind: core.KindClass, Name: "Host", Signature: "partial class Host", RawText: "partial class Host { }"},
+		{ID: "Src/Host.cs::Host.Run", FilePath: "Src/Host.cs", Language: "csharp", Kind: core.KindMethod, Name: "Run", ParentSymbol: "Host", Imports: []string{"Svc = App.Service"}, Signature: "void Run(object o, Svc alias)", RawText: "void Run(object o, Svc alias) { if (o is Service s2) { s2.Tag(); } _engine.Start(); alias.Tag(); }"},
+	}
+	got := csharpLocalTypes(newEdgeIndex(syms), &syms[2])
+	for name, want := range map[string]string{"s2": "Service", "_engine": "Engine", "alias": "Service"} {
+		if got[name] != want {
+			t.Errorf("%s type = %q, want %q; all=%v", name, got[name], want, got)
+		}
 	}
 }
 
@@ -784,5 +872,80 @@ func TestResolveTypeEdges_PythonModuleAliasBase(t *testing.T) {
 	}
 	if len(targets) != 1 || targets[0] != "driver/dbapi.py::Cursor@1" {
 		t.Fatalf("Wrapper(Database.Cursor) must resolve to the imported Cursor only, got %v", targets)
+	}
+}
+
+func TestCppPlainStackLocalResolvesReceiver(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "m.cpp::Widget", FilePath: "m.cpp", Language: "cpp", Kind: core.KindClass, Name: "Widget", QualifiedName: "Widget", RawText: "class Widget {};"},
+		{ID: "m.cpp::Widget.render", FilePath: "m.cpp", Language: "cpp", Kind: core.KindMethod, Name: "render", QualifiedName: "Widget.render", ParentSymbol: "Widget", RawText: "void render() {}"},
+		{ID: "m.cpp::use", FilePath: "m.cpp", Language: "cpp", Kind: core.KindFunction, Name: "use", QualifiedName: "use", RawText: "void use() { Widget w; w.render(); }", Span: core.LineRange{Start: 1, End: 1}, CallSites: []core.CallSite{{Callee: "w.render", Line: 1}}},
+	}
+	g := New()
+	g.Replace(syms, 1)
+	if !hasEdge(g, core.EdgeCalls, "m.cpp::use", "m.cpp::Widget.render") {
+		t.Fatal("plain C++ stack local did not resolve its method receiver")
+	}
+}
+
+func TestPythonWithBindingUsesEnterReturnTypeAndOneLineSuite(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "ctx.py::Manager", FilePath: "ctx.py", Language: "python", Kind: core.KindClass, Name: "Manager", QualifiedName: "Manager"},
+		{ID: "ctx.py::Manager.__enter__", FilePath: "ctx.py", Language: "python", Kind: core.KindMethod, Name: "__enter__", QualifiedName: "Manager.__enter__", ParentSymbol: "Manager", Signature: "def __enter__(self) -> Worker:", RawText: "def __enter__(self) -> Worker:\n    return Worker()"},
+		{ID: "ctx.py::Manager.__exit__", FilePath: "ctx.py", Language: "python", Kind: core.KindMethod, Name: "__exit__", QualifiedName: "Manager.__exit__", ParentSymbol: "Manager"},
+		{ID: "ctx.py::Worker", FilePath: "ctx.py", Language: "python", Kind: core.KindClass, Name: "Worker", QualifiedName: "Worker"},
+		{ID: "ctx.py::Worker.run", FilePath: "ctx.py", Language: "python", Kind: core.KindMethod, Name: "run", QualifiedName: "Worker.run", ParentSymbol: "Worker"},
+		{ID: "use.py::use", FilePath: "use.py", Language: "python", Kind: core.KindFunction, Name: "use", QualifiedName: "use", Imports: []string{"ctx"}, Signature: "def use(manager: Manager):", RawText: "def use(manager: Manager):\n    with Manager() as worker:\n        worker.run()\n    with manager: pass\n", CallSites: []core.CallSite{{Callee: "Manager", Line: 2}, {Callee: "worker.run", Line: 3}}},
+	}
+	if types := pyLocalTypes(newEdgeIndex(syms), &syms[5]); types["worker"] != "Worker" {
+		t.Fatalf("with-bound local types = %v, want worker=Worker", types)
+	}
+	edges := BuildEdges(syms)
+	for _, target := range []string{syms[1].ID, syms[2].ID, syms[4].ID} {
+		if !javaHasCall(edges, syms[5].ID, target) {
+			t.Fatalf("with binding missing call edge to %s; edges=%+v", target, edges)
+		}
+	}
+}
+
+func TestPythonImplicitCallGetattrAndGetitem(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "token.py::Token", FilePath: "token.py", Language: "python", Kind: core.KindClass, Name: "Token", QualifiedName: "Token"},
+		{ID: "token.py::Token.__call__", FilePath: "token.py", Language: "python", Kind: core.KindMethod, Name: "__call__", QualifiedName: "Token.__call__", ParentSymbol: "Token"},
+		{ID: "token.py::Token.__getattr__", FilePath: "token.py", Language: "python", Kind: core.KindMethod, Name: "__getattr__", QualifiedName: "Token.__getattr__", ParentSymbol: "Token"},
+		{ID: "token.py::Token.__getitem__", FilePath: "token.py", Language: "python", Kind: core.KindMethod, Name: "__getitem__", QualifiedName: "Token.__getitem__", ParentSymbol: "Token"},
+		{ID: "use.py::use", FilePath: "use.py", Language: "python", Kind: core.KindFunction, Name: "use", QualifiedName: "use", Imports: []string{"token"}, Signature: "def use(t: Token):", RawText: "def use(t: Token):\n    t(1)\n    print(t.missing)\n    return t[0]\n", CallSites: []core.CallSite{{Callee: "t", Line: 2}}, AttrSites: []core.CallSite{{Callee: "t.missing", Line: 3}}},
+	}
+	edges := BuildEdges(syms)
+	for _, target := range syms[1:4] {
+		if !javaHasCall(edges, syms[4].ID, target.ID) {
+			t.Fatalf("implicit dunder edge missing to %s; edges=%+v", target.Name, edges)
+		}
+	}
+}
+
+func TestPythonPropertyReadExcludesSetter(t *testing.T) {
+	typ := core.SymbolRecord{ID: "p.py::Prop", FilePath: "p.py", Language: "python", Kind: core.KindClass, Name: "Prop", QualifiedName: "Prop"}
+	getter := core.SymbolRecord{ID: "p.py::Prop.value", FilePath: "p.py", Language: "python", Kind: core.KindMethod, Name: "value", QualifiedName: "Prop.value", ParentSymbol: "Prop", Annotations: []string{"property"}}
+	setter := core.SymbolRecord{ID: "p.py::Prop.value#2", FilePath: "p.py", Language: "python", Kind: core.KindMethod, Name: "value", QualifiedName: "Prop.value", ParentSymbol: "Prop", Annotations: []string{"value.setter"}}
+	read := core.SymbolRecord{ID: "p.py::read", FilePath: "p.py", Language: "python", Kind: core.KindFunction, Name: "read", QualifiedName: "read", Signature: "def read(p: Prop):", AttrSites: []core.CallSite{{Callee: "p.value"}}}
+	write := core.SymbolRecord{ID: "p.py::write", FilePath: "p.py", Language: "python", Kind: core.KindFunction, Name: "write", QualifiedName: "write", Signature: "def write(p: Prop):", AttrSites: []core.CallSite{{Callee: "p.value", Write: true}}}
+	edges := BuildEdges([]core.SymbolRecord{typ, getter, setter, read, write})
+	if !javaHasCall(edges, read.ID, getter.ID) || javaHasCall(edges, read.ID, setter.ID) {
+		t.Fatalf("read must target only getter; edges=%+v", edges)
+	}
+	if !javaHasCall(edges, write.ID, setter.ID) || javaHasCall(edges, write.ID, getter.ID) {
+		t.Fatalf("write must target only setter; edges=%+v", edges)
+	}
+}
+
+func TestDeclParamCountSkipsGoReceiver(t *testing.T) {
+	zero := core.SymbolRecord{Language: "go", Kind: core.KindMethod, Name: "Close", Signature: "func (a Alpha) Close() error"}
+	if n, variadic, ok := declParamCount(&zero); !ok || variadic || n != 0 {
+		t.Fatalf("zero-arg Go method = n:%d variadic:%v ok:%v", n, variadic, ok)
+	}
+	one := core.SymbolRecord{Language: "go", Kind: core.KindMethod, Name: "Save", Signature: "func (a *Alpha) Save(value int) error"}
+	if n, variadic, ok := declParamCount(&one); !ok || variadic || n != 1 {
+		t.Fatalf("one-arg Go method = n:%d variadic:%v ok:%v", n, variadic, ok)
 	}
 }

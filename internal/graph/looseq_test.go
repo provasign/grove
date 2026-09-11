@@ -76,6 +76,22 @@ func TestResolveLooseQuery_BareAmbiguous(t *testing.T) {
 	}
 }
 
+func TestResolveLooseQuery_BareParametersDisambiguate(t *testing.T) {
+	g := New()
+	g.Replace([]core.SymbolRecord{
+		{ID: "a::Alpha.Close", FilePath: "a.go", Language: "go", Kind: core.KindMethod, Name: "Close", ParentSymbol: "Alpha", Signature: "func (a Alpha) Close() error"},
+		{ID: "b::Beta.Close", FilePath: "b.go", Language: "go", Kind: core.KindMethod, Name: "Close", ParentSymbol: "Beta", Signature: "func (b Beta) Close() error"},
+		{ID: "c::Close", FilePath: "c.go", Language: "go", Kind: core.KindFunction, Name: "Close", Signature: "func Close(n int) error"},
+	}, 3)
+	got, err := g.resolveLooseQueryLocked("Close(int)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "Close" {
+		t.Fatalf("resolved = %q, want free function Close", got)
+	}
+}
+
 func TestResolveLooseQuery_UnknownSuggests(t *testing.T) {
 	g := looseFixture()
 	_, err := g.resolveLooseQueryLocked("Rende")

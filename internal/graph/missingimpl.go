@@ -348,14 +348,16 @@ func contractProvidesBody(contract []core.SymbolRecord, seedKinds map[string]cor
 		// extends. On an interface, a signature alone provides nothing. A
 		// Python ABC member (@abstractmethod / NotImplementedError body) is a
 		// contract, not an implementation.
-		if c.Language == "python" &&
-			(strings.Contains(c.RawText, "abstractmethod") ||
-				strings.Contains(c.RawText, "NotImplementedError")) {
+		if pythonAbstractMethod(&c) {
 			continue
 		}
 		for _, k := range seedKinds {
-			if k == core.KindClass || k == core.KindStruct {
-				if strings.Contains(c.RawText, "{") || c.Language == "python" {
+			inheritsBody := k == core.KindClass || k == core.KindStruct ||
+				(c.Language == "rust" && k == core.KindTrait) ||
+				(c.Language == "csharp" && k == core.KindInterface)
+			if inheritsBody {
+				if strings.Contains(c.RawText, "{") || c.Language == "python" ||
+					(c.Language == "csharp" && strings.Contains(c.RawText, "=>")) {
 					return true
 				}
 			}
@@ -385,12 +387,22 @@ func providesImplementation(m *core.SymbolRecord) bool {
 	if hasModifier(m, "abstract") || strings.Contains(m.Signature, "abstract ") {
 		return false
 	}
-	if m.Language == "python" &&
-		(strings.Contains(m.RawText, "abstractmethod") ||
-			strings.Contains(m.RawText, "NotImplementedError")) {
+	if pythonAbstractMethod(m) {
 		return false
 	}
 	return true
+}
+
+func pythonAbstractMethod(method *core.SymbolRecord) bool {
+	if method == nil || method.Language != "python" {
+		return false
+	}
+	for _, annotation := range method.Annotations {
+		if annotation == "abstractmethod" || strings.HasSuffix(annotation, ".abstractmethod") {
+			return true
+		}
+	}
+	return strings.Contains(method.RawText, "abstractmethod") || strings.Contains(method.RawText, "NotImplementedError")
 }
 
 func isAbstractType(t *core.SymbolRecord) bool {

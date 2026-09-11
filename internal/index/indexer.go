@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -64,8 +65,8 @@ type Options struct {
 // changed files were already deleted by the persist phase; here the
 // recomputed owners' rows are deleted and every row the delta could have
 // altered is upserted with merge semantics. A COUNT(*) invariant guards the
-// splice — any divergence from the in-memory edge set self-heals through the
-// full ReplaceEdges diff in the same run.
+// splice — any content or cardinality divergence from the in-memory edge set
+// self-heals through the full ReplaceEdges diff in the same run.
 func (i *Indexer) spliceEdgeWrite(ctx context.Context, symbols []core.SymbolRecord, edges []core.Edge, meta *graph.DeltaMeta, result *core.IndexResult) error {
 	owners := make([]string, 0, len(meta.AffectedOwners))
 	for id := range meta.AffectedOwners {
@@ -113,15 +114,17 @@ func (i *Indexer) spliceEdgeWrite(ctx context.Context, symbols []core.SymbolReco
 	if err := i.store.SpliceEdges(ctx, owners, nativeFiles, inserts); err != nil {
 		return err
 	}
-	count, err := i.store.EdgeCount(ctx)
+	stored, err := i.store.EdgeFingerprint(ctx)
 	if err != nil {
 		return err
 	}
-	if count != len(edges) {
+	memory := store.FingerprintEdges(edges)
+	if stored != memory {
 		// Write-set miss: self-heal with the full diff and record it —
 		// a persistent mismatch is a bug in the splice enumeration.
 		result.Native = append(result.Native,
-			fmt.Sprintf("edge splice mismatch (stored %d != memory %d): healed via full diff", count, len(edges)))
+			fmt.Sprintf("edge splice mismatch (stored %d/%x != memory %d/%x): healed via full diff",
+				stored.Count, stored.Digest[:6], memory.Count, memory.Digest[:6]))
 		return i.store.ReplaceEdges(ctx, edges)
 	}
 	result.Native = append(result.Native,
@@ -133,7 +136,7 @@ func (i *Indexer) spliceEdgeWrite(ctx context.Context, symbols []core.SymbolReco
 // GROVE_INCREMENTAL=0 opts out. The path is guarded end to end: canonical
 // install order makes its in-memory state identical to a full rebuild's,
 // degenerate deltas fall back to a full rebuild automatically, and the store
-// splice self-heals through the full diff on any COUNT invariant miss.
+// splice self-heals through the full diff on any edge-set fingerprint miss.
 func incrementalEnabled() bool {
 	return os.Getenv("GROVE_INCREMENTAL") != "0"
 }
@@ -475,7 +478,12 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 		}
 		changedRel = append(changedRel, prunedFiles...)
 	}
-	nativeResult := native.AnalyzeChangedFiles(ctx, root, symbols, i.nativeConfig, scope, changedRel)
+	allFiles := make([]string, 0, len(currentFiles))
+	for file := range currentFiles {
+		allFiles = append(allFiles, file)
+	}
+	sort.Strings(allFiles)
+	nativeResult := native.AnalyzeChangedFiles(ctx, root, symbols, i.nativeConfig, scope, changedRel, allFiles)
 	result.Native = append(result.Native, nativeResult.Diagnostics...)
 	tick("native-analyzers")
 

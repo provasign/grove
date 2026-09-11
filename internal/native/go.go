@@ -118,8 +118,12 @@ func (goAnalyzer) Analyze(ctx context.Context, req Request) Result {
 		pkgs = append(pkgs, pkg)
 	}
 	pkgByImport := map[string]goListPackage{}
+	pkgDirsByImport := map[string][]string{}
 	for _, pkg := range pkgs {
 		pkgByImport[pkg.ImportPath] = pkg
+		if rel, ok := relFile(req.Root, pkg.Dir); ok {
+			pkgDirsByImport[pkg.ImportPath] = append(pkgDirsByImport[pkg.ImportPath], rel)
+		}
 	}
 
 	var edges []core.Edge
@@ -171,9 +175,9 @@ func (goAnalyzer) Analyze(ctx context.Context, req Request) Result {
 	}
 	semanticEdges, semanticDiagnostics := goSemanticEdges(ctx, req.Root, semFiles, req.Symbols, pkgs)
 	edges = append(edges, semanticEdges...)
-	callSiteEdges := goCallSiteEdges(semSymbols, req.Symbols)
+	callSiteEdges := goCallSiteEdges(semSymbols, req.Symbols, pkgDirsByImport)
 	edges = append(edges, callSiteEdges...)
-	typeUseEdges := goTypeUseEdges(ctx, semSymbols, req.Symbols)
+	typeUseEdges := goTypeUseEdges(ctx, semSymbols, req.Symbols, pkgDirsByImport)
 	edges = append(edges, typeUseEdges...)
 
 	head := []string{"go list resolved " + itoa(len(pkgs)) + " package(s)"}
@@ -604,11 +608,6 @@ func goSymbolForFunc(currentDir string, fn *types.Func, symbolIdx goSymbolIndex,
 		if symbol, ok := symbolIdx.byFunc[goCallableKey(dir, recv, fn.Name())]; ok {
 			return symbol, true
 		}
-		if recv != "" {
-			if symbol, ok := symbolIdx.byFunc[goCallableKey(dir, "", fn.Name())]; ok {
-				return symbol, true
-			}
-		}
 	}
 	return core.SymbolRecord{}, false
 }
@@ -720,7 +719,7 @@ func lastPathSegment(path string) string {
 
 // goCallSiteEdges resolves call sites for callers against the FULL symbol
 // index — callers may be scoped to changed packages, targets live anywhere.
-func goCallSiteEdges(callers, all []core.SymbolRecord) []core.Edge {
+func goCallSiteEdges(callers, all []core.SymbolRecord, pkgDirsByImport map[string][]string) []core.Edge {
 	idx := newGoNativeIndex(all)
 	var edges []core.Edge
 	seen := map[string]bool{}
@@ -747,7 +746,7 @@ func goCallSiteEdges(callers, all []core.SymbolRecord) []core.Edge {
 					continue
 				}
 				for _, symbol := range idx.funcsByName[name] {
-					if goDirMatchesImport(packageDir(symbol.FilePath), imp) {
+					if goDirMatchesImport(packageDir(symbol.FilePath), imp, pkgDirsByImport) {
 						targets = append(targets, symbol)
 					}
 				}
@@ -792,6 +791,12 @@ func splitGoCallSite(callee string) (string, string) {
 // "internal/store", silently dropping qualified cross-package call edges
 // for every nested package.
 func goImportedPackageForQualifier(imports []string, qualifier string) (string, bool) {
+	aliased := map[string]bool{}
+	for _, imp := range imports {
+		if _, path, ok := core.ParseGoImportAlias(imp); ok {
+			aliased[path] = true
+		}
+	}
 	for _, imp := range imports {
 		if alias, path, ok := core.ParseGoImportAlias(imp); ok {
 			if alias == qualifier {
@@ -799,7 +804,7 @@ func goImportedPackageForQualifier(imports []string, qualifier string) (string, 
 			}
 			continue
 		}
-		if lastPathSegment(imp) == qualifier {
+		if !aliased[imp] && lastPathSegment(imp) == qualifier {
 			return imp, true
 		}
 	}
@@ -809,14 +814,16 @@ func goImportedPackageForQualifier(imports []string, qualifier string) (string, 
 // goDirMatchesImport reports whether a repo-relative package dir is the
 // package an import path names (the import carries the module prefix that
 // repo-relative dirs lack).
-func goDirMatchesImport(dir, imp string) bool {
-	if dir == "" || dir == "." {
-		return false
+func goDirMatchesImport(dir, imp string, pkgDirsByImport map[string][]string) bool {
+	for _, localDir := range pkgDirsByImport[imp] {
+		if dir == localDir {
+			return true
+		}
 	}
-	return imp == dir || strings.HasSuffix(imp, "/"+dir)
+	return false
 }
 
-func goImportScope(caller core.SymbolRecord, idx *goNativeIndex) map[string]bool {
+func goImportScope(caller core.SymbolRecord, idx *goNativeIndex, pkgDirsByImport map[string][]string) map[string]bool {
 	scope := map[string]bool{caller.FilePath: true}
 	for _, file := range idx.filesByDir[packageDir(caller.FilePath)] {
 		scope[file] = true
@@ -826,7 +833,7 @@ func goImportScope(caller core.SymbolRecord, idx *goNativeIndex) map[string]bool
 			imp = path
 		}
 		for dir, files := range idx.filesByDir {
-			if !goDirMatchesImport(dir, imp) {
+			if !goDirMatchesImport(dir, imp, pkgDirsByImport) {
 				continue
 			}
 			for _, file := range files {
@@ -839,6 +846,7 @@ func goImportScope(caller core.SymbolRecord, idx *goNativeIndex) map[string]bool
 
 // goIdentRe extracts identifier tokens from a stripped body in one pass.
 var goIdentRe = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]*`)
+var goQualifiedIdentRe = regexp.MustCompile(`\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b`)
 
 // goTypeUseEdges emits lexical type-use edges. Each caller body is stripped
 // and tokenized exactly once and tokens are resolved through the type index;
@@ -848,7 +856,7 @@ var goIdentRe = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]*`)
 // goTypeUseEdges resolves type references for callers against the FULL
 // symbol index — callers may be scoped to changed packages, but their
 // targets live anywhere in the repo.
-func goTypeUseEdges(ctx context.Context, callers, all []core.SymbolRecord) []core.Edge {
+func goTypeUseEdges(ctx context.Context, callers, all []core.SymbolRecord, pkgDirsByImport map[string][]string) []core.Edge {
 	idx := newGoNativeIndex(all)
 	if len(idx.typesByName) == 0 {
 		return nil
@@ -859,8 +867,34 @@ func goTypeUseEdges(ctx context.Context, callers, all []core.SymbolRecord) []cor
 		if caller.Language != "go" || !callableKind(caller.Kind) || caller.RawText == "" {
 			continue
 		}
-		scope := goImportScope(caller, idx)
+		scope := goImportScope(caller, idx, pkgDirsByImport)
 		stripped := stripQuotedText(caller.RawText)
+		emit := func(target core.SymbolRecord) {
+			if target.ID == caller.ID {
+				return
+			}
+			key := caller.ID + "\x00" + target.ID
+			if seen[key] {
+				return
+			}
+			seen[key] = true
+			edges = append(edges, symbolEdge(caller, target, core.EdgeUsesType, 0.98))
+		}
+		for _, match := range goQualifiedIdentRe.FindAllStringSubmatch(stripped, -1) {
+			imp, ok := goImportedPackageForQualifier(caller.Imports, match[1])
+			if !ok {
+				continue
+			}
+			for _, target := range idx.typesByName[match[2]] {
+				if goDirMatchesImport(packageDir(target.FilePath), imp, pkgDirsByImport) {
+					emit(target)
+				}
+			}
+		}
+		// Qualified names were resolved with their import identity above. Remove
+		// them before bare-token matching so alias.Type cannot fan out to every
+		// imported package that declares Type.
+		stripped = goQualifiedIdentRe.ReplaceAllString(stripped, " ")
 		seenToken := map[string]bool{}
 		for _, token := range goIdentRe.FindAllString(stripped, -1) {
 			if seenToken[token] {
@@ -868,15 +902,10 @@ func goTypeUseEdges(ctx context.Context, callers, all []core.SymbolRecord) []cor
 			}
 			seenToken[token] = true
 			for _, target := range idx.typesByName[token] {
-				if target.ID == caller.ID || !scope[target.FilePath] {
+				if !scope[target.FilePath] {
 					continue
 				}
-				key := caller.ID + "\x00" + target.ID
-				if seen[key] {
-					continue
-				}
-				seen[key] = true
-				edges = append(edges, symbolEdge(caller, target, core.EdgeUsesType, 0.98))
+				emit(target)
 			}
 		}
 	}

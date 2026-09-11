@@ -2,9 +2,13 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"hash"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -19,6 +23,14 @@ import (
 
 type Store struct {
 	db *sql.DB
+}
+
+// EdgeFingerprint identifies the complete persisted edge set. Count makes
+// diagnostics useful; Digest detects equal-count substitutions and metadata
+// drift that a cardinality-only invariant cannot see.
+type EdgeFingerprint struct {
+	Count  int
+	Digest [sha256.Size]byte
 }
 
 // diagnoseOpenErr turns sqlite's bare open-time errors (e.g. "unable to open
@@ -706,10 +718,10 @@ func storeTimer(label string) func(string) {
 // SpliceEdges applies an incremental write-set instead of ReplaceEdges' full
 // 6.3M-row diff: point-delete the out-rows of recomputed owners, range-delete
 // the native-source rows of natively re-analyzed files, then upsert the
-// insert rows with merge semantics (higher confidence wins, first-wins on
-// ties — the same resolution mergeEdges applies in memory). The caller
-// verifies the result with a COUNT(*) equality check and falls back to
-// ReplaceEdges on any mismatch, so a write-set miss self-heals in-run.
+// insert rows with merge semantics (higher confidence wins, native wins exact
+// ties — the same resolution mergeEdges applies in memory). The caller verifies
+// the result with an edge-set fingerprint and falls back to ReplaceEdges on any
+// mismatch, so a write-set miss self-heals in-run.
 func (s *Store) SpliceEdges(ctx context.Context, deleteOwners []string, nativeFiles []string, inserts []core.Edge) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -746,7 +758,7 @@ func (s *Store) SpliceEdges(ctx context.Context, deleteOwners []string, nativeFi
 	}
 
 	// Dedupe the write-set in Go with mergeEdges' exact resolution (higher
-	// confidence wins, first-wins on ties) so the SQL upsert can be
+	// confidence wins, native wins exact ties) so the SQL upsert can be
 	// unconditional. A confidence-gated upsert would let a STALE stored row
 	// survive whenever it tied or beat the incoming row's confidence,
 	// keeping its old source/reason while the in-memory set — which the
@@ -781,8 +793,8 @@ func (s *Store) SpliceEdges(ctx context.Context, deleteOwners []string, nativeFi
 }
 
 // dedupeWriteSet collapses duplicate (from, type, to) rows using the same
-// resolution mergeEdges applies in memory: higher confidence wins, first
-// occurrence wins on a tie. Order of first appearance is preserved.
+// resolution mergeEdges applies in memory: higher confidence wins, native
+// evidence wins exact ties. Order of first appearance is preserved.
 func dedupeWriteSet(edges []core.Edge) []core.Edge {
 	type key struct {
 		from string
@@ -799,7 +811,7 @@ func dedupeWriteSet(edges []core.Edge) []core.Edge {
 			out = append(out, e)
 			continue
 		}
-		if e.Confidence > out[i].Confidence {
+		if core.EdgeWinsMerge(e, out[i]) {
 			out[i] = e
 		}
 	}
@@ -825,6 +837,76 @@ func (s *Store) EdgeCount(ctx context.Context) (int, error) {
 	var n int
 	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM edges`).Scan(&n)
 	return n, err
+}
+
+// FingerprintEdges returns a deterministic fingerprint of an in-memory edge
+// set. The input is copied before sorting so callers retain their graph order.
+func FingerprintEdges(edges []core.Edge) EdgeFingerprint {
+	ordered := append([]core.Edge(nil), edges...)
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].From != ordered[j].From {
+			return ordered[i].From < ordered[j].From
+		}
+		if ordered[i].Type != ordered[j].Type {
+			return ordered[i].Type < ordered[j].Type
+		}
+		return ordered[i].To < ordered[j].To
+	})
+
+	h := sha256.New()
+	for _, edge := range ordered {
+		writeEdgeFingerprint(h, edge)
+	}
+	var digest [sha256.Size]byte
+	copy(digest[:], h.Sum(nil))
+	return EdgeFingerprint{Count: len(ordered), Digest: digest}
+}
+
+// EdgeFingerprint returns the fingerprint of the persisted edge set without
+// materializing every row. The query order matches FingerprintEdges.
+func (s *Store) EdgeFingerprint(ctx context.Context) (EdgeFingerprint, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT from_node, to_node, edge_type, confidence, COALESCE(source, 'unknown'), COALESCE(reason, '')
+		FROM edges
+		ORDER BY from_node, edge_type, to_node
+	`)
+	if err != nil {
+		return EdgeFingerprint{}, err
+	}
+	defer rows.Close()
+
+	h := sha256.New()
+	count := 0
+	for rows.Next() {
+		var edge core.Edge
+		var typ, source, reason string
+		if err := rows.Scan(&edge.From, &edge.To, &typ, &edge.Confidence, &source, &reason); err != nil {
+			return EdgeFingerprint{}, err
+		}
+		edge.Type = core.EdgeType(typ)
+		edge.Source = core.EvidenceSource(source)
+		edge.Reason = core.EdgeReason(reason)
+		writeEdgeFingerprint(h, edge)
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		return EdgeFingerprint{}, err
+	}
+	var digest [sha256.Size]byte
+	copy(digest[:], h.Sum(nil))
+	return EdgeFingerprint{Count: count, Digest: digest}, nil
+}
+
+func writeEdgeFingerprint(h hash.Hash, edge core.Edge) {
+	id := edge.From + "::" + string(edge.Type) + "::" + edge.To
+	var word [8]byte
+	for _, value := range []string{id, string(edge.Source), string(edge.Reason)} {
+		binary.BigEndian.PutUint64(word[:], uint64(len(value)))
+		_, _ = h.Write(word[:])
+		_, _ = h.Write([]byte(value))
+	}
+	binary.BigEndian.PutUint64(word[:], math.Float64bits(edge.Confidence))
+	_, _ = h.Write(word[:])
 }
 
 // EdgesBySource returns stored edges whose evidence source equals source, in

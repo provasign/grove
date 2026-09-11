@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -244,7 +245,6 @@ func symbols(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) i
 	return printJSON(map[string]any{"symbols": codeGraph.Search(query, 50)})
 }
 
-
 func deps(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int {
 	args, refresh := stripRefresh(args)
 	if len(args) == 0 {
@@ -267,8 +267,13 @@ func deps(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int 
 
 func impact(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) int {
 	args, refresh := stripRefresh(args)
+	args, depth, err := parseImpactArgs(args)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: grove impact <symbol-or-file-query> [dir] [--refresh]")
+		fmt.Fprintln(os.Stderr, "usage: grove impact <symbol-or-file-query> [dir] [--depth N] [--refresh]")
 		return 2
 	}
 	query := args[0]
@@ -282,7 +287,40 @@ func impact(engine *parser.Engine, codeGraph *graph.CodeGraph, args []string) in
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	return printJSON(map[string]any{"nodes": codeGraph.Impact(query, 3)})
+	return printJSON(map[string]any{"nodes": codeGraph.Impact(query, depth)})
+}
+
+func parseImpactArgs(args []string) ([]string, int, error) {
+	positional := make([]string, 0, 2)
+	depth := 3
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		value := ""
+		switch {
+		case arg == "--depth":
+			if i+1 >= len(args) {
+				return nil, 0, fmt.Errorf("impact: --depth requires a positive integer")
+			}
+			i++
+			value = args[i]
+		case strings.HasPrefix(arg, "--depth="):
+			value = strings.TrimPrefix(arg, "--depth=")
+		case strings.HasPrefix(arg, "-"):
+			return nil, 0, fmt.Errorf("impact: unknown option %q", arg)
+		default:
+			positional = append(positional, arg)
+			continue
+		}
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed <= 0 {
+			return nil, 0, fmt.Errorf("impact: --depth must be a positive integer, got %q", value)
+		}
+		depth = parsed
+	}
+	if len(positional) > 2 {
+		return nil, 0, fmt.Errorf("impact: unexpected argument %q", positional[2])
+	}
+	return positional, depth, nil
 }
 
 // changeImpact prints the type-resolved change-set for a method signature

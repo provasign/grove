@@ -25,6 +25,10 @@ func newMCPTestServer(t *testing.T) (*Server, string) {
 func Login() error { return Logout() }
 
 func Logout() error { return nil }
+
+type Runner interface { Run() }
+type Worker struct{}
+func (Worker) Run() {}
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -113,13 +117,15 @@ func TestMCPToolsListReturnsExpectedTools(t *testing.T) {
 	resp := rpcCall(t, s, "tools/list", nil)
 	result, _ := resp["result"].(map[string]any)
 	list, _ := result["tools"].([]any)
-	if len(list) != 7 {
-		t.Fatalf("expected 7 tools, got %d: %v", len(list), list)
+	if len(list) != 11 {
+		t.Fatalf("expected 11 tools, got %d: %v", len(list), list)
 	}
 	want := map[string]bool{
 		"grove_index": false, "grove_impact": false,
 		"grove_deps": false, "grove_icr": false,
 		"grove_conflicts": false, "grove_symbols": false, "grove_certify": false,
+		"grove_change_impact": false, "grove_missing_implementations": false,
+		"grove_rename_plan": false, "grove_dead_code": false,
 	}
 	for _, tool := range list {
 		obj, _ := tool.(map[string]any)
@@ -155,6 +161,10 @@ func TestMCPCallEveryTool(t *testing.T) {
 		{"grove_symbols", map[string]any{"query": "Logout", "limit": 5}},
 		{"grove_deps", map[string]any{"file": "auth.go"}},
 		{"grove_impact", map[string]any{"query": "Logout", "maxDepth": 3}},
+		{"grove_change_impact", map[string]any{"query": "Login"}},
+		{"grove_missing_implementations", map[string]any{"query": "Runner.Run"}},
+		{"grove_rename_plan", map[string]any{"query": "Login", "newName": "SignIn"}},
+		{"grove_dead_code", map[string]any{"roots": []any{"Login"}}},
 		{"grove_icr", map[string]any{"intent": "Login"}},
 	}
 	for _, c := range cases {

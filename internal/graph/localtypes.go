@@ -344,7 +344,7 @@ func findTypeSymbol(idx *edgeIndex, symbol *core.SymbolRecord) *core.SymbolRecor
 //     the call targets a type we don't index
 //
 // An unknown qualifier leaves candidates untouched.
-func narrowByLocalType(idx *edgeIndex, sat *interfaceSatisfaction, localTypes map[string]string, qualifier, calleeName string, cands []*core.SymbolRecord, scope map[string]struct{}) (kept, dispatch []*core.SymbolRecord, decided bool) {
+func narrowByLocalType(idx *edgeIndex, sat *interfaceSatisfaction, caller *core.SymbolRecord, localTypes map[string]string, qualifier, calleeName string, cands []*core.SymbolRecord, scope map[string]struct{}) (kept, dispatch []*core.SymbolRecord, decided bool) {
 	if qualifier == "" || strings.HasSuffix(qualifier, "()") {
 		return cands, nil, false
 	}
@@ -360,6 +360,18 @@ func narrowByLocalType(idx *edgeIndex, sat *interfaceSatisfaction, localTypes ma
 		return nil, nil, true
 	}
 	byType := filterByParent(cands, typ)
+	if caller != nil && caller.Language == "java" {
+		// A single-type import shadows a same-package type with the same
+		// simple name. Scope intentionally contains both packages, so pin the
+		// already type-matched methods to the explicit import here.
+		byType = narrowByExplicitImport(idx, caller, typ, byType)
+	}
+	if caller != nil && caller.Language == "php" {
+		byType = phpNarrowMethodsByImport(idx, caller, typ, byType)
+	}
+	if len(byType) == 0 && caller != nil && caller.Language == "csharp" {
+		byType = csharpExtensionTargets(cands, typ)
+	}
 	// Class-hierarchy dispatch: a receiver typed by a class or interface
 	// runs whichever subtype's override the instance carries. The declared
 	// method (byType) stays; the overrides and implementors join as
@@ -413,6 +425,22 @@ func narrowByLocalType(idx *edgeIndex, sat *interfaceSatisfaction, localTypes ma
 		return byType, targets, true
 	}
 	return nil, nil, true
+}
+
+func csharpExtensionTargets(cands []*core.SymbolRecord, receiverType string) []*core.SymbolRecord {
+	var out []*core.SymbolRecord
+	for _, cand := range cands {
+		params := tsDeclParams(cand.Signature)
+		if params == "" {
+			params = tsDeclParams(cand.RawText)
+		}
+		first := strings.TrimSpace(strings.SplitN(params, ",", 2)[0])
+		fields := strings.Fields(first)
+		if len(fields) >= 3 && fields[0] == "this" && csNormalizeType(fields[1]) == receiverType {
+			out = append(out, cand)
+		}
+	}
+	return out
 }
 
 // maxDispatchFanout bounds class-hierarchy dispatch through one typed

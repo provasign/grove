@@ -33,9 +33,7 @@ type CodeGraph struct {
 	// sort the result to undo the map's randomness. The index does both once
 	// per install instead of once per query.
 	byName map[string][]string
-
 }
-
 
 func New() *CodeGraph {
 	return &CodeGraph{symbols: map[string]core.SymbolRecord{}}
@@ -148,7 +146,8 @@ func (g *CodeGraph) install(symbols []core.SymbolRecord, edges []core.Edge, file
 func (g *CodeGraph) idsNamed(name string) []string { return g.byName[name] }
 
 // mergeEdges overlays native analyzer edges onto baseline graph edges. For a
-// duplicate (from, type, to), the higher-confidence edge wins.
+// duplicate (from, type, to), the higher-confidence edge wins; native evidence
+// wins exact ties so its stronger provenance is not discarded.
 func mergeEdges(base, enriched []core.Edge) []core.Edge {
 	type key struct {
 		from string
@@ -168,7 +167,7 @@ func mergeEdges(base, enriched []core.Edge) []core.Edge {
 			byKey[k] = edge
 			return
 		}
-		if edge.Confidence > existing.Confidence {
+		if core.EdgeWinsMerge(edge, existing) {
 			byKey[k] = edge
 		}
 	}
@@ -209,7 +208,9 @@ func BuildEdges(symbols []core.SymbolRecord) []core.Edge {
 	tick("defines+imports")
 	edges = append(edges, buildContains(idx, symbols)...)
 	tick("contains")
-	edges = append(edges, buildExtendsImplements(idx, symbols)...)
+	inheritanceEdges := buildExtendsImplements(idx, symbols)
+	edges = append(edges, inheritanceEdges...)
+	edges = append(edges, buildJavaOverrideEdges(idx, symbols, inheritanceEdges)...)
 	tick("extends+implements")
 	edges = append(edges, buildUsesType(idx, symbols)...)
 	tick("uses-type")
@@ -432,11 +433,13 @@ func (g *CodeGraph) Deps(filePath string) []core.Edge {
 	defer g.mu.RUnlock()
 
 	fileNode := "file:" + filePath
+	importNode := "import:" + filePath
 	idPrefix := filePath + "::"
 
 	var deps []core.Edge
 	for _, edge := range g.edges {
-		if edge.From == fileNode || strings.HasPrefix(edge.From, idPrefix) ||
+		if edge.From == fileNode || edge.To == fileNode || edge.To == importNode ||
+			strings.HasPrefix(edge.From, idPrefix) ||
 			strings.HasPrefix(edge.To, idPrefix) {
 			deps = append(deps, edge)
 		}
@@ -603,7 +606,8 @@ func (g *CodeGraph) ImpactWithPolicy(query string, maxDepth int, policy Traversa
 			// Only traverse meaningful inbound edge types for blast radius
 			if edge.Type != core.EdgeCalls &&
 				edge.Type != core.EdgeContains && edge.Type != core.EdgeImplements &&
-				edge.Type != core.EdgeExtends && edge.Type != core.EdgeUsesType {
+				edge.Type != core.EdgeExtends && edge.Type != core.EdgeUsesType &&
+				edge.Type != core.EdgeOverrides {
 				continue
 			}
 			if !policy.Allows(edge) {
@@ -787,12 +791,13 @@ func confidenceForSeeds(count int) float64 {
 	switch {
 	case count == 0:
 		return 0.2
-	case count < 3:
-		return 0.65
-	case count < 10:
-		return 0.8
-	default:
+	case count == 1:
 		return 0.9
+	case count < 4:
+		return 0.8
+	case count < 10:
+		return 0.65
+	default:
+		return 0.4
 	}
 }
-

@@ -99,11 +99,23 @@ def type_qualifiers(node, out=None):
     if node is None:
         return out
     if isinstance(node, ast.Attribute):
+        parts = []
         root = node
         while isinstance(root, ast.Attribute):
+            parts.append(root.attr)
             root = root.value
         if isinstance(root, ast.Name):
-            out[node.attr] = root.id
+            parts.append(root.id)
+            parts.reverse()
+            out[node.attr] = ".".join(parts[:-1])
+    elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+        # A forward annotation stores its expression as a string constant.
+        # Parse that expression just as type_names does so module qualifiers
+        # survive a value: "models.Widget" annotation and pin homonyms.
+        try:
+            type_qualifiers(ast.parse(node.value, mode="eval").body, out)
+        except Exception:
+            pass
     for child in ast.iter_child_nodes(node):
         type_qualifiers(child, out)
     return out
@@ -153,7 +165,7 @@ for rel in files:
             for alias in node.names:
                 target_file = local_module_file(rel, alias.name, 0)
                 if target_file:
-                    imported_modules[alias.asname or alias.name.split(".")[0]] = target_file
+                    imported_modules[alias.asname or alias.name] = target_file
                     edges.append({"from": rel, "to": target_file})
                 else:
                     mods.append(alias.name)
@@ -168,6 +180,7 @@ for rel in files:
                     if alias.name != "*" and target_file:
                         imported_names[alias.asname or alias.name] = (alias.name, target_file)
             else:
+                package_file = local_module_file(rel, None, node.level)
                 for alias in node.names:
                     if alias.name == "*":
                         continue
@@ -175,6 +188,9 @@ for rel in files:
                     if target_file:
                         imported_modules[alias.asname or alias.name] = target_file
                         edges.append({"from": rel, "to": target_file})
+                    elif package_file:
+                        imported_names[alias.asname or alias.name] = (alias.name, package_file)
+                        edges.append({"from": rel, "to": package_file})
     for mod in mods:
         spec = find_spec_no_import(mod)
         origin = getattr(spec, "origin", None) if spec else None

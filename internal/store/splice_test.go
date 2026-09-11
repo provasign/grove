@@ -70,9 +70,12 @@ func TestSpliceEdgesDedupesWriteSetLikeMergeEdges(t *testing.T) {
 		{"higher confidence first still wins", []core.Edge{
 			mk(0.99, core.EvidenceSourceNative), mk(0.7, core.EvidenceSourceHeuristic),
 		}, mk(0.99, core.EvidenceSourceNative)},
-		{"first wins on tie", []core.Edge{
+		{"first wins on non-native tie", []core.Edge{
 			mk(0.8, core.EvidenceSourceASTKit), mk(0.8, core.EvidenceSourceHeuristic),
 		}, mk(0.8, core.EvidenceSourceASTKit)},
+		{"native wins on tie", []core.Edge{
+			mk(0.8, core.EvidenceSourceHeuristic), mk(0.8, core.EvidenceSourceNative),
+		}, mk(0.8, core.EvidenceSourceNative)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -91,5 +94,40 @@ func TestSpliceEdgesDedupesWriteSetLikeMergeEdges(t *testing.T) {
 				t.Errorf("got %+v, want %+v", got[0], tc.want)
 			}
 		})
+	}
+}
+
+func TestEdgeFingerprintDetectsEqualCountDifferentSets(t *testing.T) {
+	st := openStore(t)
+	ctx := context.Background()
+
+	keep := core.Edge{From: "a.go::A@s", To: "b.go::B@s", Type: core.EdgeCalls, Confidence: 0.9, Source: core.EvidenceSourceNative}
+	stale := core.Edge{From: "a.go::A@s", To: "c.go::C@s", Type: core.EdgeCalls, Confidence: 0.8, Source: core.EvidenceSourceHeuristic}
+	wantNew := core.Edge{From: "a.go::A@s", To: "d.go::D@s", Type: core.EdgeCalls, Confidence: 0.8, Source: core.EvidenceSourceHeuristic}
+
+	if err := st.ReplaceEdges(ctx, []core.Edge{keep, stale}); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := st.EdgeFingerprint(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := FingerprintEdges([]core.Edge{keep, wantNew})
+	if stored.Count != want.Count {
+		t.Fatalf("test setup requires equal counts: stored=%d memory=%d", stored.Count, want.Count)
+	}
+	if stored.Digest == want.Digest {
+		t.Fatal("fingerprint missed an equal-count stale/missing edge substitution")
+	}
+
+	if err := st.ReplaceEdges(ctx, []core.Edge{keep, wantNew}); err != nil {
+		t.Fatal(err)
+	}
+	stored, err = st.EdgeFingerprint(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored != want {
+		t.Fatalf("fingerprint differs for identical edge sets: stored=%x memory=%x", stored.Digest, want.Digest)
 	}
 }

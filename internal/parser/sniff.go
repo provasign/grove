@@ -28,7 +28,8 @@ var (
 	sniffCOBOLKeyword = regexp.MustCompile(`(?im)^.{0,7}\s*(IDENTIFICATION\s+DIVISION|PROGRAM-ID\s*\.)`)
 	// Copybook shape: a fixed-format level-number line (data name in area B).
 	sniffLevelLine = regexp.MustCompile(`(?m)^.{7}\s*\d{2}\s+[A-Z0-9][A-Z0-9-]*`)
-	sniffPIC      = regexp.MustCompile(`(?i)\bPIC(?:TURE)?\s+`)
+	sniffPIC       = regexp.MustCompile(`(?i)\bPIC(?:TURE)?\s+`)
+	sniffCPPHeader = regexp.MustCompile(`(?m)^\s*(?:template\s*<|namespace\b|class\s+[A-Za-z_]|extern\s+"C")`)
 )
 
 // sniffMainframe classifies head bytes as "cobol", "jcl", or "".
@@ -75,6 +76,9 @@ func DetectLanguageFile(path string) string {
 // DetectLanguageContent is DetectLanguage plus the same sniff applied to
 // in-memory content — for callers that already hold the bytes.
 func DetectLanguageContent(relPath string, content []byte) string {
+	if strings.EqualFold(filepath.Ext(relPath), ".h") && sniffCPPHeader.Match(content) {
+		return "cpp"
+	}
 	if lang := DetectLanguage(relPath); lang != "" {
 		return lang
 	}

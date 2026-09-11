@@ -30,7 +30,7 @@ var securityExtensions = map[string]bool{
 // detector fixes, synthesized records): the indexer re-extracts every file
 // when the stored stamp differs, because the blobSHA cache is otherwise
 // blind to binary upgrades and serves stale symbols indefinitely.
-const ExtractorVersion = "2026-09-10.5"
+const ExtractorVersion = "2026-09-11.6"
 
 // DetectLanguage returns the Grove language tag for a file path.
 // Returns "" for unsupported or security-excluded files.

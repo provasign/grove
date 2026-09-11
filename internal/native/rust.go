@@ -230,17 +230,133 @@ type rustImplRef struct {
 	TypeName  string
 }
 
-var rustImplForPattern = regexp.MustCompile(`\bimpl(?:<[^>]+>)?\s+([A-Za-z_][A-Za-z0-9_:]*)(?:<[^{}]+>)?\s+for\s+([A-Za-z_][A-Za-z0-9_:]*)(?:<[^{}]+>)?`)
-
 func rustImplRefs(rawText string) []rustImplRef {
-	matches := rustImplForPattern.FindAllStringSubmatch(rawText, -1)
-	out := make([]rustImplRef, 0, len(matches))
-	for _, match := range matches {
-		if len(match) == 3 {
-			out = append(out, rustImplRef{TraitName: rustLastPathSegment(match[1]), TypeName: rustLastPathSegment(match[2])})
+	var out []rustImplRef
+	for search := 0; search < len(rawText); {
+		rel := strings.Index(rawText[search:], "impl")
+		if rel < 0 {
+			break
 		}
+		start := search + rel
+		search = start + len("impl")
+		if start > 0 && isRustIdentByte(rawText[start-1]) || search < len(rawText) && isRustIdentByte(rawText[search]) {
+			continue
+		}
+		i := skipRustSpace(rawText, search)
+		if i < len(rawText) && rawText[i] == '<' {
+			var ok bool
+			i, ok = skipRustAngles(rawText, i)
+			if !ok {
+				continue
+			}
+			i = skipRustSpace(rawText, i)
+		}
+		forPos := rustTopLevelFor(rawText, i)
+		if forPos < 0 {
+			continue // inherent impl, or malformed header
+		}
+		traitName := rustImplBaseName(rawText[i:forPos])
+		typeStart := skipRustSpace(rawText, forPos+len("for"))
+		typeEnd := rustImplTypeEnd(rawText, typeStart)
+		typeName := rustImplBaseName(rawText[typeStart:typeEnd])
+		if traitName != "" && typeName != "" {
+			out = append(out, rustImplRef{TraitName: traitName, TypeName: typeName})
+		}
+		search = typeEnd
 	}
 	return out
+}
+
+func isRustIdentByte(ch byte) bool {
+	return ch == '_' || ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9'
+}
+
+func skipRustSpace(text string, i int) int {
+	for i < len(text) && (text[i] == ' ' || text[i] == '\t' || text[i] == '\r' || text[i] == '\n') {
+		i++
+	}
+	return i
+}
+
+func skipRustAngles(text string, start int) (int, bool) {
+	depth := 0
+	for i := start; i < len(text); i++ {
+		switch text[i] {
+		case '<':
+			depth++
+		case '>':
+			depth--
+			if depth == 0 {
+				return i + 1, true
+			}
+		}
+	}
+	return start, false
+}
+
+func rustTopLevelFor(text string, start int) int {
+	depth := 0
+	for i := start; i < len(text); i++ {
+		switch text[i] {
+		case '<', '(', '[':
+			depth++
+		case '>', ')', ']':
+			if depth > 0 {
+				depth--
+			}
+		case '{', ';':
+			if depth == 0 {
+				return -1
+			}
+		case 'f':
+			if depth == 0 && strings.HasPrefix(text[i:], "for") &&
+				(i == start || !isRustIdentByte(text[i-1])) &&
+				(i+3 == len(text) || !isRustIdentByte(text[i+3])) {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+func rustImplTypeEnd(text string, start int) int {
+	depth := 0
+	for i := start; i < len(text); i++ {
+		switch text[i] {
+		case '<', '(', '[':
+			depth++
+		case '>', ')', ']':
+			if depth > 0 {
+				depth--
+			}
+		case '{', ';':
+			if depth == 0 {
+				return i
+			}
+		case 'w':
+			if depth == 0 && strings.HasPrefix(text[i:], "where") &&
+				(i == start || !isRustIdentByte(text[i-1])) &&
+				(i+5 == len(text) || !isRustIdentByte(text[i+5])) {
+				return i
+			}
+		}
+	}
+	return len(text)
+}
+
+func rustImplBaseName(text string) string {
+	text = strings.TrimSpace(text)
+	text = strings.TrimSpace(strings.TrimPrefix(text, "&"))
+	if strings.HasPrefix(text, "'") {
+		if i := strings.IndexAny(text, " \t\r\n"); i >= 0 {
+			text = strings.TrimSpace(text[i:])
+		}
+	}
+	text = strings.TrimSpace(strings.TrimPrefix(text, "mut "))
+	if i := strings.IndexByte(text, '<'); i >= 0 {
+		text = text[:i]
+	}
+	return rustLastPathSegment(strings.TrimSpace(text))
 }
 
 var rustSignatureTypePattern = regexp.MustCompile(`(?:->|:)\s*&?(?:'[A-Za-z_][A-Za-z0-9_]*\s+)?(?:mut\s+)?([A-Z][A-Za-z0-9_:]*)`)

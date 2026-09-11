@@ -21,6 +21,8 @@ var (
 	csharpLocalDeclRe = regexp.MustCompile(`(?m)(?:^|[;{}()]\s*)\s*([A-Z]\w*)(?:<[^<>]*>)?(?:\[\])?\s+(\w+)\s*[=;)]`)
 	// foreach (Type x in ...)
 	csharpForeachRe = regexp.MustCompile(`\bforeach\s*\(\s*(?:var|([A-Z]\w*)(?:<[^<>]*>)?)\s+(\w+)\s+in\b`)
+	// if (value is Type name) / while (... is Type name)
+	csharpIsPatternRe = regexp.MustCompile(`\bis\s+([A-Z]\w*)(?:<[^<>]*>)?\s+([a-z_]\w*)\b`)
 	// auto-property / field: "public Foo Bar { ..." or "Foo _bar ;|="
 	csharpFieldRe = regexp.MustCompile(`(?m)^\s*(?:(?:public|private|protected|internal|static|readonly|virtual|override|sealed|abstract|new|volatile|const)\s+)*([A-Z]\w*)(?:<[^<>]*>)?(?:\[\])?\s+(\w+)\s*[{;=]`)
 )
@@ -96,9 +98,31 @@ func csharpLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]stri
 				out[m[2]] = t
 			}
 		}
+		for _, m := range csharpIsPatternRe.FindAllStringSubmatch(body, -1) {
+			if t := javaBareType(m[1]); t != "" && !csharpKeyword(t) {
+				out[m[2]] = t
+			}
+		}
 		// var x = new Type() overrides any spurious local-decl capture.
 		for _, m := range csharpVarNewRe.FindAllStringSubmatch(body, -1) {
 			out[m[1]] = m[2]
+		}
+	}
+	aliases := map[string]string{}
+	for _, imp := range symbol.Imports {
+		left, right, ok := strings.Cut(imp, "=")
+		if !ok {
+			continue
+		}
+		alias := strings.TrimSpace(left)
+		target := csNormalizeType(strings.TrimSpace(right))
+		if alias != "" && target != "" {
+			aliases[alias] = target
+		}
+	}
+	for name, typ := range out {
+		if target := aliases[typ]; target != "" {
+			out[name] = target
 		}
 	}
 	delete(out, "this")
@@ -705,9 +729,9 @@ func csharpTypeFragments(idx *edgeIndex, className, preferDir string) []*core.Sy
 			preferred = append(preferred, cand)
 		}
 	}
-	candidates := preferred
-	if len(candidates) == 0 {
-		candidates = fallback
+	candidates := fallback
+	if len(preferred) > 0 {
+		candidates = preferred
 	}
 	if len(candidates) == 0 {
 		return nil
@@ -716,8 +740,11 @@ func csharpTypeFragments(idx *edgeIndex, className, preferDir string) []*core.Sy
 	if !csharpPartialRe.MatchString(first.Signature + "\n" + first.RawText) {
 		return []*core.SymbolRecord{first}
 	}
-	out := make([]*core.SymbolRecord, 0, len(candidates))
-	for _, cand := range candidates {
+	// Partial declarations form one type even when source generators place
+	// fragments in a different directory. Once the preferred declaration is
+	// proven partial, collect every partial fragment of that name.
+	out := make([]*core.SymbolRecord, 0, len(fallback))
+	for _, cand := range fallback {
 		if csharpPartialRe.MatchString(cand.Signature + "\n" + cand.RawText) {
 			out = append(out, cand)
 		}
@@ -744,6 +771,9 @@ func csharpBaseList(text string) []string {
 		tail = tail[:i]
 	}
 	if i := strings.IndexByte(tail, '{'); i >= 0 {
+		tail = tail[:i]
+	}
+	if i := strings.IndexByte(tail, ';'); i >= 0 {
 		tail = tail[:i]
 	}
 	var out []string

@@ -112,6 +112,37 @@ func TestCallsEdgesDetectedInRawText(t *testing.T) {
 	}
 }
 
+func TestImpactTraversesOverrideEdges(t *testing.T) {
+	g := New()
+	g.ReplaceWithEdges([]core.SymbolRecord{
+		{ID: "contract", FilePath: "api.java", Language: "java", Kind: core.KindMethod, Name: "run", QualifiedName: "Runner.run", ParentSymbol: "Runner"},
+		{ID: "impl", FilePath: "worker.java", Language: "java", Kind: core.KindMethod, Name: "run", QualifiedName: "Worker.run", ParentSymbol: "Worker"},
+	}, []core.Edge{{From: "impl", To: "contract", Type: core.EdgeOverrides, Confidence: 0.95}}, 2)
+
+	found := false
+	for _, sym := range g.Impact("Runner.run", 1) {
+		if sym.ID == "impl" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("impact did not reach overriding implementation")
+	}
+}
+
+func TestICRConfidenceDeclinesAsSeedSetBroadens(t *testing.T) {
+	counts := []int{1, 2, 8, 20}
+	for i := 1; i < len(counts); i++ {
+		if confidenceForSeeds(counts[i-1]) <= confidenceForSeeds(counts[i]) {
+			t.Fatalf("confidence did not decline: count %d => %.2f, count %d => %.2f",
+				counts[i-1], confidenceForSeeds(counts[i-1]), counts[i], confidenceForSeeds(counts[i]))
+		}
+	}
+	if confidenceForSeeds(0) > 0.2 {
+		t.Fatalf("zero-seed confidence = %.2f", confidenceForSeeds(0))
+	}
+}
+
 func TestImportEdgesAttachedToFileNodeNotPerSymbol(t *testing.T) {
 	codeGraph := New()
 	// Two symbols in same file, both with same imports
@@ -164,6 +195,20 @@ func TestDepsExactPrefixNotSubstring(t *testing.T) {
 		}
 	}
 }
+
+func TestDepsIncludesInboundFileImports(t *testing.T) {
+	g := New()
+	g.ReplaceWithEdges(nil, []core.Edge{
+		{From: "file:consumer.go", To: "file:target.go", Type: core.EdgeImports},
+		{From: "file:other.go", To: "import:target.go", Type: core.EdgeImports},
+		{From: "file:wrong.go", To: "file:not-target.go", Type: core.EdgeImports},
+	}, 0)
+	deps := g.Deps("target.go")
+	if len(deps) != 2 {
+		t.Fatalf("inbound deps = %+v, want resolved and unresolved import targets", deps)
+	}
+}
+
 func TestComputeICRAndDetectConflicts(t *testing.T) {
 	codeGraph := New()
 	codeGraph.Replace([]core.SymbolRecord{

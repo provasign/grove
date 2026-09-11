@@ -47,3 +47,47 @@ func TestPythonImportAliasesResolveCallsAndTypes(t *testing.T) {
 		t.Fatal("function-local import leaked into a sibling function")
 	}
 }
+
+func TestPythonDottedImportUsesOnlyItsRealRootBinding(t *testing.T) {
+	files := map[string]string{
+		"lib/engine.py": "def start(): return 1\n",
+		"other.py":      "def start(): return 2\n",
+		"app.py":        "import lib.engine\ndef good(): return lib.engine.start()\ndef invalid(): return engine.start()\n",
+	}
+	var symbols []core.SymbolRecord
+	for file, src := range files {
+		imports := extractImports("python", src)
+		if file == "app.py" {
+			bindings := map[string]string{}
+			for _, imp := range imports {
+				if _, local, target, ok := core.ParsePythonImportBinding(imp); ok {
+					bindings[local] = target
+				}
+			}
+			if bindings["lib"] != "lib.engine" || bindings["engine"] != "" {
+				t.Fatalf("dotted import bindings = %v", bindings)
+			}
+		}
+		syms, ok, _ := extractSymbolsFromAST("python", file, "sha", []byte(src), imports)
+		if !ok {
+			t.Fatalf("parse %s", file)
+		}
+		symbols = append(symbols, syms...)
+	}
+	labels := map[string]string{}
+	for _, symbol := range symbols {
+		labels[symbol.ID] = symbol.FilePath + ":" + symbol.QualifiedName
+	}
+	calls := map[string]bool{}
+	for _, edge := range graph.BuildEdges(symbols) {
+		if edge.Type == core.EdgeCalls {
+			calls[labels[edge.From]+" -> "+labels[edge.To]] = true
+		}
+	}
+	if !calls["app.py:good -> lib/engine.py:start"] {
+		t.Fatalf("full dotted binding did not resolve: %v", calls)
+	}
+	if calls["app.py:invalid -> lib/engine.py:start"] || calls["app.py:invalid -> other.py:start"] {
+		t.Fatalf("fabricated leaf binding resolved invalid engine.start(): %v", calls)
+	}
+}

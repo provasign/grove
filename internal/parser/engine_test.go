@@ -281,6 +281,7 @@ func TestCppNamespaceMetadataQualifiesTypesAndMethods(t *testing.T) {
 class Handle { public: void close(); };
 void Handle::close() {}
 }
+
 namespace fs {
 class Handle { public: void close(); };
 void Handle::close() {}
@@ -316,6 +317,20 @@ using fs::Handle;`)
 		if !found {
 			t.Fatalf("missing C++ namespace binding %q: %#v", annotation, symbols[0].Annotations)
 		}
+	}
+}
+
+func TestCppOneLineNestedNamespacesDoNotCycle(t *testing.T) {
+	symbols, err := extractSymbolsFromString("cpp", "nested.cpp", `namespace outer { namespace inner { void deep() {} } }`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := map[string]bool{}
+	for _, symbol := range symbols {
+		found[symbol.QualifiedName] = true
+	}
+	if !found["outer"] || !found["outer::inner"] || !found["outer::inner::deep"] {
+		t.Fatalf("one-line namespace nesting was not preserved: %#v", symbols)
 	}
 }
 
@@ -634,6 +649,27 @@ function internalHelper() {}
 		t.Fatal("internalHelper not extracted")
 	} else if s.Exports {
 		t.Fatal("internalHelper.Exports = true, but it has no export keyword")
+	}
+}
+
+func TestJSImportMixedDefaultAndNamedKeepsDefaultAlias(t *testing.T) {
+	imports, ok := extractImportsFromAST("typescript", []byte(`import React, { useState as state } from './react'`))
+	if !ok {
+		t.Fatal("TypeScript AST import extraction unavailable")
+	}
+	want := map[string]bool{
+		"./react": true,
+		core.JSImportAlias("React", "./react#default"):  true,
+		core.JSImportAlias("state", "./react#useState"): true,
+	}
+	got := map[string]bool{}
+	for _, imp := range imports {
+		got[imp] = true
+	}
+	for imp := range want {
+		if !got[imp] {
+			t.Errorf("missing import %q in %v", imp, imports)
+		}
 	}
 }
 
@@ -1367,6 +1403,55 @@ public:
 	if saveCount != 2 {
 		t.Fatalf("Save method count = %d, want 2; symbols=%#v", saveCount, syms)
 	}
+}
+
+func TestCPPModernMemberDeclarationsAndNoPhantomInlineTwin(t *testing.T) {
+	src := `class Sink { public: virtual void write(int b) noexcept = 0; };
+class FileSink : public Sink {
+public:
+    void write(int b) noexcept override final;
+    int size() const noexcept { return 1; }
+};
+`
+	syms, err := extractSymbolsFromString("cpp", "sink.hpp", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var write, sizeMethod, sizeFree int
+	for _, sym := range syms {
+		switch {
+		case sym.Name == "write" && sym.ParentSymbol == "FileSink" && sym.Kind == core.KindMethod:
+			write++
+		case sym.Name == "size" && sym.ParentSymbol == "FileSink" && sym.Kind == core.KindMethod:
+			sizeMethod++
+		case sym.Name == "size" && sym.ParentSymbol == "" && sym.Kind == core.KindFunction:
+			sizeFree++
+		}
+	}
+	if write != 1 || sizeMethod != 1 || sizeFree != 0 {
+		t.Fatalf("modern members: write=%d sizeMethod=%d sizeFree=%d symbols=%#v", write, sizeMethod, sizeFree, syms)
+	}
+}
+
+func TestCPPOutOfLineTemplateMemberKeepsParent(t *testing.T) {
+	src := `template<typename T>
+class Holder { public: void put(T value); };
+template<typename T>
+void Holder<T>::put(T value) {}
+`
+	syms, err := extractSymbolsFromString("cpp", "holder.hpp", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sym := range syms {
+		if sym.Name == "put" && sym.Span.Start == 4 {
+			if sym.Kind != core.KindMethod || sym.ParentSymbol != "Holder" {
+				t.Fatalf("out-of-line template member = %#v", sym)
+			}
+			return
+		}
+	}
+	t.Fatalf("out-of-line template member missing: %#v", syms)
 }
 
 // nameIndex builds a map[name]SymbolRecord for assertion helpers.

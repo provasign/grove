@@ -13,6 +13,7 @@ import (
 
 	"errors"
 	"github.com/provasign/grove/internal/core"
+	"github.com/provasign/grove/internal/parser"
 )
 
 const defaultTimeout = 5 * time.Second
@@ -127,19 +128,21 @@ func AnalyzeWithConfig(ctx context.Context, root string, symbols []core.SymbolRe
 // On a polyglot monorepo this is the difference between a one-file Go edit
 // re-running the whole TypeScript program check and not.
 func AnalyzeChanged(ctx context.Context, root string, symbols []core.SymbolRecord, cfg Config, changedLanguages map[string]bool) Result {
-	return AnalyzeChangedFiles(ctx, root, symbols, cfg, changedLanguages, nil)
+	return AnalyzeChangedFiles(ctx, root, symbols, cfg, changedLanguages, nil, nil)
 }
 
 // AnalyzeChangedFiles additionally passes the changed file list so analyzers
-// can scope per-package work (see Request.ChangedFiles).
-func AnalyzeChangedFiles(ctx context.Context, root string, symbols []core.SymbolRecord, cfg Config, changedLanguages map[string]bool, changedFiles []string) Result {
+// can scope per-package work (see Request.ChangedFiles). allFiles is the full
+// supported-file inventory, including files such as TS re-export barrels that
+// legitimately contain no symbols.
+func AnalyzeChangedFiles(ctx context.Context, root string, symbols []core.SymbolRecord, cfg Config, changedLanguages map[string]bool, changedFiles, allFiles []string) Result {
 	if !cfg.Enabled {
 		return Result{Diagnostics: []string{"native analyzers disabled"}}
 	}
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = defaultTimeout
 	}
-	files := filesByLanguage(symbols)
+	files := filesByLanguage(symbols, allFiles)
 	var combined Result
 	for _, analyzer := range PriorityAnalyzers() {
 		if !analyzerEnabled(analyzer, cfg) {
@@ -262,7 +265,7 @@ func languageSet(value string) map[string]bool {
 	return out
 }
 
-func filesByLanguage(symbols []core.SymbolRecord) map[string][]string {
+func filesByLanguage(symbols []core.SymbolRecord, allFiles []string) map[string][]string {
 	seen := map[string]bool{}
 	out := map[string][]string{}
 	for _, symbol := range symbols {
@@ -275,6 +278,21 @@ func filesByLanguage(symbols []core.SymbolRecord) map[string][]string {
 		}
 		seen[key] = true
 		out[symbol.Language] = append(out[symbol.Language], symbol.FilePath)
+	}
+	for _, file := range allFiles {
+		language := parser.DetectLanguage(file)
+		if file == "" || language == "" {
+			continue
+		}
+		key := language + "\x00" + file
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out[language] = append(out[language], file)
+	}
+	for language := range out {
+		sort.Strings(out[language])
 	}
 	return out
 }

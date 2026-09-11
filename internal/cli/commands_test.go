@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/provasign/grove/internal/core"
@@ -383,5 +384,26 @@ func TestArgOrDefault(t *testing.T) {
 	}
 	if got := argOrDefault([]string{""}, 0, "def"); got != "def" {
 		t.Errorf("got %q", got)
+	}
+}
+
+func TestParseImpactArgs(t *testing.T) {
+	for _, tc := range []struct {
+		in        []string
+		wantArgs  []string
+		wantDepth int
+		wantErr   bool
+	}{
+		{[]string{"Thing"}, []string{"Thing"}, 3, false},
+		{[]string{"Thing", "repo", "--depth", "1"}, []string{"Thing", "repo"}, 1, false},
+		{[]string{"--depth=4", "Thing"}, []string{"Thing"}, 4, false},
+		{[]string{"Thing", "--depth", "0"}, nil, 0, true},
+		{[]string{"Thing", "--unknown"}, nil, 0, true},
+		{[]string{"Thing", "repo", "extra"}, nil, 0, true},
+	} {
+		gotArgs, gotDepth, err := parseImpactArgs(tc.in)
+		if (err != nil) != tc.wantErr || !reflect.DeepEqual(gotArgs, tc.wantArgs) || gotDepth != tc.wantDepth {
+			t.Errorf("parseImpactArgs(%v) = (%v, %d, %v), want (%v, %d, err=%v)", tc.in, gotArgs, gotDepth, err, tc.wantArgs, tc.wantDepth, tc.wantErr)
+		}
 	}
 }

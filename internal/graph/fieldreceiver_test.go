@@ -156,3 +156,40 @@ func TestBuildCalls_JavaWildcardImportScope(t *testing.T) {
 		t.Error("wildcard import must bring the package into scope: missing call edge to JsonSerializer.serialize")
 	}
 }
+
+func TestBuildCalls_JavaSameLineAnnotatedFieldReceiver(t *testing.T) {
+	target := core.SymbolRecord{ID: "Repo.java::Repo.find", FilePath: "Repo.java", Language: "java", Kind: core.KindMethod, Name: "find", QualifiedName: "Repo.find", ParentSymbol: "Repo"}
+	owner := core.SymbolRecord{ID: "Svc.java::Svc", FilePath: "Svc.java", Language: "java", Kind: core.KindClass, Name: "Svc", QualifiedName: "Svc", RawText: "class Svc {\n    @Autowired private Repo repo;\n}"}
+	caller := core.SymbolRecord{ID: "Svc.java::Svc.load", FilePath: "Svc.java", Language: "java", Kind: core.KindMethod, Name: "load", QualifiedName: "Svc.load", ParentSymbol: "Svc", RawText: "void load() { repo.find(); }", Span: core.LineRange{Start: 3, End: 3}, CallSites: []core.CallSite{{Callee: "repo.find", Line: 3}}}
+	edges := BuildEdges([]core.SymbolRecord{target, owner, caller})
+	for _, e := range edges {
+		if e.Type == core.EdgeCalls && e.From == caller.ID && e.To == target.ID {
+			return
+		}
+	}
+	t.Fatal("same-line annotated Java field did not retain its receiver type")
+}
+
+func TestBuildCalls_CPPFieldReceiverType(t *testing.T) {
+	widget := core.SymbolRecord{ID: "Widget.h::Widget", FilePath: "Widget.h", Language: "cpp", Kind: core.KindClass, Name: "Widget", QualifiedName: "Widget", RawText: "class Widget { public: void render(); };"}
+	render := core.SymbolRecord{ID: "Widget.h::Widget.render", FilePath: "Widget.h", Language: "cpp", Kind: core.KindMethod, Name: "render", QualifiedName: "Widget::render", ParentSymbol: "Widget"}
+	otherRender := core.SymbolRecord{ID: "Other.h::Other.render", FilePath: "Other.h", Language: "cpp", Kind: core.KindMethod, Name: "render", QualifiedName: "Other::render", ParentSymbol: "Other"}
+	owner := core.SymbolRecord{ID: "Owner.cpp::Owner", FilePath: "Owner.cpp", Language: "cpp", Kind: core.KindClass, Name: "Owner", QualifiedName: "Owner", RawText: "class Owner { Widget field; void go() { field.render(); } };"}
+	caller := core.SymbolRecord{ID: "Owner.cpp::Owner.go", FilePath: "Owner.cpp", Language: "cpp", Kind: core.KindMethod, Name: "go", QualifiedName: "Owner::go", ParentSymbol: "Owner", RawText: "void go() { field.render(); }", Span: core.LineRange{Start: 1, End: 1}, CallSites: []core.CallSite{{Callee: "field.render", Line: 1}}}
+	edges := BuildEdges([]core.SymbolRecord{widget, render, otherRender, owner, caller})
+	found := false
+	for _, edge := range edges {
+		if edge.Type != core.EdgeCalls || edge.From != caller.ID {
+			continue
+		}
+		if edge.To == render.ID {
+			found = true
+		}
+		if edge.To == otherRender.ID {
+			t.Fatal("C++ field receiver resolved to an unrelated same-named method")
+		}
+	}
+	if !found {
+		t.Fatal("C++ field receiver did not resolve to its declared type")
+	}
+}

@@ -70,6 +70,8 @@ func (g *CodeGraph) DeadCode(extraRoots []string) *DeadCodeResult {
 		switch {
 		case s.Name == "main" || s.Name == "init":
 			roots[id] = true
+		case s.Name == "<top-level>":
+			roots[id] = true // executable module/script body
 		case isTestFilePath(s.FilePath):
 			roots[id] = true
 		case s.Exports:
@@ -124,7 +126,10 @@ func (g *CodeGraph) DeadCode(extraRoots []string) *DeadCodeResult {
 	// never in an order that breaks compilation).
 	tokenSymbols := make(map[string]int)
 	for _, s := range g.symbols {
-		if s.RawText == "" {
+		// Namespace RawText encloses the declarations beneath it and therefore
+		// duplicates every identifier in the namespace. It is not an independent
+		// value-use site and must not keep nested methods alive.
+		if s.RawText == "" || s.Kind == core.KindNamespace || isRustTestSymbol(&s) {
 			continue
 		}
 		seen := make(map[string]bool)
@@ -143,6 +148,34 @@ func (g *CodeGraph) DeadCode(extraRoots []string) *DeadCodeResult {
 		}
 		return 1
 	}
+	enclosingMentions := func(id, name string) int {
+		count := 0
+		seen := map[string]bool{id: true}
+		queue := []string{id}
+		for len(queue) > 0 {
+			child := queue[0]
+			queue = queue[1:]
+			for _, edgeIndex := range g.inbound[child] {
+				edge := g.edges[edgeIndex]
+				if edge.Type != core.EdgeContains || seen[edge.From] {
+					continue
+				}
+				seen[edge.From] = true
+				queue = append(queue, edge.From)
+				parent, ok := g.symbols[edge.From]
+				if !ok || parent.RawText == "" {
+					continue
+				}
+				for _, token := range identTokenRe.FindAllString(parent.RawText, -1) {
+					if token == name {
+						count++
+						break
+					}
+				}
+			}
+		}
+		return count
+	}
 
 	res := &DeadCodeResult{RootCount: len(roots), ReachableCount: len(reached), Caveats: deadCodeCaveats}
 
@@ -151,11 +184,11 @@ func (g *CodeGraph) DeadCode(extraRoots []string) *DeadCodeResult {
 		if s.Kind != core.KindFunction && s.Kind != core.KindMethod {
 			continue
 		}
-		if isTestFilePath(s.FilePath) || implicitNames[s.Name] {
+		if isTestFilePath(s.FilePath) || isRustTestSymbol(&s) || implicitNames[s.Name] || strings.HasPrefix(s.Name, "<lambda@") {
 			continue
 		}
 		res.Considered++
-		outsideMentions := tokenSymbols[s.Name] - selfMentions(&s)
+		outsideMentions := tokenSymbols[s.Name] - selfMentions(&s) - enclosingMentions(id, s.Name)
 
 		if s.Exports {
 			// Exported symbols are roots; their own liveness is judged by
@@ -185,6 +218,18 @@ func (g *CodeGraph) hasInboundReference(id string) bool {
 		switch g.edges[ei].Type {
 		case core.EdgeContains, core.EdgeDefines:
 		default:
+			return true
+		}
+	}
+	return false
+}
+
+func isRustTestSymbol(s *core.SymbolRecord) bool {
+	if s == nil || s.Language != "rust" {
+		return false
+	}
+	for _, annotation := range s.Annotations {
+		if annotation == "test" {
 			return true
 		}
 	}

@@ -23,6 +23,11 @@ var (
 	// let x = Type::new(...) / Builder::default() / Foo::with_capacity(n) /
 	// Foo::from(y) — the conventional Self-returning constructors.
 	rustLetCtorRe = regexp.MustCompile(`(?m)\blet\s+(?:mut\s+)?([a-z_]\w*)\s*=\s*(?:[A-Za-z_]\w*::)*([A-Z]\w*)::(?:new|default|from|with_\w+)\s*[(<]`)
+	// let x = Type { ... } / crate::Type { ... } — Rust's ordinary value
+	// construction syntax does not call a constructor function.
+	rustLetStructRe = regexp.MustCompile(`(?m)\blet\s+(?:mut\s+)?([a-z_]\w*)\s*=\s*(?:[A-Za-z_]\w*::)*([A-Z]\w*)(?:\s*::<[^>{}\n]+>)?\s*\{`)
+	// use crate::types::{Thing as Alias};
+	rustTypeAliasRe = regexp.MustCompile(`(?:^|[,{]\s*)([A-Z]\w*)\s+as\s+([A-Z]\w*)\b`)
 	// |x: Type, ...| — typed closure parameters.
 	rustClosureParamRe = regexp.MustCompile(`\|([^|{}\n]{1,160})\|`)
 	// let x = some_function(...) — typed through the callee's return type.
@@ -82,6 +87,9 @@ func rustLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string
 		}
 		for _, m := range rustLetCtorRe.FindAllStringSubmatch(body, -1) {
 			lets[m[1]] = m[2]
+		}
+		for _, m := range rustLetStructRe.FindAllStringSubmatch(body, -1) {
+			lets[m[1]] = rustResolveTypeAlias(symbol, m[2])
 		}
 		for _, m := range rustBuilderChainRe.FindAllStringSubmatch(body, -1) {
 			if typ := m[2]; typeSymbolExists(idx, typ) {
@@ -145,6 +153,17 @@ func rustLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string
 	}
 	delete(out, "_")
 	return out
+}
+
+func rustResolveTypeAlias(symbol *core.SymbolRecord, typ string) string {
+	for _, imp := range symbol.Imports {
+		for _, match := range rustTypeAliasRe.FindAllStringSubmatch(stripRustUsePrefix(imp), -1) {
+			if match[2] == typ {
+				return match[1]
+			}
+		}
+	}
+	return typ
 }
 
 // rustCallResultTypes resolves a "name()" qualifier through the return

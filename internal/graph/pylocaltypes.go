@@ -35,8 +35,12 @@ var (
 	// x = [await] [self.|mod.]func(...) — typed through func's return
 	// annotation (ctx = self.app_context() → AppContext)
 	pyCallAssignRe = regexp.MustCompile(`(?m)^\s*(\w+)\s*=\s*(?:await\s+)?(?:((?:\w+\.)*\w+)\.)?([a-z_]\w*)\(`)
-	// with [async] item[, item]: — the items run __enter__/__exit__
-	pyWithRe = regexp.MustCompile(`(?ms)^[ \t]*(async\s+)?with\s+(.+?):[ \t]*(?:\n|$)`)
+	// with [async] item[, item]: — parenthesized items may span lines, and
+	// the suite may begin on the same line after the colon.
+	pyWithRe = regexp.MustCompile(`(?m)^[ \t]*(async\s+)?with\s+((?:\([^)]*\)|[^:\n]+)):[^\n]*$`)
+	// Read subscripts only; an assignment target invokes __setitem__, not
+	// __getitem__. The optional third group lets the consumer reject it.
+	pySubscriptRe = regexp.MustCompile(`\b([A-Za-z_]\w*)\s*\[[^]\n]*\](\s*=)?`)
 )
 
 // pyBareType reduces a Python annotation to one indexable class name.
@@ -190,6 +194,41 @@ func pyParamNames(rawText string) map[string]bool {
 }
 
 var pyIdentRe = regexp.MustCompile(`^[A-Za-z_]\w*$`)
+
+// pyUnnestedMatches returns regexp matches that begin outside parentheses,
+// brackets, and braces. Python permits an annotation statement at any
+// indentation, but a visually identical "name: Type" inside a dict literal is
+// a key/value pair, not a declaration. Input has already had strings and
+// comments blanked, so bracket depth is sufficient to distinguish the two.
+func pyUnnestedMatches(re *regexp.Regexp, src string) [][]string {
+	indices := re.FindAllStringSubmatchIndex(src, -1)
+	out := make([][]string, 0, len(indices))
+	depth, cursor := 0, 0
+	for _, loc := range indices {
+		for cursor < loc[0] {
+			switch src[cursor] {
+			case '(', '[', '{':
+				depth++
+			case ')', ']', '}':
+				if depth > 0 {
+					depth--
+				}
+			}
+			cursor++
+		}
+		if depth != 0 {
+			continue
+		}
+		match := make([]string, len(loc)/2)
+		for i := 0; i < len(loc); i += 2 {
+			if loc[i] >= 0 {
+				match[i/2] = src[loc[i]:loc[i+1]]
+			}
+		}
+		out = append(out, match)
+	}
+	return out
+}
 
 // pySplitParams splits a def's parameter list at top-level commas, aware of
 // brackets, quotes, AND lambda defaults. splitTopLevel is quote-blind and
@@ -498,7 +537,7 @@ func pyLinearize(idx *edgeIndex, className, preferDir string, visiting map[strin
 func pyResolveClass(idx *edgeIndex, className, preferDir string) *core.SymbolRecord {
 	var chosen *core.SymbolRecord
 	for _, cand := range idx.byName[strings.ToLower(className)] {
-		if cand.Name != className || cand.Kind != core.KindClass {
+		if cand.Name != className || (cand.Kind != core.KindClass && cand.Kind != core.KindInterface) {
 			continue
 		}
 		if dirOf(cand.FilePath) == preferDir {
@@ -569,7 +608,7 @@ func pyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 	// Body declarations (highest precedence).
 	if symbol.RawText != "" {
 		body := stripCommentsAndStrings(symbol.RawText)
-		for _, m := range pyAnnAssignRe.FindAllStringSubmatch(body, -1) {
+		for _, m := range pyUnnestedMatches(pyAnnAssignRe, body) {
 			if t := pyAnnotationType(idx, symbol, m[2]); t != "" {
 				out[m[1]] = t
 			}
@@ -582,6 +621,24 @@ func pyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 		for _, m := range pyCtorAssignRe.FindAllStringSubmatch(body, -1) {
 			if typeSymbolExists(idx, m[2]) {
 				out[m[1]] = m[2]
+			}
+		}
+		selfVars := callerSelfQualifiers(symbol)
+		for _, m := range pyWithRe.FindAllStringSubmatch(body, -1) {
+			items := strings.TrimSpace(m[2])
+			if strings.HasPrefix(items, "(") && strings.HasSuffix(items, ")") {
+				items = strings.TrimSpace(items[1 : len(items)-1])
+			}
+			for _, item := range splitTopLevel(items, ',') {
+				expr, bound, ok := strings.Cut(strings.TrimSpace(item), " as ")
+				bound = strings.TrimSpace(bound)
+				if !ok || bound == "" || strings.ContainsAny(bound, " .()[]") {
+					continue
+				}
+				className := pyExprType(idx, strings.TrimPrefix(strings.TrimSpace(expr), "await "), symbol, out, selfVars)
+				if className != "" {
+					out[bound] = pyContextValueType(idx, className, m[1] != "", symbol)
+				}
 			}
 		}
 		aliased := map[string]bool{}
@@ -682,11 +739,14 @@ func pyClassAttrTypes(idx *edgeIndex, symbol *core.SymbolRecord, className strin
 		if cand.ParentSymbol != className {
 			continue
 		}
-		if init == nil || dirOf(cand.FilePath) == preferDir {
-			init = cand
+		// ParentSymbol is only a display name, so same-named classes in other
+		// modules can also have an __init__ candidate. Attribute inference must
+		// stay attached to the concrete class declaration selected above.
+		if class != nil && cand.FilePath != class.FilePath {
+			continue
 		}
-		if dirOf(cand.FilePath) == preferDir {
-			break
+		if init == nil {
+			init = cand
 		}
 	}
 	if init != nil {
@@ -708,7 +768,7 @@ func pyClassAttrTypes(idx *edgeIndex, symbol *core.SymbolRecord, className strin
 func pyBaseClasses(idx *edgeIndex, className, preferDir string) []string {
 	var chosen *core.SymbolRecord
 	for _, cand := range idx.byName[strings.ToLower(className)] {
-		if cand.Name != className || cand.Kind != core.KindClass {
+		if cand.Name != className || (cand.Kind != core.KindClass && cand.Kind != core.KindInterface) {
 			continue
 		}
 		if dirOf(cand.FilePath) == preferDir {
@@ -995,6 +1055,62 @@ func pyWithTargets(idx *edgeIndex, symbol *core.SymbolRecord, localTypes map[str
 		}
 	}
 	return out
+}
+
+func pyContextValueType(idx *edgeIndex, className string, async bool, symbol *core.SymbolRecord) string {
+	dunder := "__enter__"
+	if async {
+		dunder = "__aenter__"
+	}
+	for _, method := range pyDunderTargets(idx, className, dunder, dirOf(symbol.FilePath)) {
+		ret := pyReturnType(method)
+		if ret == "Self" || ret == "typing.Self" {
+			return className
+		}
+		if typ := pyAnnotationType(idx, method, ret); typ != "" {
+			return strings.TrimPrefix(typ, "class:")
+		}
+	}
+	return className
+}
+
+func pySubscriptTargets(idx *edgeIndex, symbol *core.SymbolRecord, localTypes map[string]string) []*core.SymbolRecord {
+	if symbol.RawText == "" {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []*core.SymbolRecord
+	for _, match := range pySubscriptRe.FindAllStringSubmatch(stripCommentsAndStrings(symbol.RawText), -1) {
+		if match[2] != "" {
+			continue
+		}
+		typ := strings.TrimPrefix(localTypes[match[1]], "class:")
+		if typ == "" {
+			continue
+		}
+		for _, candidate := range pyDunderTargets(idx, typ, "__getitem__", dirOf(symbol.FilePath)) {
+			if !seen[candidate.ID] {
+				seen[candidate.ID] = true
+				out = append(out, candidate)
+			}
+		}
+	}
+	return out
+}
+
+func pyTypeHasMember(idx *edgeIndex, className, member, preferDir string) bool {
+	for _, owner := range pyMRO(idx, className, preferDir) {
+		cls := pyResolveClass(idx, owner, preferDir)
+		if cls == nil {
+			continue
+		}
+		for _, candidate := range idx.byFile[cls.FilePath] {
+			if candidate.ParentSymbol == owner && candidate.Name == member {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // pyExprType types a simple receiver expression: Name(...) constructs Name;

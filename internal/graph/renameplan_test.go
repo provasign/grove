@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/provasign/grove/internal/core"
+	"github.com/provasign/grove/internal/parser"
 )
 
 // renamePlanFixture: interface Store { load(String) } with
@@ -136,6 +137,34 @@ func TestRenamePlan(t *testing.T) {
 	}
 }
 
+func TestRenamePlanModuleFunction(t *testing.T) {
+	g := New()
+	g.ReplaceWithEdges([]core.SymbolRecord{
+		{ID: "parse.ts::parse@sha", FilePath: "parse.ts", Language: "typescript", Kind: core.KindFunction,
+			Name: "parse", QualifiedName: "parse", Signature: "function parse(value: string)",
+			RawText: "function parse(value: string) { return value.length; }", Span: core.LineRange{Start: 2, End: 2}},
+		{ID: "use.ts::run@sha", FilePath: "use.ts", Language: "typescript", Kind: core.KindFunction,
+			Name: "run", QualifiedName: "run", RawText: "function run() { return parse('x'); }", Span: core.LineRange{Start: 4, End: 4},
+			CallSites: []core.CallSite{{Callee: "parse", Line: 4, Argc: 1}}},
+	}, []core.Edge{{From: "use.ts::run@sha", To: "parse.ts::parse@sha", Type: core.EdgeCalls, Confidence: 0.95}}, 2)
+
+	r, err := g.RenamePlan("parse", "parseNum")
+	if err != nil {
+		t.Fatalf("RenamePlan: %v", err)
+	}
+	if r.Completeness != "callers-only" {
+		t.Fatalf("Completeness = %q, want callers-only", r.Completeness)
+	}
+	if len(r.Edits) != 2 || len(r.Ambiguous) != 0 || len(r.Unresolved) != 0 {
+		t.Fatalf("plan = edits:%+v ambiguous:%+v unresolved:%+v", r.Edits, r.Ambiguous, r.Unresolved)
+	}
+	for _, edit := range r.Edits {
+		if !strings.Contains(edit.After, "parseNum(") {
+			t.Fatalf("edit did not rename function call/declaration: %+v", edit)
+		}
+	}
+}
+
 // String-literal and multi-occurrence lines must never land in confirmed
 // Edits — a blanket line rewrite cannot be attributed per-occurrence.
 func TestRenamePlanOccurrenceAmbiguity(t *testing.T) {
@@ -150,8 +179,8 @@ func TestRenamePlanOccurrenceAmbiguity(t *testing.T) {
 			Span: core.LineRange{Start: 2, End: 2}},
 		{ID: "A.java::A.log@sha", FilePath: "A.java", Language: "java", Kind: core.KindFunction,
 			Name: "log", QualifiedName: "A.log",
-			RawText: "void log(S s) {\n    audit(\"save()\"); s.save();\n}",
-			Span:    core.LineRange{Start: 10, End: 12},
+			RawText:   "void log(S s) {\n    audit(\"save()\"); s.save();\n}",
+			Span:      core.LineRange{Start: 10, End: 12},
 			CallSites: []core.CallSite{{Callee: "s.save", Line: 11, Argc: 0}}},
 	}, []core.Edge{
 		{From: "A.java::A.log@sha", To: "S.java::S.save@sha", Type: core.EdgeCalls, Confidence: 1},
@@ -181,3 +210,85 @@ func TestRenamePlanOccurrenceAmbiguity(t *testing.T) {
 	}
 }
 
+func TestRenamePlanSameNamedJavaOwnersAcrossPackagesAreAmbiguous(t *testing.T) {
+	g := New()
+	g.ReplaceWithEdges([]core.SymbolRecord{
+		{ID: "src/main/java/com/ex/a/Leaf.java::Leaf", FilePath: "src/main/java/com/ex/a/Leaf.java", Language: "java", Kind: core.KindClass, Name: "Leaf", QualifiedName: "Leaf", Signature: "class Leaf", RawText: "class Leaf { void work() {} }", Span: core.LineRange{Start: 1, End: 3}},
+		{ID: "src/main/java/com/ex/a/Leaf.java::Leaf.work", FilePath: "src/main/java/com/ex/a/Leaf.java", Language: "java", Kind: core.KindMethod, Name: "work", QualifiedName: "Leaf.work", ParentSymbol: "Leaf", Signature: "void work()", RawText: "void work() {}", Span: core.LineRange{Start: 2, End: 2}},
+		{ID: "src/main/java/com/ex/b/Leaf.java::Leaf", FilePath: "src/main/java/com/ex/b/Leaf.java", Language: "java", Kind: core.KindClass, Name: "Leaf", QualifiedName: "Leaf", Signature: "class Leaf", RawText: "class Leaf { void work() {} }", Span: core.LineRange{Start: 1, End: 3}},
+		{ID: "src/main/java/com/ex/b/Leaf.java::Leaf.work", FilePath: "src/main/java/com/ex/b/Leaf.java", Language: "java", Kind: core.KindMethod, Name: "work", QualifiedName: "Leaf.work", ParentSymbol: "Leaf", Signature: "void work()", RawText: "void work() {}", Span: core.LineRange{Start: 2, End: 2}},
+	}, nil, 1)
+	r, err := g.RenamePlan("Leaf.work", "newWork")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Edits) != 0 {
+		t.Fatalf("ambiguous package-colliding seed produced confirmed edits: %+v", r.Edits)
+	}
+	if len(r.Ambiguous) != 2 {
+		t.Fatalf("Ambiguous=%d want 2: %+v", len(r.Ambiguous), r.Ambiguous)
+	}
+}
+
+func TestRenamePlanIncludesReferenceOnlySiteWithoutCallEdge(t *testing.T) {
+	g := New()
+	g.Replace([]core.SymbolRecord{
+		{ID: "Refs.java::Refs", FilePath: "Refs.java", Language: "java", Kind: core.KindClass, Name: "Refs", QualifiedName: "Refs", RawText: "class Refs { static int len(String s) { return 0; } }"},
+		{ID: "Refs.java::Refs.len", FilePath: "Refs.java", Language: "java", Kind: core.KindMethod, Name: "len", QualifiedName: "Refs.len", ParentSymbol: "Refs", RawText: "static int len(String s) { return 0; }", Signature: "static int len(String s)", Span: core.LineRange{Start: 1, End: 1}},
+		{ID: "Use.java::Use.map", FilePath: "Use.java", Language: "java", Kind: core.KindMethod, Name: "map", QualifiedName: "Use.map", ParentSymbol: "Use", RawText: "void map() { xs.map(Refs::len); }", Span: core.LineRange{Start: 4, End: 4}, CallSites: []core.CallSite{{Callee: "Refs.len", Line: 4, ReferenceOnly: true}}},
+	}, 1)
+	for _, e := range g.EdgesSnapshot() {
+		if e.Type == core.EdgeCalls && e.From == "Use.java::Use.map" && e.To == "Refs.java::Refs.len" {
+			t.Fatal("reference-only site became a runtime calls edge")
+		}
+	}
+	r, err := g.RenamePlan("Refs.len", "length")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, e := range r.Edits {
+		if e.FilePath == "Use.java" && strings.Contains(e.After, "Refs::length") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("reference-only rename site missing: edits=%+v ambiguous=%+v", r.Edits, r.Ambiguous)
+	}
+}
+
+func TestRenamePlanCPPIncludesDeclarationOverrideAndCaller(t *testing.T) {
+	src := `class Widget {
+public:
+    virtual void render();
+};
+class Fancy : public Widget {
+public:
+    void render() override;
+};
+void Widget::render() {}
+void Fancy::render() {}
+void use(Widget* w) { w->render(); }
+`
+	syms, err := parser.NewEngine().ExtractContent("widget.cpp", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := New()
+	g.Replace(syms, 1)
+	plan, err := g.RenamePlan("Widget.render", "paint")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := map[int]bool{}
+	for _, edit := range append(append([]RenameEdit(nil), plan.Edits...), plan.Ambiguous...) {
+		if edit.FilePath == "widget.cpp" {
+			lines[edit.Line] = true
+		}
+	}
+	for _, want := range []int{3, 7, 9, 10, 11} {
+		if !lines[want] {
+			t.Errorf("rename plan missing C++ family/caller line %d: edits=%+v ambiguous=%+v unresolved=%v", want, plan.Edits, plan.Ambiguous, plan.Unresolved)
+		}
+	}
+}
