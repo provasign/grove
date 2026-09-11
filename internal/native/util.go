@@ -43,6 +43,7 @@ var envAllowlist = map[string]bool{
 	// Windows runtime essentials.
 	"SystemRoot": true, "SystemDrive": true, "windir": true, "USERPROFILE": true,
 	"HOMEDRIVE": true, "HOMEPATH": true, "PATHEXT": true, "ComSpec": true,
+	"LOCALAPPDATA": true,
 	// Language-runtime search/config that are safe and sometimes required.
 	// The Go vars let `go list` honor the operator's module setup (private
 	// proxies, GOPRIVATE) in trusted mode; untrusted mode overrides the

@@ -20,6 +20,10 @@ parser fixtures for Python, JavaScript/TypeScript, and Go import bindings,
 persisted-index upgrades, overlay isolation, and incremental/full graph
 equivalence.
 
+Windows native Go analysis now preserves `%LocalAppData%` in its hardened
+subprocess environment so `go list` can locate the build cache. Failed
+`go list` diagnostics retain stderr instead of reporting only an exit code.
+
 ## v0.43.3 - 2026-09-08
 
 Python: type-use edges now cover modern annotations and resolve them to the
