@@ -179,9 +179,8 @@ for rel in files:
                     name = node.func.id
                 elif isinstance(node.func, ast.Attribute):
                     name = node.func.attr
-                if name:
-                    calls.append({"from": rel, "fromName": stack[-1], "fromLine": node.lineno,
-                                  "to": rel, "toName": name})
+                # Calls are resolved by the graph's receiver-aware resolver.
+                # A name-only match here is not native binding evidence.
             self.generic_visit(node)
     Visitor().visit(tree)
 print(json.dumps({"edges": edges, "calls": calls, "types": types}))
@@ -252,13 +251,6 @@ print(json.dumps({"edges": edges, "calls": calls, "types": types}))
 			continue
 		}
 		edges = append(edges, nativeImportEdge(from, to, 0.94))
-	}
-	for _, edge := range payload.Calls {
-		from, okFrom := symbols.at(edge.From, edge.FromName, edge.FromLine)
-		to, okTo := symbols.at(edge.To, edge.ToName, 0)
-		if okFrom && okTo && from.ID != to.ID {
-			edges = append(edges, symbolEdge(from, to, core.EdgeCalls, 0.98))
-		}
 	}
 	for _, edge := range payload.Types {
 		from, okFrom := symbols.at(edge.From, edge.FromName, edge.FromLine)

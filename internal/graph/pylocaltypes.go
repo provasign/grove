@@ -67,6 +67,19 @@ func pyBareType(ann string) string {
 			return ""
 		}
 	}
+	// Keep the nominal outer class of a generic receiver. Strip type
+	// arguments before qualification: ParamType[t.Any] is ParamType.
+	if i := strings.IndexByte(ann, '['); i >= 0 {
+		if !strings.HasSuffix(ann, "]") || len(splitTopLevel(ann, '|')) != 1 {
+			return ""
+		}
+		outer := strings.TrimSpace(ann[:i])
+		switch leaf := outer[strings.LastIndexByte(outer, '.')+1:]; leaf {
+		case "Union", "Literal", "Annotated", "Callable", "List", "Dict", "Tuple", "Set", "Sequence", "Mapping", "Iterable", "Iterator":
+			return ""
+		}
+		ann = outer
+	}
 	if i := strings.LastIndexByte(ann, '.'); i >= 0 {
 		ann = ann[i+1:]
 	}
@@ -79,6 +92,21 @@ func pyBareType(ann string) string {
 		return ""
 	}
 	return ann
+}
+
+func pyAnnotationType(idx *edgeIndex, symbol *core.SymbolRecord, ann string) string {
+	typ := pyBareType(ann)
+	prefix := ""
+	if strings.HasPrefix(typ, "class:") {
+		prefix, typ = "class:", strings.TrimPrefix(typ, "class:")
+	}
+	if _, member, ok, _ := idx.pyImportBinding(symbol, typ); ok && member != "" {
+		typ = member
+	}
+	if typ == "" {
+		return ""
+	}
+	return prefix + typ
 }
 
 // pyDefParams extracts the parameter list of a def from its raw text,
@@ -476,7 +504,7 @@ func pyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 			if eq := strings.Index(ann, "="); eq >= 0 {
 				ann = ann[:eq]
 			}
-			if t := pyBareType(ann); t != "" && name != "" {
+			if t := pyAnnotationType(idx, symbol, ann); t != "" && name != "" {
 				out[name] = t
 			}
 		}
@@ -486,7 +514,7 @@ func pyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 	if symbol.RawText != "" {
 		body := stripCommentsAndStrings(symbol.RawText)
 		for _, m := range pyAnnAssignRe.FindAllStringSubmatch(body, -1) {
-			if t := pyBareType(m[2]); t != "" {
+			if t := pyAnnotationType(idx, symbol, m[2]); t != "" {
 				out[m[1]] = t
 			}
 		}
@@ -570,7 +598,7 @@ func pyClassAttrTypes(idx *edgeIndex, symbol *core.SymbolRecord, className strin
 			continue
 		}
 		for _, m := range pyClassAnnRe.FindAllStringSubmatch(cls.RawText, -1) {
-			record(m[1], pyBareType(m[2]))
+			record(m[1], pyAnnotationType(idx, cls, m[2]))
 		}
 		for _, m := range pyClassRefRe.FindAllStringSubmatch(cls.RawText, -1) {
 			if typeSymbolExists(idx, m[2]) {
@@ -585,7 +613,7 @@ func pyClassAttrTypes(idx *edgeIndex, symbol *core.SymbolRecord, className strin
 		}
 		body := stripCommentsAndStrings(cand.RawText)
 		for _, m := range pySelfAnnRe.FindAllStringSubmatch(body, -1) {
-			record(m[1], pyBareType(m[2]))
+			record(m[1], pyAnnotationType(idx, cand, m[2]))
 		}
 		for _, m := range pySelfCtorRe.FindAllStringSubmatch(body, -1) {
 			if typeSymbolExists(idx, m[2]) {
@@ -623,11 +651,17 @@ func pyBaseClasses(idx *edgeIndex, className, preferDir string) []string {
 		var bases []string
 		for _, b := range splitTopLevel(sig[open+1:closeIdx], ',') {
 			b = strings.TrimSpace(b)
-			if b == "" || strings.ContainsAny(b, "=[") {
+			if b == "" || strings.Contains(b, "=") {
 				continue
+			}
+			if i := strings.IndexByte(b, '['); i >= 0 {
+				b = b[:i]
 			}
 			if i := strings.LastIndexByte(b, '.'); i >= 0 {
 				b = b[i+1:]
+			}
+			if _, member, ok, _ := idx.pyImportBinding(chosen, b); ok && member != "" {
+				b = member
 			}
 			if b != "" && b != "object" {
 				bases = append(bases, b)
@@ -799,7 +833,7 @@ func pyCallResultType(idx *edgeIndex, name string, symbol *core.SymbolRecord) st
 		if _, ok := scope[cand.FilePath]; !ok && !own[cand.ParentSymbol] {
 			continue
 		}
-		r := pyReturnType(cand)
+		r := pyAnnotationType(idx, cand, pyReturnType(cand))
 		if own[cand.ParentSymbol] {
 			if r == "" {
 				ownAgree = false

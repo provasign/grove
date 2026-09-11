@@ -180,7 +180,7 @@ func tsLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 			if eq := strings.Index(ann, "="); eq >= 0 {
 				ann = ann[:eq]
 			}
-			if t := tsBareType(ann); t != "" && name != "" && !strings.ContainsAny(name, "{[ ") {
+			if t := tsAliasType(idx, symbol.FilePath, tsBareType(ann)); t != "" && name != "" && !strings.ContainsAny(name, "{[ ") {
 				out[name] = t
 			}
 		}
@@ -190,19 +190,27 @@ func tsLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 	if symbol.RawText != "" {
 		body := stripCommentsAndStrings(symbol.RawText)
 		for _, m := range tsVarAnnRe.FindAllStringSubmatch(body, -1) {
-			if t := tsBareType(m[2]); t != "" {
+			if t := tsAliasType(idx, symbol.FilePath, tsBareType(m[2])); t != "" {
 				out[m[1]] = t
 			}
 		}
 		for _, m := range tsNewAssignRe.FindAllStringSubmatch(body, -1) {
-			if typeSymbolExists(idx, m[2]) {
-				out[m[1]] = m[2]
+			if typ := tsAliasType(idx, symbol.FilePath, m[2]); typeSymbolExists(idx, typ) {
+				out[m[1]] = typ
 			}
 		}
 	}
 	delete(out, "this")
 	delete(out, "_")
 	return out
+}
+
+func tsAliasType(idx *edgeIndex, file, typ string) string {
+	symbol := &core.SymbolRecord{FilePath: file}
+	if target, ok := idx.jsImportTargetName(symbol, typ); ok && target != "" {
+		return target
+	}
+	return typ
 }
 
 // tsResolveClassFile picks the file declaring className, resolved from the

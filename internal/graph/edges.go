@@ -11,6 +11,7 @@ import (
 
 	"github.com/provasign/grove/internal/core"
 	"sort"
+	"strconv"
 )
 
 // edgeIndex holds per-build symbol indexes used by the edge constructors.
@@ -78,7 +79,10 @@ type edgeIndex struct {
 	// names are kept (a name declared with conflicting types across modules is
 	// dropped). Empty when the indexer predates module-var extraction, so the
 	// resolution paths that consult it are no-ops on older indexes.
-	pyModuleGlobals map[string]string
+	pyModuleGlobals  map[string]string
+	pyImportBindings map[string]map[string][]pyImportBinding
+	jsImportAliases  map[string]map[string]string
+	goImportAliases  map[string]map[string]string
 
 	// pySubclasses is the inverse of pyBaseClasses over every indexed
 	// Python class (base name → direct subclass names), built lazily for
@@ -99,6 +103,31 @@ func newEdgeIndex(symbols []core.SymbolRecord) *edgeIndex {
 		importPathToFiles:  make(map[string][]string),
 		baseToFiles:        make(map[string][]string),
 		importedFilesCache: make(map[string]map[string]struct{}),
+		pyImportBindings:   make(map[string]map[string][]pyImportBinding),
+		jsImportAliases:    make(map[string]map[string]string),
+		goImportAliases:    make(map[string]map[string]string),
+	}
+	seenPyBinding := map[string]bool{}
+	for i := range symbols {
+		s := &symbols[i]
+		if s.Language != "python" {
+			continue
+		}
+		for _, imp := range s.Imports {
+			line, local, target, ok := core.ParsePythonImportBinding(imp)
+			if !ok {
+				continue
+			}
+			key := s.FilePath + "\x00" + local + "\x00" + target + "\x00" + strconv.Itoa(line)
+			if seenPyBinding[key] {
+				continue
+			}
+			seenPyBinding[key] = true
+			if idx.pyImportBindings[s.FilePath] == nil {
+				idx.pyImportBindings[s.FilePath] = map[string][]pyImportBinding{}
+			}
+			idx.pyImportBindings[s.FilePath][local] = append(idx.pyImportBindings[s.FilePath][local], pyImportBinding{line: line, target: target})
+		}
 	}
 	for i := range symbols {
 		s := &symbols[i]
@@ -109,6 +138,23 @@ func newEdgeIndex(symbols []core.SymbolRecord) *edgeIndex {
 			idx.fileImports[s.FilePath] = make(map[string]struct{})
 		}
 		for _, imp := range s.Imports {
+			if _, _, _, binding := core.ParsePythonImportBinding(imp); binding {
+				continue
+			}
+			if local, target, alias := core.ParseJSImportAlias(imp); alias {
+				if idx.jsImportAliases[s.FilePath] == nil {
+					idx.jsImportAliases[s.FilePath] = map[string]string{}
+				}
+				idx.jsImportAliases[s.FilePath][local] = target
+				continue
+			}
+			if local, target, alias := core.ParseGoImportAlias(imp); alias {
+				if idx.goImportAliases[s.FilePath] == nil {
+					idx.goImportAliases[s.FilePath] = map[string]string{}
+				}
+				idx.goImportAliases[s.FilePath][local] = target
+				continue
+			}
 			if strings.Contains(imp, "#") {
 				continue // Python from-import member: validated below
 			}
@@ -127,6 +173,7 @@ func newEdgeIndex(symbols []core.SymbolRecord) *edgeIndex {
 	for _, syms := range idx.byFile {
 		sortSymbolRecords(syms)
 	}
+	idx.assignPyImportOwners()
 	// Build dirToFiles after byFile is populated so each directory maps to
 	// all its files in one pass (O(n) total, vs O(n) per-file scan later).
 	// Iterate file paths SORTED: these derived slices feed first-match and
@@ -166,6 +213,15 @@ func (idx *edgeIndex) bindPySubmoduleImports(symbols []core.SymbolRecord) {
 			continue
 		}
 		for _, imp := range s.Imports {
+			if _, _, _, binding := core.ParsePythonImportBinding(imp); binding {
+				continue
+			}
+			if _, _, alias := core.ParseJSImportAlias(imp); alias {
+				continue
+			}
+			if _, _, alias := core.ParseGoImportAlias(imp); alias {
+				continue
+			}
 			mod, name, ok := strings.Cut(imp, "#")
 			if !ok {
 				continue
@@ -1069,6 +1125,12 @@ func buildDefinesAndImports(symbols []core.SymbolRecord) []core.Edge {
 		}
 		seenFiles[symbol.FilePath] = true
 		for _, imp := range symbol.Imports {
+			if _, _, _, binding := core.ParsePythonImportBinding(imp); binding {
+				continue
+			}
+			if _, _, alias := core.ParseJSImportAlias(imp); alias {
+				continue
+			}
 			if strings.Contains(imp, "#") {
 				continue // Python from-import member candidate, not a module
 			}
@@ -1562,6 +1624,17 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			if j := strings.LastIndexByte(qualifier, '.'); j >= 0 {
 				qualifier = qualifier[j+1:]
 			}
+			pyCallName := calleeName
+			if symbol.Language == "python" && qualifier == "" {
+				if _, member, ok, _ := idx.pyImportBinding(&symbol, calleeName); ok && member != "" {
+					calleeName = member
+				}
+			}
+			if tsFamilyLang(symbol.Language) && qualifier == "" {
+				if target, ok := idx.jsImportTargetName(&symbol, calleeName); ok && target != "" {
+					calleeName = target
+				}
+			}
 			// astkit collapses a member-chain receiver to its last segment
 			// (`this.connection.driver.escape` → callee "driver.escape"), so
 			// fullChain lost the intermediate hops. For TS/JS/Java recover the
@@ -1614,6 +1687,10 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			// and the typed-receiver narrowing below pins (or precisely
 			// drops) the widened candidate set.
 			sameFileWins := true
+			if symbol.Language == "python" {
+				// Member receivers bind by type, not the caller's file.
+				sameFileWins = false
+			}
 			if qualifier == "super" || qualifier == "super()" || (symbol.Language == "csharp" && qualifier == "base") {
 				// The target lives in the base class's file; a same-file
 				// override must not shadow it.
@@ -1631,6 +1708,10 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				}
 			}
 			cands, capped := resolveCallees(idx, &symbol, calleeName, scope, true, sameFileWins)
+			if symbol.Language == "python" {
+				cands = pyCallCandidates(idx, &symbol, qualifier, pyCallName, calleeName, cands)
+				capped = len(cands) > maxCalleeFanout
+			}
 			if traceCalls {
 				ids := make([]string, 0, 4)
 				for i, c := range cands {
@@ -1641,7 +1722,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				}
 				fmt.Fprintf(os.Stderr, "grove-trace %s: callee=%q qual=%q args=%v cands=%d capped=%v scope=%d first=%v\n", symbol.QualifiedName, cs.Callee, qualifier, cs.Args, len(cands), capped, len(scope), ids)
 			}
-			if capped && symbol.Language != "java" && symbol.Language != "rust" {
+			if capped && symbol.Language != "java" && symbol.Language != "rust" && symbol.Language != "python" {
 				// Only narrowing with real evidence may keep very large
 				// same-name sets: Java (arity, arg types) and Rust
 				// (typed receivers/qualifiers — crate-wide scope makes
@@ -2015,7 +2096,12 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				fmt.Fprintf(os.Stderr, "grove-trace %s: callee=%q narrowed=%v\n", symbol.QualifiedName, cs.Callee, ids)
 			}
 			for _, cand := range narrowed {
-				addEdge(symbol.ID, cand.ID, 0.95, core.EvidenceSourceASTKit, core.ReasonASTNarrowed)
+				if symbol.Language == "python" && qualifier != "" && !isSelf && !resolvedByType {
+					// AST syntax does not prove an untyped receiver's target.
+					addEdge(symbol.ID, cand.ID, 0.7, core.EvidenceSourceHeuristic, core.ReasonDispatch)
+				} else {
+					addEdge(symbol.ID, cand.ID, 0.95, core.EvidenceSourceASTKit, core.ReasonASTNarrowed)
+				}
 			}
 			// Class instantiation: "Flask(...)" executes Flask.__init__.
 			// Route class-named calls to the class's constructor method;
@@ -2418,7 +2504,7 @@ func narrowByImport(idx *edgeIndex, symbol *core.SymbolRecord, qualifier string,
 	if qualifier == "" || len(cands) == 0 || strings.HasSuffix(qualifier, "()") {
 		return cands
 	}
-	files, isImport := idx.importFilesForQualifier(symbol.FilePath, qualifier)
+	files, isImport := idx.importFilesForQualifierForSymbol(symbol, qualifier)
 	if !isImport {
 		// Java: an uppercase qualifier is a class reference. With no import
 		// and no indexed type of that name, it's an implicit-JDK class
@@ -2445,12 +2531,22 @@ func narrowByImport(idx *edgeIndex, symbol *core.SymbolRecord, qualifier string,
 // imports to same-named in-repo dirs here ("encoding/json" → internal/json).
 // The second return reports whether such an import exists at all.
 func (idx *edgeIndex) importFilesForQualifier(fromFile, qualifier string) (map[string]struct{}, bool) {
-	key := fromFile + "\x00" + qualifier
+	return idx.importFilesForQualifierForSymbol(&core.SymbolRecord{
+		FilePath: fromFile,
+		Language: fileLanguage(idx, fromFile),
+	}, qualifier)
+}
+
+func (idx *edgeIndex) importFilesForQualifierForSymbol(symbol *core.SymbolRecord, qualifier string) (map[string]struct{}, bool) {
+	key := symbol.FilePath + "\x00" + qualifier
+	if symbol.Language == "python" {
+		key = symbol.ID + "\x00" + qualifier
+	}
 	if v, ok := idx.qualifierFiles.Load(key); ok {
 		hit := v.(qualifierFileSet)
 		return hit.files, hit.found
 	}
-	files, found := idx.computeImportFilesForQualifier(fromFile, qualifier)
+	files, found := idx.computeImportFilesForQualifierForSymbol(symbol, qualifier)
 	idx.qualifierFiles.Store(key, qualifierFileSet{files: files, found: found})
 	return files, found
 }
@@ -2462,14 +2558,62 @@ type qualifierFileSet struct {
 }
 
 func (idx *edgeIndex) computeImportFilesForQualifier(fromFile, qualifier string) (map[string]struct{}, bool) {
-	imports, ok := idx.fileImports[fromFile]
+	return idx.computeImportFilesForQualifierForSymbol(&core.SymbolRecord{
+		FilePath: fromFile,
+		Language: fileLanguage(idx, fromFile),
+	}, qualifier)
+}
+
+func (idx *edgeIndex) computeImportFilesForQualifierForSymbol(symbol *core.SymbolRecord, qualifier string) (map[string]struct{}, bool) {
+	fromFile := symbol.FilePath
+	forcedAlias := false
+	imports := idx.fileImports[fromFile]
+	if symbol.Language == "go" {
+		if target, ok := idx.goImportAliases[fromFile][qualifier]; ok {
+			imports = map[string]struct{}{target: {}}
+			forcedAlias = true
+		}
+	}
+	if tsFamilyLang(symbol.Language) {
+		if mod, member, ok := idx.jsImportAlias(fromFile, qualifier); ok {
+			if member != "" {
+				return map[string]struct{}{}, true // named imports are not module qualifiers
+			}
+			out := map[string]struct{}{}
+			for _, file := range idx.resolveRelativeImport(fromFile, mod) {
+				out[file] = struct{}{}
+			}
+			return out, true
+		}
+	}
+	if symbol.Language == "python" {
+		if mod, member, ok, known := idx.pyImportBinding(symbol, qualifier); ok {
+			if member != "" {
+				path := mod + "." + member
+				if strings.HasSuffix(mod, ".") {
+					path = mod + member
+				}
+				if files := idx.pyModuleFiles(fromFile, path); len(files) > 0 {
+					mod = path
+				}
+			}
+			out := map[string]struct{}{}
+			for _, file := range idx.pyModuleFiles(fromFile, mod) {
+				out[file] = struct{}{}
+			}
+			return out, true
+		} else if known {
+			return map[string]struct{}{}, true
+		}
+	}
+	_, ok := imports, imports != nil
 	if !ok {
 		return nil, false
 	}
 	found := false
 	out := map[string]struct{}{}
 	for _, imp := range sortedKeys(imports) {
-		if lastImportSegment(imp) != qualifier {
+		if !forcedAlias && lastImportSegment(imp) != qualifier {
 			continue
 		}
 		found = true

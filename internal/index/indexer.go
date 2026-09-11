@@ -207,9 +207,13 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 	if err != nil {
 		return nil, result, err
 	}
-	forceExtract := opts.Force || storedExtractor != parser.ExtractorVersion
+	storedResolver, _, err := i.store.GetMeta(ctx, "resolver-version")
+	if err != nil {
+		return nil, result, err
+	}
+	forceExtract := opts.Force || storedExtractor != parser.ExtractorVersion || storedResolver != graph.ResolverVersion
 	statRefresh := map[string][2]int64{} // touched but content-identical
-	var walkFailed []string // relPaths whose subtree could not be read this run
+	var walkFailed []string              // relPaths whose subtree could not be read this run
 	err = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			// A failed subtree contributes nothing to currentFiles, so the
@@ -461,7 +465,7 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 	// Scope native analysis to the languages that changed. A cold index
 	// (store was empty before this run) or Force analyzes everything.
 	scope := changedLanguages
-	if opts.Force || result.FilesUpdated == result.FilesSeen {
+	if forceExtract || result.FilesUpdated == result.FilesSeen {
 		scope = nil
 	}
 	var changedRel []string
@@ -503,6 +507,7 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 
 	codeGraph := graph.New()
 	var deltaMeta *graph.DeltaMeta
+	nativeResult.Edges = graph.CurrentNativeEdges(symbols, nativeResult.Edges)
 	if incrementalEnabled() && opts.PrevEdges != nil && scope != nil {
 		// Incremental edge construction: recompute only affected owners'
 		// call/test edges (graph.BuildEdgesDelta). Natively re-analyzed
@@ -539,6 +544,9 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 		return nil, result, err
 	}
 	tick("edge-store-write")
+	if err := i.store.SetMeta(ctx, "resolver-version", graph.ResolverVersion); err != nil {
+		return nil, result, err
+	}
 
 	result.SymbolCount = len(symbols)
 	result.EdgeCount = len(edges)

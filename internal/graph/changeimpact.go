@@ -52,6 +52,10 @@ type ChangeImpactResult struct {
 	// working unmodified — a suffixed value broke both silently until this
 	// comment (2026-08-29).
 	Completeness string
+	// CallerCoverage is independent of the family boundary above:
+	// "indexed" means resolved edges only, "heuristic" includes uncertain
+	// bindings, and "partial" also has dynamic-language resolution gaps.
+	CallerCoverage string
 	// HasHeuristicRefs is true when the caller/impact set includes at least
 	// one name-derived edge (framework template/JPA references, evidence
 	// Heuristic or Regex) rather than only AST-certain ones. The set is
@@ -107,6 +111,14 @@ func (g *CodeGraph) ChangeImpact(query string) (*ChangeImpactResult, error) {
 // applies to the type-seeded path (the ambiguous case); loose/field/free-
 // function resolution is already unambiguous-or-error and ignores it.
 func (g *CodeGraph) ChangeImpactScoped(query, file string) (*ChangeImpactResult, error) {
+	result, err := g.changeImpactScoped(query, file)
+	if result != nil {
+		result.CallerCoverage = impactCallerCoverage(result)
+	}
+	return result, err
+}
+
+func (g *CodeGraph) changeImpactScoped(query, file string) (*ChangeImpactResult, error) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
@@ -127,7 +139,7 @@ func (g *CodeGraph) ChangeImpactScoped(query, file string) (*ChangeImpactResult,
 	// Accept a bare member name or file:line and pin it to the canonical
 	// Type.method form (unambiguous only — see resolveLooseQueryLocked).
 	// Already-canonical queries pass through untouched.
-	resolved, err := g.resolveLooseQueryLocked(query)
+	resolved, err := g.resolveLooseQueryScopedLocked(query, file)
 	if err != nil {
 		return nil, err
 	}
@@ -137,7 +149,7 @@ func (g *CodeGraph) ChangeImpactScoped(query, file string) (*ChangeImpactResult,
 	// family to close over and the Type.method parser below cannot represent
 	// it. Its blast radius is exactly its callers — reported as such, with
 	// completeness downgraded so no consumer mistakes it for a closed set.
-	if free := g.freeFunctionImpactLocked(query); free != nil {
+	if free := g.freeFunctionImpactLocked(query, file); free != nil {
 		return free, nil
 	}
 
@@ -180,7 +192,21 @@ func (g *CodeGraph) ChangeImpactScoped(query, file string) (*ChangeImpactResult,
 		switch g.symbols[id].Kind {
 		case core.KindClass, core.KindInterface, core.KindType, core.KindStruct, core.KindTrait, core.KindEnum:
 			if file != "" && !strings.Contains(g.symbols[id].FilePath, file) {
-				continue
+				// Go receivers and their methods may be declared in separate
+				// files. A containment edge is evidence for the requested
+				// member's owner; matching the type name alone is not.
+				matchesMember := false
+				if g.symbols[id].Language == "go" {
+					for _, m := range g.containedMethods([]string{id}, methodName) {
+						if strings.Contains(m.FilePath, file) {
+							matchesMember = true
+							break
+						}
+					}
+				}
+				if !matchesMember {
+					continue
+				}
 			}
 			typeIDs = append(typeIDs, id)
 		}
@@ -467,6 +493,21 @@ func (g *CodeGraph) ChangeImpactScoped(query, file string) (*ChangeImpactResult,
 		Completeness:      completeness,
 		HasHeuristicRefs:  heuristicCallers,
 	}, nil
+}
+
+func impactCallerCoverage(r *ChangeImpactResult) string {
+	for _, group := range [][]core.SymbolRecord{r.Declarations, r.Supers, r.Family, r.DeclaringTypes} {
+		for _, s := range group {
+			switch s.Language {
+			case "python", "javascript", "php", "ruby":
+				return "partial"
+			}
+		}
+	}
+	if r.HasHeuristicRefs {
+		return "heuristic"
+	}
+	return "indexed"
 }
 
 // synthesizeMemberDecl builds the declaration record for a member that
@@ -857,6 +898,10 @@ const maxLooseCandidates = 10
 //   - "method"      — pinned to "Type.method" when exactly one member matches.
 //   - "file.go:120" — the member whose span contains that line.
 func (g *CodeGraph) resolveLooseQueryLocked(query string) (string, error) {
+	return g.resolveLooseQueryScopedLocked(query, "")
+}
+
+func (g *CodeGraph) resolveLooseQueryScopedLocked(query, file string) (string, error) {
 	q := strings.TrimSpace(query)
 	// A parameter list may itself contain dots ("m(java.util.Map)"), so judge
 	// canonical-ness on the part before "(".
@@ -886,6 +931,9 @@ func (g *CodeGraph) resolveLooseQueryLocked(query string) (string, error) {
 	var matches []cand
 	for _, i := range g.idsNamed(head) {
 		s := g.symbols[i]
+		if file != "" && !strings.Contains(s.FilePath, file) {
+			continue
+		}
 		switch s.Kind {
 		case core.KindMethod, core.KindFunction, core.KindConstructor:
 		default:
@@ -928,7 +976,7 @@ func (g *CodeGraph) resolveLooseQueryLocked(query string) (string, error) {
 // Completeness is "callers-only": there is no type hierarchy to close over,
 // so the answer is every resolved inbound call edge and nothing more. Callers
 // must not read it as the closed guarantee Type.method queries carry.
-func (g *CodeGraph) freeFunctionImpactLocked(query string) *ChangeImpactResult {
+func (g *CodeGraph) freeFunctionImpactLocked(query, file string) *ChangeImpactResult {
 	if strings.ContainsAny(query, ".(") {
 		return nil
 	}
@@ -937,6 +985,9 @@ func (g *CodeGraph) freeFunctionImpactLocked(query string) *ChangeImpactResult {
 	for id := range g.symbols {
 		s := g.symbols[id]
 		if s.Name != query || s.ParentSymbol != "" {
+			continue
+		}
+		if file != "" && !strings.Contains(s.FilePath, file) {
 			continue
 		}
 		switch s.Kind {

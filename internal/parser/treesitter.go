@@ -14,6 +14,8 @@ import (
 	"context"
 	"fmt"
 	sitter "github.com/smacker/go-tree-sitter"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -153,7 +155,12 @@ func extractSymbolsFromAST(language, filePath, blobSHA string, src []byte, fileI
 	}
 	syms = make([]core.SymbolRecord, 0, len(akSyms))
 	for _, s := range akSyms {
-		syms = append(syms, projectSymbol(s, filePath, blobSHA, language, fileImports))
+		projected := projectSymbol(s, filePath, blobSHA, language, fileImports)
+		if (key == astkit.LangJavaScript || key == astkit.LangTypeScript || key == astkit.LangTSX) &&
+			jsDefaultExportAt(src, s.Span.Start) {
+			projected.Modifiers = append(projected.Modifiers, "default-export")
+		}
+		syms = append(syms, projected)
 	}
 	return syms, true, hasErrors
 }
@@ -188,6 +195,13 @@ func extractImportsFromAST(language string, src []byte) ([]string, bool) {
 		}
 		seen[imp.Path] = true
 		imports = append(imports, imp.Path)
+		if key == astkit.LangGo && imp.Alias != "" && imp.Alias != "_" && imp.Alias != "." {
+			alias := core.GoImportAlias(imp.Alias, imp.Path)
+			if !seen[alias] {
+				seen[alias] = true
+				imports = append(imports, alias)
+			}
+		}
 	}
 	if key == astkit.LangPython {
 		// From-import members as "module#name" candidates: a member that
@@ -195,6 +209,30 @@ func extractImportsFromAST(language string, src []byte) ([]string, bool) {
 		// which the edge index rewrites into a plain module path; the rest
 		// are dropped there. The "#" form never reaches consumers.
 		for _, imp := range akImports {
+			aliases := map[string]string{}
+			for _, match := range pythonAliasedImportRE.FindAllStringSubmatch(imp.Raw, -1) {
+				aliases[match[1]] = match[2]
+			}
+			if len(imp.Names) == 0 {
+				local := imp.Alias
+				if local == "" {
+					local = strings.Split(imp.Path, ".")[0]
+				}
+				bindings := []string{local}
+				if last := strings.TrimPrefix(lastDottedSegment(imp.Path), "."); last != "" && last != local {
+					// astkit currently retains the last receiver segment of
+					// a.b.call(), so preserve both Python's actual a binding
+					// and the segment carried by the call site.
+					bindings = append(bindings, last)
+				}
+				for _, name := range bindings {
+					encoded := core.PythonImportBinding(imp.Line, name, imp.Path)
+					if !seen[encoded] {
+						seen[encoded] = true
+						imports = append(imports, encoded)
+					}
+				}
+			}
 			for _, name := range imp.Names {
 				cand := imp.Path + "#" + name
 				if imp.Path == "" || seen[cand] {
@@ -202,10 +240,88 @@ func extractImportsFromAST(language string, src []byte) ([]string, bool) {
 				}
 				seen[cand] = true
 				imports = append(imports, cand)
+				local := name
+				if alias := aliases[name]; alias != "" {
+					local = alias
+				}
+				encoded := core.PythonImportBinding(imp.Line, local, cand)
+				if !seen[encoded] {
+					seen[encoded] = true
+					imports = append(imports, encoded)
+				}
+			}
+		}
+	}
+	if key == astkit.LangJavaScript || key == astkit.LangTypeScript || key == astkit.LangTSX {
+		for _, imp := range akImports {
+			if match := jsDefaultImportRE.FindStringSubmatch(imp.Raw); len(match) == 2 {
+				encoded := core.JSImportAlias(match[1], imp.Path+"#default")
+				if !seen[encoded] {
+					seen[encoded] = true
+					imports = append(imports, encoded)
+				}
+			}
+			if match := jsNamespaceImportRE.FindStringSubmatch(imp.Raw); len(match) == 2 {
+				encoded := core.JSImportAlias(match[1], imp.Path)
+				if !seen[encoded] {
+					seen[encoded] = true
+					imports = append(imports, encoded)
+				}
+			}
+			match := jsNamedImportRE.FindStringSubmatch(imp.Raw)
+			if len(match) != 2 {
+				continue
+			}
+			for _, item := range strings.Split(match[1], ",") {
+				item = strings.TrimSpace(item)
+				item = strings.TrimSpace(strings.TrimPrefix(item, "type "))
+				parts := strings.Fields(item)
+				if len(parts) != 3 || parts[1] != "as" {
+					continue
+				}
+				encoded := core.JSImportAlias(parts[2], imp.Path+"#"+parts[0])
+				if !seen[encoded] {
+					seen[encoded] = true
+					imports = append(imports, encoded)
+				}
 			}
 		}
 	}
 	return imports, true
+}
+
+var pythonAliasedImportRE = regexp.MustCompile(`([A-Za-z_][A-Za-z0-9_\.]*)\s+as\s+([A-Za-z_][A-Za-z0-9_]*)`)
+var jsNamespaceImportRE = regexp.MustCompile(`\*\s+as\s+([A-Za-z_$][A-Za-z0-9_$]*)`)
+var jsNamedImportRE = regexp.MustCompile(`(?s)\{([^}]*)\}`)
+var jsDefaultImportRE = regexp.MustCompile(`^\s*import\s+([A-Za-z_$][A-Za-z0-9_$]*)\s+from\b`)
+
+func lastDottedSegment(value string) string {
+	if i := strings.LastIndexByte(value, '.'); i >= 0 {
+		return value[i+1:]
+	}
+	return value
+}
+
+func jsDefaultExportAt(src []byte, line int) bool {
+	if line < 1 {
+		return false
+	}
+	lines := bytes.Split(src, []byte{'\n'})
+	if line > len(lines) {
+		return false
+	}
+	if bytes.Contains(lines[line-1], []byte("export default")) {
+		return true
+	}
+	for previous := line - 2; previous >= 0; previous-- {
+		trimmed := bytes.TrimSpace(lines[previous])
+		if len(trimmed) == 0 {
+			continue
+		}
+		return bytes.Equal(trimmed, []byte("export default")) ||
+			bytes.Equal(trimmed, []byte("export default;"))
+	}
+	return false
 }
 
 // projectSymbol converts an astkit.Symbol into a Grove SymbolRecord by adding

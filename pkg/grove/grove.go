@@ -182,7 +182,15 @@ func (e *Engine) currentGraph() (*graph.CodeGraph, error) {
 		if err != nil {
 			return nil, fmt.Errorf("grove: graph rehydration failed: %w", err)
 		}
-		g.ReplaceWithStoredEdges(symbols, edges, 0)
+		version, _, err := e.store.GetMeta(ctx, "resolver-version")
+		if err != nil {
+			return nil, fmt.Errorf("grove: resolver version: %w", err)
+		}
+		if version == graph.ResolverVersion {
+			g.ReplaceWithStoredEdges(symbols, edges, 0)
+		} else {
+			g.ReplaceWithEdges(symbols, graph.CurrentNativeEdges(symbols, edges), 0)
+		}
 	}
 	e.graph = g
 	return g, nil
@@ -315,6 +323,9 @@ type ChangeImpactResult struct {
 	// Completeness: "closed" (family fully rooted in indexed types) or
 	// "project-local" (bounded by an external contract).
 	Completeness string
+	// CallerCoverage describes resolved call evidence separately from
+	// family closure: indexed, heuristic, or partial (dynamic languages).
+	CallerCoverage string
 	// HasHeuristicRefs is true when the caller set includes at least one
 	// name-derived edge (framework template/JPA references) rather than
 	// only AST-certain ones — over-inclusive by design, not certain.
@@ -367,6 +378,7 @@ func (e *Engine) ChangeImpactScoped(ctx context.Context, query, file string) (Ch
 		ExternalSupers:    raw.ExternalSupers,
 		OverridesExternal: raw.OverridesExternal,
 		Completeness:      raw.Completeness,
+		CallerCoverage:    raw.CallerCoverage,
 		HasHeuristicRefs:  raw.HasHeuristicRefs,
 	}, nil
 }
