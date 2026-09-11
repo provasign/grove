@@ -1802,7 +1802,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					_, typed := localTypes[qualifier]
 					if !isSelf && !typed && !typeSymbolExists(idx, qualifier) {
 						if strings.HasSuffix(qualifier, "()") {
-							if rets := javaCallResultTypes(idx, qualifier, scope); len(rets) > 0 {
+							if rets := javaCallResultTypes(idx, qualifier, scope, &symbol, cs); len(rets) > 0 {
 								var byType []*core.SymbolRecord
 								for t := range rets {
 									byType = append(byType, filterByParent(cands, t)...)

@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.44.1 - 2026-09-10
+
+Java chained-call resolution now binds an inner call only when its owner is
+the caller's class hierarchy or an explicitly named type at the call site.
+This removes name-only matches such as `List.stream()` being attributed to an
+unrelated in-repo `Streams.stream()` while preserving concrete factory and
+singleton chains. On the pinned Commons Lang oracle, precision improves from
+0.8478 to 0.8653, recall from 0.9039 to 0.9047, and F1 from 0.8750 to 0.8846.
+
 ## v0.44.0 - 2026-09-10
 
 Graph correctness: imported and historical change-impact resolution is now

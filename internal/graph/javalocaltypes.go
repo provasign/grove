@@ -25,7 +25,8 @@ var (
 	javaFieldRe = regexp.MustCompile(`(?m)^\s+(?:(?:public|private|protected|static|final|transient|volatile)\s+)*([A-Z]\w*)(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?(?:\[\])?\s+(\w+)\s*[;=]`)
 	// field declaration line, primitives included, raw type token kept —
 	// for overload matching (AT_SIGN is a char; javaFieldRe skips it)
-	javaFieldArgRe = regexp.MustCompile(`(?m)^\s+(?:(?:public|private|protected|static|final|transient|volatile)\s+)*((?:boolean|byte|char|short|int|long|float|double|[A-Z]\w*)(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?(?:\[\])?)\s+(\w+)\s*[;=]`)
+	javaFieldArgRe      = regexp.MustCompile(`(?m)^\s+(?:(?:public|private|protected|static|final|transient|volatile)\s+)*((?:boolean|byte|char|short|int|long|float|double|[A-Z]\w*)(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?(?:\[\])?)\s+(\w+)\s*[;=]`)
+	javaQualifiedCallRe = regexp.MustCompile(`\b([A-Z]\w*)\s*\.\s*([A-Za-z_]\w*)\s*\(`)
 )
 
 // javaArgTypes infers identifier → raw type token (primitives and arrays
@@ -497,16 +498,17 @@ var jdkReturnTypes = map[string]string{
 }
 
 // javaCallResultTypes resolves a "name()" qualifier to the set of declared
-// return types of the in-scope same-named declarations. The receiver call's
-// arguments are not recorded, so overloads cannot be told apart here — the
-// caller narrows by which of these types actually declares the method
-// (ConfigManager.getProtocol returns ProtocolConfig or Optional<…> by
-// overload; only ProtocolConfig has getTriple). An unparseable return on any
-// declaration yields nil: the set would be incomplete, and a partial set
-// binds the wrong overload's type with the same confidence as a full one.
-func javaCallResultTypes(idx *edgeIndex, qualifier string, scope map[string]struct{}) map[string]bool {
+// return types of the inner call. AST call sites retain only that inner name,
+// not its receiver, so a repo-wide name match is unsafe: List.stream() was
+// being bound to unrelated in-repo Streams.stream() methods and then to every
+// FailableStream.filter/collect downstream. Bind only declarations owned by
+// the caller's class (or ancestors), or by an explicit Type.name(...) on the
+// source line. An unparseable return on any surviving declaration yields nil:
+// a partial set binds the wrong overload with the same confidence as a full
+// one.
+func javaCallResultTypes(idx *edgeIndex, qualifier string, scope map[string]struct{}, symbol *core.SymbolRecord, cs core.CallSite) map[string]bool {
 	name := strings.TrimSuffix(qualifier, "()")
-	var rets map[string]bool
+	var candidates []*core.SymbolRecord
 	for _, cand := range idx.byName[strings.ToLower(name)] {
 		if cand.Name != name {
 			continue
@@ -517,6 +519,11 @@ func javaCallResultTypes(idx *edgeIndex, qualifier string, scope map[string]stru
 		if _, ok := scope[cand.FilePath]; !ok {
 			continue
 		}
+		candidates = append(candidates, cand)
+	}
+	candidates = javaCallResultOwners(idx, candidates, name, symbol, cs)
+	var rets map[string]bool
+	for _, cand := range candidates {
 		r := javaReturnType(cand)
 		if r == "" {
 			return nil
@@ -527,6 +534,55 @@ func javaCallResultTypes(idx *edgeIndex, qualifier string, scope map[string]stru
 		rets[r] = true
 	}
 	return rets
+}
+
+func javaCallResultOwners(idx *edgeIndex, candidates []*core.SymbolRecord, name string, symbol *core.SymbolRecord, cs core.CallSite) []*core.SymbolRecord {
+	if len(candidates) == 0 || symbol == nil {
+		return nil
+	}
+	owners := map[string]bool{symbol.ParentSymbol: true}
+	level := map[string]bool{symbol.ParentSymbol: true}
+	for depth := 0; depth < 4 && len(level) > 0; depth++ {
+		next := map[string]bool{}
+		for owner := range level {
+			for _, base := range baseClassesFor(idx, "java", owner, dirOf(symbol.FilePath)) {
+				if !owners[base] {
+					owners[base] = true
+					next[base] = true
+				}
+			}
+		}
+		level = next
+	}
+	if own := javaMethodsOwnedBy(candidates, owners); len(own) > 0 {
+		return own
+	}
+
+	if cs.Line <= 0 || symbol.Span.Start <= 0 {
+		return nil
+	}
+	off := cs.Line - symbol.Span.Start
+	lines := strings.Split(symbol.RawText, "\n")
+	if off < 0 || off >= len(lines) {
+		return nil
+	}
+	explicit := map[string]bool{}
+	for _, match := range javaQualifiedCallRe.FindAllStringSubmatch(lines[off], -1) {
+		if match[2] == name {
+			explicit[match[1]] = true
+		}
+	}
+	return javaMethodsOwnedBy(candidates, explicit)
+}
+
+func javaMethodsOwnedBy(candidates []*core.SymbolRecord, owners map[string]bool) []*core.SymbolRecord {
+	var out []*core.SymbolRecord
+	for _, cand := range candidates {
+		if owners[cand.ParentSymbol] {
+			out = append(out, cand)
+		}
+	}
+	return out
 }
 
 // javaMethodsOfTypes finds the methods named name declared on any of the
