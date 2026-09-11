@@ -92,10 +92,16 @@ func (goAnalyzer) Analyze(ctx context.Context, req Request) Result {
 		cmd := exec.CommandContext(ctx, "go", "list", "-mod=readonly", "-json", "./...")
 		cmd.Dir = req.Root
 		cmd.Env = goAnalyzerEnv(req.Root)
+		var stderr strings.Builder
+		cmd.Stderr = &stderr
 		var err error
 		out, err = cmd.Output()
 		if err != nil {
-			return Result{Diagnostics: []string{"go list failed: " + err.Error()}}
+			diagnostic := "go list failed: " + err.Error()
+			if detail := strings.TrimSpace(stderr.String()); detail != "" {
+				diagnostic += ": " + detail
+			}
+			return Result{Diagnostics: []string{diagnostic}}
 		}
 		saveGoListCache(cachePath, topoKey, out)
 	}
