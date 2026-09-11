@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.44.0 - 2026-09-10
+
+Graph correctness: imported and historical change-impact resolution is now
+binding-aware. Python preserves generic receiver types, import aliases, lexical
+import ownership, and the distinction between member calls and free functions;
+JavaScript and TypeScript preserve named, namespace, default, and type-only
+aliases; Go package aliases disambiguate same-named functions across packages.
+File-scoped free-function queries and methods whose receiver is declared in a
+different Go file now resolve to the intended contract instead of same-name
+decoys. Unresolved dynamic Python dispatch is reported as heuristic rather than
+high-confidence evidence.
+
+The public in-memory `PreviewChangeImpacts` API builds isolated base-source
+overlays without mutating the worktree or live index. Extractor and resolver
+version stamps force upgraded indexes to rebuild stale graph edges, including
+obsolete Python-native name-only calls. Regression coverage includes real
+parser fixtures for Python, JavaScript/TypeScript, and Go import bindings,
+persisted-index upgrades, overlay isolation, and incremental/full graph
+equivalence.
+
 ## v0.43.3 - 2026-09-08
 
 Python: type-use edges now cover modern annotations and resolve them to the
