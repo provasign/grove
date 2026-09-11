@@ -10,12 +10,14 @@ import (
 
 type goDispatchCandidate struct {
 	typ     types.Type
+	named   *types.Named
 	methods *types.MethodSet
 	symbol  core.SymbolRecord
 }
 
 type goDispatchInterface struct {
 	typ    *types.Interface
+	named  *types.Named
 	symbol core.SymbolRecord
 }
 
@@ -31,12 +33,13 @@ type goInterfaceDispatch struct {
 	candidates      []goDispatchCandidate
 	interfaces      []goDispatchInterface
 	interfaceByType map[*types.Interface]core.SymbolRecord
-	cache           map[*types.Interface]map[string][]core.SymbolRecord
+	interfaceByName map[*types.TypeName]core.SymbolRecord
+	cache           map[types.Type]map[string][]core.SymbolRecord
 }
 
 func newGoInterfaceDispatch(pkg *types.Package, root, dir string, fset *token.FileSet, index goSymbolIndex, pkgDirsByImport map[string][]string) *goInterfaceDispatch {
 	d := &goInterfaceDispatch{pkg: pkg, root: root, dir: dir, fset: fset, index: index,
-		interfaceByType: map[*types.Interface]core.SymbolRecord{}, cache: map[*types.Interface]map[string][]core.SymbolRecord{}}
+		interfaceByType: map[*types.Interface]core.SymbolRecord{}, interfaceByName: map[*types.TypeName]core.SymbolRecord{}, cache: map[types.Type]map[string][]core.SymbolRecord{}}
 	if pkg == nil {
 		return d
 	}
@@ -52,7 +55,7 @@ func newGoInterfaceDispatch(pkg *types.Package, root, dir string, fset *token.Fi
 			continue
 		}
 		named, ok := obj.Type().(*types.Named)
-		if !ok || named.TypeParams().Len() > 0 {
+		if !ok {
 			continue
 		}
 		if _, ok := named.Underlying().(*types.Interface); ok {
@@ -65,7 +68,7 @@ func newGoInterfaceDispatch(pkg *types.Package, root, dir string, fset *token.Fi
 		// *T includes value- and pointer-receiver methods and correctly handles
 		// promotion, shadowing, and ambiguous embedded selectors.
 		ptr := types.NewPointer(named)
-		d.candidates = append(d.candidates, goDispatchCandidate{ptr, types.NewMethodSet(ptr), symbol})
+		d.candidates = append(d.candidates, goDispatchCandidate{ptr, named, types.NewMethodSet(ptr), symbol})
 	}
 	return d
 }
@@ -80,7 +83,7 @@ func (d *goInterfaceDispatch) addInterfaces(pkg *types.Package, dir string) {
 			continue
 		}
 		named, ok := obj.Type().(*types.Named)
-		if !ok || named.TypeParams().Len() > 0 {
+		if !ok {
 			continue
 		}
 		iface, ok := named.Underlying().(*types.Interface)
@@ -88,8 +91,9 @@ func (d *goInterfaceDispatch) addInterfaces(pkg *types.Package, dir string) {
 			continue
 		}
 		if symbol, found := d.index.byType[dir+"\x00"+name]; found {
-			d.interfaces = append(d.interfaces, goDispatchInterface{iface, symbol})
+			d.interfaces = append(d.interfaces, goDispatchInterface{iface, named, symbol})
 			d.interfaceByType[iface] = symbol
+			d.interfaceByName[named.Obj()] = symbol
 		}
 	}
 }
@@ -103,11 +107,17 @@ func (d *goInterfaceDispatch) interfaceAnchor(expr ast.Expr, info *types.Info) (
 	if selection == nil {
 		return "", false
 	}
-	iface, ok := selection.Recv().Underlying().(*types.Interface)
+	recv := selection.Recv()
+	iface, ok := recv.Underlying().(*types.Interface)
 	if !ok || !iface.IsMethodSet() || !goDispatchTypeValid(iface, map[types.Type]bool{}) {
 		return "", false
 	}
 	symbol, ok := d.interfaceByType[iface]
+	if !ok {
+		if named, namedOK := recv.(*types.Named); namedOK {
+			symbol, ok = d.interfaceByName[named.Obj()]
+		}
+	}
 	if !ok {
 		return "", false
 	}
@@ -134,13 +144,27 @@ func (d *goInterfaceDispatch) contractEdges() []core.Edge {
 			add(iface.symbol.ID, iface.symbol.ID+"#"+iface.typ.Method(i).Name(), core.EdgeContains)
 		}
 		for _, candidate := range d.candidates {
-			if !types.Implements(candidate.typ, iface.typ) {
+			contract := iface.typ
+			if iface.named != nil && iface.named.TypeParams().Len() > 0 && candidate.named != nil &&
+				iface.named.TypeParams().Len() == candidate.named.TypeParams().Len() {
+				args := make([]types.Type, candidate.named.TypeParams().Len())
+				for i := range args {
+					args[i] = candidate.named.TypeParams().At(i)
+				}
+				if instantiated, err := types.Instantiate(nil, iface.named, args, true); err == nil {
+					if instantiatedInterface, ok := instantiated.Underlying().(*types.Interface); ok {
+						contract = instantiatedInterface
+					}
+				}
+			}
+			candidateType, methods, ok := candidateForInterface(candidate, iface.named, iface.typ)
+			if !ok || !types.Implements(candidateType, contract) {
 				continue
 			}
 			add(candidate.symbol.ID, iface.symbol.ID, core.EdgeImplements)
 			for i := 0; i < iface.typ.NumMethods(); i++ {
 				method := iface.typ.Method(i)
-				selection := candidate.methods.Lookup(method.Pkg(), method.Name())
+				selection := methods.Lookup(method.Pkg(), method.Name())
 				if selection == nil {
 					continue
 				}
@@ -162,31 +186,33 @@ func (d *goInterfaceDispatch) targets(expr ast.Expr, info *types.Info) []core.Sy
 	if selection == nil {
 		return nil
 	}
-	iface, ok := selection.Recv().Underlying().(*types.Interface)
+	recv := selection.Recv()
+	iface, ok := recv.Underlying().(*types.Interface)
 	if !ok || !iface.IsMethodSet() {
 		return nil
 	}
-	methods, cached := d.cache[iface]
+	methods, cached := d.cache[recv]
 	if !cached {
-		methods = d.implementations(iface)
-		d.cache[iface] = methods
+		methods = d.implementations(recv, iface)
+		d.cache[recv] = methods
 	}
 	return methods[selection.Obj().Id()]
 }
 
-func (d *goInterfaceDispatch) implementations(iface *types.Interface) map[string][]core.SymbolRecord {
+func (d *goInterfaceDispatch) implementations(recv types.Type, iface *types.Interface) map[string][]core.SymbolRecord {
 	result := map[string][]core.SymbolRecord{}
 	if !goDispatchTypeValid(iface, map[types.Type]bool{}) {
 		return result
 	}
 	seen := map[string]bool{}
 	for _, candidate := range d.candidates {
-		if !types.Implements(candidate.typ, iface) {
+		candidateType, methods, ok := candidateForInterface(candidate, recv, iface)
+		if !ok || !types.Implements(candidateType, iface) {
 			continue
 		}
 		for i := 0; i < iface.NumMethods(); i++ {
 			method := iface.Method(i)
-			selection := candidate.methods.Lookup(method.Pkg(), method.Name())
+			selection := methods.Lookup(method.Pkg(), method.Name())
 			if selection == nil {
 				continue
 			}
@@ -199,6 +225,34 @@ func (d *goInterfaceDispatch) implementations(iface *types.Interface) map[string
 		}
 	}
 	return result
+}
+
+func candidateForInterface(candidate goDispatchCandidate, recv types.Type, iface *types.Interface) (types.Type, *types.MethodSet, bool) {
+	if types.Implements(candidate.typ, iface) {
+		return candidate.typ, candidate.methods, true
+	}
+	if candidate.named == nil || candidate.named.TypeParams().Len() == 0 {
+		return nil, nil, false
+	}
+	var args []types.Type
+	if named, ok := recv.(*types.Named); ok && named.TypeArgs().Len() == candidate.named.TypeParams().Len() {
+		for i := 0; i < named.TypeArgs().Len(); i++ {
+			args = append(args, named.TypeArgs().At(i))
+		}
+	} else if named, ok := recv.(*types.Named); ok && named.TypeParams().Len() == candidate.named.TypeParams().Len() {
+		for i := 0; i < candidate.named.TypeParams().Len(); i++ {
+			args = append(args, candidate.named.TypeParams().At(i))
+		}
+	}
+	if len(args) == 0 {
+		return nil, nil, false
+	}
+	instantiated, err := types.Instantiate(nil, candidate.named, args, true)
+	if err != nil {
+		return nil, nil, false
+	}
+	ptr := types.NewPointer(instantiated)
+	return ptr, types.NewMethodSet(ptr), true
 }
 
 func (d *goInterfaceDispatch) localMethodSymbol(obj types.Object) (core.SymbolRecord, bool) {
@@ -247,6 +301,8 @@ func goDispatchTypeValid(typ types.Type, seen map[types.Type]bool) bool {
 			}
 		}
 		return valid(t.Underlying())
+	case *types.TypeParam:
+		return valid(t.Constraint())
 	case *types.Signature:
 		return valid(t.Params()) && valid(t.Results())
 	case *types.Tuple:

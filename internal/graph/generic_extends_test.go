@@ -109,27 +109,34 @@ func TestCalls_JavaFieldOfParameterChain(t *testing.T) {
 
 func TestTSBaseClasses_GenericConstraintForms(t *testing.T) {
 	cases := []struct {
+		name string
+		lang string
+		kind core.SymbolKind
 		sig  string
-		want string
+		want []string
 	}{
-		{"class TreeRepo<\n    Entity extends ObjectLiteral,\n> extends Repo<Entity>", "Repo"},
-		{"class A<T extends B> extends C implements D", "C"},
-		{"class A extends B<T>", "B"},
-		{"class A<T = () => void> extends B", "B"},
-		{"class A<T extends B>", ""}, // constraint only, no real base
+		{"generic constraint", "typescript", core.KindClass, "class A<\n    Entity extends ObjectLiteral,\n> extends Repo<Entity>", []string{"Repo"}},
+		{"class implements", "typescript", core.KindClass, "class A<T extends B> extends C implements D, E<F, G>", []string{"C", "D", "E"}},
+		{"interface multi extends", "typescript", core.KindInterface, "interface A extends B<T>, ns.C", []string{"B", "C"}},
+		{"generic base", "java", core.KindClass, "class A extends B<T> implements Comparable<A>, Serializable", []string{"B", "Comparable", "Serializable"}},
+		{"constraint only", "typescript", core.KindClass, "class A<T extends B>", nil},
+		{"cpp multiple inheritance", "cpp", core.KindClass, "class A : public ns::B<T>, protected virtual C", []string{"ns::B", "C"}},
 	}
 	for _, tc := range cases {
-		idx := newEdgeIndex([]core.SymbolRecord{{
-			ID: "x.ts::A@sha", FilePath: "x.ts", BlobSHA: "sha",
-			Language: "typescript", Kind: core.KindClass, Name: "A",
-			QualifiedName: "A", Signature: tc.sig, RawText: tc.sig + " {\n}"}})
-		got := tsBaseClasses(idx, "A", "")
-		if tc.want == "" {
-			if len(got) != 0 {
-				t.Errorf("sig %q: want no base, got %v", tc.sig, got)
+		t.Run(tc.name, func(t *testing.T) {
+			idx := newEdgeIndex([]core.SymbolRecord{{
+				ID: "x::A@sha", FilePath: "x", BlobSHA: "sha",
+				Language: tc.lang, Kind: tc.kind, Name: "A",
+				QualifiedName: "A", Signature: tc.sig, RawText: tc.sig + " {\n}"}})
+			got := tsBaseClasses(idx, "A", "")
+			if len(got) != len(tc.want) {
+				t.Fatalf("sig %q: want %v, got %v", tc.sig, tc.want, got)
 			}
-		} else if len(got) != 1 || got[0] != tc.want {
-			t.Errorf("sig %q: want [%s], got %v", tc.sig, tc.want, got)
-		}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Fatalf("sig %q: want %v, got %v", tc.sig, tc.want, got)
+				}
+			}
+		})
 	}
 }

@@ -19,7 +19,7 @@ import (
 
 var (
 	// x: Type = ... (annotated assignment in a body)
-	pyAnnAssignRe = regexp.MustCompile(`(?m)^\s*(\w+)\s*:\s*([^=\n]+?)\s*=`)
+	pyAnnAssignRe = regexp.MustCompile(`(?m)^\s*(\w+)\s*:\s*([^=\n]+?)\s*(?:=|$)`)
 	// x = Type(...) (constructor call; verified against indexed types)
 	pyCtorAssignRe = regexp.MustCompile(`(?m)\b(\w+)\s*=\s*(?:\w+\.)?(_*[A-Z]\w*)\(`)
 	// x = self.attr — the local aliases a typed attribute (cls = self.test_client_class)
@@ -27,7 +27,7 @@ var (
 	// self.x = Type(...) inside __init__
 	pySelfCtorRe = regexp.MustCompile(`self\.(\w+)\s*=\s*(?:\w+\.)?([A-Z]\w*)\(`)
 	// self.x: Type = ... inside __init__
-	pySelfAnnRe = regexp.MustCompile(`self\.(\w+)\s*:\s*([^=\n]+?)\s*=`)
+	pySelfAnnRe = regexp.MustCompile(`(?m)self\.(\w+)\s*:\s*([^=\n]+?)\s*(?:=|$)`)
 	// class-body attribute annotation: "name: Type" / "name: Type = default"
 	pyClassAnnRe = regexp.MustCompile(`(?m)^\s+(\w+)\s*:\s*([^=\n]+?)\s*(?:=|$)`)
 	// class-body attribute holding a class reference: "name = SomeClass"
@@ -36,7 +36,7 @@ var (
 	// annotation (ctx = self.app_context() → AppContext)
 	pyCallAssignRe = regexp.MustCompile(`(?m)^\s*(\w+)\s*=\s*(?:await\s+)?(?:((?:\w+\.)*\w+)\.)?([a-z_]\w*)\(`)
 	// with [async] item[, item]: — the items run __enter__/__exit__
-	pyWithRe = regexp.MustCompile(`(?m)^\s*(async\s+)?with\s+(.+?):\s*$`)
+	pyWithRe = regexp.MustCompile(`(?ms)^[ \t]*(async\s+)?with\s+(.+?):[ \t]*(?:\n|$)`)
 )
 
 // pyBareType reduces a Python annotation to one indexable class name.
@@ -398,42 +398,98 @@ func pyModuleGlobalType(sig string) string {
 // which parses bases from class signatures (so proxy stubs that only exist for
 // type-checking still contribute their inheritance link once indexed).
 func pyDunderTargets(idx *edgeIndex, className, dunder, preferDir string) []*core.SymbolRecord {
-	seen := map[string]bool{className: true}
-	queue := []string{className}
-	for level := 0; level < 5 && len(queue) > 0; level++ {
+	for _, cn := range pyMRO(idx, className, preferDir) {
 		var found []*core.SymbolRecord
-		for _, cn := range queue {
-			// Pin the class NAME to one class symbol (preferDir-preferred,
-			// same choice rule as pyBaseClasses) and accept only the dunder
-			// declared in THAT class's file. Bare ParentSymbol matching
-			// across all files let an unrelated same-named class in another
-			// package supply the wrong __setattr__ — and returned it at
-			// level 0, so the real ancestor was never reached.
-			cls := pyResolveClass(idx, cn, preferDir)
-			if cls == nil {
-				continue
-			}
-			for _, cand := range idx.byName[strings.ToLower(dunder)] {
-				if cand.Name == dunder && cand.ParentSymbol == cn && cand.FilePath == cls.FilePath {
-					found = append(found, cand)
-				}
+		// Pin the class NAME to one class symbol (preferDir-preferred,
+		// same choice rule as pyBaseClasses) and accept only the dunder
+		// declared in THAT class's file.
+		cls := pyResolveClass(idx, cn, preferDir)
+		if cls == nil {
+			continue
+		}
+		for _, cand := range idx.byName[strings.ToLower(dunder)] {
+			if cand.Name == dunder && cand.ParentSymbol == cn && cand.FilePath == cls.FilePath {
+				found = append(found, cand)
 			}
 		}
 		if len(found) > 0 {
-			return found // nearest definition in the hierarchy wins
+			return found // first definition in Python's C3 MRO wins
 		}
-		var next []string
-		for _, cn := range queue {
-			for _, base := range pyBaseClasses(idx, cn, preferDir) {
-				if !seen[base] {
-					seen[base] = true
-					next = append(next, base)
+	}
+	return nil
+}
+
+func pyMRO(idx *edgeIndex, className, preferDir string) []string {
+	return pyLinearize(idx, className, preferDir, map[string]bool{})
+}
+
+func pyLinearize(idx *edgeIndex, className, preferDir string, visiting map[string]bool) []string {
+	if className == "" || visiting[className] {
+		return nil
+	}
+	visiting[className] = true
+	defer delete(visiting, className)
+	bases := pyBaseClasses(idx, className, preferDir)
+	seqs := make([][]string, 0, len(bases)+1)
+	for _, base := range bases {
+		seqs = append(seqs, pyLinearize(idx, base, preferDir, visiting))
+	}
+	seqs = append(seqs, append([]string(nil), bases...))
+	out := []string{className}
+	seen := map[string]bool{className: true}
+	for {
+		var nonEmpty bool
+		candidate := ""
+		for _, seq := range seqs {
+			if len(seq) == 0 {
+				continue
+			}
+			nonEmpty = true
+			head := seq[0]
+			inTail := false
+			for _, other := range seqs {
+				if len(other) < 2 {
+					continue
+				}
+				for _, tail := range other[1:] {
+					if tail == head {
+						inTail = true
+						break
+					}
+				}
+				if inTail {
+					break
+				}
+			}
+			if !inTail {
+				candidate = head
+				break
+			}
+		}
+		if !nonEmpty {
+			break
+		}
+		if candidate == "" {
+			// Invalid/inconsistent hierarchy: retain deterministic coverage
+			// rather than looping or dropping all ancestors.
+			for _, seq := range seqs {
+				if len(seq) > 0 {
+					candidate = seq[0]
+					break
 				}
 			}
 		}
-		queue = next
+		if !seen[candidate] {
+			seen[candidate] = true
+			out = append(out, candidate)
+		}
+		for i, seq := range seqs {
+			if len(seq) > 0 && seq[0] == candidate {
+				seqs[i] = seq[1:]
+			}
+		}
 	}
-	return nil
+	return out
 }
 
 // pyResolveClass picks the single class symbol a bare class name refers to,
@@ -518,6 +574,11 @@ func pyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 				out[m[1]] = t
 			}
 		}
+		for _, m := range pySelfAnnRe.FindAllStringSubmatch(body, -1) {
+			if t := pyAnnotationType(idx, symbol, m[2]); t != "" {
+				out[m[1]] = t
+			}
+		}
 		for _, m := range pyCtorAssignRe.FindAllStringSubmatch(body, -1) {
 			if typeSymbolExists(idx, m[2]) {
 				out[m[1]] = m[2]
@@ -593,34 +654,51 @@ func pyClassAttrTypes(idx *edgeIndex, symbol *core.SymbolRecord, className strin
 			out[name] = typ
 		}
 	}
+	preferDir := dirOf(symbol.FilePath)
+	var class *core.SymbolRecord
 	for _, cls := range idx.byName[strings.ToLower(className)] {
 		if cls.Name != className || cls.Kind != core.KindClass || cls.RawText == "" {
 			continue
 		}
-		for _, m := range pyClassAnnRe.FindAllStringSubmatch(cls.RawText, -1) {
-			record(m[1], pyAnnotationType(idx, cls, m[2]))
+		if class == nil || dirOf(cls.FilePath) == preferDir {
+			class = cls
 		}
-		for _, m := range pyClassRefRe.FindAllStringSubmatch(cls.RawText, -1) {
+		if dirOf(cls.FilePath) == preferDir {
+			break
+		}
+	}
+	if class != nil {
+		for _, m := range pyClassAnnRe.FindAllStringSubmatch(class.RawText, -1) {
+			record(m[1], pyAnnotationType(idx, class, m[2]))
+		}
+		for _, m := range pyClassRefRe.FindAllStringSubmatch(class.RawText, -1) {
 			if typeSymbolExists(idx, m[2]) {
 				record(m[1], "class:"+m[2])
 			}
 		}
-		break
 	}
+	var init *core.SymbolRecord
 	for _, cand := range idx.byName["__init__"] {
 		if cand.ParentSymbol != className {
 			continue
 		}
-		body := stripCommentsAndStrings(cand.RawText)
+		if init == nil || dirOf(cand.FilePath) == preferDir {
+			init = cand
+		}
+		if dirOf(cand.FilePath) == preferDir {
+			break
+		}
+	}
+	if init != nil {
+		body := stripCommentsAndStrings(init.RawText)
 		for _, m := range pySelfAnnRe.FindAllStringSubmatch(body, -1) {
-			record(m[1], pyAnnotationType(idx, cand, m[2]))
+			record(m[1], pyAnnotationType(idx, init, m[2]))
 		}
 		for _, m := range pySelfCtorRe.FindAllStringSubmatch(body, -1) {
 			if typeSymbolExists(idx, m[2]) {
 				record(m[1], m[2])
 			}
 		}
-		break
 	}
 }
 
@@ -717,6 +795,15 @@ func inheritedTargets(idx *edgeIndex, symbol *core.SymbolRecord, calleeName stri
 // caller's base classes (walking up to three levels of the hierarchy).
 func narrowBySuper(idx *edgeIndex, symbol *core.SymbolRecord, cands []*core.SymbolRecord) []*core.SymbolRecord {
 	if symbol.ParentSymbol == "" || len(cands) == 0 {
+		return nil
+	}
+	if symbol.Language == "python" {
+		mro := pyMRO(idx, symbol.ParentSymbol, dirOf(symbol.FilePath))
+		for _, base := range mro[1:] {
+			if matched := filterByParent(cands, base); len(matched) > 0 {
+				return matched
+			}
+		}
 		return nil
 	}
 	bases := baseClassesFor(idx, symbol.Language, symbol.ParentSymbol, dirOf(symbol.FilePath))
@@ -883,7 +970,11 @@ func pyWithTargets(idx *edgeIndex, symbol *core.SymbolRecord, localTypes map[str
 		if m[1] != "" {
 			enter, exit = "__aenter__", "__aexit__"
 		}
-		for _, item := range splitTopLevel(m[2], ',') {
+		items := strings.TrimSpace(m[2])
+		if strings.HasPrefix(items, "(") && strings.HasSuffix(items, ")") {
+			items = strings.TrimSpace(items[1 : len(items)-1])
+		}
+		for _, item := range splitTopLevel(items, ',') {
 			item = strings.TrimSpace(item)
 			if i := strings.Index(item, " as "); i >= 0 {
 				item = strings.TrimSpace(item[:i])
@@ -966,8 +1057,12 @@ func subclassOverrides(idx *edgeIndex, language, className, calleeName, preferDi
 					byLang = map[string][]string{}
 					idx.subclasses[c.Language] = byLang
 				}
-				for _, base := range baseClassesFor(idx, c.Language, c.Name, dirOf(c.FilePath)) {
-					byLang[base] = append(byLang[base], c.Name)
+				className := c.Name
+				if c.Language == "cpp" && strings.Contains(c.QualifiedName, "::") {
+					className = c.QualifiedName
+				}
+				for _, base := range baseClassesFor(idx, c.Language, className, dirOf(c.FilePath)) {
+					byLang[base] = append(byLang[base], className)
 				}
 			}
 		}
@@ -983,7 +1078,7 @@ func subclassOverrides(idx *edgeIndex, language, className, calleeName, preferDi
 	}
 	var methods []*core.SymbolRecord
 	for _, cand := range idx.byName[strings.ToLower(calleeName)] {
-		if cand.Name == calleeName && cand.Kind == core.KindMethod && cand.Language == language {
+		if cand.Name == calleeName && graphCallableSymbol(cand) && cand.Language == language {
 			methods = append(methods, cand)
 		}
 	}

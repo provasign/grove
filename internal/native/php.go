@@ -90,7 +90,7 @@ func addPSR4(out map[string][]string, in map[string]any) {
 	}
 }
 
-var phpUsePattern = regexp.MustCompile(`(?m)^\s*use\s+([A-Za-z_\\][A-Za-z0-9_\\]*)\s*;`)
+var phpUsePattern = regexp.MustCompile(`(?m)^[ \t]*use[ \t]+([^;\n]+);`)
 var phpNewPattern = regexp.MustCompile(`\bnew\s+\\?([A-Za-z_\\][A-Za-z0-9_\\]*)\s*\(`)
 
 func phpReferencedClasses(content string) []string {
@@ -103,10 +103,8 @@ func phpReferencedClasses(content string) []string {
 			out = append(out, name)
 		}
 	}
-	for _, match := range phpUsePattern.FindAllStringSubmatch(content, -1) {
-		if len(match) == 2 {
-			add(match[1])
-		}
+	for _, ref := range phpUseRefs(content) {
+		add(ref.Name)
 	}
 	for _, match := range phpNewPattern.FindAllStringSubmatch(content, -1) {
 		if len(match) == 2 {
@@ -246,8 +244,58 @@ func phpUseAliases(symbols []core.SymbolRecord) map[string]map[string]string {
 		if _, ok := out[symbol.FilePath]; !ok {
 			out[symbol.FilePath] = map[string]string{}
 		}
-		for _, class := range phpReferencedClasses(symbol.RawText) {
-			out[symbol.FilePath][lastDottedName(strings.ReplaceAll(class, "\\", "."))] = class
+		for _, ref := range phpUseRefs(symbol.RawText) {
+			out[symbol.FilePath][ref.Alias] = ref.Name
+		}
+	}
+	return out
+}
+
+type phpUseRef struct {
+	Name  string
+	Alias string
+}
+
+var phpUseAliasSeparator = regexp.MustCompile(`(?i)\s+as\s+`)
+
+func phpUseRefs(content string) []phpUseRef {
+	var out []phpUseRef
+	add := func(prefix, item string) {
+		item = strings.TrimSpace(item)
+		if strings.HasPrefix(item, "function ") || strings.HasPrefix(item, "const ") {
+			return
+		}
+		parts := phpUseAliasSeparator.Split(item, 2)
+		name := strings.Trim(prefix+strings.TrimSpace(parts[0]), "\\")
+		if name == "" {
+			return
+		}
+		alias := lastDottedName(strings.ReplaceAll(name, "\\", "."))
+		if len(parts) == 2 {
+			alias = strings.TrimSpace(parts[1])
+		}
+		if alias != "" {
+			out = append(out, phpUseRef{Name: name, Alias: alias})
+		}
+	}
+	for _, match := range phpUsePattern.FindAllStringSubmatch(content, -1) {
+		if len(match) != 2 {
+			continue
+		}
+		clause := strings.TrimSpace(match[1])
+		if open := strings.IndexByte(clause, '{'); open >= 0 {
+			close := strings.LastIndexByte(clause, '}')
+			if close < open {
+				continue
+			}
+			prefix := strings.TrimSpace(clause[:open])
+			for _, item := range strings.Split(clause[open+1:close], ",") {
+				add(prefix, item)
+			}
+			continue
+		}
+		for _, item := range strings.Split(clause, ",") {
+			add("", item)
 		}
 	}
 	return out
@@ -258,30 +306,24 @@ type phpInheritanceRef struct {
 	EdgeType core.EdgeType
 }
 
-var phpExtendsPattern = regexp.MustCompile(`\bextends\s+\\?([A-Za-z_\\][A-Za-z0-9_\\]*)`)
-var phpImplementsPattern = regexp.MustCompile(`\bimplements\s+([A-Za-z_\\][A-Za-z0-9_\\]*(?:\s*,\s*\\?[A-Za-z_\\][A-Za-z0-9_\\]*)*)`)
-var phpTraitUsePattern = regexp.MustCompile(`\buse\s+\\?([A-Za-z_\\][A-Za-z0-9_\\]*)\s*;`)
+var phpTraitUsePattern = regexp.MustCompile(`\buse[ \t]+([^;{\n]+)(?:;|\{)`)
 
 func phpInheritanceRefs(rawText string) []phpInheritanceRef {
 	var refs []phpInheritanceRef
-	for _, match := range phpExtendsPattern.FindAllStringSubmatch(rawText, -1) {
-		if len(match) == 2 {
-			refs = append(refs, phpInheritanceRef{Name: match[1], EdgeType: core.EdgeExtends})
-		}
+	for _, name := range inheritanceClause(rawText, "extends", "implements") {
+		refs = append(refs, phpInheritanceRef{Name: strings.Trim(name, "\\"), EdgeType: core.EdgeExtends})
 	}
-	for _, match := range phpImplementsPattern.FindAllStringSubmatch(rawText, -1) {
+	for _, name := range inheritanceClause(rawText, "implements") {
+		refs = append(refs, phpInheritanceRef{Name: strings.Trim(name, "\\"), EdgeType: core.EdgeImplements})
+	}
+	for _, match := range phpTraitUsePattern.FindAllStringSubmatch(rawText, -1) {
 		if len(match) != 2 {
 			continue
 		}
-		for _, part := range strings.Split(match[1], ",") {
-			if part = strings.TrimSpace(part); part != "" {
-				refs = append(refs, phpInheritanceRef{Name: strings.Trim(part, "\\"), EdgeType: core.EdgeImplements})
+		for _, name := range strings.Split(match[1], ",") {
+			if name = strings.Trim(strings.TrimSpace(name), "\\"); name != "" {
+				refs = append(refs, phpInheritanceRef{Name: name, EdgeType: core.EdgeImplements})
 			}
-		}
-	}
-	for _, match := range phpTraitUsePattern.FindAllStringSubmatch(rawText, -1) {
-		if len(match) == 2 {
-			refs = append(refs, phpInheritanceRef{Name: match[1], EdgeType: core.EdgeImplements})
 		}
 	}
 	return refs

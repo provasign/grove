@@ -3,6 +3,7 @@
 package graph
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -406,6 +407,115 @@ func TestPyWithProtocolAndReturnAnnotation(t *testing.T) {
 	}
 	if rt := pyReturnType(&syms[6]); rt != "AppContext" {
 		t.Errorf("pyReturnType = %q, want AppContext", rt)
+	}
+}
+
+func TestPyAnnotationOnlyLocalsAndParenthesizedWith(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "ctx.py::Ctx@1", FilePath: "ctx.py", BlobSHA: "1", Language: "python", Kind: core.KindClass, Name: "Ctx", QualifiedName: "Ctx", RawText: "class Ctx:\n    pass\n"},
+		{ID: "ctx.py::Ctx.__enter__@2", FilePath: "ctx.py", BlobSHA: "1", Language: "python", Kind: core.KindMethod, Name: "__enter__", QualifiedName: "Ctx.__enter__", ParentSymbol: "Ctx"},
+		{ID: "ctx.py::Ctx.__exit__@3", FilePath: "ctx.py", BlobSHA: "1", Language: "python", Kind: core.KindMethod, Name: "__exit__", QualifiedName: "Ctx.__exit__", ParentSymbol: "Ctx"},
+		{ID: "app.py::App@1", FilePath: "app.py", BlobSHA: "1", Language: "python", Kind: core.KindClass, Name: "App", QualifiedName: "App", RawText: "class App:\n    pass\n"},
+		{ID: "app.py::App.run@2", FilePath: "app.py", BlobSHA: "1", Language: "python", Kind: core.KindMethod, Name: "run", QualifiedName: "App.run", ParentSymbol: "App", RawText: "def run(self):\n    ctx: Ctx\n    self.saved: Ctx\n    with (\n        ctx,\n        self.saved,\n    ):\n        pass\n"},
+	}
+	idx := newEdgeIndex(syms)
+	types := pyLocalTypes(idx, &syms[4])
+	if types["ctx"] != "Ctx" || types["saved"] != "Ctx" {
+		t.Fatalf("annotation-only types missing: %v", types)
+	}
+	targets := pyWithTargets(idx, &syms[4], types, map[string]struct{}{"saved": {}})
+	if len(targets) != 2 {
+		t.Fatalf("parenthesized with targets: got %v, want enter and exit", targets)
+	}
+}
+
+func TestModernCppAndTSLocalTypeForms(t *testing.T) {
+	params := cFamilyParamTypes("void run(std::shared_ptr<Foo> foo)", "")
+	if params["foo"] != "Foo" {
+		t.Fatalf("smart-pointer parameter: %v", params)
+	}
+	syms := []core.SymbolRecord{
+		{ID: "driver.ts::MysqlDriver@1", FilePath: "driver.ts", BlobSHA: "1", Language: "typescript", Kind: core.KindClass, Name: "MysqlDriver", QualifiedName: "MysqlDriver"},
+		{ID: "app.ts::run@1", FilePath: "app.ts", BlobSHA: "1", Language: "typescript", Kind: core.KindFunction, Name: "run", QualifiedName: "run", RawText: "function run() { this.driver = new db.drivers.MysqlDriver() }"},
+	}
+	if got := tsLocalTypes(newEdgeIndex(syms), &syms[1])["driver"]; got != "MysqlDriver" {
+		t.Fatalf("multi-segment TS construction: got %q", got)
+	}
+}
+
+func TestCppNamespaceReceiverAndInheritanceStayQualified(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "h.cpp::net.Handle@1", FilePath: "h.cpp", BlobSHA: "1", Language: "cpp", Kind: core.KindClass, Name: "Handle", QualifiedName: "net::Handle", Signature: "class Handle"},
+		{ID: "h.cpp::fs.Handle@2", FilePath: "h.cpp", BlobSHA: "1", Language: "cpp", Kind: core.KindClass, Name: "Handle", QualifiedName: "fs::Handle", Signature: "class Handle"},
+		{ID: "h.cpp::net.Handle.close@3", FilePath: "h.cpp", BlobSHA: "1", Language: "cpp", Kind: core.KindMethod, Name: "close", QualifiedName: "net::Handle::close", ParentSymbol: "net::Handle"},
+		{ID: "h.cpp::fs.Handle.close@4", FilePath: "h.cpp", BlobSHA: "1", Language: "cpp", Kind: core.KindMethod, Name: "close", QualifiedName: "fs::Handle::close", ParentSymbol: "fs::Handle"},
+		{ID: "h.cpp::net.Derived@5", FilePath: "h.cpp", BlobSHA: "1", Language: "cpp", Kind: core.KindClass, Name: "Derived", QualifiedName: "net::Derived", Signature: "class Derived : public Handle"},
+		{ID: "h.cpp::run@6", FilePath: "h.cpp", BlobSHA: "1", Language: "cpp", Kind: core.KindFunction, Name: "run", QualifiedName: "net::run", Signature: "void run(Derived& h)", RawText: "void run(Derived& h) { h.close(); }", CallSites: []core.CallSite{{Callee: "h.close", Line: 1}}},
+		{ID: "h.cpp::runImported@7", FilePath: "h.cpp", BlobSHA: "1", Language: "cpp", Kind: core.KindFunction, Name: "runImported", QualifiedName: "runImported", Signature: "void runImported(Handle& h)", RawText: "void runImported(Handle& h) { h.close(); }", Annotations: []string{core.CppUsingNamespace("net")}, CallSites: []core.CallSite{{Callee: "h.close", Line: 1}}},
+	}
+	g := New()
+	g.Replace(syms, 1)
+	if !hasEdge(g, core.EdgeContains, "h.cpp::net.Handle@1", "h.cpp::net.Handle.close@3") {
+		t.Fatal("namespace-qualified class did not contain its method")
+	}
+	if !hasEdge(g, core.EdgeExtends, "h.cpp::net.Derived@5", "h.cpp::net.Handle@1") {
+		t.Fatal("namespace-qualified C++ inheritance edge was not emitted")
+	}
+	if !hasEdge(g, core.EdgeCalls, "h.cpp::run@6", "h.cpp::net.Handle.close@3") {
+		idx := newEdgeIndex(syms)
+		t.Fatalf("namespaced derived receiver did not reach namespaced base method: locals=%v bases=%v", cFamilyLocalTypes(idx, &syms[5]), baseClassesFor(idx, "cpp", "net::Derived", ""))
+	}
+	if hasEdge(g, core.EdgeCalls, "h.cpp::run@6", "h.cpp::fs.Handle.close@4") {
+		t.Fatal("namespaced receiver crossed into same-named namespace")
+	}
+	if !hasEdge(g, core.EdgeCalls, "h.cpp::runImported@7", "h.cpp::net.Handle.close@3") ||
+		hasEdge(g, core.EdgeCalls, "h.cpp::runImported@7", "h.cpp::fs.Handle.close@4") {
+		t.Fatal("using-namespace receiver was not pinned to its imported namespace")
+	}
+}
+
+func TestCSharpPartialAndPrimaryConstructorTypes(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "src/Base.cs::Base@1", FilePath: "src/Base.cs", BlobSHA: "1", Language: "csharp", Kind: core.KindClass, Name: "Base", QualifiedName: "Base", Signature: "class Base"},
+		{ID: "src/IShape.cs::IShape@1", FilePath: "src/IShape.cs", BlobSHA: "1", Language: "csharp", Kind: core.KindInterface, Name: "IShape", QualifiedName: "IShape", Signature: "interface IShape"},
+		{ID: "src/Repo.cs::Repo@1", FilePath: "src/Repo.cs", BlobSHA: "1", Language: "csharp", Kind: core.KindClass, Name: "Repo", QualifiedName: "Repo", Signature: "class Repo"},
+		{ID: "src/Widget.cs::Widget@1", FilePath: "src/Widget.cs", BlobSHA: "1", Language: "csharp", Kind: core.KindClass, Name: "Widget", QualifiedName: "Widget", Signature: "partial class Widget", RawText: "partial class Widget { }"},
+		{ID: "src/Widget.Fields.cs::Widget@1", FilePath: "src/Widget.Fields.cs", BlobSHA: "1", Language: "csharp", Kind: core.KindClass, Name: "Widget", QualifiedName: "Widget", Signature: "partial class Widget : Base", RawText: "partial class Widget : Base { private Repo repo; }"},
+		{ID: "src/Widget.cs::Widget.Run@2", FilePath: "src/Widget.cs", BlobSHA: "1", Language: "csharp", Kind: core.KindMethod, Name: "Run", QualifiedName: "Widget.Run", ParentSymbol: "Widget", RawText: "void Run() { repo.Save(); }"},
+	}
+	idx := newEdgeIndex(syms)
+	if got := csharpLocalTypes(idx, &syms[5])["repo"]; got != "Repo" {
+		t.Fatalf("partial-class field type: got %q", got)
+	}
+	if got := csBaseClasses(idx, "Widget", "src"); len(got) != 1 || got[0] != "Base" {
+		t.Fatalf("partial-class bases: %v", got)
+	}
+	primary := core.SymbolRecord{ID: "src/Person.cs::Person@1", FilePath: "src/Person.cs", BlobSHA: "1", Language: "csharp", Kind: core.KindClass, Name: "Person", QualifiedName: "Person", Signature: "record Person(string Name) : Base(Name), IShape where T : class"}
+	idx = newEdgeIndex(append(syms, primary))
+	if got := csBaseClasses(idx, "Person", "src"); !reflect.DeepEqual(got, []string{"Base", "IShape"}) {
+		t.Fatalf("primary-constructor bases: %v", got)
+	}
+}
+
+func TestPythonC3MROPrefersLeftBranch(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "m.py::A@1", FilePath: "m.py", Language: "python", Kind: core.KindClass, Name: "A", Signature: "class A"},
+		{ID: "m.py::B@2", FilePath: "m.py", Language: "python", Kind: core.KindClass, Name: "B", Signature: "class B(A)"},
+		{ID: "m.py::C@3", FilePath: "m.py", Language: "python", Kind: core.KindClass, Name: "C", Signature: "class C(A)"},
+		{ID: "m.py::D@4", FilePath: "m.py", Language: "python", Kind: core.KindClass, Name: "D", Signature: "class D(B, C)"},
+		{ID: "m.py::B.enter@5", FilePath: "m.py", Language: "python", Kind: core.KindMethod, Name: "__enter__", ParentSymbol: "B"},
+		{ID: "m.py::C.enter@6", FilePath: "m.py", Language: "python", Kind: core.KindMethod, Name: "__enter__", ParentSymbol: "C"},
+		{ID: "m.py::B.work@7", FilePath: "m.py", Language: "python", Kind: core.KindMethod, Name: "work", ParentSymbol: "B"},
+		{ID: "m.py::C.work@8", FilePath: "m.py", Language: "python", Kind: core.KindMethod, Name: "work", ParentSymbol: "C"},
+		{ID: "m.py::D.run@9", FilePath: "m.py", Language: "python", Kind: core.KindMethod, Name: "run", ParentSymbol: "D"},
+	}
+	idx := newEdgeIndex(syms)
+	if got := pyDunderTargets(idx, "D", "__enter__", ""); len(got) != 1 || got[0].ParentSymbol != "B" {
+		t.Fatalf("C3 dunder target: %#v", got)
+	}
+	cands := []*core.SymbolRecord{&syms[6], &syms[7]}
+	if got := narrowBySuper(idx, &syms[8], cands); len(got) != 1 || got[0].ParentSymbol != "B" {
+		t.Fatalf("C3 super target: %#v", got)
 	}
 }
 

@@ -109,6 +109,30 @@ func Call(c Contract) { c.Send() }
 	}
 }
 
+func TestGoInterfaceDispatchIncludesGenericImplementors(t *testing.T) {
+	got := goDispatchFixture(t, `package coverage
+type Contract interface { Send() }
+type writer[T any] struct{}
+func (*writer[T]) Send() {}
+func Call(c Contract) { c.Send() }
+`, false)
+	if !reflect.DeepEqual(got["Call"], []string{"writer.Send"}) {
+		t.Fatalf("generic implementor missing from dispatch: %v", got)
+	}
+}
+
+func TestGoInterfaceDispatchInstantiatesGenericInterface(t *testing.T) {
+	got := goDispatchFixture(t, `package coverage
+type Contract[T any] interface { Send(T) }
+type writer[T any] struct{}
+func (*writer[T]) Send(T) {}
+func Call(c Contract[int]) { c.Send(1) }
+`, false)
+	if !reflect.DeepEqual(got["Call"], []string{"writer.Send"}) {
+		t.Fatalf("generic interface dispatch missing: %v", got)
+	}
+}
+
 func goDispatchFixture(t *testing.T, src string, wantTypeError bool, extra ...core.SymbolRecord) map[string][]string {
 	t.Helper()
 	fset := token.NewFileSet()

@@ -41,13 +41,8 @@ func csharpLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]stri
 					continue
 				}
 				seen[className] = true
-				for _, cls := range idx.byName[strings.ToLower(className)] {
-					if cls.Name != className || cls.RawText == "" {
-						continue
-					}
-					switch cls.Kind {
-					case core.KindClass, core.KindStruct, core.KindEnum, core.KindInterface:
-					default:
+				for _, cls := range csharpTypeFragments(idx, className, dirOf(symbol.FilePath)) {
+					if cls.RawText == "" {
 						continue
 					}
 					body := cls.RawText
@@ -61,7 +56,6 @@ func csharpLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]stri
 							}
 						}
 					}
-					break
 				}
 				next = append(next, csBaseClasses(idx, className, dirOf(symbol.FilePath))...)
 			}
@@ -336,15 +330,7 @@ func csharpArgTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string
 					continue
 				}
 				seen[className] = true
-				for _, cls := range idx.byName[strings.ToLower(className)] {
-					if cls.Name != className {
-						continue
-					}
-					switch cls.Kind {
-					case core.KindClass, core.KindStruct, core.KindEnum, core.KindInterface:
-					default:
-						continue
-					}
+				for _, cls := range csharpTypeFragments(idx, className, dirOf(symbol.FilePath)) {
 					for _, f := range idx.byFile[cls.FilePath] {
 						if f.Kind != core.KindField || f.ParentSymbol != className {
 							continue
@@ -356,7 +342,6 @@ func csharpArgTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string
 							record(m[1], m[2])
 						}
 					}
-					break
 				}
 				next = append(next, csBaseClasses(idx, className, dirOf(symbol.FilePath))...)
 			}
@@ -683,51 +668,128 @@ func csAssignable(idx *edgeIndex, argType, paramType string) bool {
 // IDisposable]. Generic arguments and `where` constraints are dropped.
 // Interfaces ride along: assignability and dispatch both need them.
 func csBaseClasses(idx *edgeIndex, className, preferDir string) []string {
-	var chosen *core.SymbolRecord
+	fragments := csharpTypeFragments(idx, className, preferDir)
+	if len(fragments) == 0 {
+		return nil
+	}
+	var bases []string
+	seen := map[string]bool{}
+	for _, fragment := range fragments {
+		for _, b := range csharpBaseList(csDeclSource(fragment)) {
+			b = csNormalizeType(strings.TrimSpace(b))
+			if b != "" && b != "object" && !seen[b] {
+				seen[b] = true
+				bases = append(bases, b)
+			}
+		}
+	}
+	return bases
+}
+
+var csharpTypeDeclHeadRe = regexp.MustCompile(`\b(?:class|struct|interface|record(?:\s+(?:class|struct))?)\s+[A-Za-z_][A-Za-z0-9_]*`)
+var csharpPartialRe = regexp.MustCompile(`\bpartial\b`)
+
+func csharpTypeFragments(idx *edgeIndex, className, preferDir string) []*core.SymbolRecord {
+	var preferred, fallback []*core.SymbolRecord
 	for _, cand := range idx.byName[strings.ToLower(className)] {
 		if cand.Name != className {
 			continue
 		}
 		switch cand.Kind {
-		case core.KindClass, core.KindStruct, core.KindInterface:
+		case core.KindClass, core.KindStruct, core.KindEnum, core.KindInterface:
 		default:
 			continue
 		}
+		fallback = append(fallback, cand)
 		if dirOf(cand.FilePath) == preferDir {
-			chosen = cand
-			break
-		}
-		if chosen == nil {
-			chosen = cand
+			preferred = append(preferred, cand)
 		}
 	}
-	if chosen == nil {
+	candidates := preferred
+	if len(candidates) == 0 {
+		candidates = fallback
+	}
+	if len(candidates) == 0 {
 		return nil
 	}
-	// The stored signature may begin with attributes ([Obsolete("...")]
-	// spanning lines, with colons of its own) — parse the declaration
-	// head after them.
-	sig := csDeclSource(chosen)
-	if i := strings.IndexByte(sig, '{'); i >= 0 {
-		sig = sig[:i]
+	first := candidates[0]
+	if !csharpPartialRe.MatchString(first.Signature + "\n" + first.RawText) {
+		return []*core.SymbolRecord{first}
 	}
-	sig = stripLeadingGenericParams(sig)
-	colon := strings.IndexByte(sig, ':')
-	if colon < 0 {
-		return nil
-	}
-	rest := sig[colon+1:]
-	if w := strings.Index(rest, " where "); w >= 0 {
-		rest = rest[:w]
-	}
-	var bases []string
-	for _, b := range splitTopLevel(rest, ',') {
-		b = csNormalizeType(strings.TrimSpace(b))
-		if b != "" && b != "object" {
-			bases = append(bases, b)
+	out := make([]*core.SymbolRecord, 0, len(candidates))
+	for _, cand := range candidates {
+		if csharpPartialRe.MatchString(cand.Signature + "\n" + cand.RawText) {
+			out = append(out, cand)
 		}
 	}
-	return bases
+	return out
+}
+
+func csharpBaseList(text string) []string {
+	loc := csharpTypeDeclHeadRe.FindStringIndex(text)
+	if loc == nil {
+		return nil
+	}
+	tail := strings.TrimLeft(text[loc[1]:], " \t\r\n")
+	for _, pair := range [][2]byte{{'<', '>'}, {'(', ')'}} {
+		if n := csharpBalancedPrefix(tail, pair[0], pair[1]); n > 0 {
+			tail = strings.TrimLeft(tail[n:], " \t\r\n")
+		}
+	}
+	if !strings.HasPrefix(tail, ":") {
+		return nil
+	}
+	tail = strings.TrimLeft(tail[1:], " \t")
+	if i := strings.Index(tail, " where "); i >= 0 {
+		tail = tail[:i]
+	}
+	if i := strings.IndexByte(tail, '{'); i >= 0 {
+		tail = tail[:i]
+	}
+	var out []string
+	start, depth := 0, 0
+	for i := 0; i <= len(tail); i++ {
+		if i < len(tail) {
+			switch tail[i] {
+			case '<', '(', '[':
+				depth++
+			case '>', ')', ']':
+				if depth > 0 {
+					depth--
+				}
+			}
+		}
+		if i < len(tail) && (tail[i] != ',' || depth != 0) {
+			continue
+		}
+		part := strings.TrimSpace(tail[start:i])
+		start = i + 1
+		if j := strings.IndexByte(part, '('); j >= 0 {
+			part = strings.TrimSpace(part[:j])
+		}
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+func csharpBalancedPrefix(text string, open, close byte) int {
+	if text == "" || text[0] != open {
+		return 0
+	}
+	depth := 0
+	for i := 0; i < len(text); i++ {
+		if text[i] == open {
+			depth++
+		} else if text[i] == close {
+			depth--
+			if depth == 0 {
+				return i + 1
+			}
+		}
+	}
+	return 0
 }
 
 // csBclBases lists base types of common BCL classes the index cannot see

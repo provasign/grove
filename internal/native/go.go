@@ -245,27 +245,6 @@ func goAffectedDirs(root string, changedFiles []string, pkgs []goListPackage) ma
 			}
 		}
 	}
-	// The lexical passes (goCallSiteEdges/goTypeUseEdges) resolve imports by
-	// BASENAME, so a package importing any path whose last segment matches a
-	// changed dir's basename may hold edges into it even without a go-list
-	// import edge. One basename-level expansion (no transitive re-queue —
-	// lexical edges are caller→target one-hop) keeps those callers fresh.
-	changedBase := map[string]bool{}
-	for d := range changedDirs {
-		changedBase[lastPathSegment(d)] = true
-	}
-	for _, pkg := range pkgs {
-		rel, ok := relFile(root, pkg.Dir)
-		if !ok || affected[rel] {
-			continue
-		}
-		for _, imp := range append(append(append([]string(nil), pkg.Imports...), pkg.TestImports...), pkg.XTestImports...) {
-			if changedBase[lastPathSegment(imp)] {
-				affected[rel] = true
-				break
-			}
-		}
-	}
 	return affected
 }
 
@@ -581,6 +560,10 @@ func goCallerSymbolAt(relPath string, fn *ast.FuncDecl, symbolIdx goSymbolIndex)
 
 func goResolveCall(currentDir string, expr ast.Expr, info *types.Info, symbolIdx goSymbolIndex, pkgDirsByImport map[string][]string) (core.SymbolRecord, bool) {
 	switch fun := expr.(type) {
+	case *ast.IndexExpr:
+		return goResolveCall(currentDir, fun.X, info, symbolIdx, pkgDirsByImport)
+	case *ast.IndexListExpr:
+		return goResolveCall(currentDir, fun.X, info, symbolIdx, pkgDirsByImport)
 	case *ast.Ident:
 		obj, ok := info.Uses[fun].(*types.Func)
 		if !ok {
@@ -700,7 +683,6 @@ type goNativeIndex struct {
 	funcsByName map[string][]core.SymbolRecord
 	typesByName map[string][]core.SymbolRecord
 	filesByDir  map[string][]string // package dir → files
-	filesByBase map[string][]string // last dir segment → files
 }
 
 func newGoNativeIndex(symbols []core.SymbolRecord) *goNativeIndex {
@@ -708,7 +690,6 @@ func newGoNativeIndex(symbols []core.SymbolRecord) *goNativeIndex {
 		funcsByName: map[string][]core.SymbolRecord{},
 		typesByName: map[string][]core.SymbolRecord{},
 		filesByDir:  map[string][]string{},
-		filesByBase: map[string][]string{},
 	}
 	seenFile := map[string]bool{}
 	for _, symbol := range symbols {
@@ -725,7 +706,6 @@ func newGoNativeIndex(symbols []core.SymbolRecord) *goNativeIndex {
 			seenFile[symbol.FilePath] = true
 			dir := packageDir(symbol.FilePath)
 			idx.filesByDir[dir] = append(idx.filesByDir[dir], symbol.FilePath)
-			idx.filesByBase[lastPathSegment(dir)] = append(idx.filesByBase[lastPathSegment(dir)], symbol.FilePath)
 		}
 	}
 	return idx
@@ -813,6 +793,12 @@ func splitGoCallSite(callee string) (string, string) {
 // for every nested package.
 func goImportedPackageForQualifier(imports []string, qualifier string) (string, bool) {
 	for _, imp := range imports {
+		if alias, path, ok := core.ParseGoImportAlias(imp); ok {
+			if alias == qualifier {
+				return path, true
+			}
+			continue
+		}
 		if lastPathSegment(imp) == qualifier {
 			return imp, true
 		}
@@ -836,8 +822,16 @@ func goImportScope(caller core.SymbolRecord, idx *goNativeIndex) map[string]bool
 		scope[file] = true
 	}
 	for _, imp := range caller.Imports {
-		for _, file := range idx.filesByBase[lastPathSegment(imp)] {
-			scope[file] = true
+		if _, path, ok := core.ParseGoImportAlias(imp); ok {
+			imp = path
+		}
+		for dir, files := range idx.filesByDir {
+			if !goDirMatchesImport(dir, imp) {
+				continue
+			}
+			for _, file := range files {
+				scope[file] = true
+			}
 		}
 	}
 	return scope

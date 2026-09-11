@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.45.0 - 2026-09-10
+
+Graph correctness across all supported language backends. Shared hierarchy
+resolution now handles interfaces, multiple and generic bases, Java
+`implements`, C++ inheritance and namespaces, Rust traits and supertraits,
+modern C# declarations, and PHP multi-trait/interface forms. Go native
+resolution covers exact import paths, aliases, explicit generic calls, and
+generic interface dispatch; Python covers relative/module aliases, annotation-
+only locals, parenthesized `with`, directory-local class attributes, and C3
+method resolution. JavaScript/TypeScript adds CommonJS and dynamic-import
+edges, implementation-line selection for overloads, callable arrow fields,
+and multi-segment constructor types.
+
+C++ type-use analysis now ignores comments, understands smart pointers, keeps
+namespace-qualified identities distinct, and honors file-scope `using
+namespace`, namespace aliases, and `using ns::Type` declarations. Existing
+indexes rebuild through new extractor and resolver stamps. Regression coverage
+exercises every reproducible defect from the 2026-09-10 language graph review.
+
 ## v0.44.1 - 2026-09-10
 
 Java chained-call resolution now binds an inner call only when its owner is

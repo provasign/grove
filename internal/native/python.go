@@ -93,12 +93,31 @@ def type_names(node, out=None):
     elif hasattr(ast, "Index") and isinstance(node, ast.Index):
         type_names(node.value, out)
     return out
-def add_types(rel, from_name, from_line, node, seen, imported_names):
+def type_qualifiers(node, out=None):
+    if out is None:
+        out = {}
+    if node is None:
+        return out
+    if isinstance(node, ast.Attribute):
+        root = node
+        while isinstance(root, ast.Attribute):
+            root = root.value
+        if isinstance(root, ast.Name):
+            out[node.attr] = root.id
+    for child in ast.iter_child_nodes(node):
+        type_qualifiers(child, out)
+    return out
+def add_types(rel, from_name, from_line, node, seen, imported_names, imported_modules):
+    qualifiers = type_qualifiers(node)
     for name in type_names(node):
         key = (from_name, name)
         if name and key not in seen:
             seen.add(key)
             imported = imported_names.get(name)
+            if not imported:
+                target_file = imported_modules.get(qualifiers.get(name))
+                if target_file:
+                    imported = (name, target_file)
             target_name, target_file = imported if imported else (name, rel)
             types.append({"from": rel, "fromName": from_name, "fromLine": from_line,
                           "to": target_file, "toName": target_name,
@@ -128,16 +147,34 @@ for rel in files:
         continue
     mods = []
     imported_names = {}
+    imported_modules = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            mods.extend(alias.name for alias in node.names)
+            for alias in node.names:
+                target_file = local_module_file(rel, alias.name, 0)
+                if target_file:
+                    imported_modules[alias.asname or alias.name.split(".")[0]] = target_file
+                    edges.append({"from": rel, "to": target_file})
+                else:
+                    mods.append(alias.name)
         elif isinstance(node, ast.ImportFrom):
             if node.module:
-                mods.append(node.module)
-            target_file = local_module_file(rel, node.module, node.level)
-            for alias in node.names:
-                if alias.name != "*" and target_file:
-                    imported_names[alias.asname or alias.name] = (alias.name, target_file)
+                target_file = local_module_file(rel, node.module, node.level)
+                if target_file:
+                    edges.append({"from": rel, "to": target_file})
+                elif not node.level:
+                    mods.append(node.module)
+                for alias in node.names:
+                    if alias.name != "*" and target_file:
+                        imported_names[alias.asname or alias.name] = (alias.name, target_file)
+            else:
+                for alias in node.names:
+                    if alias.name == "*":
+                        continue
+                    target_file = local_module_file(rel, alias.name, node.level)
+                    if target_file:
+                        imported_modules[alias.asname or alias.name] = target_file
+                        edges.append({"from": rel, "to": target_file})
     for mod in mods:
         spec = find_spec_no_import(mod)
         origin = getattr(spec, "origin", None) if spec else None
@@ -154,13 +191,11 @@ for rel in files:
     stack = []
     class Visitor(ast.NodeVisitor):
         def visit_FunctionDef(self, node):
-            if stack and node.args.args:
-                self_name = node.args.args[0].arg
             stack.append(node.name)
             seen = set()
             for arg in node.args.args + node.args.kwonlyargs:
-                add_types(rel, node.name, node.lineno, arg.annotation, seen, imported_names)
-            add_types(rel, node.name, node.lineno, node.returns, seen, imported_names)
+                add_types(rel, node.name, node.lineno, arg.annotation, seen, imported_names, imported_modules)
+            add_types(rel, node.name, node.lineno, node.returns, seen, imported_names, imported_modules)
             self.generic_visit(node)
             stack.pop()
         def visit_AsyncFunctionDef(self, node):
@@ -168,7 +203,7 @@ for rel in files:
         def visit_ClassDef(self, node):
             seen = set()
             for base in node.bases:
-                add_types(rel, node.name, node.lineno, base, seen, imported_names)
+                add_types(rel, node.name, node.lineno, base, seen, imported_names, imported_modules)
             stack.append(node.name)
             self.generic_visit(node)
             stack.pop()

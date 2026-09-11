@@ -19,7 +19,7 @@ var (
 	// constructor parameter property: "private readonly opts: Options"
 	tsCtorPropRe = regexp.MustCompile(`(?:public|private|protected)\s+(?:readonly\s+)?(\w+)\??\s*:\s*([A-Za-z_][\w.<>\[\]| ]*)`)
 	// x = new Type(...) / this.x = new pkg.Type(...)
-	tsNewAssignRe = regexp.MustCompile(`(?:this\.)?(\w+)\s*=\s*new\s+(?:\w+\.)?([A-Z]\w*)`)
+	tsNewAssignRe = regexp.MustCompile(`(?:this\.)?(\w+)\s*=\s*new\s+(?:\w+\.)*([A-Z]\w*)`)
 	// const x: Type = ... / let x: Type = ...
 	tsVarAnnRe = regexp.MustCompile(`(?:const|let|var)\s+(\w+)\s*:\s*([^=\n]+?)\s*=`)
 	// this.x = y (plain field assignment from a constructor parameter)
@@ -60,11 +60,16 @@ func tsBareType(ann string) string {
 	return ann
 }
 
-// tsBaseClasses parses base classes from "class X extends Y implements Z {".
+// tsBaseClasses parses nominal ancestors from class/interface declarations.
+// Despite the historical name, Java and PHP use this helper too. Implemented
+// interfaces participate because callers use this ancestry for inherited
+// members and dynamic-dispatch expansion, not only class inheritance.
 func tsBaseClasses(idx *edgeIndex, className, preferDir string) []string {
 	var chosen *core.SymbolRecord
-	for _, cand := range idx.byName[strings.ToLower(className)] {
-		if cand.Name != className || cand.Kind != core.KindClass {
+	for _, cand := range namedSymbols(idx, className) {
+		switch cand.Kind {
+		case core.KindClass, core.KindStruct, core.KindInterface, core.KindTrait:
+		default:
 			continue
 		}
 		if dirOf(cand.FilePath) == preferDir {
@@ -78,28 +83,223 @@ func tsBaseClasses(idx *edgeIndex, className, preferDir string) []string {
 	if chosen == nil {
 		return nil
 	}
-	// Strip the class's own generic parameter list before locating "extends":
+	// Strip the declaration's own generic parameter list before locating
+	// inheritance clauses:
 	// in `class X<Entity extends Base> extends Y` the CONSTRAINT's "extends"
 	// wins a plain Index search and the real base class is lost (typeorm's
 	// TreeRepository chain miss). The first top-level <...> group before any
 	// "extends"/"{" is the parameter list; the base's own generic arguments
 	// come after "extends" and are untouched (tsBareType strips them later).
 	sig := stripLeadingGenericParams(chosen.Signature)
-	i := strings.Index(sig, "extends ")
-	if i < 0 {
+	if chosen.Language == "cpp" {
+		bases := cppBaseClasses(sig)
+		if split := strings.LastIndex(chosen.QualifiedName, "::"); split >= 0 {
+			namespace := chosen.QualifiedName[:split]
+			for i, base := range bases {
+				if strings.Contains(base, "::") {
+					continue
+				}
+				candidate := namespace + "::" + base
+				if len(namedSymbols(idx, candidate)) > 0 {
+					bases[i] = candidate
+				}
+			}
+		}
+		return bases
+	}
+	if chosen.Language == "rust" {
+		return rustBaseClasses(chosen)
+	}
+	var out []string
+	out = append(out, inheritanceClauseTypes(sig, "extends", "implements")...)
+	out = append(out, inheritanceClauseTypes(sig, "implements")...)
+	return uniqueStrings(out)
+}
+
+func rustBaseClasses(chosen *core.SymbolRecord) []string {
+	if chosen.Kind == core.KindTrait {
+		if i := strings.IndexByte(chosen.Signature, ':'); i >= 0 {
+			rest := chosen.Signature[i+1:]
+			for _, stop := range []string{" where ", "{"} {
+				if j := strings.Index(rest, stop); j >= 0 {
+					rest = rest[:j]
+				}
+			}
+			var out []string
+			for _, part := range strings.Split(rest, "+") {
+				if typ := rustBareType(part); typ != "" {
+					out = append(out, typ)
+				}
+			}
+			return uniqueStrings(out)
+		}
 		return nil
 	}
-	rest := sig[i+len("extends "):]
-	for _, stop := range []string{" implements ", "{"} {
-		if j := strings.Index(rest, stop); j >= 0 {
-			rest = rest[:j]
+	var out []string
+	for _, match := range rustImplForRe.FindAllStringSubmatch(chosen.RawText, -1) {
+		if len(match) == 3 && rustBareType(match[2]) == chosen.Name {
+			if trait := rustBareType(match[1]); trait != "" {
+				out = append(out, trait)
+			}
 		}
 	}
-	base := tsBareType(rest)
-	if base == "" || strings.HasPrefix(base, "extern:") {
+	return uniqueStrings(out)
+}
+
+// inheritanceClauseTypes returns every top-level type in one extends or
+// implements clause. Commas inside generic arguments do not split the list.
+func inheritanceClauseTypes(sig, keyword string, stopKeywords ...string) []string {
+	start := inheritanceKeyword(sig, keyword)
+	if start < 0 {
 		return nil
 	}
-	return []string{base}
+	rest := sig[start+len(keyword):]
+	end := len(rest)
+	depth := 0
+	for i := 0; i < len(rest); i++ {
+		switch rest[i] {
+		case '<', '(', '[':
+			depth++
+		case '>', ')', ']':
+			if depth > 0 {
+				depth--
+			}
+		case '{':
+			if depth == 0 {
+				end = i
+				i = len(rest)
+			}
+		default:
+			if depth != 0 {
+				continue
+			}
+			for _, stop := range stopKeywords {
+				if wordAt(rest, i, stop) {
+					end = i
+					i = len(rest)
+					break
+				}
+			}
+		}
+	}
+	return nominalTypeList(rest[:end], false)
+}
+
+func inheritanceKeyword(sig, keyword string) int {
+	for i := 0; i+len(keyword) <= len(sig); i++ {
+		if wordAt(sig, i, keyword) {
+			return i
+		}
+	}
+	return -1
+}
+
+func wordAt(s string, i int, word string) bool {
+	if i < 0 || i+len(word) > len(s) || s[i:i+len(word)] != word {
+		return false
+	}
+	isIdent := func(b byte) bool {
+		return b == '_' || b >= '0' && b <= '9' || b >= 'A' && b <= 'Z' || b >= 'a' && b <= 'z'
+	}
+	return (i == 0 || !isIdent(s[i-1])) && (i+len(word) == len(s) || !isIdent(s[i+len(word)]))
+}
+
+func cppBaseClasses(sig string) []string {
+	depth := 0
+	for i := 0; i < len(sig); i++ {
+		switch sig[i] {
+		case '<', '(', '[':
+			depth++
+		case '>', ')', ']':
+			if depth > 0 {
+				depth--
+			}
+		case ':':
+			if depth != 0 || i+1 < len(sig) && sig[i+1] == ':' || i > 0 && sig[i-1] == ':' {
+				continue
+			}
+			rest := sig[i+1:]
+			if j := strings.IndexByte(rest, '{'); j >= 0 {
+				rest = rest[:j]
+			}
+			return nominalTypeList(rest, true)
+		}
+	}
+	return nil
+}
+
+func nominalTypeList(list string, cpp bool) []string {
+	var out []string
+	start, depth := 0, 0
+	for i := 0; i <= len(list); i++ {
+		if i < len(list) {
+			switch list[i] {
+			case '<', '(', '[':
+				depth++
+			case '>', ')', ']':
+				if depth > 0 {
+					depth--
+				}
+			}
+		}
+		if i < len(list) && (list[i] != ',' || depth != 0) {
+			continue
+		}
+		part := strings.TrimSpace(list[start:i])
+		start = i + 1
+		if cpp {
+			for {
+				trimmed := part
+				for _, prefix := range []string{"public ", "protected ", "private ", "virtual ", "class ", "struct "} {
+					trimmed = strings.TrimPrefix(trimmed, prefix)
+				}
+				trimmed = strings.TrimSpace(trimmed)
+				if trimmed == part {
+					break
+				}
+				part = trimmed
+			}
+		}
+		if j := strings.IndexByte(part, '<'); j >= 0 {
+			part = part[:j]
+		}
+		part = strings.TrimSpace(part)
+		if cpp {
+			typ := cFamilyBareType(part)
+			leaf := typ
+			if j := strings.LastIndex(leaf, "::"); j >= 0 {
+				leaf = leaf[j+2:]
+			}
+			if leaf != "" && leaf[0] >= 'A' && leaf[0] <= 'Z' {
+				out = append(out, typ)
+			}
+			continue
+		}
+		separators := []string{"\\", "."}
+		separators = append([]string{"::"}, separators...)
+		for _, sep := range separators {
+			if j := strings.LastIndex(part, sep); j >= 0 {
+				part = part[j+len(sep):]
+			}
+		}
+		if typ := tsBareType(part); typ != "" && !strings.HasPrefix(typ, "extern:") {
+			out = append(out, typ)
+		}
+	}
+	return uniqueStrings(out)
+}
+
+func uniqueStrings(in []string) []string {
+	seen := make(map[string]bool, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
 }
 
 // baseClassesFor dispatches base-class parsing per language.
@@ -107,7 +307,7 @@ func baseClassesFor(idx *edgeIndex, language, className, preferDir string) []str
 	switch language {
 	case "python":
 		return pyBaseClasses(idx, className, preferDir)
-	case "typescript", "tsx", "javascript", "java", "php":
+	case "typescript", "tsx", "javascript", "java", "php", "cpp", "rust":
 		return tsBaseClasses(idx, className, preferDir)
 	case "csharp":
 		return csBaseClasses(idx, className, preferDir)
@@ -516,7 +716,7 @@ func tsTypeOwnMember(idx *edgeIndex, typ, calleeName, preferFile string) []*core
 		if cand.Name != calleeName || cand.ParentSymbol != typ {
 			continue
 		}
-		if cand.Kind != core.KindMethod && cand.Kind != core.KindFunction {
+		if !graphCallableSymbol(cand) {
 			continue
 		}
 		if cand.FilePath == classFile {

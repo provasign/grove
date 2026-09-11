@@ -129,7 +129,13 @@ func rustModuleNames(content string) []string {
 	var mods []string
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
-		line = strings.TrimPrefix(line, "pub ")
+		if strings.HasPrefix(line, "pub(") {
+			if end := strings.IndexByte(line, ')'); end >= 0 {
+				line = strings.TrimSpace(line[end+1:])
+			}
+		} else {
+			line = strings.TrimPrefix(line, "pub ")
+		}
 		if !strings.HasPrefix(line, "mod ") || !strings.HasSuffix(line, ";") {
 			continue
 		}
@@ -224,7 +230,7 @@ type rustImplRef struct {
 	TypeName  string
 }
 
-var rustImplForPattern = regexp.MustCompile(`\bimpl(?:<[^>]+>)?\s+([A-Za-z_][A-Za-z0-9_:]*)\s+for\s+([A-Za-z_][A-Za-z0-9_:]*)`)
+var rustImplForPattern = regexp.MustCompile(`\bimpl(?:<[^>]+>)?\s+([A-Za-z_][A-Za-z0-9_:]*)(?:<[^{}]+>)?\s+for\s+([A-Za-z_][A-Za-z0-9_:]*)(?:<[^{}]+>)?`)
 
 func rustImplRefs(rawText string) []rustImplRef {
 	matches := rustImplForPattern.FindAllStringSubmatch(rawText, -1)
@@ -237,7 +243,7 @@ func rustImplRefs(rawText string) []rustImplRef {
 	return out
 }
 
-var rustSignatureTypePattern = regexp.MustCompile(`(?:->|:)\s*&?(?:mut\s+)?([A-Z][A-Za-z0-9_:]*)`)
+var rustSignatureTypePattern = regexp.MustCompile(`(?:->|:)\s*&?(?:'[A-Za-z_][A-Za-z0-9_]*\s+)?(?:mut\s+)?([A-Z][A-Za-z0-9_:]*)`)
 
 func rustSignatureTypes(text string) []string {
 	matches := rustSignatureTypePattern.FindAllStringSubmatch(text, -1)

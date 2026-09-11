@@ -65,6 +65,42 @@ func TestInterfaceSatisfaction_MethodSetInclusion(t *testing.T) {
 	}
 }
 
+func TestInterfaceSatisfaction_DoesNotRequireDirectImport(t *testing.T) {
+	iface := core.SymbolRecord{
+		ID: "contracts/runner.go::Runner@1", FilePath: "contracts/runner.go", BlobSHA: "1",
+		Language: "go", Kind: core.KindInterface, Name: "Runner", QualifiedName: "Runner",
+		RawText: "type Runner interface { Run() }",
+	}
+	typ := core.SymbolRecord{
+		ID: "workers/task.go::Task@1", FilePath: "workers/task.go", BlobSHA: "1",
+		Language: "go", Kind: core.KindStruct, Name: "Task", QualifiedName: "Task",
+	}
+	method := core.SymbolRecord{
+		ID: "workers/task.go::Task.Run@5", FilePath: "workers/task.go", BlobSHA: "1",
+		Language: "go", Kind: core.KindMethod, Name: "Run", QualifiedName: "Task.Run", ParentSymbol: "Task",
+	}
+	edges := BuildEdges([]core.SymbolRecord{iface, typ, method})
+	found := false
+	for _, edge := range edges {
+		found = found || edge.From == typ.ID && edge.To == iface.ID && edge.Type == core.EdgeImplements
+	}
+	if !found {
+		t.Fatal("structural Go satisfaction incorrectly required a direct import")
+	}
+}
+
+func TestCppInterfaceSatisfactionIsNominal(t *testing.T) {
+	iface := core.SymbolRecord{ID: "Closer", FilePath: "close.hpp", Language: "cpp", Kind: core.KindInterface, Name: "Closer"}
+	typ := core.SymbolRecord{ID: "Accidental", FilePath: "other.hpp", Language: "cpp", Kind: core.KindClass, Name: "Accidental"}
+	method := core.SymbolRecord{ID: "Accidental.close", FilePath: "other.hpp", Language: "cpp", Kind: core.KindMethod, Name: "close", ParentSymbol: "Accidental"}
+	ifaceMethod := core.SymbolRecord{ID: "Closer.close", FilePath: "close.hpp", Language: "cpp", Kind: core.KindMethod, Name: "close", ParentSymbol: "Closer"}
+	for _, edge := range BuildEdges([]core.SymbolRecord{iface, typ, method, ifaceMethod}) {
+		if edge.Type == core.EdgeImplements || edge.Type == core.EdgeOverrides {
+			t.Fatalf("unrelated C++ method synthesized structural interface edge: %+v", edge)
+		}
+	}
+}
+
 func TestBuildCalls_CappedFanoutRescuedAsDispatch(t *testing.T) {
 	// More same-named cross-file methods than maxCalleeFanout: the plain
 	// resolver drops them all. With an in-scope interface declaring the

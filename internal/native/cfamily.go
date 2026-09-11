@@ -223,13 +223,13 @@ func cFamilySemanticEdges(symbols []core.SymbolRecord, includeTargets map[string
 				if target.ID == caller.ID {
 					continue
 				}
-				if typeKind(target.Kind) && cFamilyContainsType(caller.RawText, target, file != caller.FilePath) {
+				if typeKind(target.Kind) && cFamilyContainsType(caller, target, file != caller.FilePath) {
 					add(symbolEdge(caller, target, core.EdgeUsesType, 0.91))
 				}
 			}
 		}
 		for _, typeName := range cFamilyConstructedTypes(caller.RawText) {
-			if target, ok := cFamilyBestType(idx, typeName, caller.FilePath); ok && target.ID != caller.ID {
+			if target, ok := cFamilyBestType(idx, typeName, caller); ok && target.ID != caller.ID {
 				add(symbolEdge(caller, target, core.EdgeUsesType, 0.93))
 			}
 		}
@@ -262,17 +262,74 @@ func cFamilyContainsCallable(rawText string, target core.SymbolRecord, crossFile
 	return containsCall(rawText, target.Name)
 }
 
-func cFamilyContainsType(rawText string, target core.SymbolRecord, crossFile bool) bool {
+func cFamilyContainsType(caller, target core.SymbolRecord, crossFile bool) bool {
+	clean := stripCStyleComments(stripQuotedText(caller.RawText))
+	if strings.Contains(target.QualifiedName, "::") {
+		pattern := regexp.MustCompile(`\b` + regexp.QuoteMeta(target.QualifiedName) + `\b`)
+		if pattern.MatchString(clean) {
+			return true
+		}
+		callerScope := caller.QualifiedName
+		if strings.Contains(caller.ParentSymbol, "::") {
+			callerScope = caller.ParentSymbol
+		}
+		if split := strings.LastIndex(callerScope, "::"); split >= 0 &&
+			target.QualifiedName == callerScope[:split]+"::"+target.Name {
+			return containsTypeToken(clean, target.Name)
+		}
+		for _, annotation := range caller.Annotations {
+			if namespace, ok := core.ParseCppUsingNamespace(annotation); ok && target.QualifiedName == namespace+"::"+target.Name {
+				return containsTypeToken(clean, target.Name)
+			}
+			if local, qualified, ok := core.ParseCppUsingType(annotation); ok && qualified == target.QualifiedName {
+				return containsTypeToken(clean, local)
+			}
+			if local, namespace, ok := core.ParseCppNamespaceAlias(annotation); ok && strings.HasPrefix(target.QualifiedName, namespace+"::") {
+				aliased := local + strings.TrimPrefix(target.QualifiedName, namespace)
+				return containsTypeToken(clean, aliased)
+			}
+		}
+		return false
+	}
 	if !crossFile {
-		return containsTypeToken(rawText, target.Name)
+		return containsTypeToken(clean, target.Name)
 	}
 	if target.ParentSymbol != "" {
 		pattern := regexp.MustCompile(`\b` + regexp.QuoteMeta(target.ParentSymbol) + `::` + regexp.QuoteMeta(target.Name) + `\b`)
-		if pattern.MatchString(stripQuotedText(rawText)) {
+		if pattern.MatchString(clean) {
 			return true
 		}
 	}
-	return containsTypeToken(rawText, target.Name)
+	return containsTypeToken(clean, target.Name)
+}
+
+func stripCStyleComments(text string) string {
+	var out strings.Builder
+	out.Grow(len(text))
+	for i := 0; i < len(text); {
+		if i+1 < len(text) && text[i] == '/' && text[i+1] == '/' {
+			for i < len(text) && text[i] != '\n' {
+				i++
+			}
+			continue
+		}
+		if i+1 < len(text) && text[i] == '/' && text[i+1] == '*' {
+			i += 2
+			for i+1 < len(text) && !(text[i] == '*' && text[i+1] == '/') {
+				if text[i] == '\n' {
+					out.WriteByte('\n')
+				}
+				i++
+			}
+			if i+1 < len(text) {
+				i += 2
+			}
+			continue
+		}
+		out.WriteByte(text[i])
+		i++
+	}
+	return out.String()
 }
 
 type cFamilyQualifiedCall struct {
@@ -293,7 +350,7 @@ func cFamilyQualifiedCalls(rawText string) []cFamilyQualifiedCall {
 	return out
 }
 
-var cFamilyConstructorPattern = regexp.MustCompile(`\b(?:new\s+)?([A-Z_][A-Za-z0-9_]*)\s*\(`)
+var cFamilyConstructorPattern = regexp.MustCompile(`\b(?:new\s+)?([A-Z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*)\s*\(`)
 
 func cFamilyConstructedTypes(rawText string) []string {
 	matches := cFamilyConstructorPattern.FindAllStringSubmatch(stripQuotedText(rawText), -1)
@@ -312,17 +369,72 @@ func cFamilyConstructedTypes(rawText string) []string {
 	return out
 }
 
-func cFamilyBestType(idx cFamilyIndex, name, fromFile string) (core.SymbolRecord, bool) {
-	candidates := idx.typesByName[name]
+func cFamilyBestType(idx cFamilyIndex, name string, caller core.SymbolRecord) (core.SymbolRecord, bool) {
+	for _, annotation := range caller.Annotations {
+		if local, target, ok := core.ParseCppUsingType(annotation); ok && local == name {
+			name = target
+			break
+		}
+		if local, target, ok := core.ParseCppNamespaceAlias(annotation); ok && strings.HasPrefix(name, local+"::") {
+			name = target + strings.TrimPrefix(name, local)
+			break
+		}
+	}
+	simple := name
+	if i := strings.LastIndex(name, "::"); i >= 0 {
+		simple = name[i+2:]
+	}
+	candidates := idx.typesByName[simple]
 	if len(candidates) == 0 {
 		return core.SymbolRecord{}, false
 	}
+	if simple != name {
+		for _, candidate := range candidates {
+			if candidate.QualifiedName == name {
+				return candidate, true
+			}
+		}
+		return core.SymbolRecord{}, false
+	}
+	callerScope := caller.QualifiedName
+	if strings.Contains(caller.ParentSymbol, "::") {
+		callerScope = caller.ParentSymbol
+	}
+	if split := strings.LastIndex(callerScope, "::"); split >= 0 {
+		qualified := callerScope[:split] + "::" + simple
+		for _, candidate := range candidates {
+			if candidate.QualifiedName == qualified {
+				return candidate, true
+			}
+		}
+	}
+	var imported *core.SymbolRecord
+	for _, annotation := range caller.Annotations {
+		namespace, ok := core.ParseCppUsingNamespace(annotation)
+		if !ok {
+			continue
+		}
+		qualified := namespace + "::" + simple
+		for i := range candidates {
+			if candidates[i].QualifiedName != qualified {
+				continue
+			}
+			if imported != nil && imported.ID != candidates[i].ID {
+				return core.SymbolRecord{}, false
+			}
+			candidate := candidates[i]
+			imported = &candidate
+		}
+	}
+	if imported != nil {
+		return *imported, true
+	}
 	for _, candidate := range candidates {
-		if candidate.FilePath == fromFile {
+		if candidate.FilePath == caller.FilePath {
 			return candidate, true
 		}
 	}
-	fromDir := packageDir(fromFile)
+	fromDir := packageDir(caller.FilePath)
 	for _, candidate := range candidates {
 		if packageDir(candidate.FilePath) == fromDir {
 			return candidate, true

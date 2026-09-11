@@ -144,31 +144,28 @@ func javaInheritanceRefs(text string) []javaInheritanceRef {
 	// qualifier ("SettableBeanProperty.Delegating") to scope resolution to
 	// the right nested type — stripping it here re-created the bare-name
 	// fan-out the scoping exists to prevent.
-	for _, name := range javaMatchNameList(`\bextends\s+([A-Za-z_][A-Za-z0-9_.]*)`, text) {
+	tail := javaDeclarationTail(text)
+	for _, name := range inheritanceClause(tail, "extends", "implements") {
 		refs = append(refs, javaInheritanceRef{Name: name, EdgeType: core.EdgeExtends})
 	}
-	for _, name := range javaMatchNameList(`\bimplements\s+([A-Za-z_][A-Za-z0-9_.]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_.]*)*)`, text) {
+	for _, name := range inheritanceClause(tail, "implements") {
 		refs = append(refs, javaInheritanceRef{Name: name, EdgeType: core.EdgeImplements})
 	}
 	return refs
 }
 
-func javaMatchNameList(pattern, text string) []string {
-	re := regexp.MustCompile(pattern)
-	matches := re.FindAllStringSubmatch(text, -1)
-	var out []string
-	for _, match := range matches {
-		if len(match) != 2 {
-			continue
-		}
-		for _, part := range strings.Split(match[1], ",") {
-			part = strings.TrimSpace(part)
-			if part != "" {
-				out = append(out, part)
-			}
-		}
+var javaDeclarationHead = regexp.MustCompile(`\b(?:class|interface|enum|record)\s+[A-Za-z_][A-Za-z0-9_]*`)
+
+func javaDeclarationTail(text string) string {
+	loc := javaDeclarationHead.FindStringIndex(text)
+	if loc == nil {
+		return ""
 	}
-	return out
+	tail := strings.TrimLeft(text[loc[1]:], " \t\r\n")
+	if n := balancedSuffixEnd(tail, '<', '>'); n > 0 {
+		tail = strings.TrimLeft(tail[n:], " \t\r\n")
+	}
+	return tail
 }
 
 type javaQualifiedCall struct {
@@ -189,7 +186,7 @@ func javaQualifiedCalls(rawText string) []javaQualifiedCall {
 	return out
 }
 
-var javaNewPattern = regexp.MustCompile(`\bnew\s+([A-Za-z_][A-Za-z0-9_.]*)\s*\(`)
+var javaNewPattern = regexp.MustCompile(`\bnew\s+([A-Za-z_][A-Za-z0-9_.]*)(?:\s*<[^;(){}]*>)?\s*\(`)
 
 func javaConstructedTypes(rawText string) []string {
 	matches := javaNewPattern.FindAllStringSubmatch(stripQuotedText(rawText), -1)

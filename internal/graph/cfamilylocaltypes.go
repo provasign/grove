@@ -17,12 +17,18 @@ var (
 	// Foo x = new Foo(  /  auto x = new Foo(
 	cppNewLocalRe = regexp.MustCompile(`(?m)\b(?:auto|[A-Za-z_][\w:]*\s*[*&]?)\s+(\w+)\s*=\s*new\s+([A-Za-z_][\w:]*)`)
 	// Type var;  /  Type *var;  (class-like Type, uppercase or struct-tagged)
-	cppLocalDeclRe = regexp.MustCompile(`(?m)(?:^|[;{}]\s*)\s*(?:const\s+)?(?:struct\s+|class\s+)?([A-Za-z_][\w:]*)\s*[*&]?\s+(\w+)\s*[;=]`)
+	cppLocalDeclRe = regexp.MustCompile(`(?m)(?:^|[;{}]\s*)\s*(?:const\s+)?(?:struct\s+|class\s+)?([A-Za-z_][\w:]*(?:<[^;={}()]+>)?)\s*[*&]?\s+(\w+)\s*[;=]`)
 )
 
 // cFamilyLocalTypes infers identifier → bare class name for one C/C++ callable.
 func cFamilyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 	out := map[string]string{}
+	record := func(name, typ string) {
+		if name == "" || typ == "" {
+			return
+		}
+		out[name] = cFamilyTypeInContext(idx, symbol, typ)
+	}
 
 	// Fields of the enclosing class and its bases (C++).
 	if symbol.ParentSymbol != "" {
@@ -35,8 +41,8 @@ func cFamilyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]str
 					continue
 				}
 				seen[className] = true
-				for _, cls := range idx.byName[strings.ToLower(className)] {
-					if cls.Name != className || cls.RawText == "" {
+				for _, cls := range namedSymbols(idx, className) {
+					if cls.RawText == "" {
 						continue
 					}
 					switch cls.Kind {
@@ -51,7 +57,7 @@ func cFamilyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]str
 					for _, m := range cppLocalDeclRe.FindAllStringSubmatch(body, -1) {
 						if t := cFamilyBareType(m[1]); t != "" {
 							if _, exists := out[m[2]]; !exists {
-								out[m[2]] = t
+								record(m[2], t)
 							}
 						}
 					}
@@ -65,7 +71,7 @@ func cFamilyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]str
 
 	// Parameters.
 	for name, typ := range cFamilyParamTypes(symbol.Signature, symbol.RawText) {
-		out[name] = typ
+		record(name, typ)
 	}
 
 	// Body locals (highest precedence): new-expressions.
@@ -73,12 +79,64 @@ func cFamilyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]str
 		body := stripCommentsAndStrings(symbol.RawText)
 		for _, m := range cppNewLocalRe.FindAllStringSubmatch(body, -1) {
 			if t := cFamilyBareType(m[2]); t != "" {
-				out[m[1]] = t
+				record(m[1], t)
 			}
 		}
 	}
 	delete(out, "this")
 	return out
+}
+
+func cFamilyTypeInContext(idx *edgeIndex, symbol *core.SymbolRecord, typ string) string {
+	if typ == "" {
+		return typ
+	}
+	if split := strings.Index(typ, "::"); split >= 0 {
+		prefix := typ[:split]
+		for _, annotation := range symbol.Annotations {
+			if local, target, ok := core.ParseCppNamespaceAlias(annotation); ok && local == prefix {
+				candidate := target + typ[split:]
+				if len(namedSymbols(idx, candidate)) > 0 {
+					return candidate
+				}
+			}
+		}
+		return typ
+	}
+	qualified := symbol.QualifiedName
+	if strings.Contains(symbol.ParentSymbol, "::") {
+		qualified = symbol.ParentSymbol
+	}
+	if split := strings.LastIndex(qualified, "::"); split >= 0 {
+		candidate := qualified[:split] + "::" + typ
+		if len(namedSymbols(idx, candidate)) > 0 {
+			return candidate
+		}
+	}
+	for _, annotation := range symbol.Annotations {
+		if local, target, ok := core.ParseCppUsingType(annotation); ok && local == typ && len(namedSymbols(idx, target)) > 0 {
+			return target
+		}
+	}
+	matched := ""
+	for _, annotation := range symbol.Annotations {
+		namespace, ok := core.ParseCppUsingNamespace(annotation)
+		if !ok {
+			continue
+		}
+		candidate := namespace + "::" + typ
+		if len(namedSymbols(idx, candidate)) == 0 {
+			continue
+		}
+		if matched != "" && matched != candidate {
+			return typ
+		}
+		matched = candidate
+	}
+	if matched != "" {
+		return matched
+	}
+	return typ
 }
 
 // cFamilyParamTypes parses "(const Foo& a, Bar* b)" into {a: Foo, b: Bar}.
@@ -150,10 +208,22 @@ func cFamilyBareType(t string) string {
 	t = strings.TrimPrefix(t, "class ")
 	t = strings.TrimRight(t, "*& \t")
 	if i := strings.IndexByte(t, '<'); i >= 0 {
-		t = t[:i]
-	}
-	if i := strings.LastIndex(t, "::"); i >= 0 {
-		t = t[i+2:]
+		outer := strings.TrimSpace(t[:i])
+		inner := ""
+		if strings.HasSuffix(t, ">") {
+			inner = strings.TrimSpace(t[i+1 : len(t)-1])
+		}
+		leaf := outer
+		if j := strings.LastIndex(leaf, "::"); j >= 0 {
+			leaf = leaf[j+2:]
+		}
+		switch leaf {
+		case "shared_ptr", "unique_ptr", "weak_ptr", "intrusive_ptr":
+			if !strings.Contains(inner, ",") {
+				return cFamilyBareType(inner)
+			}
+		}
+		t = outer
 	}
 	if t == "" {
 		return ""
@@ -164,10 +234,15 @@ func cFamilyBareType(t string) string {
 		"int32_t", "int64_t", "uint8_t", "uint16_t", "uint32_t", "uint64_t":
 		return ""
 	}
-	for i := 0; i < len(t); i++ {
-		c := t[i]
-		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_') {
+	for _, segment := range strings.Split(t, "::") {
+		if segment == "" {
 			return ""
+		}
+		for i := 0; i < len(segment); i++ {
+			c := segment[i]
+			if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_') {
+				return ""
+			}
 		}
 	}
 	return t

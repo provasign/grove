@@ -96,10 +96,23 @@ const input = new Set(inputFiles.map(f => path.resolve(root, f)));
 const edges = [];
 const calls = [];
 const types = [];
+const edgeKeys = new Set();
 function rel(abs) { return path.relative(root, path.resolve(abs)).split(path.sep).join('/'); }
+function addModuleEdge(spec, abs, from) {
+  if (!spec) return;
+  const resolved = ts.resolveModuleName(spec, abs, parsed.options, host).resolvedModule;
+  if (!resolved || !resolved.resolvedFileName) return;
+  const targetRel = rel(resolved.resolvedFileName);
+  if (targetRel.startsWith('..') || path.isAbsolute(targetRel)) return;
+  const key = from + '\0' + targetRel;
+  if (!edgeKeys.has(key)) {
+    edgeKeys.add(key);
+    edges.push({from, to: targetRel});
+  }
+}
 function declInfo(sym) {
   if (!sym || !sym.declarations || !sym.declarations.length) return undefined;
-  const decl = sym.declarations[0];
+	const decl = sym.declarations.find(d => d.body) || sym.valueDeclaration || sym.declarations[0];
   const sf = decl.getSourceFile();
   const name = sym.getName && sym.getName();
   if (!sf || !name || name === '__function') return undefined;
@@ -120,6 +133,12 @@ function currentName(sf, stack) {
   return undefined;
 }
 function visit(sf, node, stack) {
+	if (ts.isCallExpression(node) && node.arguments.length > 0 && ts.isStringLiteralLike(node.arguments[0])) {
+	  const expr = node.expression;
+	  if ((ts.isIdentifier(expr) && expr.text === 'require') || expr.kind === ts.SyntaxKind.ImportKeyword) {
+	    addModuleEdge(node.arguments[0].text, sf.fileName, rel(sf.fileName));
+	  }
+	}
   const enclosing = currentName(sf, stack);
   const fromName = enclosing && enclosing.name;
   const fromLine = enclosing && enclosing.line;
@@ -149,12 +168,7 @@ for (const relPath of inputFiles) {
     } else if (ts.isImportEqualsDeclaration(stmt) && ts.isExternalModuleReference(stmt.moduleReference)) {
       spec = stmt.moduleReference.expression && stmt.moduleReference.expression.text;
     }
-    if (!spec) continue;
-    const resolved = ts.resolveModuleName(spec, abs, parsed.options, host).resolvedModule;
-    if (!resolved || !resolved.resolvedFileName) continue;
-    const targetRel = rel(resolved.resolvedFileName);
-    if (targetRel.startsWith('..') || path.isAbsolute(targetRel)) continue;
-    edges.push({from: relPath, to: targetRel});
+	if (spec) addModuleEdge(spec, abs, relPath);
   }
 }
 for (const sf of program.getSourceFiles()) {
@@ -172,8 +186,12 @@ console.log(JSON.stringify({files: parsed.fileNames.length, config: cfg, edges, 
 		cmd.Dir = neutralNodeCWD()
 	}
 	cmd.Env = appendEnv("GROVE_FILES="+string(filesJSON), "GROVE_ROOT="+req.Root)
-	out, err := cmd.Output()
+	out, err := cmd.CombinedOutput()
 	if err != nil {
+		detail := strings.TrimSpace(string(out))
+		if detail != "" {
+			return Result{Diagnostics: []string{"typescript language service bootstrap failed: " + err.Error() + ": " + detail}}
+		}
 		return Result{Diagnostics: []string{"typescript language service bootstrap failed: " + err.Error()}}
 	}
 	var payload struct {

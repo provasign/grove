@@ -74,6 +74,61 @@ func TestRustImplForTrait(t *testing.T) {
 	}
 }
 
+func TestRustGenericTraitImplDispatchAndSupertraitDefault(t *testing.T) {
+	g := New()
+	g.Replace([]core.SymbolRecord{
+		{ID: "lib.rs::Sink@1", FilePath: "lib.rs", BlobSHA: "1", Language: "rust", Kind: core.KindTrait, Name: "Sink", QualifiedName: "Sink", Signature: "trait Sink"},
+		{ID: "lib.rs::Sink.flush@2", FilePath: "lib.rs", BlobSHA: "1", Language: "rust", Kind: core.KindMethod, Name: "flush", QualifiedName: "Sink.flush", ParentSymbol: "Sink"},
+		{ID: "lib.rs::Matcher@3", FilePath: "lib.rs", BlobSHA: "1", Language: "rust", Kind: core.KindTrait, Name: "Matcher", QualifiedName: "Matcher", Signature: "trait Matcher: Sink"},
+		{ID: "lib.rs::Matcher.matches@4", FilePath: "lib.rs", BlobSHA: "1", Language: "rust", Kind: core.KindMethod, Name: "matches", QualifiedName: "Matcher.matches", ParentSymbol: "Matcher"},
+		{ID: "lib.rs::Concrete@5", FilePath: "lib.rs", BlobSHA: "1", Language: "rust", Kind: core.KindStruct, Name: "Concrete", QualifiedName: "Concrete", RawText: "struct Concrete;\nimpl Matcher<Result<u8>> for Concrete {}"},
+		{ID: "lib.rs::Concrete.matches@6", FilePath: "lib.rs", BlobSHA: "1", Language: "rust", Kind: core.KindMethod, Name: "matches", QualifiedName: "Concrete.matches", ParentSymbol: "Concrete"},
+		{ID: "lib.rs::Concrete.run@7", FilePath: "lib.rs", BlobSHA: "1", Language: "rust", Kind: core.KindMethod, Name: "run", QualifiedName: "Concrete.run", ParentSymbol: "Concrete", Annotations: []string{"impl_trait:Matcher"}, RawText: "fn run(&self) { self.flush(); }", CallSites: []core.CallSite{{Callee: "self.flush", Line: 1}}},
+		{ID: "lib.rs::drive@8", FilePath: "lib.rs", BlobSHA: "1", Language: "rust", Kind: core.KindFunction, Name: "drive", QualifiedName: "drive", Signature: "fn drive(m: &dyn Matcher)", RawText: "fn drive(m: &dyn Matcher) { m.matches(); }", CallSites: []core.CallSite{{Callee: "m.matches", Line: 1}}},
+	}, 1)
+	if !hasEdge(g, core.EdgeImplements, "lib.rs::Concrete@5", "lib.rs::Matcher@3") {
+		t.Fatal("missing generic trait implementation edge")
+	}
+	if !hasEdge(g, core.EdgeExtends, "lib.rs::Matcher@3", "lib.rs::Sink@1") {
+		t.Fatal("missing supertrait inheritance edge")
+	}
+	if !hasEdge(g, core.EdgeCalls, "lib.rs::drive@8", "lib.rs::Concrete.matches@6") {
+		t.Fatal("missing trait-object dispatch to concrete override")
+	}
+	if !hasEdge(g, core.EdgeCalls, "lib.rs::Concrete.run@7", "lib.rs::Sink.flush@2") {
+		t.Fatal("missing default-method resolution through supertrait")
+	}
+}
+
+func TestPHPParentAndStaticCallsResolveNominally(t *testing.T) {
+	g := New()
+	g.Replace([]core.SymbolRecord{
+		{ID: "base.php::Base@1", FilePath: "base.php", BlobSHA: "1", Language: "php", Kind: core.KindClass, Name: "Base", QualifiedName: "Base", Signature: "class Base"},
+		{ID: "base.php::Base.work@2", FilePath: "base.php", BlobSHA: "1", Language: "php", Kind: core.KindMethod, Name: "work", QualifiedName: "Base.work", ParentSymbol: "Base"},
+		{ID: "child.php::Child@1", FilePath: "child.php", BlobSHA: "1", Language: "php", Kind: core.KindClass, Name: "Child", QualifiedName: "Child", Signature: "class Child extends Base"},
+		{ID: "child.php::Child.work@2", FilePath: "child.php", BlobSHA: "1", Language: "php", Kind: core.KindMethod, Name: "work", QualifiedName: "Child.work", ParentSymbol: "Child"},
+		{ID: "child.php::Child.run@3", FilePath: "child.php", BlobSHA: "1", Language: "php", Kind: core.KindMethod, Name: "run", QualifiedName: "Child.run", ParentSymbol: "Child", RawText: "function run() { parent::work(); static::work(); }", CallSites: []core.CallSite{{Callee: "parent.work", Line: 1}, {Callee: "static.work", Line: 1}}},
+	}, 1)
+	if !hasEdge(g, core.EdgeCalls, "child.php::Child.run@3", "base.php::Base.work@2") {
+		t.Fatal("parent:: call did not resolve to base method")
+	}
+	if !hasEdge(g, core.EdgeCalls, "child.php::Child.run@3", "child.php::Child.work@2") {
+		t.Fatal("static:: call did not resolve to current class")
+	}
+}
+
+func TestTypeScriptArrowFieldIsCallable(t *testing.T) {
+	g := New()
+	g.Replace([]core.SymbolRecord{
+		{ID: "widget.ts::Widget@1", FilePath: "widget.ts", BlobSHA: "1", Language: "typescript", Kind: core.KindClass, Name: "Widget", QualifiedName: "Widget", Signature: "class Widget"},
+		{ID: "widget.ts::Widget.handle@2", FilePath: "widget.ts", BlobSHA: "1", Language: "typescript", Kind: core.KindField, Name: "handle", QualifiedName: "Widget.handle", ParentSymbol: "Widget", Signature: "handle = () => 1", RawText: "handle = () => 1"},
+		{ID: "widget.ts::Widget.run@3", FilePath: "widget.ts", BlobSHA: "1", Language: "typescript", Kind: core.KindMethod, Name: "run", QualifiedName: "Widget.run", ParentSymbol: "Widget", RawText: "run() { return this.handle() }", CallSites: []core.CallSite{{Callee: "this.handle", Line: 1}}},
+	}, 1)
+	if !hasEdge(g, core.EdgeCalls, "widget.ts::Widget.run@3", "widget.ts::Widget.handle@2") {
+		t.Fatal("call to function-valued class field was dropped")
+	}
+}
+
 func TestGoStructEmbedding(t *testing.T) {
 	g := New()
 	g.Replace([]core.SymbolRecord{
@@ -465,6 +520,7 @@ func itoa(i int) string {
 	}
 	return string(out)
 }
+
 // @property method blueprints, and never to a plain (non-property) method.
 func TestBuildCalls_PropertyReadEdges(t *testing.T) {
 	caller := core.SymbolRecord{

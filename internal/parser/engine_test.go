@@ -257,6 +257,68 @@ func TestParseTreeValidatesSupportedLanguage(t *testing.T) {
 	}
 }
 
+func TestTypeScriptArrowClassFieldIsPreservedAsCallableField(t *testing.T) {
+	symbols, err := extractSymbolsFromString("typescript", "widget.ts", `class Widget {
+  handleClick = () => 1
+  run() { return this.handleClick() }
+}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, symbol := range symbols {
+		if symbol.Name == "handleClick" {
+			if symbol.Kind != core.KindField || !strings.Contains(symbol.RawText, "=>") {
+				t.Fatalf("arrow field metadata: %#v", symbol)
+			}
+			return
+		}
+	}
+	t.Fatalf("arrow field not extracted: %#v", symbols)
+}
+
+func TestCppNamespaceMetadataQualifiesTypesAndMethods(t *testing.T) {
+	symbols, err := extractSymbolsFromString("cpp", "handles.cpp", `namespace net {
+class Handle { public: void close(); };
+void Handle::close() {}
+}
+namespace fs {
+class Handle { public: void close(); };
+void Handle::close() {}
+}
+using namespace net;
+namespace network = net;
+using fs::Handle;`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := map[string]bool{}
+	for _, symbol := range symbols {
+		if symbol.Kind == core.KindClass || symbol.Kind == core.KindMethod {
+			found[symbol.QualifiedName] = true
+		}
+	}
+	for _, want := range []string{"net::Handle", "net::Handle::close", "fs::Handle", "fs::Handle::close"} {
+		if !found[want] {
+			t.Fatalf("missing %s in namespace metadata: %#v", want, symbols)
+		}
+	}
+	wantAnnotations := map[string]bool{
+		core.CppUsingNamespace("net"):             false,
+		core.CppNamespaceAlias("network", "net"):  false,
+		core.CppUsingType("Handle", "fs::Handle"): false,
+	}
+	for _, annotation := range symbols[0].Annotations {
+		if _, ok := wantAnnotations[annotation]; ok {
+			wantAnnotations[annotation] = true
+		}
+	}
+	for annotation, found := range wantAnnotations {
+		if !found {
+			t.Fatalf("missing C++ namespace binding %q: %#v", annotation, symbols[0].Annotations)
+		}
+	}
+}
+
 // TestGoTypeAndConstExtraction verifies that Tree-sitter correctly extracts
 // type aliases, struct types, and grouped const blocks — cases that the old
 // regex extractor missed (it skipped them when they followed a var declaration

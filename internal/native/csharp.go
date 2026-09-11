@@ -164,7 +164,15 @@ func csharpSemanticEdges(symbols []core.SymbolRecord) []core.Edge {
 		if typeKind(symbol.Kind) {
 			for _, ref := range csharpInheritanceRefs(symbol.Signature+"\n"+firstLine(symbol.RawText), symbol.Kind) {
 				if target, ok := csharpBestType(idx, ref.Name, symbol.FilePath); ok && target.ID != symbol.ID {
-					add(symbolEdge(symbol, target, ref.EdgeType, 0.96))
+					edgeType := ref.EdgeType
+					if symbol.Kind != core.KindInterface {
+						if target.Kind == core.KindInterface {
+							edgeType = core.EdgeImplements
+						} else {
+							edgeType = core.EdgeExtends
+						}
+					}
+					add(symbolEdge(symbol, target, edgeType, 0.96))
 				}
 			}
 		}
@@ -214,20 +222,17 @@ type csharpInheritanceRef struct {
 // resolved to nothing — so C# extends/implements resolution emitted zero
 // edges on real code. `{` is also excluded so a same-line body brace can't
 // leak in.
-var csharpDeclInheritancePattern = regexp.MustCompile(`\b(?:class|record|struct|interface)\s+[A-Za-z_][A-Za-z0-9_]*(?:<[^>{}]+>)?[ \t]*:[ \t]*([A-Za-z_][A-Za-z0-9_.,<> \t]*)`)
+var csharpDeclHeadPattern = regexp.MustCompile(`\b(?:class|struct|interface|record(?:\s+(?:class|struct))?)\s+[A-Za-z_][A-Za-z0-9_]*`)
 
 func csharpInheritanceRefs(text string, kind core.SymbolKind) []csharpInheritanceRef {
-	match := csharpDeclInheritancePattern.FindStringSubmatch(text)
-	if len(match) != 2 {
+	baseList := csharpBaseList(text)
+	if baseList == "" {
 		return nil
 	}
-	names := splitCSharpTypeList(match[1])
+	names := splitNominalTypeList(baseList)
 	refs := make([]csharpInheritanceRef, 0, len(names))
-	for i, name := range names {
+	for _, name := range names {
 		edgeType := core.EdgeImplements
-		if kind == core.KindClass && i == 0 && !strings.HasPrefix(name, "I") {
-			edgeType = core.EdgeExtends
-		}
 		if kind == core.KindInterface {
 			edgeType = core.EdgeExtends
 		}
@@ -236,22 +241,46 @@ func csharpInheritanceRefs(text string, kind core.SymbolKind) []csharpInheritanc
 	return refs
 }
 
-func splitCSharpTypeList(text string) []string {
-	parts := strings.Split(text, ",")
-	out := make([]string, 0, len(parts))
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if i := strings.IndexByte(part, '<'); i >= 0 {
-			part = strings.TrimSpace(part[:i])
-		}
-		if part != "" {
-			out = append(out, part)
+func csharpBaseList(text string) string {
+	loc := csharpDeclHeadPattern.FindStringIndex(text)
+	if loc == nil {
+		return ""
+	}
+	tail := strings.TrimLeft(text[loc[1]:], " \t")
+	for _, pair := range [][2]byte{{'<', '>'}, {'(', ')'}} {
+		if n := balancedSuffixEnd(tail, pair[0], pair[1]); n > 0 {
+			tail = strings.TrimLeft(tail[n:], " \t")
 		}
 	}
-	return out
+	if !strings.HasPrefix(tail, ":") {
+		return ""
+	}
+	tail = strings.TrimLeft(tail[1:], " \t")
+	end, depth := len(tail), 0
+	for i := 0; i < len(tail); i++ {
+		switch tail[i] {
+		case '<', '(', '[':
+			depth++
+		case '>', ')', ']':
+			if depth > 0 {
+				depth--
+			}
+		case '{', '\n', '\r':
+			if depth == 0 {
+				end = i
+				i = len(tail)
+			}
+		default:
+			if depth == 0 && strings.HasPrefix(tail[i:], " where ") {
+				end = i
+				i = len(tail)
+			}
+		}
+	}
+	return strings.TrimSpace(tail[:end])
 }
 
-var csharpNewPattern = regexp.MustCompile(`\bnew\s+([A-Za-z_][A-Za-z0-9_.]*)\s*\(`)
+var csharpNewPattern = regexp.MustCompile(`\bnew\s+([A-Za-z_][A-Za-z0-9_.]*)(?:\s*<[^;(){}]*>)?\s*\(`)
 
 func csharpConstructedTypes(rawText string) []string {
 	matches := csharpNewPattern.FindAllStringSubmatch(stripQuotedText(rawText), -1)

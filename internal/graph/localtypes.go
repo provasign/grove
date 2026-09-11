@@ -190,10 +190,7 @@ func resolveCtorType(idx *edgeIndex, captured string) string {
 }
 
 func typeSymbolExists(idx *edgeIndex, name string) bool {
-	for _, cand := range idx.byName[strings.ToLower(name)] {
-		if cand.Name != name {
-			continue
-		}
+	for _, cand := range namedSymbols(idx, name) {
 		switch cand.Kind {
 		case core.KindStruct, core.KindClass, core.KindType, core.KindInterface:
 			return true
@@ -326,10 +323,7 @@ func bareTypeName(t string) string {
 // in the same package directory.
 func findTypeSymbol(idx *edgeIndex, symbol *core.SymbolRecord) *core.SymbolRecord {
 	dir := dirOf(symbol.FilePath)
-	for _, cand := range idx.byName[strings.ToLower(symbol.ParentSymbol)] {
-		if cand.Name != symbol.ParentSymbol {
-			continue
-		}
+	for _, cand := range namedSymbols(idx, symbol.ParentSymbol) {
 		switch cand.Kind {
 		case core.KindStruct, core.KindClass, core.KindType:
 			if dirOf(cand.FilePath) == dir {

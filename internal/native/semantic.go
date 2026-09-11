@@ -2,17 +2,123 @@ package native
 
 import (
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 
 	"github.com/provasign/grove/internal/core"
-	"sort"
 )
 
 var (
 	lexCallRe  = regexp.MustCompile(`([A-Za-z_$][A-Za-z0-9_$]*)\s*\(`)
 	lexIdentRe = regexp.MustCompile(`[A-Za-z_$][A-Za-z0-9_$]*`)
 )
+
+// splitNominalTypeList splits a declaration's comma-separated base list while
+// ignoring commas nested in generic arguments or constructor calls. It returns
+// the source-level name without generic/argument suffixes.
+func splitNominalTypeList(list string) []string {
+	var out []string
+	start, depth := 0, 0
+	for i := 0; i <= len(list); i++ {
+		if i < len(list) {
+			switch list[i] {
+			case '<', '(', '[':
+				depth++
+			case '>', ')', ']':
+				if depth > 0 {
+					depth--
+				}
+			}
+		}
+		if i < len(list) && (list[i] != ',' || depth != 0) {
+			continue
+		}
+		part := strings.TrimSpace(list[start:i])
+		start = i + 1
+		if j := strings.IndexAny(part, "<("); j >= 0 {
+			part = strings.TrimSpace(part[:j])
+		}
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+func balancedSuffixEnd(text string, open, close byte) int {
+	if text == "" || text[0] != open {
+		return 0
+	}
+	depth := 0
+	for i := 0; i < len(text); i++ {
+		switch text[i] {
+		case open:
+			depth++
+		case close:
+			depth--
+			if depth == 0 {
+				return i + 1
+			}
+		}
+	}
+	return 0
+}
+
+func inheritanceClause(text, keyword string, stops ...string) []string {
+	i := nominalKeyword(text, keyword)
+	if i < 0 {
+		return nil
+	}
+	rest := strings.TrimLeft(text[i+len(keyword):], " \t\r\n")
+	end, depth := len(rest), 0
+	for i := 0; i < len(rest); i++ {
+		switch rest[i] {
+		case '<', '(', '[':
+			depth++
+		case '>', ')', ']':
+			if depth > 0 {
+				depth--
+			}
+		case '{':
+			if depth == 0 {
+				end = i
+				i = len(rest)
+			}
+		default:
+			if depth == 0 {
+				for _, stop := range stops {
+					if nominalWordAt(rest, i, stop) {
+						end = i
+						i = len(rest)
+						break
+					}
+				}
+			}
+		}
+	}
+	return splitNominalTypeList(rest[:end])
+}
+
+func nominalKeyword(text, keyword string) int {
+	for i := 0; i+len(keyword) <= len(text); i++ {
+		if nominalWordAt(text, i, keyword) {
+			return i
+		}
+	}
+	return -1
+}
+
+func nominalWordAt(text string, offset int, word string) bool {
+	if offset < 0 || offset+len(word) > len(text) || text[offset:offset+len(word)] != word {
+		return false
+	}
+	isIdent := func(b byte) bool {
+		return b == '_' || b >= '0' && b <= '9' || b >= 'A' && b <= 'Z' || b >= 'a' && b <= 'z'
+	}
+	return (offset == 0 || !isIdent(text[offset-1])) &&
+		(offset+len(word) == len(text) || !isIdent(text[offset+len(word)]))
+}
 
 func lexicalSemanticEdges(symbols []core.SymbolRecord, languages map[string]bool, callConfidence, typeConfidence float64) []core.Edge {
 	byFile := map[string][]core.SymbolRecord{}

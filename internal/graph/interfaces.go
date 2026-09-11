@@ -163,7 +163,7 @@ func interfaceMemberSignatures(iface *core.SymbolRecord, methodName string) []st
 // structural.
 func nominalInterfaceLang(language string) bool {
 	switch language {
-	case "java", "typescript", "tsx", "javascript", "python", "php", "csharp":
+	case "java", "typescript", "tsx", "javascript", "python", "php", "csharp", "cpp", "rust":
 		return true
 	}
 	return false

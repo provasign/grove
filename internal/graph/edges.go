@@ -199,6 +199,28 @@ func newEdgeIndex(symbols []core.SymbolRecord) *edgeIndex {
 	return idx
 }
 
+// namedSymbols returns exact-name candidates while allowing languages such as
+// C++ to preserve a namespace-qualified identity in QualifiedName. byName is
+// intentionally keyed by the leaf Name, so qualified lookups must first peel
+// that leaf and then verify the full identity.
+func namedSymbols(idx *edgeIndex, name string) []*core.SymbolRecord {
+	leaf := name
+	if split := strings.LastIndex(name, "::"); split >= 0 {
+		leaf = name[split+2:]
+	}
+	var out []*core.SymbolRecord
+	for _, candidate := range idx.byName[strings.ToLower(leaf)] {
+		if leaf != name {
+			if candidate.QualifiedName == name {
+				out = append(out, candidate)
+			}
+		} else if candidate.Name == name {
+			out = append(out, candidate)
+		}
+	}
+	return out
+}
+
 // bindPySubmoduleImports turns "module#name" from-import members into plain
 // module imports when the member is an in-repo submodule (`from . import
 // cli` → ".cli"). A member that resolves to no file is a class/function
@@ -1159,13 +1181,13 @@ func buildContains(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
 		if symbol.ParentSymbol == "" {
 			continue
 		}
-		for _, parent := range idx.byName[strings.ToLower(symbol.ParentSymbol)] {
+		for _, parent := range namedSymbols(idx, symbol.ParentSymbol) {
 			// The byName key is lowercase but identifiers are case-sensitive
 			// (PHP class names excepted): without this check a method whose
 			// receiver is `responseWriter` also attached to the interface
 			// `ResponseWriter` — Go idiomatically pairs exported/unexported
 			// names, so the conflation poisoned real interfaces.
-			if parent.Name != symbol.ParentSymbol && symbol.Language != "php" {
+			if parent.Name != symbol.ParentSymbol && parent.QualifiedName != symbol.ParentSymbol && symbol.Language != "php" {
 				continue
 			}
 			if parent.FilePath != symbol.FilePath {
@@ -1206,7 +1228,7 @@ var (
 	extendsRe       = regexp.MustCompile(`\bextends\s+([A-Za-z_][A-Za-z0-9_.]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_.]*)*)`)
 	implementsRe    = regexp.MustCompile(`\bimplements\s+([A-Za-z_][A-Za-z0-9_.]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_.]*)*)`)
 	pythonClassBase = regexp.MustCompile(`^\s*class\s+[A-Za-z_][A-Za-z0-9_]*\s*\(([^)]+)\)`)
-	rustImplForRe   = regexp.MustCompile(`\bimpl\s+(?:<[^>]+>\s+)?([A-Za-z_][A-Za-z0-9_:]*)\s+for\s+([A-Za-z_][A-Za-z0-9_:]*)`)
+	rustImplForRe   = regexp.MustCompile(`\bimpl\s+(?:<[^>]+>\s+)?([A-Za-z_][A-Za-z0-9_:]*)(?:<[^{}]+>)?\s+for\s+([A-Za-z_][A-Za-z0-9_:]*)(?:<[^{}]+>)?`)
 	usesTypeIdent   = regexp.MustCompile(`\b([A-Z][A-Za-z0-9_]+)\b`)
 )
 
@@ -1283,6 +1305,25 @@ func buildExtendsImplements(idx *edgeIndex, symbols []core.SymbolRecord) []core.
 				}
 				edges = append(edges, resolveTypeEdges(idx, symbol, name, edgeType, 0.85)...)
 			}
+		case "cpp":
+			if symbol.Kind != core.KindClass && symbol.Kind != core.KindStruct {
+				continue
+			}
+			className := symbol.Name
+			if strings.Contains(symbol.QualifiedName, "::") {
+				className = symbol.QualifiedName
+			}
+			for _, base := range baseClassesFor(idx, "cpp", className, dirOf(symbol.FilePath)) {
+				for _, target := range namedSymbols(idx, base) {
+					if target.ID == symbol.ID || (target.Kind != core.KindClass && target.Kind != core.KindStruct && target.Kind != core.KindInterface) {
+						continue
+					}
+					edges = append(edges, core.Edge{
+						From: symbol.ID, To: target.ID, Type: core.EdgeExtends,
+						Confidence: 0.85, Source: core.EvidenceSourceHeuristic, Reason: core.ReasonTypeRef,
+					})
+				}
+			}
 		case "python":
 			if symbol.Kind != core.KindClass {
 				continue
@@ -1302,6 +1343,12 @@ func buildExtendsImplements(idx *edgeIndex, symbols []core.SymbolRecord) []core.
 		case "rust":
 			// Rust uses `impl Trait for Type` to implement traits; we attach
 			// the implements edge to the *type* symbol.
+			if symbol.Kind == core.KindTrait {
+				for _, base := range baseClassesFor(idx, "rust", symbol.Name, dirOf(symbol.FilePath)) {
+					edges = append(edges, resolveTypeEdges(idx, symbol, base, core.EdgeExtends, 0.85)...)
+				}
+				continue
+			}
 			if symbol.Kind != core.KindStruct && symbol.Kind != core.KindEnum {
 				continue
 			}
@@ -1425,7 +1472,7 @@ func resolveCallees(idx *edgeIndex, symbol *core.SymbolRecord, calleeName string
 		if exactCase && cand.Name != calleeName {
 			continue
 		}
-		if cand.Kind != core.KindFunction && cand.Kind != core.KindMethod && cand.Kind != core.KindConstructor {
+		if !graphCallableSymbol(cand) {
 			continue
 		}
 		if _, ok := scope[cand.FilePath]; !ok {
@@ -1447,6 +1494,17 @@ func resolveCallees(idx *edgeIndex, symbol *core.SymbolRecord, calleeName string
 		return crossFile, true
 	}
 	return crossFile, false
+}
+
+func graphCallableSymbol(symbol *core.SymbolRecord) bool {
+	if symbol.Kind == core.KindFunction || symbol.Kind == core.KindMethod || symbol.Kind == core.KindConstructor {
+		return true
+	}
+	if symbol.Kind != core.KindField || (symbol.Language != "javascript" && symbol.Language != "typescript" && symbol.Language != "tsx") {
+		return false
+	}
+	text := symbol.Signature + "\n" + symbol.RawText
+	return strings.Contains(text, "=>") || strings.Contains(text, "function")
 }
 
 // buildCalls emits same-file + imported-file call edges with strings/comments
@@ -1691,7 +1749,8 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// Member receivers bind by type, not the caller's file.
 				sameFileWins = false
 			}
-			if qualifier == "super" || qualifier == "super()" || (symbol.Language == "csharp" && qualifier == "base") {
+			if qualifier == "super" || qualifier == "super()" || (symbol.Language == "csharp" && qualifier == "base") ||
+				(symbol.Language == "php" && qualifier == "parent") {
 				// The target lives in the base class's file; a same-file
 				// override must not shadow it.
 				sameFileWins = false
@@ -1935,8 +1994,19 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					// impl Matcher for X, where X declares no
 					// is_match, executes the trait's declaration.
 					if trait := rustImplTrait(&symbol); trait != "" {
-						if byTrait := filterByParent(cands, trait); len(byTrait) > 0 {
-							cands = byTrait
+						traits := []string{trait}
+						for level := 0; level < 4 && len(traits) > 0; level++ {
+							var next []string
+							for _, candidateTrait := range traits {
+								if byTrait := filterByParent(cands, candidateTrait); len(byTrait) > 0 {
+									cands = byTrait
+									traits = nil
+									next = nil
+									break
+								}
+								next = append(next, baseClassesFor(idx, "rust", candidateTrait, dirOf(symbol.FilePath))...)
+							}
+							traits = next
 						}
 					}
 				} else if !isSelf && !typed && len(filterByParent(cands, qualifier)) == 0 {
@@ -1966,7 +2036,8 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			}
 			// super().method() / super.method() resolves on the caller's
 			// base classes; bare super() invokes the base constructor.
-			if qualifier == "super()" || qualifier == "super" || (symbol.Language == "csharp" && qualifier == "base") {
+			if qualifier == "super()" || qualifier == "super" || (symbol.Language == "csharp" && qualifier == "base") ||
+				(symbol.Language == "php" && qualifier == "parent") {
 				if traceCalls {
 					fmt.Fprintf(os.Stderr, "grove-trace %s: super bases=%v matched=%d\n", symbol.QualifiedName, baseClassesFor(idx, symbol.Language, symbol.ParentSymbol, dirOf(symbol.FilePath)), len(narrowBySuper(idx, &symbol, cands)))
 				}
@@ -2207,7 +2278,7 @@ var astCallSiteLanguages = map[string]bool{
 // classLanguage reports whether the language has class inheritance our
 // base-class parsers understand.
 func classLanguage(lang string) bool {
-	return lang == "python" || lang == "typescript" || lang == "javascript" || lang == "java" || lang == "csharp" || lang == "php" || lang == "cpp"
+	return lang == "python" || lang == "typescript" || lang == "javascript" || lang == "java" || lang == "csharp" || lang == "php" || lang == "cpp" || lang == "rust"
 }
 
 // implicitSelfLanguage reports whether a bare, unqualified call inside a method
@@ -2224,6 +2295,9 @@ func implicitSelfLanguage(lang string) bool {
 // receiver variable parsed from the method signature ("func (r JSON) ...").
 func callerSelfQualifiers(symbol *core.SymbolRecord) map[string]struct{} {
 	out := map[string]struct{}{"self": {}, "this": {}, "cls": {}}
+	if symbol.Language == "php" {
+		out["static"] = struct{}{}
+	}
 	if symbol.Language == "go" && symbol.Kind == core.KindMethod {
 		if v := goReceiverVar(symbol.Signature); v != "" {
 			out[v] = struct{}{}
@@ -2283,7 +2357,7 @@ func filterByParent(cands []*core.SymbolRecord, parent string) []*core.SymbolRec
 	for _, cand := range cands {
 		// Constructors count: Rust's Type::new is a constructor-kind
 		// method and must narrow by its parent like any other.
-		if (cand.Kind == core.KindMethod || cand.Kind == core.KindConstructor) && cand.ParentSymbol == parent {
+		if graphCallableSymbol(cand) && cand.ParentSymbol == parent {
 			out = append(out, cand)
 		}
 	}

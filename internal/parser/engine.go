@@ -487,12 +487,21 @@ func extractSymbols(language, filePath, blobSHA, content string, fileImports []s
 	astSyms, ok, hasErrors := extractSymbolsFromAST(language, filePath, blobSHA, []byte(content), fileImports)
 	if !ok {
 		syms := extractSymbolsRegex(language, filePath, blobSHA, content, fileImports)
+		if language == "cpp" {
+			syms = enrichCppNamespaces(syms, content)
+		}
 		attachDocstrings(language, content, syms)
 		return syms
 	}
 	if !hasErrors {
 		if language == "c" || language == "cpp" {
-			astSyms = mergeSymbolsByShape(astSyms, extractSymbolsRegex(language, filePath, blobSHA, content, fileImports))
+			regexSyms := extractSymbolsRegex(language, filePath, blobSHA, content, fileImports)
+			if language == "cpp" {
+				n := len(astSyms)
+				combined := enrichCppNamespaces(append(append([]core.SymbolRecord(nil), astSyms...), regexSyms...), content)
+				astSyms, regexSyms = combined[:n], combined[n:]
+			}
+			astSyms = mergeSymbolsByShape(astSyms, regexSyms)
 		}
 		attachDocstrings(language, content, astSyms)
 		return astSyms
@@ -500,9 +509,204 @@ func extractSymbols(language, filePath, blobSHA, content string, fileImports []s
 	// Syntax errors present — supplement AST results with regex to recover symbols
 	// that fell inside ERROR subtrees (e.g. a function being actively typed).
 	regexSyms := extractSymbolsRegex(language, filePath, blobSHA, content, fileImports)
+	if language == "cpp" {
+		n := len(astSyms)
+		combined := enrichCppNamespaces(append(append([]core.SymbolRecord(nil), astSyms...), regexSyms...), content)
+		astSyms, regexSyms = combined[:n], combined[n:]
+	}
 	merged := mergeSymbols(astSyms, regexSyms)
 	attachDocstrings(language, content, merged)
 	return merged
+}
+
+var cppQualifiedCallableRe = regexp.MustCompile(`([A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*)::([~A-Za-z_][A-Za-z0-9_]*)\s*\(`)
+
+func enrichCppNamespaces(symbols []core.SymbolRecord, content string) []core.SymbolRecord {
+	type scope struct {
+		index  int
+		parent int
+		path   string
+	}
+	var scopes []scope
+	for i := range symbols {
+		if symbols[i].Kind == core.KindNamespace {
+			scopes = append(scopes, scope{index: i, parent: -1})
+		}
+	}
+	for i := range scopes {
+		child := symbols[scopes[i].index]
+		bestWidth := int(^uint(0) >> 1)
+		for j := range scopes {
+			if i == j {
+				continue
+			}
+			parent := symbols[scopes[j].index]
+			if parent.Span.Start <= child.Span.Start && parent.Span.End >= child.Span.End {
+				width := parent.Span.End - parent.Span.Start
+				if width < bestWidth {
+					bestWidth = width
+					scopes[i].parent = j
+				}
+			}
+		}
+	}
+	var scopePath func(int) string
+	scopePath = func(i int) string {
+		if scopes[i].path != "" {
+			return scopes[i].path
+		}
+		name := symbols[scopes[i].index].Name
+		if scopes[i].parent >= 0 {
+			name = scopePath(scopes[i].parent) + "::" + name
+		}
+		scopes[i].path = name
+		return name
+	}
+	for i := range scopes {
+		path := scopePath(i)
+		symbols[scopes[i].index].QualifiedName = path
+	}
+	bindings := cppFileNamespaceBindings(content)
+	for i := range symbols {
+		symbol := &symbols[i]
+		symbol.Annotations = append(symbol.Annotations, bindings...)
+		if symbol.Kind == core.KindNamespace {
+			continue
+		}
+		namespace := ""
+		bestWidth := int(^uint(0) >> 1)
+		for j := range scopes {
+			ns := symbols[scopes[j].index]
+			if ns.Span.Start <= symbol.Span.Start && ns.Span.End >= symbol.Span.End {
+				if width := ns.Span.End - ns.Span.Start; width < bestWidth {
+					bestWidth = width
+					namespace = scopePath(j)
+				}
+			}
+		}
+		owner, name := symbol.ParentSymbol, symbol.Name
+		if match := cppQualifiedCallableRe.FindStringSubmatch(symbol.Signature); len(match) == 3 {
+			owner, name = match[1], match[2]
+		} else if split := strings.LastIndex(symbol.Name, "::"); split >= 0 {
+			owner, name = symbol.Name[:split], symbol.Name[split+2:]
+		}
+		if owner != "" {
+			if namespace != "" && !strings.Contains(owner, "::") {
+				owner = namespace + "::" + owner
+			}
+			symbol.Name = name
+			symbol.ParentSymbol = owner
+			separator := "."
+			if namespace != "" || strings.Contains(owner, "::") {
+				separator = "::"
+			}
+			symbol.QualifiedName = owner + separator + name
+			if symbol.Kind == core.KindFunction {
+				ownerName := owner
+				if split := strings.LastIndex(owner, "::"); split >= 0 {
+					ownerName = owner[split+2:]
+				}
+				if name == ownerName {
+					symbol.Kind = core.KindConstructor
+				} else {
+					symbol.Kind = core.KindMethod
+				}
+			}
+		} else if namespace != "" {
+			symbol.QualifiedName = namespace + "::" + symbol.Name
+		}
+	}
+	return symbols
+}
+
+var (
+	cppUsingNamespaceLineRe = regexp.MustCompile(`^using\s+namespace\s+([A-Za-z_][A-Za-z0-9_:]*)\s*;`)
+	cppNamespaceAliasLineRe = regexp.MustCompile(`^namespace\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([A-Za-z_][A-Za-z0-9_:]*)\s*;`)
+	cppUsingTypeLineRe      = regexp.MustCompile(`^using\s+([A-Za-z_][A-Za-z0-9_:]*)::([A-Za-z_][A-Za-z0-9_]*)\s*;`)
+)
+
+func cppFileNamespaceBindings(content string) []string {
+	clean := stripCppCommentsAndStrings(content)
+	depth := 0
+	var out []string
+	for _, line := range strings.Split(clean, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if depth == 0 {
+			switch {
+			case cppUsingNamespaceLineRe.MatchString(trimmed):
+				match := cppUsingNamespaceLineRe.FindStringSubmatch(trimmed)
+				out = append(out, core.CppUsingNamespace(match[1]))
+			case cppNamespaceAliasLineRe.MatchString(trimmed):
+				match := cppNamespaceAliasLineRe.FindStringSubmatch(trimmed)
+				out = append(out, core.CppNamespaceAlias(match[1], match[2]))
+			case cppUsingTypeLineRe.MatchString(trimmed):
+				match := cppUsingTypeLineRe.FindStringSubmatch(trimmed)
+				out = append(out, core.CppUsingType(match[2], match[1]+"::"+match[2]))
+			}
+		}
+		for i := 0; i < len(line); i++ {
+			switch line[i] {
+			case '{':
+				depth++
+			case '}':
+				if depth > 0 {
+					depth--
+				}
+			}
+		}
+	}
+	return out
+}
+
+func stripCppCommentsAndStrings(content string) string {
+	out := []byte(content)
+	for i := 0; i < len(out); {
+		if i+1 < len(out) && out[i] == '/' && out[i+1] == '/' {
+			for i < len(out) && out[i] != '\n' {
+				out[i] = ' '
+				i++
+			}
+			continue
+		}
+		if i+1 < len(out) && out[i] == '/' && out[i+1] == '*' {
+			out[i], out[i+1] = ' ', ' '
+			i += 2
+			for i+1 < len(out) && !(out[i] == '*' && out[i+1] == '/') {
+				if out[i] != '\n' {
+					out[i] = ' '
+				}
+				i++
+			}
+			if i+1 < len(out) {
+				out[i], out[i+1] = ' ', ' '
+				i += 2
+			}
+			continue
+		}
+		if out[i] == '\'' || out[i] == '"' {
+			quote := out[i]
+			out[i] = ' '
+			i++
+			for i < len(out) {
+				if out[i] == '\\' && i+1 < len(out) {
+					out[i], out[i+1] = ' ', ' '
+					i += 2
+					continue
+				}
+				end := out[i] == quote
+				if out[i] != '\n' {
+					out[i] = ' '
+				}
+				i++
+				if end {
+					break
+				}
+			}
+			continue
+		}
+		i++
+	}
+	return string(out)
 }
 
 // mergeSymbols returns the union of astSyms and regexSyms, preferring AST
@@ -531,8 +735,15 @@ func mergeSymbolsByShape(astSyms, regexSyms []core.SymbolRecord) []core.SymbolRe
 	}
 	seen := make(map[string]bool, len(astSyms))
 	callable := make(map[string]bool, len(astSyms))
+	type locationKey struct {
+		name, parent string
+		kind         core.SymbolKind
+		start, end   int
+	}
+	locations := make(map[locationKey]bool, len(astSyms))
 	for _, s := range astSyms {
 		seen[symbolShapeKey(s)] = true
+		locations[locationKey{s.Name, s.ParentSymbol, s.Kind, s.Span.Start, s.Span.End}] = true
 		if isCallableKind(s.Kind) {
 			callable[s.Name+"\x00"+s.ParentSymbol] = true
 		}
@@ -546,6 +757,9 @@ func mergeSymbolsByShape(astSyms, regexSyms []core.SymbolRecord) []core.SymbolRe
 		// three 1-line twins this way, and span-based matching then
 		// attributed the real body's 64 calls to none of them.
 		if isCallableKind(s.Kind) && callable[s.Name+"\x00"+s.ParentSymbol] {
+			continue
+		}
+		if locations[locationKey{s.Name, s.ParentSymbol, s.Kind, s.Span.Start, s.Span.End}] {
 			continue
 		}
 		key := symbolShapeKey(s)
