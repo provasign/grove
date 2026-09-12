@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -71,6 +72,50 @@ func TestLazyRehydrationServesQueriesBeforeIndex(t *testing.T) {
 	}
 	if got := fileSyms(t, ctx, eng2, "a.go"); len(got) != 3 {
 		t.Fatalf("post-delta query: got %d symbols, want 3", len(got))
+	}
+}
+
+// An interrupted edge write must not make every query rebuild a partial graph
+// in memory. The existing no-change Index recovery persists the repaired edges.
+func TestIncompleteIndexRequiresRecoveryBeforeQuery(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("package main\n\nfunc A() {}\n\nfunc B() { A() }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	seed, err := Open(ctx, Config{RepoRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := seed.Index(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := seed.store.ReplaceEdges(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	eng, err := Open(ctx, Config{RepoRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Close()
+	for range 2 {
+		if _, err := eng.FileSymbols(ctx, "a.go"); err == nil || !strings.Contains(err.Error(), "run 'grove index'") {
+			t.Fatalf("incomplete index query error = %v", err)
+		}
+	}
+	if _, err := eng.Index(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := fileSyms(t, ctx, eng, "a.go"); len(got) != 2 {
+		t.Fatalf("recovered index returned %d symbols, want 2", len(got))
+	}
+	status, err := eng.Status(ctx)
+	if err != nil || status.EdgeCount == 0 {
+		t.Fatalf("recovery did not persist edges: status=%+v err=%v", status, err)
 	}
 }
 

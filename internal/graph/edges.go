@@ -2053,6 +2053,17 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 		}
 		var javaArgTypeCache map[string]string
 		var csArgTypeCache map[string]string
+		narrowJavaCall := func(cands []*core.SymbolRecord, cs core.CallSite, scope map[string]struct{}) []*core.SymbolRecord {
+			cands = javaKnownArityCandidates(cands, cs)
+			if len(cands) > 1 && len(cs.Args) > 0 {
+				if javaArgTypeCache == nil {
+					javaArgTypeCache = javaArgTypes(idx, &symbol)
+				}
+				javaResolveCallReturnTypes(idx, cs.Args, scope, javaArgTypeCache)
+				cands = narrowOverloadsByArgTypes(cands, cs.Args, javaArgTypeCache)
+			}
+			return cands
+		}
 		narrowDispatch := func(cands []*core.SymbolRecord, cs core.CallSite) []*core.SymbolRecord {
 			if symbol.Language != "csharp" && symbol.Language != "java" {
 				return cands
@@ -2618,7 +2629,11 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				if len(filterByParent(narrowed, symbol.ParentSymbol)) == 0 {
 					// Not a method on the caller's own class: inheritance
 					// reaches files import scope never sees.
-					if inherited := inheritedTargets(idx, &symbol, calleeName, false); len(inherited) > 0 {
+					inherited := inheritedTargets(idx, &symbol, calleeName, false)
+					if symbol.Language == "java" {
+						inherited = narrowJavaCall(inherited, cs, scope)
+					}
+					if len(inherited) > 0 {
 						// A monorepo declares `Transport` in both the client
 						// and the server package; the caller's base class is
 						// the one its import scope reaches. Prefer in-scope
@@ -2636,6 +2651,18 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 							addEdge(symbol.ID, cand.ID, 0.85, core.EvidenceSourceHeuristic, core.ReasonInheritance)
 						}
 						continue
+					}
+					if symbol.Language == "java" && implicitSelf {
+						// A non-static inner class can call methods on its enclosing
+						// class (and its bases) without a receiver. Resolve that
+						// lexical owner before name-matched imports or interfaces.
+						outer := javaEnclosingBareTargets(idx, &symbol, calleeName, cs)
+						for _, cand := range narrowJavaCall(outer, cs, scope) {
+							addEdge(symbol.ID, cand.ID, 0.95, core.EvidenceSourceASTKit, core.ReasonASTNarrowed)
+						}
+						if len(outer) > 0 {
+							continue
+						}
 					}
 				} else {
 					// Template method: self.to_json() inside the base class
@@ -3007,6 +3034,81 @@ func filterByArgc(cands []*core.SymbolRecord, argc int) []*core.SymbolRecord {
 	return out
 }
 
+// javaKnownArityCandidates rejects a definitely wrong Java overload even
+// when it is the only candidate. The general filterByArgc keeps a singleton
+// (or an all-mismatch set) to avoid losing calls whose argument count was not
+// extracted; that fallback fabricated an edge from a three-argument call to
+// JsonDeserializer.deserialize(JsonParser, DeserializationContext).
+func javaKnownArityCandidates(cands []*core.SymbolRecord, cs core.CallSite) []*core.SymbolRecord {
+	argc := cs.Argc
+	if argc == 0 {
+		argc = len(cs.Args)
+	}
+	if argc == 0 {
+		return filterByArgc(cands, 0) // zero arguments or unknown: preserve existing behavior
+	}
+	var out []*core.SymbolRecord
+	for _, cand := range cands {
+		n, variadic, ok := declParamCount(cand)
+		if !ok || n == argc || (variadic && argc >= n-1) {
+			out = append(out, cand)
+		}
+	}
+	return out
+}
+
+// javaEnclosingBareTargets resolves a bare call in a non-static nested class
+// against the nearest enclosing class, then that class's ancestors. Java's
+// lexical outer binding precedes unrelated same-named imported methods.
+func javaEnclosingBareTargets(idx *edgeIndex, caller *core.SymbolRecord, name string, cs core.CallSite) []*core.SymbolRecord {
+	owner := strings.TrimSuffix(caller.QualifiedName, "."+caller.Name)
+	if owner == caller.QualifiedName {
+		return nil
+	}
+	for {
+		dot := strings.LastIndexByte(owner, '.')
+		if dot < 0 {
+			return nil
+		}
+		inner := javaTypeInFile(idx, caller.FilePath, owner)
+		if inner == nil || hasModifier(inner, "static") {
+			return nil
+		}
+		outerName := owner[:dot]
+		outer := javaTypeInFile(idx, caller.FilePath, outerName)
+		if outer == nil {
+			return nil
+		}
+		var direct []*core.SymbolRecord
+		for _, cand := range idx.byName[strings.ToLower(name)] {
+			if cand.Language == "java" && cand.Kind == core.KindMethod &&
+				cand.FilePath == outer.FilePath && cand.QualifiedName == outer.QualifiedName+"."+name {
+				direct = append(direct, cand)
+			}
+		}
+		if direct = javaKnownArityCandidates(direct, cs); len(direct) > 0 {
+			return direct
+		}
+		outerReceiver := *caller
+		outerReceiver.ParentSymbol = outer.Name
+		outerReceiver.FilePath = outer.FilePath
+		if inherited := javaKnownArityCandidates(inheritedTargets(idx, &outerReceiver, name, false), cs); len(inherited) > 0 {
+			return inherited
+		}
+		owner = outerName
+	}
+}
+
+func javaTypeInFile(idx *edgeIndex, file, qualifiedName string) *core.SymbolRecord {
+	for _, cand := range idx.byFile[file] {
+		if cand.Language == "java" && cand.QualifiedName == qualifiedName &&
+			(cand.Kind == core.KindClass || cand.Kind == core.KindInterface || cand.Kind == core.KindEnum) {
+			return cand
+		}
+	}
+	return nil
+}
+
 // filterByGeneric keeps the overloads whose generic-ness matches the call's:
 // a call with explicit type arguments (Foo<T>()) binds a generic overload, a
 // plain call binds a non-generic one. Never zeroes the set — if no candidate
@@ -3062,6 +3164,9 @@ func declParamCount(s *core.SymbolRecord) (int, bool, bool) {
 		return 0, false, false
 	}
 	groups := splitTopLevel(params, ',')
+	if s.Language == "java" {
+		groups = splitJavaParamGroups(params)
+	}
 	n := 0
 	variadic := false
 	for _, g := range groups {
@@ -3077,6 +3182,36 @@ func declParamCount(s *core.SymbolRecord) (int, bool, bool) {
 		}
 	}
 	return n, variadic, true
+}
+
+// splitJavaParamGroups keeps commas inside generic type arguments such as
+// Map<?,?> out of the method's parameter count. The shared splitTopLevel
+// intentionally does not treat angle brackets as nesting for other languages.
+func splitJavaParamGroups(params string) []string {
+	var groups []string
+	angle, nesting, last := 0, 0, 0
+	for i := 0; i < len(params); i++ {
+		switch params[i] {
+		case '<':
+			angle++
+		case '>':
+			if angle > 0 {
+				angle--
+			}
+		case '(', '[', '{':
+			nesting++
+		case ')', ']', '}':
+			if nesting > 0 {
+				nesting--
+			}
+		case ',':
+			if angle == 0 && nesting == 0 {
+				groups = append(groups, params[last:i])
+				last = i + 1
+			}
+		}
+	}
+	return append(groups, params[last:])
 }
 
 // constructorTargets resolves a class-named call ("Flask(...)") to the

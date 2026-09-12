@@ -172,6 +172,13 @@ func (e *Engine) currentGraph() (*graph.CodeGraph, error) {
 		return e.graph, nil
 	}
 	ctx := context.Background()
+	status, err := e.store.Status(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("grove: graph rehydration failed: %w", err)
+	}
+	if status.SymbolCount > 0 && status.EdgeCount == 0 {
+		return nil, errors.New("grove: persisted index has symbols but no edges; run 'grove index' to recover the incomplete index")
+	}
 	g = graph.New()
 	symbols, err := e.store.AllSymbols(ctx)
 	if err != nil {
