@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.48.0 - 2026-09-11
+
+Grove now builds and evaluates against astkit v0.11.0, incorporating improved
+COBOL copybook, continuation, span, and PERFORM-range metadata; JCL symbolic
+execution and INCLUDE resolution; and explicit C prototype annotations. The
+full unit and race suites, vet, Prism verification, and all nine edge-accuracy
+corpora pass unchanged against the updated extractor.
+
 ## v0.47.0 - 2026-09-11
 
 Graph resolution is now scoped by language family, and ambiguous cross-language
