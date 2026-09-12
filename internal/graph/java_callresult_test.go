@@ -111,6 +111,91 @@ func TestJavaCallResult_DoesNotGuessFromSameNamedMethod(t *testing.T) {
 	}
 }
 
+func TestJavaCallResult_IndexedReceiverReachesReturnType(t *testing.T) {
+	class := core.SymbolRecord{
+		ID: "Caller.java::Caller", FilePath: "Caller.java", BlobSHA: "1",
+		Language: "java", Kind: core.KindClass, Name: "Caller", QualifiedName: "Outer.Caller",
+		RawText: "class Caller {\n    private ExtTypedProperty[] properties;\n}",
+	}
+	field := core.SymbolRecord{
+		ID: "Caller.java::Caller.properties", FilePath: "Caller.java", BlobSHA: "1",
+		Language: "java", Kind: core.KindField, Name: "properties", QualifiedName: "Outer.Caller.properties", ParentSymbol: "Outer.Caller",
+		RawText: "private ExtTypedProperty[] properties;",
+	}
+	caller := core.SymbolRecord{
+		ID: "Caller.java::Caller.run", FilePath: "Caller.java", BlobSHA: "1",
+		Language: "java", Kind: core.KindMethod, Name: "run", QualifiedName: "Outer.Caller.run", ParentSymbol: "Outer.Caller",
+		Span:    core.LineRange{Start: 1},
+		RawText: "void run(int index, Object bean) {\n    properties[index].getProperty().set(bean, null);\n}",
+		CallSites: []core.CallSite{
+			{Callee: "properties.getProperty", Line: 2},
+			{Callee: "getProperty().set", Line: 2, Argc: 2, Args: []string{"bean", ""}},
+		},
+	}
+	getter := core.SymbolRecord{
+		ID: "Caller.java::ExtTypedProperty.getProperty", FilePath: "Caller.java", BlobSHA: "1",
+		Language: "java", Kind: core.KindMethod, Name: "getProperty", QualifiedName: "ExtTypedProperty.getProperty", ParentSymbol: "ExtTypedProperty",
+		Signature: "SettableBeanProperty getProperty()",
+	}
+	set := core.SymbolRecord{
+		ID: "SettableBeanProperty.java::SettableBeanProperty.set", FilePath: "SettableBeanProperty.java", BlobSHA: "1",
+		Language: "java", Kind: core.KindMethod, Name: "set", QualifiedName: "SettableBeanProperty.set", ParentSymbol: "SettableBeanProperty",
+		Signature: "void set(Object bean, Object value)",
+	}
+	wrong := core.SymbolRecord{
+		ID: "Other.java::Other.set", FilePath: "Other.java", BlobSHA: "1",
+		Language: "java", Kind: core.KindMethod, Name: "set", QualifiedName: "Other.set", ParentSymbol: "Other",
+		Signature: "void set(Object bean, Object value)",
+	}
+	edges := BuildEdges([]core.SymbolRecord{class, field, caller, getter, set, wrong})
+	if !javaHasCall(edges, caller.ID, set.ID) {
+		t.Fatal("indexed receiver's call result must resolve the downstream method")
+	}
+	if javaHasCall(edges, caller.ID, wrong.ID) {
+		t.Fatal("indexed receiver's call result must not fan out to an unrelated method")
+	}
+}
+
+func TestJavaDispatchNarrowsOverloadsByArgumentType(t *testing.T) {
+	base := core.SymbolRecord{ID: "Base.java::Base", FilePath: "Base.java", Language: "java", Kind: core.KindClass, Name: "Base", QualifiedName: "Base"}
+	baseInt := core.SymbolRecord{ID: "Base.java::Base.get-int", FilePath: "Base.java", Language: "java", Kind: core.KindMethod, Name: "get", QualifiedName: "Base.get", ParentSymbol: "Base", Signature: "Object get(int index)"}
+	baseString := core.SymbolRecord{ID: "Base.java::Base.get-string", FilePath: "Base.java", Language: "java", Kind: core.KindMethod, Name: "get", QualifiedName: "Base.get", ParentSymbol: "Base", Signature: "Object get(String name)"}
+	sub := core.SymbolRecord{ID: "Sub.java::Sub", FilePath: "Sub.java", Language: "java", Kind: core.KindClass, Name: "Sub", QualifiedName: "Sub", Signature: "class Sub extends Base"}
+	subInt := core.SymbolRecord{ID: "Sub.java::Sub.get-int", FilePath: "Sub.java", Language: "java", Kind: core.KindMethod, Name: "get", QualifiedName: "Sub.get", ParentSymbol: "Sub", Signature: "Object get(int index)"}
+	subString := core.SymbolRecord{ID: "Sub.java::Sub.get-string", FilePath: "Sub.java", Language: "java", Kind: core.KindMethod, Name: "get", QualifiedName: "Sub.get", ParentSymbol: "Sub", Signature: "Object get(String name)"}
+	caller := core.SymbolRecord{
+		ID: "Use.java::Use.run", FilePath: "Use.java", Language: "java", Kind: core.KindMethod,
+		Name: "run", QualifiedName: "Use.run", ParentSymbol: "Use", Signature: "void run(Base node)",
+		RawText:   "void run(Base node) { node.get(\"name\"); }",
+		CallSites: []core.CallSite{{Callee: "node.get", Line: 1, Argc: 1, Args: []string{"#String"}}},
+	}
+	edges := BuildEdges([]core.SymbolRecord{base, baseInt, baseString, sub, subInt, subString, caller})
+	if !javaHasCall(edges, caller.ID, subString.ID) {
+		t.Fatal("dispatch must retain the override matching the argument type")
+	}
+	if javaHasCall(edges, caller.ID, subInt.ID) {
+		t.Fatal("dispatch must exclude an override of a different overload")
+	}
+}
+
+func TestJavaDispatchNarrowsCallResultArgumentFromKnownExternalContract(t *testing.T) {
+	objectInt := core.SymbolRecord{ID: "ObjectNode.java::ObjectNode.get-int", FilePath: "ObjectNode.java", Language: "java", Kind: core.KindMethod, Name: "get", QualifiedName: "ObjectNode.get", ParentSymbol: "ObjectNode", Signature: "Object get(int index)"}
+	objectString := core.SymbolRecord{ID: "ObjectNode.java::ObjectNode.get-string", FilePath: "ObjectNode.java", Language: "java", Kind: core.KindMethod, Name: "get", QualifiedName: "ObjectNode.get", ParentSymbol: "ObjectNode", Signature: "Object get(String name)"}
+	caller := core.SymbolRecord{
+		ID: "ObjectNode.java::ObjectNode.at", FilePath: "ObjectNode.java", Language: "java", Kind: core.KindMethod,
+		Name: "at", QualifiedName: "ObjectNode.at", ParentSymbol: "ObjectNode", Signature: "Object at(JsonPointer ptr)",
+		RawText:   "Object at(JsonPointer ptr) { return get(ptr.getMatchingProperty()); }",
+		CallSites: []core.CallSite{{Callee: "get", Line: 1, Argc: 1, Args: []string{"call:getMatchingProperty"}}},
+	}
+	edges := BuildEdges([]core.SymbolRecord{objectInt, objectString, caller})
+	if !javaHasCall(edges, caller.ID, objectString.ID) {
+		t.Fatal("known external return type must retain the matching overload")
+	}
+	if javaHasCall(edges, caller.ID, objectInt.ID) {
+		t.Fatal("known external return type must exclude a conflicting overload")
+	}
+}
+
 func TestJavaConstructorDelegationUsesArity(t *testing.T) {
 	baseType := core.SymbolRecord{ID: "Base.java::type", FilePath: "Base.java", Language: "java", Kind: core.KindClass, Name: "Base", QualifiedName: "Base", Signature: "class Base"}
 	baseZero := core.SymbolRecord{ID: "Base.java::Base@1", FilePath: "Base.java", Language: "java", Kind: core.KindConstructor, Name: "Base", ParentSymbol: "Base", Signature: "Base()"}

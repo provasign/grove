@@ -2054,11 +2054,18 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 		var javaArgTypeCache map[string]string
 		var csArgTypeCache map[string]string
 		narrowDispatch := func(cands []*core.SymbolRecord, cs core.CallSite) []*core.SymbolRecord {
-			if symbol.Language != "csharp" {
+			if symbol.Language != "csharp" && symbol.Language != "java" {
 				return cands
 			}
 			cands = filterByArgc(cands, cs.Argc)
-			if len(cands) > 1 {
+			if symbol.Language == "java" && len(cands) > 1 && len(cs.Args) > 0 {
+				if javaArgTypeCache == nil {
+					javaArgTypeCache = javaArgTypes(idx, &symbol)
+				}
+				javaResolveCallReturnTypes(idx, cs.Args, nil, javaArgTypeCache)
+				return narrowOverloadsByArgTypes(cands, cs.Args, javaArgTypeCache)
+			}
+			if symbol.Language == "csharp" && len(cands) > 1 {
 				if csArgTypeCache == nil {
 					csArgTypeCache = csharpArgTypes(idx, &symbol)
 				}
@@ -2207,6 +2214,20 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			if symbol.Language == "python" && !localDefinition {
 				cands = pyCallCandidates(idx, &symbol, qualifier, fullChain, pyCallName, calleeName, cands)
 				capped = len(cands) > maxCalleeFanout
+				if len(cands) == 0 && !capped {
+					if qualifier == "" {
+						if dynamicName := pyCallableAliasTarget(&symbol, pyCallName, cs.Line); dynamicName != "" {
+							cands, capped = pyDynamicMemberCandidates(idx, &symbol, dynamicName, "")
+						}
+					} else if strings.Contains(fullChain, ".") {
+						root := strings.SplitN(fullChain, ".", 2)[0]
+						if pyReceiverAssignedFromSubscription(&symbol, root, cs.Line) {
+							cands, capped = pyDynamicMemberCandidates(idx, &symbol, calleeName, qualifier)
+						} else {
+							cands, capped = pyOneHopMemberCandidates(idx, &symbol, scope, calleeName, qualifier)
+						}
+					}
+				}
 			}
 			if symbol.Language == "go" && qualifier == "" {
 				// Go never performs implicit method lookup for a bare call:

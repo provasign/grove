@@ -20,13 +20,13 @@ var (
 	// typed local including primitives and arrays, for overload matching:
 	// anchored to statement starts so "return x =" / cast fragments can't
 	// masquerade as declarations
-	javaTypedLocalRe = regexp.MustCompile(`(?m)(?:^|[;{)]\s*)\s*(?:final\s+)?((?:boolean|byte|char|short|int|long|float|double|[A-Z][\w.]*)(?:<[^<>]*>)?(?:\[\])?)\s+(\w+)\s*=`)
+	javaTypedLocalRe = regexp.MustCompile(`(?m)(?:^|[;{()]\s*)\s*(?:final\s+)?((?:boolean|byte|char|short|int|long|float|double|[A-Z][\w.]*)(?:<[^<>]*>)?(?:\[\])?)\s+(\w+)\s*[=;]`)
 	// field declaration line in a class body
 	javaFieldRe = regexp.MustCompile(`(?m)^\s+(?:@[\w.]+(?:\([^)]*\))?\s+)*(?:(?:public|private|protected|static|final|transient|volatile)\s+)*([A-Z]\w*)(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?(?:\[\])?\s+(\w+)\s*[;=]`)
 	// field declaration line, primitives included, raw type token kept —
 	// for overload matching (AT_SIGN is a char; javaFieldRe skips it)
 	javaFieldArgRe      = regexp.MustCompile(`(?m)^\s+(?:@[\w.]+(?:\([^)]*\))?\s+)*(?:(?:public|private|protected|static|final|transient|volatile)\s+)*((?:boolean|byte|char|short|int|long|float|double|[A-Z]\w*)(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?(?:\[\])?)\s+(\w+)\s*[;=]`)
-	javaQualifiedCallRe = regexp.MustCompile(`\b([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\s*\(`)
+	javaQualifiedCallRe = regexp.MustCompile(`\b([A-Za-z_]\w*)(?:\s*\[[^\]\n]+\])?\s*\.\s*([A-Za-z_]\w*)\s*\(`)
 )
 
 // javaArgTypes infers identifier → raw type token (primitives and arrays
@@ -85,20 +85,12 @@ func javaArgTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 					continue
 				}
 				seen[className] = true
-				for _, cls := range idx.byName[strings.ToLower(className)] {
-					if cls.Name != className {
-						continue
-					}
-					switch cls.Kind {
-					case core.KindClass, core.KindEnum, core.KindInterface:
-					default:
-						continue
-					}
+				if cls := javaOwnerType(idx, className, symbol.FilePath); cls != nil {
 					// Indexed field symbols, not a regex over the class
 					// text: that also matched method locals and typed a
 					// caller's `ctor` from an unrelated method's local.
 					for _, f := range idx.byFile[cls.FilePath] {
-						if f.Kind != core.KindField || f.ParentSymbol != className {
+						if f.Kind != core.KindField || (f.ParentSymbol != className && f.ParentSymbol != cls.Name && f.ParentSymbol != cls.QualifiedName) {
 							continue
 						}
 						if _, exists := out[f.Name]; exists {
@@ -108,7 +100,6 @@ func javaArgTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 							record(m[1], m[2])
 						}
 					}
-					break
 				}
 				next = append(next, tsBaseClasses(idx, className, dirOf(symbol.FilePath))...)
 			}
@@ -495,6 +486,7 @@ var jdkReturnTypes = map[string]string{
 	"intValue": "int", "longValue": "long", "doubleValue": "double", "booleanValue": "boolean",
 	"getBytes": "byte[]", "toCharArray": "char[]", "getType": "Class", "getReturnType": "Class",
 	"getParameterTypes": "Class[]", "getDeclaringClass": "Class", "getModifiers": "int",
+	"getMatchingProperty": "String", "getMatchingIndex": "int",
 }
 
 // javaCallResultTypes resolves a "name()" qualifier to the set of declared
@@ -715,6 +707,37 @@ func javaBareType(t string) string {
 	return t
 }
 
+// javaOwnerType resolves both simple and nested parent identities. Astkit uses
+// qualified parents for nested methods (`Outer.Builder`) while the name index
+// is keyed by the declaration's simple name (`Builder`).
+func javaOwnerType(idx *edgeIndex, className, preferFile string) *core.SymbolRecord {
+	if idx == nil || className == "" {
+		return nil
+	}
+	simple := className
+	if dot := strings.LastIndexByte(simple, '.'); dot >= 0 {
+		simple = simple[dot+1:]
+	}
+	var first *core.SymbolRecord
+	for _, cls := range idx.byName[strings.ToLower(simple)] {
+		switch cls.Kind {
+		case core.KindClass, core.KindEnum, core.KindInterface:
+		default:
+			continue
+		}
+		if cls.Name != simple && cls.QualifiedName != className {
+			continue
+		}
+		if cls.QualifiedName == className || cls.FilePath == preferFile {
+			return cls
+		}
+		if first == nil {
+			first = cls
+		}
+	}
+	return first
+}
+
 // javaLocalTypes infers identifier → type for one Java callable.
 func javaLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 	out := map[string]string{}
@@ -730,15 +753,7 @@ func javaLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string
 					continue
 				}
 				seen[className] = true
-				for _, cls := range idx.byName[strings.ToLower(className)] {
-					if cls.Name != className || cls.RawText == "" {
-						continue
-					}
-					switch cls.Kind {
-					case core.KindClass, core.KindEnum, core.KindInterface:
-					default:
-						continue
-					}
+				if cls := javaOwnerType(idx, className, symbol.FilePath); cls != nil && cls.RawText != "" {
 					for _, m := range javaFieldRe.FindAllStringSubmatch(cls.RawText, -1) {
 						if t := javaBareType(m[1]); t != "" {
 							if _, exists := out[m[2]]; !exists {
@@ -746,7 +761,6 @@ func javaLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string
 							}
 						}
 					}
-					break
 				}
 				next = append(next, tsBaseClasses(idx, className, dirOf(symbol.FilePath))...)
 			}

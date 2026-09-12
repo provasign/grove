@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.49.0 - 2026-09-12
+
+Java call resolution now preserves overload identity through dynamic dispatch,
+infers uninitialized locals and nested-class fields, recognizes indexed
+receivers in fluent chains, and applies known external call-result types when
+narrowing overloads. Python resolution now recovers bounded dynamic member
+families through same-name callable aliases, registry-sourced receivers, and
+one additional import hop while retaining heuristic evidence and fanout caps.
+
+These changes restore the Jackson `JsonNode.get(int)` and
+`SettableBeanProperty.set` ceilings and Django `quote_name` coverage. The full
+unit and race suites, vet, all nine edge-accuracy corpora, and Prism's complete
+release invariant suite pass.
+
 ## v0.48.0 - 2026-09-11
 
 Grove now builds and evaluates against astkit v0.11.0, incorporating improved
