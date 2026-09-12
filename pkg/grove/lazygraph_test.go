@@ -102,6 +102,9 @@ func TestIncompleteIndexRequiresRecoveryBeforeQuery(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer eng.Close()
+	if stale, err := eng.IndexNeedsRefresh(ctx); err != nil || !stale {
+		t.Fatalf("missing edges must require reindex: stale=%v err=%v", stale, err)
+	}
 	for range 2 {
 		if _, err := eng.FileSymbols(ctx, "a.go"); err == nil || !strings.Contains(err.Error(), "run 'grove index'") {
 			t.Fatalf("incomplete index query error = %v", err)
@@ -116,6 +119,9 @@ func TestIncompleteIndexRequiresRecoveryBeforeQuery(t *testing.T) {
 	status, err := eng.Status(ctx)
 	if err != nil || status.EdgeCount == 0 {
 		t.Fatalf("recovery did not persist edges: status=%+v err=%v", status, err)
+	}
+	if stale, err := eng.IndexNeedsRefresh(ctx); err != nil || stale {
+		t.Fatalf("recovered index must be current: stale=%v err=%v", stale, err)
 	}
 }
 

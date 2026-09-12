@@ -245,6 +245,28 @@ func (e *Engine) Status(ctx context.Context) (Status, error) {
 	return e.store.Status(ctx)
 }
 
+// IndexNeedsRefresh reports whether persisted graph data was built under older
+// extraction or resolution semantics, or an interrupted index left no edges.
+// It does not walk source files; Index performs the one-time rebuild.
+func (e *Engine) IndexNeedsRefresh(ctx context.Context) (bool, error) {
+	status, err := e.store.Status(ctx)
+	if err != nil {
+		return false, err
+	}
+	if status.SymbolCount == 0 || status.EdgeCount == 0 {
+		return true, nil
+	}
+	extractor, _, err := e.store.GetMeta(ctx, "extractor-version")
+	if err != nil {
+		return false, err
+	}
+	resolver, _, err := e.store.GetMeta(ctx, "resolver-version")
+	if err != nil {
+		return false, err
+	}
+	return extractor != parser.ExtractorVersion || resolver != graph.ResolverVersion, nil
+}
+
 // QuickStatus reports the persisted index summary without constructing an
 // Engine. Open() rehydrates every stored symbol and edge into the in-memory
 // graph so reads work immediately — work Status never touches (it is three

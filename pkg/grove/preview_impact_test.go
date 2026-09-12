@@ -80,6 +80,9 @@ func TestResolverUpgradeDiscardsPersistedFalsePythonCall(t *testing.T) {
 	if err := e.store.SetMeta(t.Context(), "resolver-version", "old"); err != nil {
 		t.Fatal(err)
 	}
+	if stale, err := e.IndexNeedsRefresh(t.Context()); err != nil || !stale {
+		t.Fatalf("old resolver version must require reindex: stale=%v err=%v", stale, err)
+	}
 	e.Close()
 	e, err = Open(t.Context(), Config{RepoRoot: root})
 	if err != nil {
@@ -105,5 +108,8 @@ func TestResolverUpgradeDiscardsPersistedFalsePythonCall(t *testing.T) {
 	version, _, _ := e.store.GetMeta(t.Context(), "resolver-version")
 	if version != graph.ResolverVersion {
 		t.Fatalf("version=%s", version)
+	}
+	if stale, err := e.IndexNeedsRefresh(t.Context()); err != nil || stale {
+		t.Fatalf("reindexed resolver version must be current: stale=%v err=%v", stale, err)
 	}
 }
