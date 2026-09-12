@@ -362,9 +362,17 @@ func (g *CodeGraph) Search(query string, limit int) []core.SymbolRecord {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
-	query = strings.ToLower(strings.TrimSpace(query))
+	rawQuery := strings.TrimSpace(query)
+	query = strings.ToLower(rawQuery)
 	if limit <= 0 {
 		limit = 50
+	}
+	hasCaseExact := false
+	for _, symbol := range g.symbols {
+		if symbol.Name == rawQuery || symbol.QualifiedName == rawQuery || symbol.ID == rawQuery || symbol.FilePath == rawQuery {
+			hasCaseExact = true
+			break
+		}
 	}
 
 	type rankedSymbol struct {
@@ -373,6 +381,11 @@ func (g *CodeGraph) Search(query string, limit int) []core.SymbolRecord {
 	}
 	var results []rankedSymbol
 	for _, symbol := range g.symbols {
+		if hasCaseExact && (strings.EqualFold(symbol.Name, rawQuery) || strings.EqualFold(symbol.QualifiedName, rawQuery) ||
+			strings.EqualFold(symbol.ID, rawQuery) || strings.EqualFold(symbol.FilePath, rawQuery)) &&
+			symbol.Name != rawQuery && symbol.QualifiedName != rawQuery && symbol.ID != rawQuery && symbol.FilePath != rawQuery {
+			continue
+		}
 		rank := searchRank(symbol, query)
 		if rank < 0 {
 			continue
@@ -560,16 +573,26 @@ func (g *CodeGraph) ImpactWithPolicy(query string, maxDepth int, policy Traversa
 	if maxDepth <= 0 {
 		maxDepth = 3
 	}
-	needle := strings.ToLower(strings.TrimSpace(query))
+	rawQuery := strings.TrimSpace(query)
+	needle := strings.ToLower(rawQuery)
 
-	// Find seed symbol IDs: exact name / qualified name / ID / file path.
+	// Find seed symbol IDs. Prefer exact casing when it exists: COBOL/JCL are
+	// case-insensitive while modern languages commonly are not, and folding
+	// both at once made `impact User` seed an unrelated COBOL program USER.
 	seeds := make(map[string]bool)
 	for id, symbol := range g.symbols {
-		if needle != "" && (strings.EqualFold(symbol.Name, query) ||
-			strings.EqualFold(symbol.QualifiedName, query) ||
-			strings.EqualFold(symbol.ID, query) ||
-			strings.EqualFold(symbol.FilePath, query)) {
+		if needle != "" && (symbol.Name == rawQuery || symbol.QualifiedName == rawQuery || symbol.ID == rawQuery || symbol.FilePath == rawQuery) {
 			seeds[id] = true
+		}
+	}
+	if len(seeds) == 0 {
+		for id, symbol := range g.symbols {
+			if needle != "" && (strings.EqualFold(symbol.Name, rawQuery) ||
+				strings.EqualFold(symbol.QualifiedName, rawQuery) ||
+				strings.EqualFold(symbol.ID, rawQuery) ||
+				strings.EqualFold(symbol.FilePath, rawQuery)) {
+				seeds[id] = true
+			}
 		}
 	}
 	// Fallback: substring over symbol names and path suffix only. Matching
@@ -607,7 +630,9 @@ func (g *CodeGraph) ImpactWithPolicy(query string, maxDepth int, policy Traversa
 			if edge.Type != core.EdgeCalls &&
 				edge.Type != core.EdgeContains && edge.Type != core.EdgeImplements &&
 				edge.Type != core.EdgeExtends && edge.Type != core.EdgeUsesType &&
-				edge.Type != core.EdgeOverrides {
+				edge.Type != core.EdgeOverrides && edge.Type != core.EdgeReads &&
+				edge.Type != core.EdgeWrites && edge.Type != core.EdgeRedefines &&
+				edge.Type != core.EdgeBinds {
 				continue
 			}
 			if !policy.Allows(edge) {

@@ -291,7 +291,7 @@ func extractGoImports(content string) []string {
 // starting from startIdx (0-indexed into lines).
 func extractBody(lines []string, startIdx int, language string) (endLine int, body string) {
 	switch language {
-	case "go", "typescript", "tsx", "javascript", "java", "rust", "c", "cpp":
+	case "go", "typescript", "tsx", "javascript", "java", "rust", "c", "cpp", "csharp":
 		return extractBraceBody(lines, startIdx)
 	case "python":
 		return extractIndentBody(lines, startIdx)
@@ -511,14 +511,52 @@ func extractSymbols(language, filePath, blobSHA, content string, fileImports []s
 	// Syntax errors present — supplement AST results with regex to recover symbols
 	// that fell inside ERROR subtrees (e.g. a function being actively typed).
 	regexSyms := extractSymbolsRegex(language, filePath, blobSHA, content, fileImports)
+	for idx := range regexSyms {
+		regexSyms[idx].Annotations = append(regexSyms[idx].Annotations, "syntax-recovery")
+	}
 	if language == "cpp" {
 		n := len(astSyms)
 		combined := enrichCppNamespaces(append(append([]core.SymbolRecord(nil), astSyms...), regexSyms...), content)
 		astSyms, regexSyms = combined[:n], combined[n:]
 	}
 	merged := mergeSymbols(astSyms, regexSyms)
+	if language == "csharp" || language == "java" {
+		enrichRecoveredClassParents(merged)
+	}
 	attachDocstrings(language, content, merged)
 	return merged
+}
+
+func enrichRecoveredClassParents(symbols []core.SymbolRecord) {
+	for idx := range symbols {
+		symbol := &symbols[idx]
+		if symbol.ParentSymbol != "" || (symbol.Kind != core.KindMethod && symbol.Kind != core.KindConstructor) {
+			continue
+		}
+		best := -1
+		bestWidth := int(^uint(0) >> 1)
+		for parentIdx := range symbols {
+			parent := &symbols[parentIdx]
+			switch parent.Kind {
+			case core.KindClass, core.KindStruct, core.KindInterface:
+			default:
+				continue
+			}
+			if parent.FilePath != symbol.FilePath || parent.Span.Start > symbol.Span.Start || parent.Span.End < symbol.Span.End {
+				continue
+			}
+			if width := parent.Span.End - parent.Span.Start; width < bestWidth {
+				best, bestWidth = parentIdx, width
+			}
+		}
+		if best < 0 {
+			continue
+		}
+		parent := &symbols[best]
+		symbol.ParentSymbol = parent.Name
+		symbol.QualifiedName = parent.Name + "." + symbol.Name
+		symbol.ID = symID(symbol.FilePath, symbol.QualifiedName, symbol.BlobSHA)
+	}
 }
 
 const cppCallableNamePattern = `(?:operator\s*(?:\[\]|\(\)|new(?:\[\])?|delete(?:\[\])?|[+*/%<>=!&|^~-]+)|~?[A-Za-z_][A-Za-z0-9_]*)`
@@ -768,6 +806,9 @@ func mergeSymbols(astSyms, regexSyms []core.SymbolRecord) []core.SymbolRecord {
 	}
 	merged := append([]core.SymbolRecord(nil), astSyms...)
 	for _, s := range regexSyms {
+		if cFamilyControlKeywordPhantom(&s) {
+			continue
+		}
 		if !seen[s.Name] {
 			merged = append(merged, s)
 		}
@@ -798,6 +839,23 @@ func mergeSymbolsByShape(astSyms, regexSyms []core.SymbolRecord) []core.SymbolRe
 	}
 	merged := append([]core.SymbolRecord(nil), astSyms...)
 	for _, s := range regexSyms {
+		if cFamilyControlKeywordPhantom(&s) {
+			continue
+		}
+		insideASTCallable := false
+		for _, astSymbol := range astSyms {
+			if isCallableKind(astSymbol.Kind) && s.Span.Start > astSymbol.Span.Start && s.Span.Start <= astSymbol.Span.End {
+				insideASTCallable = true
+				break
+			}
+		}
+		if insideASTCallable {
+			// The C-family fallback scans lines without syntax context.
+			// Statements such as `return json_null();` and `if (work())`
+			// resemble old-style declarations, but an AST callable already
+			// enclosing the line proves they are not file-level symbols.
+			continue
+		}
 		cppDeclaration := false
 		for _, annotation := range s.Annotations {
 			if annotation == "declaration" {
@@ -831,6 +889,17 @@ func mergeSymbolsByShape(astSyms, regexSyms []core.SymbolRecord) []core.SymbolRe
 		}
 	}
 	return merged
+}
+
+func cFamilyControlKeywordPhantom(symbol *core.SymbolRecord) bool {
+	if symbol == nil || (symbol.Language != "c" && symbol.Language != "cpp") || !isCallableKind(symbol.Kind) {
+		return false
+	}
+	switch symbol.Name {
+	case "if", "while", "for", "switch", "catch", "return", "sizeof", "alignof", "decltype":
+		return true
+	}
+	return false
 }
 
 func isCallableKind(k core.SymbolKind) bool {
@@ -1264,12 +1333,49 @@ func extractGoSymbols(filePath, blobSHA, content string, fileImports []string) [
 				ParentSymbol:  parentSymbol,
 				TokenEstimate: estimateTokens(body),
 			})
-			// Skip past the body so inner declarations are not re-extracted.
-			i = endLine - 1
+			// Skip past a balanced body so declarations nested inside it are not
+			// re-extracted. During syntax recovery an unclosed function may swallow
+			// every later top-level declaration; keep scanning so column-zero
+			// declarations after the edit point remain visible.
+			if bracesBalanced(body) {
+				i = endLine - 1
+			}
 			break
 		}
 	}
 	return symbols
+}
+
+func bracesBalanced(body string) bool {
+	depth := 0
+	opened := false
+	for _, line := range strings.Split(body, "\n") {
+		inString := false
+		var quote rune
+		for idx, char := range line {
+			if inString {
+				if char == quote && (idx == 0 || line[idx-1] != '\\') {
+					inString = false
+				}
+				continue
+			}
+			if char == '/' && idx+1 < len(line) && line[idx+1] == '/' {
+				break
+			}
+			if char == '\'' || char == '"' || char == '`' {
+				inString, quote = true, char
+				continue
+			}
+			switch char {
+			case '{':
+				depth++
+				opened = true
+			case '}':
+				depth--
+			}
+		}
+	}
+	return !opened || depth <= 0
 }
 
 func isExported(language, name, line string) bool {

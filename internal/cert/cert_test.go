@@ -55,6 +55,30 @@ func TestCertifyDiffAllowWithMappedSymbolAndTest(t *testing.T) {
 	}
 }
 
+func TestCertifyDiffCoveredMethodDoesNotRequireSeparateClassCoverage(t *testing.T) {
+	cg := graph.New()
+	cg.ReplaceWithEdges([]core.SymbolRecord{
+		{ID: "svc.py::Service", FilePath: "svc.py", BlobSHA: "sha", Language: "python", Kind: core.KindClass, Name: "Service", QualifiedName: "Service", Span: core.LineRange{Start: 1, End: 5}},
+		{ID: "svc.py::Service.run", FilePath: "svc.py", BlobSHA: "sha", Language: "python", Kind: core.KindMethod, Name: "run", QualifiedName: "Service.run", ParentSymbol: "Service", Span: core.LineRange{Start: 2, End: 4}},
+		{ID: "test_svc.py::test_run", FilePath: "test_svc.py", BlobSHA: "sha", Language: "python", Kind: core.KindFunction, Name: "test_run", QualifiedName: "test_run", Span: core.LineRange{Start: 1, End: 2}},
+	}, []core.Edge{{From: "test_svc.py::test_run", To: "svc.py::Service.run", Type: core.EdgeCalls, Confidence: 1}}, 2)
+
+	report := CertifyDiff(cg, core.DiffInput{
+		Policy: core.CertificationPolicy{RequireTestsForCode: true},
+		UnifiedDiff: `diff --git a/svc.py b/svc.py
+--- a/svc.py
++++ b/svc.py
+@@ -2,3 +2,3 @@
+ def run(self):
+-    return False
++    return True
+ `,
+	})
+	if report.Verdict != core.VerdictAllow {
+		t.Fatalf("covered method should certify without a duplicate class requirement: %+v", report)
+	}
+}
+
 func TestCertifyDiffManualReviewForUnmappedHunk(t *testing.T) {
 	cg := graph.New()
 	cg.Replace([]core.SymbolRecord{

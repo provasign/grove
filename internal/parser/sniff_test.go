@@ -72,6 +72,8 @@ func TestDetectLanguageFile_ExtensionlessMember(t *testing.T) {
 func TestDetectLanguage_UppercaseMainframeExtensions(t *testing.T) {
 	for path, want := range map[string]string{
 		"cobol/copybook/AUCCS020.CPY": "cobol",
+		"cobol/copybook/OTHER.copy":   "cobol",
+		"cobol/copybook/OTHER.COPY":   "cobol",
 		"cobol/TESTPGM.CBL":           "cobol",
 		"jcl/NIGHTLY.JCL":             "jcl",
 		"legacy/Batch.Cbl":            "cobol",

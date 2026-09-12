@@ -96,7 +96,7 @@ func resolveMainframeCallEdges(idx *edgeIndex, symbol core.SymbolRecord) []core.
 // mainframeDataKind: kinds that anchor lineage queries (declared storage).
 func mainframeDataKind(kind core.SymbolKind) bool {
 	switch string(kind) {
-	case "data-item", "condition-name", "logical-file":
+	case "data-item", "condition-name", "logical-file", "dataset":
 		return true
 	}
 	return false
@@ -121,13 +121,110 @@ func hasMainframeSymbols(symbols []core.SymbolRecord) bool {
 }
 
 var (
-	reFieldToken  = regexp.MustCompile(`[A-Za-z0-9][A-Za-z0-9-]+`)
-	reQuoted      = regexp.MustCompile(`'[^']*'|"[^"]*"`)
-	reAssignTo    = regexp.MustCompile(`(?i)ASSIGN\s+TO\s+([A-Za-z0-9-]+)`)
-	// Write-position captures: the clause after the verb up to the next
-	// keyword/period holds the targets.
-	reWriteTarget = regexp.MustCompile(`(?i)\b(?:MOVE\s+.*?\s+TO|ADD\s+.*?\s+TO|SUBTRACT\s+.*?\s+FROM|COMPUTE|INITIALIZE|SET|STRING\s+.*?\s+INTO|UNSTRING\s+.*?\s+INTO|READ\s+.*?\s+INTO|GIVING|VARYING)\s+([A-Za-z0-9-]+(?:\s*,?\s+[A-Za-z0-9-]+)*)`)
+	reFieldToken     = regexp.MustCompile(`[A-Za-z0-9][A-Za-z0-9-]+`)
+	reQuoted         = regexp.MustCompile(`'[^']*'|"[^"]*"`)
+	reAssignTo       = regexp.MustCompile(`(?i)ASSIGN\s+TO\s+([A-Za-z0-9-]+)`)
+	reFieldQualifier = regexp.MustCompile(`(?i)^\s+(?:OF|IN)\s+([A-Za-z0-9-]+)`)
 )
+
+// mainframeAccessAt classifies one field occurrence by its position in a
+// COBOL statement. COBOL verbs frequently read and write different operands,
+// so treating an entire captured tail as a write target loses lineage (for
+// example WRITE dst FROM src and ADD a TO b GIVING c).
+func mainframeAccessAt(statement string, tokenStart int) (read, write bool) {
+	upper := strings.ToUpper(statement)
+	fields := strings.Fields(upper)
+	if len(fields) == 0 {
+		return true, false
+	}
+	verb := strings.Trim(fields[0], ".")
+	position := func(keyword string) int { return strings.Index(upper, keyword) }
+	after := func(keyword string) bool {
+		pos := position(keyword)
+		return pos >= 0 && tokenStart > pos
+	}
+
+	switch verb {
+	case "MOVE":
+		return !after(" TO "), after(" TO ")
+	case "ADD":
+		if position(" GIVING ") >= 0 {
+			return !after(" GIVING "), after(" GIVING ")
+		}
+		if after(" TO ") {
+			return true, true
+		}
+		return true, false
+	case "SUBTRACT":
+		if position(" GIVING ") >= 0 {
+			return !after(" GIVING "), after(" GIVING ")
+		}
+		if after(" FROM ") {
+			return true, true
+		}
+		return true, false
+	case "COMPUTE":
+		if eq := strings.IndexByte(upper, '='); eq >= 0 {
+			return tokenStart > eq, tokenStart < eq
+		}
+		return false, true
+	case "INITIALIZE", "ACCEPT":
+		return false, true
+	case "SET":
+		to := position(" TO ")
+		if to < 0 {
+			return false, true
+		}
+		return tokenStart > to, tokenStart < to
+	case "STRING", "UNSTRING", "READ":
+		return !after(" INTO "), after(" INTO ")
+	case "WRITE", "REWRITE":
+		return after(" FROM "), !after(" FROM ")
+	case "INSPECT":
+		tallying := position(" TALLYING ")
+		replacing := position(" REPLACING ")
+		firstClause := len(upper)
+		if tallying >= 0 && tallying < firstClause {
+			firstClause = tallying
+		}
+		if replacing >= 0 && replacing < firstClause {
+			firstClause = replacing
+		}
+		if tokenStart < firstClause {
+			return true, replacing >= 0
+		}
+		if tallying >= 0 && tokenStart > tallying {
+			forPos := position(" FOR ")
+			if forPos < 0 || tokenStart < forPos {
+				return false, true
+			}
+		}
+		return true, false
+	default:
+		return true, false
+	}
+}
+
+func mainframeQualifiedField(fields []*core.SymbolRecord, statement string, tokenEnd int) []*core.SymbolRecord {
+	match := reFieldQualifier.FindStringSubmatch(statement[tokenEnd:])
+	if len(match) == 0 {
+		return fields
+	}
+	qualifier := strings.ToUpper(match[1])
+	var matched []*core.SymbolRecord
+	for _, field := range fields {
+		parent := strings.ToUpper(field.ParentSymbol)
+		qualified := strings.ToUpper(field.QualifiedName)
+		if parent == qualifier || strings.HasSuffix(parent, "."+qualifier) ||
+			strings.Contains(qualified, "."+qualifier+".") {
+			matched = append(matched, field)
+		}
+	}
+	if len(matched) > 0 {
+		return matched
+	}
+	return fields
+}
 
 // buildMainframeDataEdges emits the lineage layer:
 //
@@ -137,10 +234,34 @@ var (
 //     honest record that the reference exists even when the member is absent.
 //  2. Field-reference edges (uses-type, 0.7, regex): paragraph/section body
 //     tokens matched against data items VISIBLE to that file — declared in
-//     it, or in the transitive closure of its resolved copybooks. Name-level
-//     matching, no direction claim; read/write direction needs the
-//     PROCEDURE DIVISION grammar phase.
+//     it, or in the transitive closure of its resolved copybooks. Operand
+//     position supplies read/write direction and OF/IN qualifiers disambiguate
+//     duplicate leaf names.
 func buildMainframeDataEdges(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
+	// A COBOL program enters the first paragraph/section of PROCEDURE
+	// DIVISION even when there is no explicit PERFORM. Model that control-flow
+	// edge so dead-code and impact do not report every program entry paragraph
+	// as unreachable.
+	firstProcedure := map[string]*core.SymbolRecord{}
+	programs := map[string]*core.SymbolRecord{}
+	for i := range symbols {
+		symbol := &symbols[i]
+		if symbol.Language != "cobol" {
+			continue
+		}
+		if string(symbol.Kind) == "program" {
+			programs[symbol.FilePath+"\x00"+strings.ToUpper(symbol.Name)] = symbol
+			continue
+		}
+		if string(symbol.Kind) != "paragraph" && string(symbol.Kind) != "section" {
+			continue
+		}
+		key := symbol.FilePath + "\x00" + strings.ToUpper(symbol.ParentSymbol)
+		if current := firstProcedure[key]; current == nil || symbol.Span.Start < current.Span.Start {
+			firstProcedure[key] = symbol
+		}
+	}
+
 	// Member name -> file path, for cobol files only.
 	memberFile := map[string]string{}
 	cobolFiles := map[string][]string{} // filePath -> imports
@@ -166,6 +287,15 @@ func buildMainframeDataEdges(idx *edgeIndex, symbols []core.SymbolRecord) []core
 	}
 
 	var edges []core.Edge
+	for key, first := range firstProcedure {
+		if program := programs[key]; program != nil {
+			edges = append(edges, core.Edge{
+				From: program.ID, To: first.ID,
+				Type: core.EdgeCalls, Confidence: 1.0,
+				Source: core.EvidenceSourceASTKit, Reason: core.ReasonStructural,
+			})
+		}
+	}
 	// 1. Resolved include edges + per-file include closure.
 	closure := map[string]map[string]bool{} // filePath -> reachable member files
 	var expand func(file string, seen map[string]bool)
@@ -207,11 +337,10 @@ func buildMainframeDataEdges(idx *edgeIndex, symbols []core.SymbolRecord) []core
 	// referenced field in the statement is a READ. Quoted literals are
 	// stripped first so 'ACCT-NOT-FOUND' never matches a field.
 	//
-	// Volume discipline (measured on a real estate: undirected refs hit
-	// 2.7M edges, 80x the source size): fields declared in the SAME file
-	// (private working storage) roll up to ONE edge from the file's
-	// program symbol per direction; paragraph-level granularity is kept
-	// only for CROSS-FILE (copybook) fields, where lineage value lives.
+	// References remain owned by their paragraph/section. Rolling same-file
+	// fields up to the program destroys the caller identity used by impact,
+	// rename, and lineage queries. Deduplication below still bounds repeated
+	// references within one owner.
 	fieldsByFile := map[string]map[string][]*core.SymbolRecord{}
 	fieldMap := func(file string) map[string][]*core.SymbolRecord {
 		if m, ok := fieldsByFile[file]; ok {
@@ -246,12 +375,6 @@ func buildMainframeDataEdges(idx *edgeIndex, symbols []core.SymbolRecord) []core
 		if write {
 			et = core.EdgeWrites
 		}
-		// Same-file fields: attribute to the program, one edge per direction.
-		if field.FilePath == from.FilePath {
-			if prog := programOfFile[from.FilePath]; prog != nil {
-				from = prog
-			}
-		}
 		key := from.ID + string(et) + field.ID
 		if seenRef[key] {
 			return
@@ -272,20 +395,22 @@ func buildMainframeDataEdges(idx *edgeIndex, symbols []core.SymbolRecord) []core
 		visible := fieldMap(s.FilePath)
 		for _, stmt := range strings.Split(s.RawText, "\n") {
 			stmt = reQuoted.ReplaceAllString(stmt, " ")
-			writeTargets := map[string]bool{}
-			for _, m := range reWriteTarget.FindAllStringSubmatch(stmt, -1) {
-				for _, tok := range reFieldToken.FindAllString(m[1], -1) {
-					writeTargets[strings.ToUpper(tok)] = true
-				}
-			}
-			for _, tok := range reFieldToken.FindAllString(stmt, -1) {
+			for _, loc := range reFieldToken.FindAllStringIndex(stmt, -1) {
+				tok := stmt[loc[0]:loc[1]]
 				u := strings.ToUpper(tok)
 				fields := visible[u]
 				if len(fields) == 0 {
 					continue
 				}
+				fields = mainframeQualifiedField(fields, stmt, loc[1])
+				read, write := mainframeAccessAt(stmt, loc[0])
 				for _, field := range fields {
-					emitRef(s, field, writeTargets[u])
+					if read {
+						emitRef(s, field, false)
+					}
+					if write {
+						emitRef(s, field, true)
+					}
 				}
 			}
 		}
@@ -420,7 +545,8 @@ func (g *CodeGraph) mainframeImpactLocked(query string) *ChangeImpactResult {
 		for _, ei := range g.inbound[id] {
 			edge := g.edges[ei]
 			ok := edge.Type == core.EdgeCalls ||
-				(dataAnchor && (edge.Type == core.EdgeReads || edge.Type == core.EdgeWrites || edge.Type == core.EdgeRedefines))
+				(dataAnchor && (edge.Type == core.EdgeReads || edge.Type == core.EdgeWrites ||
+					edge.Type == core.EdgeRedefines || edge.Type == core.EdgeBinds))
 			if !ok || declIDs[edge.From] || seen[edge.From] {
 				continue
 			}

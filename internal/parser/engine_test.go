@@ -4,6 +4,7 @@ import (
 	"github.com/provasign/grove/internal/core"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -652,6 +653,20 @@ function internalHelper() {}
 	}
 }
 
+func TestRustPublicReExportKeepsVisibilityForGraphScope(t *testing.T) {
+	imports := extractImports("rust", "pub use grep_printer as printer;\nuse grep_cli::args;\n")
+	got := map[string]bool{}
+	for _, imp := range imports {
+		got[imp] = true
+	}
+	if !got["pub use grep_printer as printer"] {
+		t.Fatalf("public re-export visibility was lost: %v", imports)
+	}
+	if !got["grep_cli::args"] {
+		t.Fatalf("ordinary Rust import changed: %v", imports)
+	}
+}
+
 func TestJSImportMixedDefaultAndNamedKeepsDefaultAlias(t *testing.T) {
 	imports, ok := extractImportsFromAST("typescript", []byte(`import React, { useState as state } from './react'`))
 	if !ok {
@@ -1199,6 +1214,63 @@ static void _internal(void) {}
 	}
 	if !found {
 		t.Error("#include <stdio.h> not captured as import")
+	}
+}
+
+func TestCRegexMergeDoesNotExtractStatementsAsFunctions(t *testing.T) {
+	src := `static json_t *pack(scanner_t *s) {
+    if (token(s)) {
+        return json_null();
+    }
+    return json_true();
+}
+`
+	syms, err := extractSymbolsFromString("c", "pack.c", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, symbol := range syms {
+		if symbol.Name == "json_null" || symbol.Name == "json_true" || symbol.Name == "if" {
+			t.Fatalf("statement extracted as function: %+v", symbol)
+		}
+	}
+	if _, ok := nameIndex(syms)["pack"]; !ok {
+		t.Fatal("real pack function missing")
+	}
+}
+
+func TestCxxSyntaxRecoveryDropsControlKeywordPhantoms(t *testing.T) {
+	content := "void broken() {\n  if (ready()) {\n    while (work()) {\n"
+	syms := extractSymbols("cpp", "broken.cpp", "sha", content, nil)
+	for _, symbol := range syms {
+		if symbol.Name == "if" || symbol.Name == "while" {
+			t.Fatalf("syntax recovery emitted control keyword phantom: %+v", symbol)
+		}
+	}
+}
+
+func TestGoSyntaxRecoveryKeepsDeclarationAfterUnclosedBody(t *testing.T) {
+	content := "package p\n\nfunc Broken() {\n\tprintln(1)\n\nfunc Good() { Keep() }\n"
+	syms := extractSymbols("go", "broken.go", "sha", content, nil)
+	index := nameIndex(syms)
+	good, ok := index["Good"]
+	if !ok {
+		t.Fatal("declaration after unclosed function body was dropped")
+	}
+	if !slices.Contains(good.Annotations, "syntax-recovery") {
+		t.Fatalf("recovered symbol annotations = %v", good.Annotations)
+	}
+}
+
+func TestCSharpSyntaxRecoveryRestoresClassParent(t *testing.T) {
+	content := "class Broken {\n  void Bad() {\n    Work();\n  void Good() { Keep(); }\n}\n"
+	syms := extractSymbols("csharp", "Broken.cs", "sha", content, nil)
+	good, ok := nameIndex(syms)["Good"]
+	if !ok {
+		t.Fatal("recovered Good method missing")
+	}
+	if good.ParentSymbol != "Broken" || good.QualifiedName != "Broken.Good" {
+		t.Fatalf("recovered Good owner = %q / %q, want Broken.Good", good.ParentSymbol, good.QualifiedName)
 	}
 }
 

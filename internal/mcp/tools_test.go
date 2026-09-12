@@ -112,6 +112,22 @@ func TestMCPCertifyTool(t *testing.T) {
 	}
 }
 
+func TestMCPIndexRejectsDirOutsideServerRoot(t *testing.T) {
+	s, root := newMCPTestServer(t)
+	foreign := t.TempDir()
+	before := len(s.currentGraph().Search("Login", 10))
+	if before == 0 {
+		t.Fatal("fixture graph missing Login before rejected index")
+	}
+
+	if _, err := s.callTool("grove_index", map[string]any{"dir": foreign}); err == nil {
+		t.Fatal("expected grove_index to reject a dir outside the server root")
+	}
+	if after := len(s.currentGraph().Search("Login", 10)); after != before {
+		t.Fatalf("rejected foreign index changed server graph: before=%d after=%d root=%s", before, after, root)
+	}
+}
+
 func TestMCPToolsListReturnsExpectedTools(t *testing.T) {
 	s, _ := newMCPTestServer(t)
 	resp := rpcCall(t, s, "tools/list", nil)

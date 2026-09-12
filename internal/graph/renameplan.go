@@ -65,6 +65,9 @@ func (g *CodeGraph) RenamePlan(query, newName string) (*RenamePlanResult, error)
 
 	g.mu.RLock()
 	defer g.mu.RUnlock()
+	if len(ci.Declarations) > 0 && mainframeAnchorKind(ci.Declarations[0].Kind) {
+		return renameMainframePlanLocked(ci, query, newName), nil
+	}
 
 	res := &RenamePlanResult{
 		Query: query, NewName: newName,
@@ -349,6 +352,70 @@ func (g *CodeGraph) RenamePlan(query, newName string) (*RenamePlanResult, error)
 	}
 	sort.Strings(res.Unresolved)
 	return res, nil
+}
+
+func renameMainframePlanLocked(ci *ChangeImpactResult, query, newName string) *RenamePlanResult {
+	oldName := ci.Declarations[0].Name
+	pattern := regexp.MustCompile(`(?i)(^|[^A-Za-z0-9-])(` + regexp.QuoteMeta(oldName) + `)([^A-Za-z0-9-]|$)`)
+	replacement := "${1}" + strings.ReplaceAll(newName, "$", "$$") + "${3}"
+	result := &RenamePlanResult{
+		Query: query, NewName: newName, SitesTotal: len(ci.Sites()),
+		ExternalSupers: ci.ExternalSupers, OverridesExternal: ci.OverridesExternal,
+		Completeness: ci.Completeness,
+	}
+	declarations := map[string]bool{}
+	for _, declaration := range ci.Declarations {
+		declarations[declaration.ID] = true
+	}
+	for _, site := range ci.Sites() {
+		lines := strings.Split(site.RawText, "\n")
+		if site.RawText == "" && site.Signature != "" {
+			lines = []string{site.Signature}
+		}
+		edited := false
+		callLines := map[int]bool{}
+		for _, call := range site.CallSites {
+			if strings.EqualFold(call.Callee, oldName) {
+				callLines[call.Line] = true
+			}
+		}
+		for idx, before := range lines {
+			line := site.Span.Start + idx
+			if !declarations[site.ID] && len(callLines) > 0 && !callLines[line] {
+				continue
+			}
+			clean := stripCommentsAndStrings(before)
+			matches := pattern.FindAllStringIndex(clean, -1)
+			if len(matches) == 0 {
+				continue
+			}
+			after := pattern.ReplaceAllString(before, replacement)
+			if after == before {
+				continue
+			}
+			edit := RenameEdit{
+				FilePath: site.FilePath, Line: line,
+				Before: strings.TrimRight(before, "\r"), After: strings.TrimRight(after, "\r"),
+				SiteID: site.ID, Site: site.FilePath + ":" + site.Name,
+			}
+			if len(matches) == 1 && len(ci.Declarations) == 1 {
+				result.Edits = append(result.Edits, edit)
+			} else {
+				result.Ambiguous = append(result.Ambiguous, edit)
+			}
+			edited = true
+			if declarations[site.ID] {
+				break
+			}
+		}
+		if !edited {
+			result.Unresolved = append(result.Unresolved, site.FilePath+":"+site.Name)
+		}
+	}
+	sortEdits(result.Edits)
+	sortEdits(result.Ambiguous)
+	sort.Strings(result.Unresolved)
+	return result
 }
 
 func sortEdits(es []RenameEdit) {

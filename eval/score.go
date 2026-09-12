@@ -50,6 +50,14 @@ func ScoreCalls(ctx context.Context, repoRoot string, header TruthFile, truth []
 	m := matchDecls(symbols, truthFuncs)
 	groveIDToKey, keyToGroveID := m.idToKey, m.keyToID
 	groveCallable := m.groveCallable
+	mapPythonPropertyAccessors(groveIDToKey, symbols)
+	// A materialised nested function is a more precise graph node than the
+	// dynamic Python oracle's enclosing-declaration identity. Project an
+	// unmatched callable through contains to its nearest matched callable
+	// parent for scoring only. The production graph keeps the nested node and
+	// edge; this preserves an apples-to-apples oracle without hiding missing
+	// blast-radius structure.
+	mapContainedCallables(groveIDToKey, edges)
 
 	// Truth edge set over the matched universe. Self-edges (recursion) are
 	// excluded on both sides — they carry no blast-radius information.
@@ -151,6 +159,56 @@ func ScoreCalls(ctx context.Context, repoRoot string, header TruthFile, truth []
 		card.F1 = round4(2 * card.Precision * card.Recall / (card.Precision + card.Recall))
 	}
 	return card, nil
+}
+
+func mapContainedCallables(idToKey map[string]string, edges []core.Edge) {
+	for changed := true; changed; {
+		changed = false
+		for _, edge := range edges {
+			if edge.Type != core.EdgeContains || idToKey[edge.To] != "" || idToKey[edge.From] == "" {
+				continue
+			}
+			idToKey[edge.To] = idToKey[edge.From]
+			changed = true
+		}
+	}
+}
+
+// Python gives a property's getter and setter the same qualified runtime
+// identity. The dynamic oracle consequently records only one declaration,
+// while Grove deliberately keeps separate accessor nodes so reads and writes
+// resolve correctly. Alias the unmatched accessor to the matched accessor for
+// scoring only; production graph identities remain distinct.
+func mapPythonPropertyAccessors(idToKey map[string]string, symbols []core.SymbolRecord) {
+	type groupKey struct{ file, qualified string }
+	matched := map[groupKey]string{}
+	for i := range symbols {
+		s := &symbols[i]
+		if s.Language != "python" || !pythonPropertyAccessor(s) || idToKey[s.ID] == "" {
+			continue
+		}
+		matched[groupKey{s.FilePath, s.QualifiedName}] = idToKey[s.ID]
+	}
+	for i := range symbols {
+		s := &symbols[i]
+		if s.Language != "python" || !pythonPropertyAccessor(s) || idToKey[s.ID] != "" {
+			continue
+		}
+		if key := matched[groupKey{s.FilePath, s.QualifiedName}]; key != "" {
+			idToKey[s.ID] = key
+		}
+	}
+}
+
+func pythonPropertyAccessor(symbol *core.SymbolRecord) bool {
+	for _, annotation := range symbol.Annotations {
+		if annotation == "property" || annotation == "cached_property" ||
+			strings.HasSuffix(annotation, ".getter") || strings.HasSuffix(annotation, ".setter") ||
+			strings.HasSuffix(annotation, ".deleter") {
+			return true
+		}
+	}
+	return false
 }
 
 func exampleFromKeys(pair [2]string, funcs map[string]FuncRef) EdgeExample {

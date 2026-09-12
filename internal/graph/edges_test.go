@@ -187,6 +187,22 @@ func TestRustPubRestrictedUseDoesNotLookExternal(t *testing.T) {
 	}
 }
 
+func TestRustFacadeReExportReachesTargetCrate(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "crates/core/src/lib.rs::crate", FilePath: "crates/core/src/lib.rs", Language: "rust", Kind: core.KindModule, Name: "crate"},
+		{ID: "crates/core/src/hiargs.rs::via_use", FilePath: "crates/core/src/hiargs.rs", Language: "rust", Kind: core.KindFunction, Name: "via_use", QualifiedName: "via_use", Imports: []string{"grep::printer::StandardBuilder"}, RawText: "fn via_use() { StandardBuilder::new().build(); }", Span: core.LineRange{Start: 1, End: 1}, CallSites: []core.CallSite{{Callee: "StandardBuilder.new", Line: 1}, {Callee: "build", Line: 1}}},
+		{ID: "crates/grep/src/lib.rs::crate", FilePath: "crates/grep/src/lib.rs", Language: "rust", Kind: core.KindModule, Name: "crate", Imports: []string{"pub use grep_printer as printer"}},
+		{ID: "crates/printer/src/lib.rs::StandardBuilder", FilePath: "crates/printer/src/lib.rs", Language: "rust", Kind: core.KindStruct, Name: "StandardBuilder", QualifiedName: "StandardBuilder"},
+		{ID: "crates/printer/src/lib.rs::StandardBuilder.new", FilePath: "crates/printer/src/lib.rs", Language: "rust", Kind: core.KindConstructor, Name: "new", QualifiedName: "StandardBuilder.new", ParentSymbol: "StandardBuilder"},
+		{ID: "crates/printer/src/lib.rs::StandardBuilder.build", FilePath: "crates/printer/src/lib.rs", Language: "rust", Kind: core.KindMethod, Name: "build", QualifiedName: "StandardBuilder.build", ParentSymbol: "StandardBuilder"},
+	}
+	g := New()
+	g.Replace(syms, 3)
+	if !hasEdge(g, core.EdgeCalls, "crates/core/src/hiargs.rs::via_use", "crates/printer/src/lib.rs::StandardBuilder.new") {
+		t.Fatal("call through Rust facade re-export did not reach target crate")
+	}
+}
+
 func TestRustContainsCrossFileImplInSameCrate(t *testing.T) {
 	syms := []core.SymbolRecord{
 		{ID: "src/lib.rs::crate", FilePath: "src/lib.rs", Language: "rust", Kind: core.KindModule, Name: "crate"},
@@ -197,6 +213,32 @@ func TestRustContainsCrossFileImplInSameCrate(t *testing.T) {
 	g.Replace(syms, 3)
 	if !hasEdge(g, core.EdgeContains, "src/a.rs::Thing", "src/b.rs::Thing.bump") {
 		t.Fatal("cross-file Rust impl method was not attached to its type")
+	}
+}
+
+func TestPythonNestedFunctionContainsAndImpactReachesParent(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "app.py::helper", FilePath: "app.py", Language: "python", Kind: core.KindFunction, Name: "helper", QualifiedName: "helper", Span: core.LineRange{Start: 1, End: 1}},
+		{ID: "app.py::outer", FilePath: "app.py", Language: "python", Kind: core.KindFunction, Name: "outer", QualifiedName: "outer", Span: core.LineRange{Start: 3, End: 8}},
+		{ID: "app.py::outer.inner", FilePath: "app.py", Language: "python", Kind: core.KindFunction, Name: "inner", QualifiedName: "outer.inner", ParentSymbol: "outer", Span: core.LineRange{Start: 4, End: 6}, CallSites: []core.CallSite{{Callee: "helper", Line: 5}}},
+		// Same leaf name, same file, but not the lexical parent.
+		{ID: "app.py::other.outer", FilePath: "app.py", Language: "python", Kind: core.KindFunction, Name: "outer", QualifiedName: "other.outer", Span: core.LineRange{Start: 10, End: 12}},
+	}
+	g := New()
+	g.Replace(syms, 2)
+	if !hasEdge(g, core.EdgeContains, "app.py::outer", "app.py::outer.inner") {
+		t.Fatal("nested Python function was not attached to its lexical parent")
+	}
+	if hasEdge(g, core.EdgeContains, "app.py::other.outer", "app.py::outer.inner") {
+		t.Fatal("same-named non-parent function claimed nested child")
+	}
+	got := g.Impact("helper", 3)
+	foundOuter := false
+	for _, symbol := range got {
+		foundOuter = foundOuter || symbol.ID == "app.py::outer"
+	}
+	if !foundOuter {
+		t.Fatalf("impact did not traverse nested child to lexical parent: %+v", got)
 	}
 }
 
@@ -736,6 +778,77 @@ func itoa(i int) string {
 		out[l], out[r] = out[r], out[l]
 	}
 	return string(out)
+}
+
+func TestResolveCalleesMatchesLanguageAndCSharpPrivateScope(t *testing.T) {
+	caller := core.SymbolRecord{ID: "use.cs::Other.Run", FilePath: "use.cs", Language: "csharp", Kind: core.KindMethod, Name: "Run", ParentSymbol: "Other"}
+	public := core.SymbolRecord{ID: "lib.cs::Helpers.Format", FilePath: "lib.cs", Language: "csharp", Kind: core.KindMethod, Name: "Format", ParentSymbol: "Helpers", Modifiers: []string{"public"}}
+	private := public
+	private.ID = "lib.cs::Helpers.Format#2"
+	private.Modifiers = []string{"private"}
+	wrongLanguage := public
+	wrongLanguage.ID = "lib.go::Helpers.Format"
+	wrongLanguage.FilePath = "lib.go"
+	wrongLanguage.Language = "go"
+	syms := []core.SymbolRecord{caller, public, private, wrongLanguage}
+	idx := newEdgeIndex(syms)
+	scope := map[string]struct{}{"use.cs": {}, "lib.cs": {}, "lib.go": {}}
+	got, _ := resolveCallees(idx, &syms[0], "Format", scope, true, false)
+	if len(got) != 1 || got[0].ID != public.ID {
+		t.Fatalf("cross-type candidates = %#v, want only public same-language method", got)
+	}
+	cHeader := core.SymbolRecord{ID: "api.h::Format", FilePath: "api.h", Language: "cpp", Kind: core.KindFunction, Name: "Format"}
+	cCaller := core.SymbolRecord{ID: "use.c::run", FilePath: "use.c", Language: "c", Kind: core.KindFunction, Name: "run"}
+	cIdx := newEdgeIndex([]core.SymbolRecord{cCaller, cHeader})
+	cGot, _ := resolveCallees(cIdx, &cCaller, "Format", map[string]struct{}{"use.c": {}, "api.h": {}}, true, false)
+	if len(cGot) != 1 || cGot[0].ID != cHeader.ID {
+		t.Fatalf("C caller did not accept C++-classified header: %#v", cGot)
+	}
+	syms[0].ParentSymbol = "Helpers"
+	got, _ = resolveCallees(idx, &syms[0], "Format", scope, true, false)
+	if len(got) != 2 {
+		t.Fatalf("same-type candidates = %#v, want public and private methods", got)
+	}
+}
+
+func TestResolveCalleesKeepsSelfRecursionWithoutCrossLanguagePromotion(t *testing.T) {
+	for _, language := range []string{"go", "java", "typescript", "python", "php", "rust"} {
+		t.Run(language, func(t *testing.T) {
+			self := core.SymbolRecord{
+				ID: language + "::walk", FilePath: "walk." + language, Language: language,
+				Kind: core.KindFunction, Name: "walk", QualifiedName: "walk",
+				CallSites: []core.CallSite{{Callee: "walk", Line: 1}},
+			}
+			foreign := core.SymbolRecord{ID: "foreign::walk", FilePath: "walk.foreign", Language: "csharp", Kind: core.KindFunction, Name: "walk", QualifiedName: "walk"}
+			g := New()
+			g.Replace([]core.SymbolRecord{self, foreign}, 2)
+			if !hasEdge(g, core.EdgeCalls, self.ID, self.ID) {
+				_, edges := g.Snapshot()
+				t.Fatalf("%s recursive call did not produce a self edge: %+v", language, edges)
+			}
+			if hasEdge(g, core.EdgeCalls, self.ID, foreign.ID) {
+				t.Fatalf("%s recursive call promoted to another language", language)
+			}
+		})
+	}
+}
+
+func TestSelfNamedWrapperDoesNotShadowQualifiedTarget(t *testing.T) {
+	caller := core.SymbolRecord{
+		ID: "wrapper.go::Use", FilePath: "wrapper.go", Language: "go", Kind: core.KindFunction,
+		Name: "Use", QualifiedName: "Use", Imports: []string{"example/engine"},
+		CallSites: []core.CallSite{{Callee: "engine().Use", Line: 1}},
+	}
+	target := core.SymbolRecord{ID: "engine/use.go::Engine.Use", FilePath: "engine/use.go", Language: "go", Kind: core.KindMethod, Name: "Use", QualifiedName: "Engine.Use", ParentSymbol: "Engine"}
+	g := New()
+	g.Replace([]core.SymbolRecord{caller, target}, 2)
+	if !hasEdge(g, core.EdgeCalls, caller.ID, target.ID) {
+		_, edges := g.Snapshot()
+		t.Fatalf("qualified wrapper target missing: %+v", edges)
+	}
+	if hasEdge(g, core.EdgeCalls, caller.ID, caller.ID) {
+		t.Fatal("qualified non-self receiver was misclassified as recursion")
+	}
 }
 
 // @property method blueprints, and never to a plain (non-property) method.

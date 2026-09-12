@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -562,14 +563,19 @@ func TestJsTSAvailableNeedsProjectConfig(t *testing.T) {
 	}
 }
 
-func TestJsTSAnalyzeCommonJSAndDynamicImports(t *testing.T) {
-	root := t.TempDir()
-	probe := exec.Command("node", "-p", "require.resolve('typescript')")
-	probe.Dir = root
+func linkTypeScriptForTest(t *testing.T, root string) {
+	t.Helper()
+	probeScript := `const path = require('path');
+const roots = [process.env.GROVE_TEST_TYPESCRIPT_ROOT, process.cwd()].filter(Boolean);
+for (const candidate of roots) {
+  try { console.log(require.resolve('typescript', {paths: [candidate]})); process.exit(0); } catch (_) {}
+}
+process.exit(1);`
+	probe := exec.Command("node", "-e", probeScript)
 	probe.Env = os.Environ()
 	resolved, err := probe.Output()
 	if err != nil {
-		t.Skip("typescript module is not available to node")
+		t.Skip("typescript module is not available to node; set GROVE_TEST_TYPESCRIPT_ROOT to a project that installs it")
 	}
 	typescriptDir := filepath.Dir(filepath.Dir(strings.TrimSpace(string(resolved))))
 	nodeModules := filepath.Join(root, "node_modules")
@@ -579,6 +585,16 @@ func TestJsTSAnalyzeCommonJSAndDynamicImports(t *testing.T) {
 	if err := os.Symlink(typescriptDir, filepath.Join(nodeModules, "typescript")); err != nil {
 		t.Skipf("cannot link temporary TypeScript toolchain: %v", err)
 	}
+	// The analyzer requires a project marker before attempting to resolve the
+	// repository-local TypeScript installation.
+	if err := os.WriteFile(filepath.Join(root, "package.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestJsTSAnalyzeCommonJSAndDynamicImports(t *testing.T) {
+	root := t.TempDir()
+	linkTypeScriptForTest(t, root)
 	for name, content := range map[string]string{
 		"tsconfig.json": `{"compilerOptions":{"module":"commonjs"},"files":["main.ts","common.ts","dynamic.ts","overload.ts","arrow.ts"]}`,
 		"main.ts":       `const common = require('./common'); async function load() { return import('./dynamic'); }`,
@@ -620,6 +636,76 @@ func TestJsTSAnalyzeCommonJSAndDynamicImports(t *testing.T) {
 		if edge.From == "widget" && edge.To == "helper" && edge.Type == core.EdgeCalls {
 			t.Fatalf("arrow-field call was attributed to class: %#v", edge)
 		}
+	}
+}
+
+func TestJsTSSolutionReferencesLoadEveryProject(t *testing.T) {
+	root := t.TempDir()
+	linkTypeScriptForTest(t, root)
+	for name, content := range map[string]string{
+		"tsconfig.json":      `{"files":[],"references":[{"path":"./tsconfig.app.json"},{"path":"./tsconfig.node.json"}]}`,
+		"tsconfig.app.json":  `{"compilerOptions":{"composite":true,"strict":true},"files":["app.ts"]}`,
+		"tsconfig.node.json": `{"compilerOptions":{"composite":true,"strict":false},"files":["node.ts"]}`,
+		"app.ts":             "function appHelper() {}\nclass App {\n  onClose() {}\n  run() { const onClose = () => appHelper(); onClose(); }\n}\n",
+		"node.ts":            "function nodeHelper() {}\nexport function nodeRun() { nodeHelper(); }\n",
+	} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result := (jsTSAnalyzer{}).Analyze(context.Background(), Request{
+		Root:  root,
+		Files: []string{"app.ts", "node.ts"},
+		Symbols: []core.SymbolRecord{
+			{ID: "app-helper", FilePath: "app.ts", Language: "typescript", Kind: core.KindFunction, Name: "appHelper", Span: core.LineRange{Start: 1, End: 1}},
+			{ID: "app-class", FilePath: "app.ts", Language: "typescript", Kind: core.KindClass, Name: "App", Span: core.LineRange{Start: 2, End: 5}},
+			{ID: "app-close", FilePath: "app.ts", Language: "typescript", Kind: core.KindMethod, Name: "onClose", ParentSymbol: "App", Span: core.LineRange{Start: 3, End: 3}},
+			{ID: "app-run", FilePath: "app.ts", Language: "typescript", Kind: core.KindMethod, Name: "run", ParentSymbol: "App", Span: core.LineRange{Start: 4, End: 4}},
+			{ID: "node-helper", FilePath: "node.ts", Language: "typescript", Kind: core.KindFunction, Name: "nodeHelper", Span: core.LineRange{Start: 1, End: 1}},
+			{ID: "node-run", FilePath: "node.ts", Language: "typescript", Kind: core.KindFunction, Name: "nodeRun", Span: core.LineRange{Start: 2, End: 2}},
+		},
+	})
+	assertNativeEdge(t, result.Edges, "app-run", "app-helper", core.EdgeCalls)
+	assertNativeEdge(t, result.Edges, "node-run", "node-helper", core.EdgeCalls)
+	for _, edge := range result.Edges {
+		if edge.From == "app-run" && edge.To == "app-close" && edge.Type == core.EdgeCalls {
+			t.Fatalf("local closure call fell back to an unrelated same-name method: %#v", edge)
+		}
+		if edge.From == "app-close" && edge.To == "app-helper" && edge.Type == core.EdgeCalls {
+			t.Fatalf("local closure body was attributed to an unrelated same-name method: %#v", edge)
+		}
+	}
+	wantDiagnostic := "typescript projects loaded 3 config(s), including 1 solution config(s), and 2 indexed file(s)"
+	if !slices.Contains(result.Diagnostics, wantDiagnostic) {
+		t.Fatalf("missing project-reference diagnostic %q: %v", wantDiagnostic, result.Diagnostics)
+	}
+}
+
+func TestJsTSFindsNestedProjectWithoutRootConfig(t *testing.T) {
+	root := t.TempDir()
+	linkTypeScriptForTest(t, root)
+	projectDir := filepath.Join(root, "packages", "api")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projectDir, "tsconfig.json"), []byte(`{"compilerOptions":{"strict":true},"files":["service.ts"]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projectDir, "service.ts"), []byte("function helper() {}\nexport function serve() { helper(); }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	result := (jsTSAnalyzer{}).Analyze(context.Background(), Request{
+		Root:  root,
+		Files: []string{"packages/api/service.ts"},
+		Symbols: []core.SymbolRecord{
+			{ID: "helper", FilePath: "packages/api/service.ts", Language: "typescript", Kind: core.KindFunction, Name: "helper", Span: core.LineRange{Start: 1, End: 1}},
+			{ID: "serve", FilePath: "packages/api/service.ts", Language: "typescript", Kind: core.KindFunction, Name: "serve", Span: core.LineRange{Start: 2, End: 2}},
+		},
+	})
+	assertNativeEdge(t, result.Edges, "serve", "helper", core.EdgeCalls)
+	wantDiagnostic := "typescript projects loaded 1 config(s), including 0 solution config(s), and 1 indexed file(s)"
+	if !slices.Contains(result.Diagnostics, wantDiagnostic) {
+		t.Fatalf("missing nested-project diagnostic %q: %v", wantDiagnostic, result.Diagnostics)
 	}
 }
 

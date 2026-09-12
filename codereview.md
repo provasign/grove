@@ -1,5 +1,10 @@
 # Grove — Language-by-Language Graph Defect Review
 
+> **Superseded for current status by [`FINAL-REVIEW.md`](FINAL-REVIEW.md)
+> (2026-09-11).** That file holds the verdict at committed HEAD, the full
+> accuracy-oracle results with bisect, the regression mechanisms, and the
+> punch list. This file is kept for provenance of rounds 1–4.
+
 Round 1: 2026-09-10 (code-read only, per-language backends)
 Round 2: 2026-09-11 (**fixture-verified**, full pipeline astkit → graph APIs),
 against HEAD `94168d31` — i.e. *after* the round-1 fixes landed.

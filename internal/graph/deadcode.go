@@ -49,7 +49,7 @@ var implicitNames = map[string]bool{
 	"constructor": true, // TS/JS
 }
 
-var identTokenRe = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]*`)
+var identTokenRe = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_-]*`)
 
 // DeadCode computes forward reachability from every entry point — main/init
 // functions, test symbols, exported symbols, plus extraRoots by name — over
@@ -181,7 +181,8 @@ func (g *CodeGraph) DeadCode(extraRoots []string) *DeadCodeResult {
 
 	// 4. Candidates: production functions/methods.
 	for id, s := range g.symbols {
-		if s.Kind != core.KindFunction && s.Kind != core.KindMethod {
+		mainframeCallable := string(s.Kind) == "paragraph" || string(s.Kind) == "section"
+		if s.Kind != core.KindFunction && s.Kind != core.KindMethod && !mainframeCallable {
 			continue
 		}
 		if isTestFilePath(s.FilePath) || isRustTestSymbol(&s) || implicitNames[s.Name] || strings.HasPrefix(s.Name, "<lambda@") {

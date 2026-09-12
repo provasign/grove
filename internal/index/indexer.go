@@ -182,6 +182,11 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 	}
 	root = absRoot
 	result.Root = root
+	releaseIndexLock, err := acquireIndexLock(ctx, root)
+	if err != nil {
+		return nil, result, err
+	}
+	defer releaseIndexLock()
 	tick := phaseTimer()
 	// Remove per-repo Go caches left behind by earlier Grove versions
 	// before walking, so they are neither indexed nor left to grow.
@@ -430,6 +435,7 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 	// seconds instead of milliseconds). Force opts back into the full path.
 	// The check runs BEFORE AllSymbols so a no-op never pays the full symbol
 	// load; counts come from COUNT(*) queries instead of loaded slices.
+	recoverMissingEdges := false
 	if !forceExtract && result.FilesUpdated == 0 && result.FilesPruned == 0 {
 		status, err := i.store.Status(ctx)
 		if err != nil {
@@ -457,6 +463,8 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 			codeGraph.ReplaceWithStoredEdges(symbols, edges, result.FilesSeen)
 			return codeGraph, result, nil
 		}
+		recoverMissingEdges = true
+		result.Native = append(result.Native, "recovery: persisted symbols have no edges; rebuilding all analyzers")
 	}
 
 	symbols, err := i.store.AllSymbols(ctx)
@@ -468,7 +476,7 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 	// Scope native analysis to the languages that changed. A cold index
 	// (store was empty before this run) or Force analyzes everything.
 	scope := changedLanguages
-	if forceExtract || result.FilesUpdated == result.FilesSeen {
+	if forceExtract || result.FilesUpdated == result.FilesSeen || recoverMissingEdges {
 		scope = nil
 	}
 	var changedRel []string

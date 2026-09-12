@@ -206,7 +206,7 @@ func buildInterfaceSatisfaction(idx *edgeIndex, symbols []core.SymbolRecord) (*i
 
 	// Concrete method sets, keyed by (package dir, type name) so same-named
 	// types in different packages stay separate.
-	type typeKey struct{ dir, name string }
+	type typeKey struct{ language, dir, name string }
 	// Every method per lowercase name, not one: Go types routinely pair an
 	// exported method with an unexported case-fold twin (grafana's
 	// WithDbSession / withDbSession(engine)), and a single-entry map made the
@@ -222,14 +222,14 @@ func buildInterfaceSatisfaction(idx *edgeIndex, symbols []core.SymbolRecord) (*i
 			if s.ParentSymbol == "" {
 				continue
 			}
-			key := typeKey{dirOf(s.FilePath), s.ParentSymbol}
+			key := typeKey{s.Language, dirOf(s.FilePath), s.ParentSymbol}
 			if methodsByType[key] == nil {
 				methodsByType[key] = map[string][]*core.SymbolRecord{}
 			}
 			ln := strings.ToLower(s.Name)
 			methodsByType[key][ln] = append(methodsByType[key][ln], s)
 		case core.KindStruct, core.KindClass, core.KindType:
-			typeSymbols[typeKey{dirOf(s.FilePath), s.Name}] = s
+			typeSymbols[typeKey{s.Language, dirOf(s.FilePath), s.Name}] = s
 		}
 	}
 
@@ -241,6 +241,9 @@ func buildInterfaceSatisfaction(idx *edgeIndex, symbols []core.SymbolRecord) (*i
 		sortedTypeKeys = append(sortedTypeKeys, k)
 	}
 	sort.Slice(sortedTypeKeys, func(i, j int) bool {
+		if sortedTypeKeys[i].language != sortedTypeKeys[j].language {
+			return sortedTypeKeys[i].language < sortedTypeKeys[j].language
+		}
 		if sortedTypeKeys[i].dir != sortedTypeKeys[j].dir {
 			return sortedTypeKeys[i].dir < sortedTypeKeys[j].dir
 		}
@@ -274,9 +277,12 @@ func buildInterfaceSatisfaction(idx *edgeIndex, symbols []core.SymbolRecord) (*i
 			paramAnchors[lower[j]] = interfaceMethodParamAnchors(iface, idx, n)
 		}
 		for _, key := range sortedTypeKeys {
+			if !callLanguagesCompatible(iface.Language, key.language) {
+				continue
+			}
 			methods := methodsByType[key]
 			// The interface's own methods would trivially "satisfy" it.
-			if key.name == iface.Name && key.dir == dirOf(iface.FilePath) {
+			if key.language == iface.Language && key.name == iface.Name && key.dir == dirOf(iface.FilePath) {
 				continue
 			}
 			// Per member: pick the implementing method among the case-fold

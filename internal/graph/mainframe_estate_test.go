@@ -88,6 +88,10 @@ func TestMainframeEstate_CallEdges(t *testing.T) {
 	sort.Strings(got)
 
 	want := []string{
+		// PROCEDURE DIVISION enters each program's first paragraph.
+		"AUDITLOG.cbl::AUDITLOG -> AUDITLOG.cbl::AUDITLOG.LOG-PARA conf=1.0 structural",
+		"CUSTRPT.cbl::CUSTRPT -> CUSTRPT.cbl::CUSTRPT.RPT-PARA conf=1.0 structural",
+		"CUSTUPD.cbl::CUSTUPD -> CUSTUPD.cbl::CUSTUPD.MAIN-PARA conf=1.0 structural",
 		// PERFORM THRU: both endpoints, same unit, full confidence.
 		"CUSTUPD.cbl::CUSTUPD.MAIN-PARA -> CUSTUPD.cbl::CUSTUPD.INIT-EXIT conf=1.0 ast-narrowed",
 		"CUSTUPD.cbl::CUSTUPD.MAIN-PARA -> CUSTUPD.cbl::CUSTUPD.INIT-PARA conf=1.0 ast-narrowed",
@@ -180,8 +184,7 @@ func diffSets(want, got []string) string {
 }
 
 // Directional field-reference (lineage) edges: verb-classified reads and
-// writes. Same-file fields roll up to the program symbol (volume bound);
-// copybook fields keep paragraph granularity.
+// writes. Both same-file and copybook fields retain paragraph ownership.
 func TestMainframeEstate_FieldReferenceEdges(t *testing.T) {
 	_, edges := indexEstate(t)
 	var got []string
@@ -197,14 +200,31 @@ func TestMainframeEstate_FieldReferenceEdges(t *testing.T) {
 		"CUSTUPD.cbl::CUSTUPD.MAIN-PARA writes CUSTREC.cpy::CUST-REC.CUST-SSN",
 		// CALL USING CUST-REC: copybook group, read.
 		"CUSTUPD.cbl::CUSTUPD.MAIN-PARA reads CUSTREC.cpy::CUST-REC",
-		// MOVE 'N' TO WS-EOF: same-file target — rolled up to the program.
-		"CUSTUPD.cbl::CUSTUPD writes CUSTUPD.cbl::WS-FLAGS.WS-EOF",
-		// CALL WS-RPT-PGM: same-file read, rolled up to the program.
-		"CUSTUPD.cbl::CUSTUPD reads CUSTUPD.cbl::WS-RPT-PGM",
+		// MOVE 'N' TO WS-EOF: same-file target owned by its paragraph.
+		"CUSTUPD.cbl::CUSTUPD.INIT-PARA writes CUSTUPD.cbl::WS-FLAGS.WS-EOF",
+		// CALL WS-RPT-PGM: same-file read owned by its paragraph.
+		"CUSTUPD.cbl::CUSTUPD.MAIN-PARA reads CUSTUPD.cbl::WS-RPT-PGM",
 	}
 	sort.Strings(want)
 	if diff := diffSets(want, got); diff != "" {
 		t.Errorf("field-reference edge drift:\n%s", diff)
+	}
+}
+
+func TestMainframeEstate_ContainsEdges(t *testing.T) {
+	_, edges := indexEstate(t)
+	want := map[string]bool{
+		"CUSTUPD.cbl::CUSTUPD -> CUSTUPD.cbl::CUSTUPD.MAIN-PARA": true,
+		"CUSTUPD.cbl::WS-FLAGS -> CUSTUPD.cbl::WS-FLAGS.WS-EOF":  true,
+		"NIGHTLY.jcl::NIGHTLY -> NIGHTLY.jcl::NIGHTLY.UPDATE":    true,
+	}
+	for _, edge := range edges {
+		if edge.Type == core.EdgeContains {
+			delete(want, trimID(edge.From)+" -> "+trimID(edge.To))
+		}
+	}
+	for missing := range want {
+		t.Errorf("missing contains edge %s", missing)
 	}
 }
 

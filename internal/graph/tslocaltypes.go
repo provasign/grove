@@ -28,6 +28,10 @@ var (
 	// applied to one class-body statement already stripped of any initializer
 	// and known not to contain '(' (which would make it a method).
 	tsBodyFieldRe = regexp.MustCompile(`^(?:(?:public|private|protected|readonly|static|declare|abstract|override|async)\s+)*(\w+)\??\s*:\s*(.+)$`)
+	// `children.forEach((child) => child.run())`: infer the callback parameter
+	// from a Set/Array-like field's element annotation.
+	tsForEachParamRe    = regexp.MustCompile(`(?:this\.)?(\w+)\.forEach\s*\(\s*\(?\s*(\w+)\s*\)?\s*=>`)
+	tsCollectionFieldRe = regexp.MustCompile(`(?s)\b(\w+)\??\s*:\s*(?:Readonly)?(?:Set|Array|Iterable)<\s*([A-Z]\w*)`)
 )
 
 // tsBareType reduces a TS annotation to one indexable class name.
@@ -410,13 +414,45 @@ func tsLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 				out[m[1]] = typ
 			}
 		}
+		if symbol.ParentSymbol != "" {
+			elements := tsCollectionFieldElementTypes(idx, symbol.ParentSymbol, symbol.FilePath)
+			for _, m := range tsForEachParamRe.FindAllStringSubmatch(body, -1) {
+				if typ := elements[m[1]]; typ != "" {
+					out[m[2]] = typ
+				}
+			}
+		}
 	}
 	delete(out, "this")
 	delete(out, "_")
 	return out
 }
 
+func tsCollectionFieldElementTypes(idx *edgeIndex, className, preferFile string) map[string]string {
+	out := map[string]string{}
+	classFile := tsResolveClassFile(idx, className, preferFile)
+	for _, cand := range idx.byName[strings.ToLower(className)] {
+		if cand.Name != className || cand.FilePath != classFile ||
+			(cand.Kind != core.KindClass && cand.Kind != core.KindInterface) {
+			continue
+		}
+		for _, match := range tsCollectionFieldRe.FindAllStringSubmatch(cand.RawText, -1) {
+			out[match[1]] = tsAliasType(idx, cand.FilePath, match[2])
+		}
+		break
+	}
+	return out
+}
+
 func tsAliasType(idx *edgeIndex, file, typ string) string {
+	if module, member, ok := idx.jsImportAlias(file, typ); ok && member != "" &&
+		!strings.HasPrefix(module, ".") && len(idx.resolveRelativeImport(file, module)) == 0 {
+		// A type imported from an external package must not bind by simple
+		// name to an unrelated class in this repository. Keep the imported
+		// member name for diagnostics, but mark it as externally owned so
+		// narrowByLocalType drops local candidates deterministically.
+		return "extern:" + member
+	}
 	symbol := &core.SymbolRecord{FilePath: file}
 	if target, ok := idx.jsImportTargetName(symbol, typ); ok && target != "" {
 		return target

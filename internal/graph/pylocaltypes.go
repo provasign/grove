@@ -858,6 +858,9 @@ func narrowBySuper(idx *edgeIndex, symbol *core.SymbolRecord, cands []*core.Symb
 		return nil
 	}
 	if symbol.Language == "python" {
+		if matched := pyImportedDirectBaseTargets(idx, symbol, cands); len(matched) > 0 {
+			return matched
+		}
 		mro := pyMRO(idx, symbol.ParentSymbol, dirOf(symbol.FilePath))
 		for _, base := range mro[1:] {
 			if matched := filterByParent(cands, base); len(matched) > 0 {
@@ -882,6 +885,54 @@ func narrowBySuper(idx *edgeIndex, symbol *core.SymbolRecord, cands []*core.Symb
 		bases = next
 	}
 	return nil
+}
+
+// pyImportedDirectBaseTargets preserves the file identity behind an aliased
+// Python base (`class Blueprint(SansioBlueprint)`). Reducing the binding to its
+// leaf name alone is ambiguous when both subclass and base are called
+// Blueprint, and makes super() walk back into the subclass.
+func pyImportedDirectBaseTargets(idx *edgeIndex, symbol *core.SymbolRecord, cands []*core.SymbolRecord) []*core.SymbolRecord {
+	var class *core.SymbolRecord
+	for _, candidate := range idx.byFile[symbol.FilePath] {
+		if candidate.Name == symbol.ParentSymbol && candidate.Kind == core.KindClass {
+			class = candidate
+			break
+		}
+	}
+	if class == nil {
+		return nil
+	}
+	open := strings.IndexByte(class.Signature, '(')
+	closeIdx := strings.LastIndexByte(class.Signature, ')')
+	if open < 0 || closeIdx <= open {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []*core.SymbolRecord
+	for _, rawBase := range splitTopLevel(class.Signature[open+1:closeIdx], ',') {
+		base := strings.TrimSpace(rawBase)
+		if base == "" || strings.Contains(base, "=") {
+			continue
+		}
+		if i := strings.IndexByte(base, '['); i >= 0 {
+			base = base[:i]
+		}
+		module, member, ok, _ := idx.pyImportBinding(class, base)
+		if !ok || member == "" {
+			continue
+		}
+		files := map[string]bool{}
+		for _, file := range idx.pyModuleFiles(class.FilePath, module) {
+			files[file] = true
+		}
+		for _, candidate := range cands {
+			if candidate.ParentSymbol == member && files[candidate.FilePath] && !seen[candidate.ID] {
+				seen[candidate.ID] = true
+				out = append(out, candidate)
+			}
+		}
+	}
+	return out
 }
 
 // pyReturnType reads a def's "-> Ann" return annotation from its raw text

@@ -136,6 +136,13 @@ func (g *CodeGraph) changeImpactScoped(query, file string) (*ChangeImpactResult,
 		return ty, nil
 	}
 
+	// Mainframe anchors must resolve before the modern loose-query parser:
+	// COBOL identifiers may contain hyphens and qualified data paths or JCL
+	// dataset names contain dots that are hierarchy, not Type.member syntax.
+	if mf := g.mainframeImpactLocked(query); mf != nil {
+		return mf, nil
+	}
+
 	// Accept a bare member name or file:line and pin it to the canonical
 	// Type.method form (unambiguous only — see resolveLooseQueryLocked).
 	// Already-canonical queries pass through untouched.
@@ -151,12 +158,6 @@ func (g *CodeGraph) changeImpactScoped(query, file string) (*ChangeImpactResult,
 	// completeness downgraded so no consumer mistakes it for a closed set.
 	if free := g.freeFunctionImpactLocked(query, file); free != nil {
 		return free, nil
-	}
-
-	// Mainframe anchors (programs, paragraphs, data items…) have their own
-	// resolution: dotted names are hierarchy paths, not type families.
-	if mf := g.mainframeImpactLocked(query); mf != nil {
-		return mf, nil
 	}
 
 	// A FIELD has no override family either — containedMethods only ever
@@ -188,6 +189,7 @@ func (g *CodeGraph) changeImpactScoped(query, file string) (*ChangeImpactResult,
 	// Determinism is the product's core claim; it starts here.
 	// idsNamed is pre-sorted, so the seed order is stable without a scan.
 	var typeIDs []string
+	seenTypeID := map[string]bool{}
 	for _, id := range g.idsNamed(typeName) {
 		switch g.symbols[id].Kind {
 		case core.KindClass, core.KindInterface, core.KindType, core.KindStruct, core.KindTrait, core.KindEnum:
@@ -209,7 +211,26 @@ func (g *CodeGraph) changeImpactScoped(query, file string) (*ChangeImpactResult,
 				}
 			}
 			typeIDs = append(typeIDs, id)
+			seenTypeID[id] = true
 		}
+	}
+	// C++ exposes namespace-qualified owners with :: while the name index is
+	// intentionally keyed by the simple class name. Honor the qualified form
+	// emitted in ambiguity hints so users can actually disambiguate it.
+	if strings.Contains(typeName, "::") {
+		for id, symbol := range g.symbols {
+			if seenTypeID[id] || symbol.Language != "cpp" || symbol.QualifiedName != typeName {
+				continue
+			}
+			switch symbol.Kind {
+			case core.KindClass, core.KindInterface, core.KindType, core.KindStruct, core.KindTrait, core.KindEnum:
+				if file == "" || strings.Contains(symbol.FilePath, file) {
+					typeIDs = append(typeIDs, id)
+					seenTypeID[id] = true
+				}
+			}
+		}
+		sort.Strings(typeIDs)
 	}
 	if len(typeIDs) == 0 && file != "" {
 		return nil, fmt.Errorf("change-impact: no type named %q declared in a file matching %q — drop file= to search every declaration", typeName, file)
@@ -220,6 +241,9 @@ func (g *CodeGraph) changeImpactScoped(query, file string) (*ChangeImpactResult,
 		// project question is the implementation closure: every indexed type
 		// whose declared extends/implements clause names it, transitively.
 		return g.externalRootedImpact(query, typeName, methodName, queryParams)
+	}
+	if err := g.rejectCrossLanguageSeedsLocked("change-impact", query, typeIDs); err != nil {
+		return nil, err
 	}
 
 	// 2. Declaration(s): methods named methodName contained in the named type,
@@ -1079,6 +1103,28 @@ func canonicalQueryFor(s *core.SymbolRecord) string {
 		return s.ParentSymbol + "." + s.Name
 	}
 	return s.Name
+}
+
+func (g *CodeGraph) rejectCrossLanguageSeedsLocked(operation, query string, typeIDs []string) error {
+	if len(typeIDs) < 2 {
+		return nil
+	}
+	firstLanguage := g.symbols[typeIDs[0]].Language
+	var candidates []string
+	crossesFamily := false
+	for _, id := range typeIDs {
+		symbol := g.symbols[id]
+		candidates = append(candidates, fmt.Sprintf("%s (%s, %s)", symbol.QualifiedName, symbol.Language, symbol.FilePath))
+		if !callLanguagesCompatible(firstLanguage, symbol.Language) {
+			crossesFamily = true
+		}
+	}
+	if !crossesFamily {
+		return nil
+	}
+	sort.Strings(candidates)
+	return fmt.Errorf("%s: %q is ambiguous across language families; scope the query by declaring file: %s",
+		operation, query, strings.Join(candidates, "; "))
 }
 
 // formatCandidates renders one line per candidate query with a sample location.

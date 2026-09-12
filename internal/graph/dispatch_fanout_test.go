@@ -2,6 +2,7 @@ package graph
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/provasign/grove/internal/core"
@@ -61,6 +62,71 @@ func TestBuildCalls_ResolvedInterfaceDoesNotFanOut(t *testing.T) {
 	for to := range callees {
 		if to != "store/sql.go::SQLStore.Get@1" && to != "store/cache.go::CacheStore.Get@1" {
 			t.Errorf("unexpected fan-out edge to %s (should be suppressed)", to)
+		}
+	}
+}
+
+func TestCSharpDispatchExpansionFiltersEachImplementorByArity(t *testing.T) {
+	method := func(id, parent, signature string) core.SymbolRecord {
+		return core.SymbolRecord{ID: id, FilePath: "all.cs", BlobSHA: "1", Language: "csharp",
+			Kind: core.KindMethod, Name: "WriteValue", QualifiedName: parent + ".WriteValue",
+			ParentSymbol: parent, Signature: signature}
+	}
+	syms := []core.SymbolRecord{
+		{ID: "all.cs::Writer", FilePath: "all.cs", Language: "csharp", Kind: core.KindInterface, Name: "Writer", QualifiedName: "Writer", RawText: "interface Writer { void WriteValue(int value); }"},
+		method("all.cs::Writer.WriteValue", "Writer", "void WriteValue(int value)"),
+		{ID: "all.cs::Use", FilePath: "all.cs", Language: "csharp", Kind: core.KindClass, Name: "Use", QualifiedName: "Use"},
+		{ID: "all.cs::Use.Run", FilePath: "all.cs", Language: "csharp", Kind: core.KindMethod, Name: "Run", QualifiedName: "Use.Run", ParentSymbol: "Use", Signature: "void Run(Writer w)", RawText: "void Run(Writer w) { w.WriteValue(1); }", CallSites: []core.CallSite{{Callee: "w.WriteValue", Line: 1, Argc: 1}}},
+	}
+	for i := 0; i < 5; i++ {
+		parent := fmt.Sprintf("Writer%d", i)
+		syms = append(syms, core.SymbolRecord{ID: "all.cs::" + parent, FilePath: "all.cs", Language: "csharp", Kind: core.KindClass, Name: parent, QualifiedName: parent, RawText: "class " + parent + " : Writer {}"})
+		for argc := 0; argc < 4; argc++ {
+			params := []string{"", "int a", "int a, int b", "int a, int b, int c"}[argc]
+			syms = append(syms, method(fmt.Sprintf("all.cs::%s.WriteValue%d", parent, argc), parent, "void WriteValue("+params+")"))
+		}
+	}
+
+	callees := map[string]bool{}
+	for _, edge := range BuildEdges(syms) {
+		if edge.Type == core.EdgeCalls && edge.From == "all.cs::Use.Run" {
+			callees[edge.To] = true
+		}
+	}
+	if len(callees) != 6 {
+		t.Fatalf("one-argument dispatch targets = %d, want base + five implementors: %v", len(callees), callees)
+	}
+	for target := range callees {
+		if strings.HasSuffix(target, "WriteValue0") || strings.HasSuffix(target, "WriteValue2") || strings.HasSuffix(target, "WriteValue3") {
+			t.Errorf("one-argument call dispatched to wrong overload %s", target)
+		}
+	}
+}
+
+func TestCSharpBroadUnknownConstructorOverloadsStayCapped(t *testing.T) {
+	syms := []core.SymbolRecord{{
+		ID: "use.cs::Use.Make@1", FilePath: "use.cs", Language: "csharp", Kind: core.KindMethod,
+		Name: "Make", QualifiedName: "Use.Make", ParentSymbol: "Use",
+		RawText:   "void Make() { var x = new Value(factory.Create()); }",
+		CallSites: []core.CallSite{{Callee: "Value", Line: 1, Argc: 1, Args: []string{""}}},
+	}}
+	for i := 0; i < 15; i++ {
+		syms = append(syms, core.SymbolRecord{
+			ID: fmt.Sprintf("value.cs::Value.Value@%d", i), FilePath: "value.cs", Language: "csharp",
+			Kind: core.KindConstructor, Name: "Value", QualifiedName: "Value.Value", ParentSymbol: "Value",
+			Signature: fmt.Sprintf("Value(Type%d value)", i),
+		})
+	}
+	for i := 0; i < 2; i++ {
+		syms = append(syms, core.SymbolRecord{
+			ID: fmt.Sprintf("other.cs::Other.Value@%d", i), FilePath: "other.cs", Language: "csharp",
+			Kind: core.KindMethod, Name: "Value", QualifiedName: "Other.Value", ParentSymbol: "Other",
+			Signature: "void Value(int first, int second)",
+		})
+	}
+	for _, edge := range BuildEdges(syms) {
+		if edge.Type == core.EdgeCalls && edge.From == syms[0].ID {
+			t.Fatalf("unresolved broad constructor overload set emitted %s", edge.To)
 		}
 	}
 }

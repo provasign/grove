@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.47.0 - 2026-09-11
+
+Graph resolution is now scoped by language family, and ambiguous cross-language
+change-impact, missing-implementation, and rename requests fail closed until the
+caller supplies a file-qualified identity. Call resolution gains arity-aware
+dispatch, inherited-method and local-type recovery across supported languages,
+top-level JavaScript coverage, TypeScript project-reference discovery, and
+correct handling for nested Python callables and imports.
+
+Indexing now serializes concurrent writers, recovers safely from incomplete
+zero-edge stores, rejects foreign-root MCP indexing, and rebuilds persisted
+graphs under new extractor and resolver stamps. Mainframe impact, lineage,
+rename, and dead-code analysis now cover COBOL/JCL containment and data-flow
+relationships. The nine-corpus edge-accuracy suite, full unit suite, race
+detector, vet, and staged-diff checks pass for this release.
+
 ## v0.45.0 - 2026-09-10
 
 Graph correctness across all supported language backends. Shared hierarchy

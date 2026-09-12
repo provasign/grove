@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/provasign/grove/internal/parser"
@@ -90,5 +91,10 @@ func TestNoopLegacyStoreWithoutEdgesStillRebuilds(t *testing.T) {
 	}
 	if res.EdgeCount == 0 {
 		t.Fatalf("rebuild produced no edges: %#v", res)
+	}
+	for _, diagnostic := range res.Native {
+		if strings.Contains(diagnostic, "skipped: no changed files") {
+			t.Fatalf("zero-edge recovery skipped a native analyzer: %q", diagnostic)
+		}
 	}
 }

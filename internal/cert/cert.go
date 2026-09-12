@@ -235,9 +235,29 @@ func missingTestFindings(changed []core.SymbolRecord, tests []core.SymbolRecord,
 		testIDs[t.ID] = struct{}{}
 	}
 	inbound := inboundIndex(edges)
+	changedIDs := make(map[string]bool, len(changed))
+	for _, symbol := range changed {
+		changedIDs[symbol.ID] = true
+	}
+	containsChangedChild := func(containerID string) bool {
+		for i := range edges {
+			if edges[i].Type == core.EdgeContains && edges[i].From == containerID && changedIDs[edges[i].To] {
+				return true
+			}
+		}
+		return false
+	}
 	var findings []core.CertificationFinding
 	for _, symbol := range changed {
 		if !requiresTestEvidence(symbol) {
+			continue
+		}
+		// A hunk inside a method overlaps both the method and its enclosing
+		// class/type span. The method is the actionable changed unit and gets
+		// its own coverage check; requiring a second inbound path to the
+		// container produces a false tests_unknown because contains points
+		// from container to member, not the reverse.
+		if containsChangedChild(symbol.ID) {
 			continue
 		}
 		if !symbolHasCoveringTest(symbol.ID, testIDs, inbound) {
@@ -423,7 +443,6 @@ func (p *diffParser) handleLine(line string) error {
 	}
 	return nil
 }
-
 
 func (p *diffParser) startFile(line string) {
 	p.sawDiff = true

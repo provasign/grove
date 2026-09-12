@@ -38,6 +38,23 @@ func mapIteratorFixture() *CodeGraph {
 	return g
 }
 
+func TestChangeImpact_CPPQualifiedNamespaceOwner(t *testing.T) {
+	g := New()
+	g.Replace([]core.SymbolRecord{
+		{ID: "x.cpp::core.User", FilePath: "x.cpp", Language: "cpp", Kind: core.KindClass, Name: "User", QualifiedName: "core::User"},
+		{ID: "x.cpp::core.User.Close", FilePath: "x.cpp", Language: "cpp", Kind: core.KindMethod, Name: "Close", QualifiedName: "core::User::Close", ParentSymbol: "core::User"},
+		{ID: "x.cpp::other.User", FilePath: "x.cpp", Language: "cpp", Kind: core.KindClass, Name: "User", QualifiedName: "other::User"},
+		{ID: "x.cpp::other.User.Close", FilePath: "x.cpp", Language: "cpp", Kind: core.KindMethod, Name: "Close", QualifiedName: "other::User::Close", ParentSymbol: "other::User"},
+	}, 1)
+	impact, err := g.ChangeImpact("core::User.Close")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(impact.Declarations) != 1 || impact.Declarations[0].ID != "x.cpp::core.User.Close" {
+		t.Fatalf("qualified C++ declarations = %+v", impact.Declarations)
+	}
+}
+
 func TestChangeImpactFlagsExternalContract(t *testing.T) {
 	g := mapIteratorFixture()
 	r, err := g.ChangeImpact("MapIterator.next")

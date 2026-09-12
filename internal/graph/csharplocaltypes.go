@@ -288,10 +288,20 @@ func csParamTypes(s *core.SymbolRecord) (types []string, variadic bool) {
 		if isThis {
 			continue // extension-method receiver: not an argument slot
 		}
-		types = append(types, csNormalizeType(fields[0]))
+		types = append(types, csOverloadType(fields[0]))
 		variadic = isParams
 	}
 	return types, variadic
+}
+
+func csOverloadType(typ string) string {
+	typ = strings.TrimSpace(typ)
+	nullable := strings.HasSuffix(typ, "?")
+	typ = csNormalizeType(strings.TrimSuffix(typ, "?"))
+	if nullable && typ != "" {
+		typ += "?"
+	}
+	return typ
 }
 
 // csharpArgTypes infers identifier → normalized type token for overload
@@ -507,6 +517,24 @@ func csNarrowOverloads(idx *edgeIndex, cands []*core.SymbolRecord, args []string
 			if p == argType {
 				continue
 			}
+			pNullable := strings.HasSuffix(p, "?")
+			p = strings.TrimSuffix(p, "?")
+			argNullable := strings.HasSuffix(argType, "?")
+			argType = strings.TrimSuffix(argType, "?")
+			if p == argType {
+				allExact = false
+				if argNullable && !pNullable {
+					conflict = true
+					break
+				}
+				// Nullable annotations on reference types do not change their
+				// overload identity. Value types do: T is a better conversion
+				// than lifting a non-null T to T?.
+				if pNullable && csValueType(idx, p) {
+					cost[cand]++
+				}
+				continue
+			}
 			// A `#Name` marker for a nested `new Name(...)` is a typed
 			// object, not a literal: it binds like a typed identifier.
 			if isLit && len(argType) > 0 && argType[0] >= 'A' && argType[0] <= 'Z' && !csIsPrimitive(argType) {
@@ -616,6 +644,25 @@ func csNarrowOverloads(idx *edgeIndex, cands []*core.SymbolRecord, args []string
 	}
 	_ = exact
 	return out
+}
+
+func csValueType(idx *edgeIndex, typ string) bool {
+	if csIsPrimitive(typ) {
+		return true
+	}
+	switch typ {
+	case "DateTime", "DateTimeOffset", "Guid", "TimeSpan", "BigInteger":
+		return true
+	}
+	if idx == nil {
+		return false
+	}
+	for _, symbol := range idx.byName[strings.ToLower(typ)] {
+		if symbol.Language == "csharp" && symbol.Name == typ && (symbol.Kind == core.KindStruct || symbol.Kind == core.KindEnum) {
+			return true
+		}
+	}
+	return false
 }
 
 // csIsEnum reports whether an indexed C# enum named t exists.

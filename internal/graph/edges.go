@@ -1458,11 +1458,22 @@ func buildContains(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
 			}
 			// KindType included: a method can attach to a named non-struct
 			// type (`type Status int; func (s Status) String()`) — Go's most
-			// idiomatic non-struct receiver. Excluding it made every such
-			// type's methods invisible to change-impact / missing-impl.
-			if parent.Kind != core.KindStruct && parent.Kind != core.KindClass &&
-				parent.Kind != core.KindInterface && parent.Kind != core.KindTrait &&
-				parent.Kind != core.KindType {
+			// idiomatic non-struct receiver. Nested callables are also valid
+			// parents: Astkit materialises Python nested defs and assigns the
+			// lexical parent's qualified name. Require the exact qualified
+			// prefix and enclosing span so an unrelated same-named function in
+			// the file cannot claim the child.
+			typeParent := parent.Kind == core.KindStruct || parent.Kind == core.KindClass ||
+				parent.Kind == core.KindInterface || parent.Kind == core.KindTrait ||
+				parent.Kind == core.KindType
+			mainframeParent := (symbol.Language == "cobol" || symbol.Language == "jcl") &&
+				(parent.Kind == core.SymbolKind("program") || parent.Kind == core.SymbolKind("data-item") ||
+					parent.Kind == core.SymbolKind("job") || parent.Kind == core.SymbolKind("step") ||
+					parent.Kind == core.SymbolKind("jcl-procedure"))
+			callableParent := graphCallableSymbol(parent) && parent.FilePath == symbol.FilePath &&
+				strings.HasPrefix(symbol.QualifiedName, parent.QualifiedName+".") &&
+				parent.Span.Start <= symbol.Span.Start && parent.Span.End >= symbol.Span.End
+			if !typeParent && !callableParent && !mainframeParent {
 				continue
 			}
 			edges = append(edges, core.Edge{
@@ -1591,6 +1602,9 @@ func buildExtendsImplements(idx *edgeIndex, symbols []core.SymbolRecord) []core.
 			}
 			for _, base := range baseClassesFor(idx, "cpp", className, dirOf(symbol.FilePath)) {
 				for _, target := range namedSymbols(idx, base) {
+					if !callLanguagesCompatible(symbol.Language, target.Language) {
+						continue
+					}
 					if target.ID == symbol.ID || (target.Kind != core.KindClass && target.Kind != core.KindStruct && target.Kind != core.KindInterface) {
 						continue
 					}
@@ -1780,6 +1794,12 @@ func resolveCallees(idx *edgeIndex, symbol *core.SymbolRecord, calleeName string
 		if cand.ID == symbol.ID {
 			continue
 		}
+		if !callLanguagesCompatible(symbol.Language, cand.Language) {
+			continue
+		}
+		if symbol.Language == "csharp" && hasModifier(cand, "private") && !sameCSharpPrivateScope(symbol.ParentSymbol, cand.ParentSymbol) {
+			continue
+		}
 		if exactCase && cand.Name != calleeName {
 			continue
 		}
@@ -1807,6 +1827,25 @@ func resolveCallees(idx *edgeIndex, symbol *core.SymbolRecord, calleeName string
 	return crossFile, false
 }
 
+func callLanguagesCompatible(caller, candidate string) bool {
+	if caller == candidate {
+		return true
+	}
+	if (caller == "c" || caller == "cpp") && (candidate == "c" || candidate == "cpp") {
+		return true
+	}
+	return tsFamilyLang(caller) && tsFamilyLang(candidate)
+}
+
+func sameCSharpPrivateScope(callerOwner, candidateOwner string) bool {
+	if callerOwner == "" || candidateOwner == "" {
+		return false
+	}
+	return callerOwner == candidateOwner ||
+		strings.HasPrefix(callerOwner, candidateOwner+".") ||
+		strings.HasPrefix(candidateOwner, callerOwner+".")
+}
+
 func graphCallableSymbol(symbol *core.SymbolRecord) bool {
 	for _, annotation := range symbol.Annotations {
 		if annotation == "declaration" {
@@ -1821,6 +1860,15 @@ func graphCallableSymbol(symbol *core.SymbolRecord) bool {
 	}
 	text := symbol.Signature + "\n" + symbol.RawText
 	return strings.Contains(text, "=>") || strings.Contains(text, "function")
+}
+
+func hasAnnotation(symbol *core.SymbolRecord, wanted string) bool {
+	for _, annotation := range symbol.Annotations {
+		if annotation == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 // buildCalls emits same-file + imported-file call edges with strings/comments
@@ -1925,11 +1973,17 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			}
 			cands := resolvePropertyTargets(idx, &symbol, name, scope, as.Write)
 			cands = narrowByReceiver(cands, &symbol, qualifier, attrSelfVars)
-			if _, isSelf := attrSelfVars[qualifier]; !isSelf && qualifier != "" && len(cands) > 0 {
+			if _, isSelf := attrSelfVars[qualifier]; !isSelf && qualifier != "" {
 				// ctx.request with ctx typed AppContext reads that class's
 				// property (or an ancestor's), not every `request` property
-				// in scope; an untyped receiver keeps the set as before.
-				if kept, dispatch, decided := narrowByLocalType(idx, nil, &symbol, attrLocalTypes, qualifier, name, cands, scope); decided && len(kept)+len(dispatch) > 0 {
+				// in scope. A typed Python receiver may inherit the property
+				// from a base module the caller never imports directly, so let
+				// type evidence narrow the language-matched global candidates.
+				pool := cands
+				if symbol.Language == "python" && attrLocalTypes[qualifier] != "" {
+					pool = resolvePropertyTargets(idx, &symbol, name, nil, as.Write)
+				}
+				if kept, dispatch, decided := narrowByLocalType(idx, nil, &symbol, attrLocalTypes, qualifier, name, pool, scope); decided {
 					cands = append(kept, dispatch...)
 				}
 			}
@@ -1999,6 +2053,19 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 		}
 		var javaArgTypeCache map[string]string
 		var csArgTypeCache map[string]string
+		narrowDispatch := func(cands []*core.SymbolRecord, cs core.CallSite) []*core.SymbolRecord {
+			if symbol.Language != "csharp" {
+				return cands
+			}
+			cands = filterByArgc(cands, cs.Argc)
+			if len(cands) > 1 {
+				if csArgTypeCache == nil {
+					csArgTypeCache = csharpArgTypes(idx, &symbol)
+				}
+				cands = csNarrowOverloads(idx, cands, cs.Args, csArgTypeCache)
+			}
+			return cands
+		}
 		for _, cs := range symbol.CallSites {
 			if cs.ReferenceOnly {
 				continue
@@ -2112,6 +2179,17 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				}
 			}
 			cands, capped := resolveCallees(idx, &symbol, calleeName, scope, true, sameFileWins)
+			if calleeName == symbol.Name {
+				_, ownReceiver := selfVars[qualifier]
+				if qualifier == "" || ownReceiver {
+					// Direct recursion is the one legitimate self target. Emit it
+					// independently rather than adding it to generic candidates:
+					// changing candidate cardinality can alter receiver narrowing,
+					// while a same-named wrapper such as `Use() { engine().Use() }`
+					// must still resolve only the qualified cross-file method.
+					addEdge(symbol.ID, symbol.ID, 0.95, core.EvidenceSourceASTKit, core.ReasonASTNarrowed)
+				}
+			}
 			if localDefinition && symbol.Language == "python" {
 				cands = pythonLexicalChild(idx, &symbol, calleeName)
 				capped = false
@@ -2179,7 +2257,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// non-generic one. Roslyn's 5-overload JsonConvert fanout
 				// was the dominant C# false-positive source.
 				cands = filterByGeneric(cands, cs.Generic)
-				if len(cands) > 1 && len(cs.Args) > 0 {
+				if len(cands) > 1 {
 					// Then argument types, as for Java: 71% of the
 					// remaining C# false edges were same-arity overloads
 					// (new BsonWriter(stream) → BsonWriter(BinaryWriter)).
@@ -2306,6 +2384,16 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 						bases = next
 					}
 					cands = byType
+				}
+			}
+			if tsFamilyLang(symbol.Language) && strings.HasSuffix(qualifier, "()") {
+				// A constructed receiver (`new L1().rootMethod()`, represented
+				// by astkit as `L1().rootMethod`) has an exact nominal type.
+				// Its inherited method may live outside the caller's direct
+				// import scope, so resolve against the type hierarchy.
+				typ := strings.TrimSuffix(qualifier, "()")
+				if typeSymbolExists(idx, typ) {
+					cands = typeOrInheritedMethodTargets(idx, &symbol, typ, calleeName, cands)
 				}
 			}
 			if (symbol.Language == "csharp" || symbol.Language == "php" ||
@@ -2559,7 +2647,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					// it so the blanket dispatch rescue below stays out.
 					resolvedByType = true
 					narrowed = kept
-					for _, m := range dispatch {
+					for _, m := range narrowDispatch(dispatch, cs) {
 						if m.ID != symbol.ID {
 							addEdge(symbol.ID, m.ID, 0.7, core.EvidenceSourceHeuristic, core.ReasonDispatch)
 						}
@@ -2567,6 +2655,12 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				} else {
 					narrowed = narrowByImport(idx, &symbol, qualifier, cands)
 				}
+			}
+			if symbol.Language == "csharp" && capped && len(narrowed) > 4 {
+				// A broad same-name set is not resolved merely because arity
+				// brought it just below the global cap. Keep precision-first
+				// behavior until type evidence pins the overload set down.
+				narrowed = nil
 			}
 			if len(narrowed) > maxCalleeFanout {
 				// Still unresolvably broad after every narrowing pass:
@@ -2619,7 +2713,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				}
 				if symbol.Language == "csharp" {
 					ctors = filterByArgc(ctors, cs.Argc)
-					if len(ctors) > 1 && len(cs.Args) > 0 {
+					if len(ctors) > 1 {
 						if csArgTypeCache == nil {
 							csArgTypeCache = csharpArgTypes(idx, &symbol)
 						}
@@ -2636,7 +2730,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			// in-scope interface declares the method: emit edges to its
 			// implementations at reduced confidence.
 			if capped && !resolvedByType && sat != nil {
-				for _, m := range sat.dispatchTargets(calleeName, scope) {
+				for _, m := range narrowDispatch(sat.dispatchTargets(calleeName, scope), cs) {
 					if m.ID != symbol.ID {
 						addEdge(symbol.ID, m.ID, 0.7, core.EvidenceSourceHeuristic, core.ReasonDispatch)
 					}
@@ -2651,13 +2745,16 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 	// extractor ran, an empty CallSites list is authoritative — a method
 	// with zero calls would otherwise regex-match its own signature
 	// ("append(final int value)" edging every sibling overload).
-	if astCallSiteLanguages[symbol.Language] {
+	if astCallSiteLanguages[symbol.Language] && !hasAnnotation(&symbol, "syntax-recovery") {
 		return edges
 	}
 	if symbol.RawText == "" {
 		return edges
 	}
 	stripped := stripCommentsAndStrings(symbol.RawText)
+	if hasAnnotation(&symbol, "syntax-recovery") {
+		stripped = stripRecoveredNestedDeclarations(symbol.Language, stripped)
+	}
 	seenCallee := make(map[string]bool)
 	for _, m := range callIdentRe.FindAllStringSubmatch(stripped, -1) {
 		calleeName := m[1]
@@ -2682,6 +2779,23 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 		}
 	}
 	return edges
+}
+
+var csharpRecoveredNestedMethodRe = regexp.MustCompile(`^\s*(?:(?:public|private|protected|internal|static|abstract|virtual|override|sealed|async)\s+)*(?:[A-Za-z_][\w<>,.?\[\]]*\s+)+[A-Za-z_]\w*\s*\([^)]*\)\s*(?:\{|=>)`)
+
+func stripRecoveredNestedDeclarations(language, body string) string {
+	lines := strings.Split(body, "\n")
+	for idx := 1; idx < len(lines); idx++ {
+		trimmed := strings.TrimSpace(lines[idx])
+		declaration := language == "go" && strings.HasPrefix(trimmed, "func ")
+		if language == "csharp" && csharpRecoveredNestedMethodRe.MatchString(lines[idx]) {
+			declaration = true
+		}
+		if declaration {
+			lines[idx] = ""
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 func pythonLexicalChild(idx *edgeIndex, caller *core.SymbolRecord, name string) []*core.SymbolRecord {
@@ -2800,14 +2914,16 @@ func filterByParent(cands []*core.SymbolRecord, parent string) []*core.SymbolRec
 func resolvePropertyTargets(idx *edgeIndex, symbol *core.SymbolRecord, name string, scope map[string]struct{}, write bool) []*core.SymbolRecord {
 	var sameFile, crossFile []*core.SymbolRecord
 	for _, cand := range idx.byName[strings.ToLower(name)] {
-		if cand.ID == symbol.ID || cand.Name != name || cand.Kind != core.KindMethod {
+		if cand.ID == symbol.ID || cand.Language != symbol.Language || cand.Name != name || cand.Kind != core.KindMethod {
 			continue
 		}
 		if !propertyAnnotationMatches(cand, write) {
 			continue
 		}
-		if _, ok := scope[cand.FilePath]; !ok {
-			continue
+		if scope != nil {
+			if _, ok := scope[cand.FilePath]; !ok {
+				continue
+			}
 		}
 		if cand.FilePath == symbol.FilePath {
 			sameFile = append(sameFile, cand)
@@ -3383,6 +3499,9 @@ func resolveTypeEdges(idx *edgeIndex, symbol core.SymbolRecord, targetName strin
 	var cands []*core.SymbolRecord
 	for _, target := range idx.byName[strings.ToLower(simple)] {
 		if target.ID == symbol.ID {
+			continue
+		}
+		if !callLanguagesCompatible(symbol.Language, target.Language) {
 			continue
 		}
 		// Identifiers are case-sensitive in every indexed language except

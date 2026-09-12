@@ -40,3 +40,44 @@ func TestMatchDecls_NestedSameNameIsDeterministic(t *testing.T) {
 		}
 	}
 }
+
+func TestMapContainedCallablesUsesNearestMatchedParent(t *testing.T) {
+	idToKey := map[string]string{"outer": "app.py\x001\x00outer"}
+	edges := []core.Edge{
+		{From: "outer", To: "inner", Type: core.EdgeContains},
+		{From: "inner", To: "deeper", Type: core.EdgeContains},
+		{From: "unmatched", To: "other", Type: core.EdgeContains},
+	}
+	mapContainedCallables(idToKey, edges)
+	for _, id := range []string{"inner", "deeper"} {
+		if idToKey[id] != idToKey["outer"] {
+			t.Errorf("%s mapped to %q, want outer key", id, idToKey[id])
+		}
+	}
+	if idToKey["other"] != "" {
+		t.Errorf("unmatched containment chain was mapped to %q", idToKey["other"])
+	}
+}
+
+func TestMapPythonPropertyAccessorsSharesOracleIdentity(t *testing.T) {
+	getter := core.SymbolRecord{
+		ID: "getter", FilePath: "app.py", Language: "python", Kind: core.KindMethod,
+		Name: "debug", QualifiedName: "App.debug", Annotations: []string{"property"},
+	}
+	setter := getter
+	setter.ID = "setter"
+	setter.Annotations = []string{"debug.setter"}
+	unrelated := getter
+	unrelated.ID = "other"
+	unrelated.QualifiedName = "Other.debug"
+	idToKey := map[string]string{"setter": "app.py\x0010\x00App.debug"}
+
+	mapPythonPropertyAccessors(idToKey, []core.SymbolRecord{getter, setter, unrelated})
+
+	if idToKey["getter"] != idToKey["setter"] {
+		t.Fatalf("getter mapped to %q, want setter oracle identity %q", idToKey["getter"], idToKey["setter"])
+	}
+	if idToKey["other"] != "" {
+		t.Fatalf("unrelated property mapped to %q", idToKey["other"])
+	}
+}

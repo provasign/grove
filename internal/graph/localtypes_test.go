@@ -607,6 +607,30 @@ func TestPythonC3MROPrefersLeftBranch(t *testing.T) {
 	}
 }
 
+func TestPythonSuperResolvesAliasedSameNamedBase(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "base.py::Blueprint@1", FilePath: "base.py", Language: "python", Kind: core.KindClass, Name: "Blueprint", QualifiedName: "Blueprint", Signature: "class Blueprint:"},
+		{ID: "base.py::Blueprint.__init__@2", FilePath: "base.py", Language: "python", Kind: core.KindMethod, Name: "__init__", QualifiedName: "Blueprint.__init__", ParentSymbol: "Blueprint"},
+		{ID: "other.py::Blueprint.__init__@2", FilePath: "other.py", Language: "python", Kind: core.KindMethod, Name: "__init__", QualifiedName: "Blueprint.__init__", ParentSymbol: "Blueprint"},
+		{
+			ID: "app.py::Blueprint@2", FilePath: "app.py", Language: "python", Kind: core.KindClass,
+			Name: "Blueprint", QualifiedName: "Blueprint", Signature: "class Blueprint(SansioBlueprint):",
+			Span: core.LineRange{Start: 2, End: 8},
+			Imports: []string{
+				".base",
+				core.PythonImportBinding(1, "SansioBlueprint", ".base#Blueprint"),
+			},
+		},
+		{ID: "app.py::Blueprint.__init__@3", FilePath: "app.py", Language: "python", Kind: core.KindMethod, Name: "__init__", QualifiedName: "Blueprint.__init__", ParentSymbol: "Blueprint", Span: core.LineRange{Start: 3, End: 5}},
+	}
+	idx := newEdgeIndex(syms)
+	cands := []*core.SymbolRecord{&syms[1], &syms[2]}
+	got := narrowBySuper(idx, &syms[4], cands)
+	if len(got) != 1 || got[0].ID != syms[1].ID {
+		t.Fatalf("aliased base constructor targets = %#v, want %s", got, syms[1].ID)
+	}
+}
+
 // self.m() inside a base class dispatches to subclass overrides of m.
 func TestPyTemplateMethodDispatch(t *testing.T) {
 	syms := []core.SymbolRecord{
@@ -936,6 +960,55 @@ func TestPythonPropertyReadExcludesSetter(t *testing.T) {
 	}
 	if !javaHasCall(edges, write.ID, setter.ID) || javaHasCall(edges, write.ID, getter.ID) {
 		t.Fatalf("write must target only setter; edges=%+v", edges)
+	}
+}
+
+func TestPythonTypedReceiverFindsInheritedPropertyOutsideImportScope(t *testing.T) {
+	base := core.SymbolRecord{ID: "base.py::App", FilePath: "base.py", Language: "python", Kind: core.KindClass, Name: "App", QualifiedName: "App", Signature: "class App:"}
+	setter := core.SymbolRecord{ID: "base.py::App.debug", FilePath: "base.py", Language: "python", Kind: core.KindMethod, Name: "debug", QualifiedName: "App.debug", ParentSymbol: "App", Annotations: []string{"debug.setter"}}
+	subclass := core.SymbolRecord{ID: "flask.py::Flask", FilePath: "flask.py", Language: "python", Kind: core.KindClass, Name: "Flask", QualifiedName: "Flask", Signature: "class Flask(App):", Imports: []string{"base"}}
+	caller := core.SymbolRecord{
+		ID: "cli.py::load", FilePath: "cli.py", Language: "python", Kind: core.KindFunction,
+		Name: "load", QualifiedName: "load", Signature: "def load(app: Flask):",
+		RawText: "def load(app: Flask):\n    app.debug = True\n", Imports: []string{"flask"},
+		AttrSites: []core.CallSite{{Callee: "app.debug", Line: 2, Write: true}},
+	}
+	edges := BuildEdges([]core.SymbolRecord{base, setter, subclass, caller})
+	if !javaHasCall(edges, caller.ID, setter.ID) {
+		t.Fatalf("typed subclass receiver did not reach inherited property outside direct import scope; edges=%+v", edges)
+	}
+}
+
+func TestCSharpOverloadPrefersNonNullableForKnownValue(t *testing.T) {
+	cands := []core.SymbolRecord{
+		{ID: "w.cs::Writer.Write@1", FilePath: "w.cs", Language: "csharp", Kind: core.KindMethod, Name: "Write", ParentSymbol: "Writer", Signature: "void Write(DateTime value)"},
+		{ID: "w.cs::Writer.Write@2", FilePath: "w.cs", Language: "csharp", Kind: core.KindMethod, Name: "Write", ParentSymbol: "Writer", Signature: "void Write(DateTime? value)"},
+	}
+	got := csNarrowOverloads(newEdgeIndex(cands), []*core.SymbolRecord{&cands[0], &cands[1]}, []string{"#DateTime"}, nil)
+	if len(got) != 1 || got[0].ID != cands[0].ID {
+		t.Fatalf("known non-nullable argument targets = %#v, want %s", got, cands[0].ID)
+	}
+}
+
+func TestCSharpNullableReferenceIsSameOverloadType(t *testing.T) {
+	cands := []core.SymbolRecord{
+		{ID: "v.cs::Value.Value@1", FilePath: "v.cs", Language: "csharp", Kind: core.KindConstructor, Name: "Value", ParentSymbol: "Value", Signature: "Value(Uri? value)"},
+		{ID: "v.cs::Value.Value@2", FilePath: "v.cs", Language: "csharp", Kind: core.KindConstructor, Name: "Value", ParentSymbol: "Value", Signature: "Value(object? value)"},
+	}
+	got := csNarrowOverloads(newEdgeIndex(cands), []*core.SymbolRecord{&cands[0], &cands[1]}, []string{"#Uri"}, nil)
+	if len(got) != 1 || got[0].ID != cands[0].ID {
+		t.Fatalf("known reference argument targets = %#v, want %s", got, cands[0].ID)
+	}
+}
+
+func TestCSharpZeroArgOverloadBeatsParams(t *testing.T) {
+	cands := []core.SymbolRecord{
+		{ID: "v.cs::Value.Value@1", FilePath: "v.cs", Language: "csharp", Kind: core.KindConstructor, Name: "Value", ParentSymbol: "Value", Signature: "Value()"},
+		{ID: "v.cs::Value.Value@2", FilePath: "v.cs", Language: "csharp", Kind: core.KindConstructor, Name: "Value", ParentSymbol: "Value", Signature: "Value(params object[] values)"},
+	}
+	got := csNarrowOverloads(newEdgeIndex(cands), []*core.SymbolRecord{&cands[0], &cands[1]}, nil, nil)
+	if len(got) != 1 || got[0].ID != cands[0].ID {
+		t.Fatalf("zero-argument targets = %#v, want %s", got, cands[0].ID)
 	}
 }
 

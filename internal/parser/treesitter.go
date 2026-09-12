@@ -162,6 +162,11 @@ func extractSymbolsFromAST(language, filePath, blobSHA string, src []byte, fileI
 		}
 		syms = append(syms, projected)
 	}
+	if tree != nil && (key == astkit.LangJavaScript || key == astkit.LangTypeScript || key == astkit.LangTSX) {
+		if topLevel := jsTopLevelSymbol(tree.RootNode(), src, filePath, blobSHA, language, fileImports); topLevel != nil {
+			syms = append(syms, *topLevel)
+		}
+	}
 	if len(syms) == 0 && len(fileImports) > 0 &&
 		(key == astkit.LangJavaScript || key == astkit.LangTypeScript || key == astkit.LangTSX) {
 		// A pure barrel (`export * from './x'`) or side-effect-only module has
@@ -180,6 +185,74 @@ func extractSymbolsFromAST(language, filePath, blobSHA string, src []byte, fileI
 		})
 	}
 	return syms, true, hasErrors
+}
+
+var jsCallableContainers = map[string]bool{
+	"function_declaration":           true,
+	"generator_function_declaration": true,
+	"function_expression":            true,
+	"generator_function":             true,
+	"arrow_function":                 true,
+	"method_definition":              true,
+	"class_declaration":              true,
+	"class":                          true,
+}
+
+var jsTopLevelCalleeRe = regexp.MustCompile(`^[A-Za-z_$][A-Za-z0-9_$]*(?:\??\.[A-Za-z_$][A-Za-z0-9_$]*)*$`)
+
+func jsTopLevelSymbol(root *sitter.Node, src []byte, filePath, blobSHA, language string, imports []string) *core.SymbolRecord {
+	if root == nil {
+		return nil
+	}
+	var calls []core.CallSite
+	var walk func(*sitter.Node)
+	walk = func(node *sitter.Node) {
+		if node == nil || jsCallableContainers[node.Type()] {
+			return
+		}
+		if node.Type() == "call_expression" {
+			calleeNode := node.ChildByFieldName("function")
+			if calleeNode != nil {
+				callee := strings.ReplaceAll(strings.TrimSpace(calleeNode.Content(src)), "?.", ".")
+				if jsTopLevelCalleeRe.MatchString(callee) {
+					argc := 0
+					if args := node.ChildByFieldName("arguments"); args != nil {
+						argc = int(args.NamedChildCount())
+					}
+					calls = append(calls, core.CallSite{Callee: callee, Line: int(node.StartPoint().Row) + 1, Argc: argc})
+				}
+			}
+		}
+		for child := 0; child < int(node.NamedChildCount()); child++ {
+			walk(node.NamedChild(child))
+		}
+	}
+	walk(root)
+	if len(calls) == 0 {
+		return nil
+	}
+	lineCount := bytes.Count(src, []byte{'\n'}) + 1
+	lines := make([]string, lineCount)
+	for _, call := range calls {
+		if call.Line > 0 && call.Line <= len(lines) {
+			lines[call.Line-1] += call.Callee + "();"
+		}
+	}
+	const name = "<top-level>"
+	return &core.SymbolRecord{
+		ID:            symID(filePath, name, blobSHA),
+		FilePath:      filePath,
+		BlobSHA:       blobSHA,
+		Language:      language,
+		Kind:          core.KindFunction,
+		Name:          name,
+		QualifiedName: name,
+		Span:          core.LineRange{Start: 1, End: lineCount},
+		RawText:       strings.Join(lines, "\n"),
+		Imports:       append([]string(nil), imports...),
+		CallSites:     calls,
+		TokenEstimate: len(calls) * 3,
+	}
 }
 
 // extractImportsFromAST parses imports through astkit when a strategy exists.
@@ -210,6 +283,15 @@ func extractImportsFromAST(language string, src []byte) ([]string, bool) {
 		if imp.Path == "" {
 			continue
 		}
+		importPath := imp.Path
+		if key == astkit.LangRust && strings.HasPrefix(strings.TrimSpace(imp.Raw), "pub ") {
+			// Astkit intentionally normalizes Path to the imported target, but
+			// Grove also needs to know that the dependency is re-exported. Rust
+			// scope traversal follows dependencies transitively only across public
+			// facade edges; losing `pub` here made `grep::printer::X` stop at the
+			// grep facade instead of reaching grep_printer.
+			importPath = "pub use " + imp.Path
+		}
 		if key == astkit.LangGo && imp.Alias != "" && imp.Alias != "_" && imp.Alias != "." {
 			alias := core.GoImportAlias(imp.Alias, imp.Path)
 			if !seen[alias] {
@@ -218,11 +300,11 @@ func extractImportsFromAST(language string, src []byte) ([]string, bool) {
 			}
 			continue
 		}
-		if seen[imp.Path] {
+		if seen[importPath] {
 			continue
 		}
-		seen[imp.Path] = true
-		imports = append(imports, imp.Path)
+		seen[importPath] = true
+		imports = append(imports, importPath)
 	}
 	if key == astkit.LangPython {
 		// From-import members as "module#name" candidates: a member that

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -118,6 +119,14 @@ func (s *Server) callTool(name string, args map[string]any) (any, error) {
 	switch name {
 	case "grove_index":
 		root := stringArg(args, "dir", s.root)
+		same, err := sameRoot(root, s.root)
+		if err != nil {
+			return nil, fmt.Errorf("grove_index: resolve dir: %w", err)
+		}
+		if !same {
+			return nil, fmt.Errorf("grove_index: dir %q differs from the MCP server root %q; start a server for that repository", root, s.root)
+		}
+		root = s.root
 		opts := index.Options{Force: boolArg(args, "force")}
 		// Incremental edge construction needs the previous state. Without
 		// it every grove_index rebuilt every edge from scratch — the delta
@@ -192,6 +201,28 @@ func (s *Server) callTool(name string, args map[string]any) (any, error) {
 	default:
 		return nil, fmt.Errorf("unknown tool: %s", name)
 	}
+}
+
+func sameRoot(left, right string) (bool, error) {
+	canonical := func(value string) (string, error) {
+		absolute, err := filepath.Abs(value)
+		if err != nil {
+			return "", err
+		}
+		if resolved, resolveErr := filepath.EvalSymlinks(absolute); resolveErr == nil {
+			absolute = resolved
+		}
+		return filepath.Clean(absolute), nil
+	}
+	leftRoot, err := canonical(left)
+	if err != nil {
+		return false, err
+	}
+	rightRoot, err := canonical(right)
+	if err != nil {
+		return false, err
+	}
+	return leftRoot == rightRoot, nil
 }
 
 // maxImpactNodes caps blast-radius payloads: a hot symbol on a monorepo can

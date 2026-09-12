@@ -359,7 +359,16 @@ func narrowByLocalType(idx *edgeIndex, sat *interfaceSatisfaction, caller *core.
 		// `private _xhr: any` — nothing of ours runs through it.
 		return nil, nil, true
 	}
-	byType := filterByParent(cands, typ)
+	pool := cands
+	if len(pool) == 0 {
+		pool = globalCallableCandidates(idx, caller, calleeName)
+	}
+	byType := filterByParent(pool, typ)
+	resolvedTypeFile := ""
+	if caller != nil && tsFamilyLang(caller.Language) {
+		resolvedTypeFile = tsResolveClassFile(idx, typ, caller.FilePath)
+		byType = filterCandidatesByFile(byType, resolvedTypeFile)
+	}
 	if caller != nil && caller.Language == "java" {
 		// A single-type import shadows a same-package type with the same
 		// simple name. Scope intentionally contains both packages, so pin the
@@ -383,6 +392,9 @@ func narrowByLocalType(idx *edgeIndex, sat *interfaceSatisfaction, caller *core.
 		lang = c.Language
 		break
 	}
+	if lang == "" && caller != nil {
+		lang = caller.Language
+	}
 	var targets []*core.SymbolRecord
 	seenD := map[string]bool{}
 	for _, m := range subclassOverrides(idx, lang, typ, calleeName, "") {
@@ -393,7 +405,8 @@ func narrowByLocalType(idx *edgeIndex, sat *interfaceSatisfaction, caller *core.
 	}
 	if sat != nil {
 		for _, iface := range idx.byName[strings.ToLower(typ)] {
-			if iface.Kind != core.KindInterface || iface.Name != typ {
+			if iface.Kind != core.KindInterface || iface.Name != typ ||
+				(caller != nil && !callLanguagesCompatible(caller.Language, iface.Language)) {
 				continue
 			}
 			for _, m := range sat.implementorsFor(iface, calleeName) {
@@ -415,8 +428,16 @@ func narrowByLocalType(idx *edgeIndex, sat *interfaceSatisfaction, caller *core.
 		for level := 0; level < 4 && len(bases) > 0 && len(byType) == 0; level++ {
 			var next []string
 			for _, b := range bases {
-				byType = append(byType, filterByParent(cands, b)...)
-				next = append(next, baseClassesFor(idx, lang, b, "")...)
+				matches := filterByParent(pool, b)
+				if caller != nil && tsFamilyLang(caller.Language) {
+					baseFile := tsResolveClassFile(idx, b, resolvedTypeFile)
+					matches = filterCandidatesByFile(matches, baseFile)
+					if baseFile != "" {
+						resolvedTypeFile = baseFile
+					}
+				}
+				byType = append(byType, matches...)
+				next = append(next, baseClassesFor(idx, lang, b, dirOf(resolvedTypeFile))...)
 			}
 			bases = next
 		}
@@ -425,6 +446,72 @@ func narrowByLocalType(idx *edgeIndex, sat *interfaceSatisfaction, caller *core.
 		return byType, targets, true
 	}
 	return nil, nil, true
+}
+
+func globalCallableCandidates(idx *edgeIndex, caller *core.SymbolRecord, name string) []*core.SymbolRecord {
+	var out []*core.SymbolRecord
+	for _, candidate := range idx.byName[strings.ToLower(name)] {
+		if candidate.Name != name || candidate.ID == caller.ID ||
+			!callLanguagesCompatible(caller.Language, candidate.Language) || !graphCallableSymbol(candidate) {
+			continue
+		}
+		if hasModifier(candidate, "private") && candidate.ParentSymbol != caller.ParentSymbol {
+			continue
+		}
+		out = append(out, candidate)
+	}
+	return out
+}
+
+func filterCandidatesByFile(cands []*core.SymbolRecord, file string) []*core.SymbolRecord {
+	if file == "" {
+		return cands
+	}
+	out := cands[:0]
+	for _, candidate := range cands {
+		if candidate.FilePath == file {
+			out = append(out, candidate)
+		}
+	}
+	return out
+}
+
+func typeOrInheritedMethodTargets(idx *edgeIndex, caller *core.SymbolRecord, typ, name string, cands []*core.SymbolRecord) []*core.SymbolRecord {
+	pool := cands
+	if len(pool) == 0 {
+		pool = globalCallableCandidates(idx, caller, name)
+	}
+	typeFile := ""
+	if tsFamilyLang(caller.Language) {
+		typeFile = tsResolveClassFile(idx, typ, caller.FilePath)
+	}
+	if own := filterCandidatesByFile(filterByParent(pool, typ), typeFile); len(own) > 0 {
+		return own
+	}
+	bases := baseClassesFor(idx, caller.Language, typ, dirOf(typeFile))
+	seen := map[string]bool{}
+	for len(bases) > 0 {
+		var next []string
+		for _, base := range bases {
+			if base == "" || seen[base] {
+				continue
+			}
+			seen[base] = true
+			baseFile := ""
+			if tsFamilyLang(caller.Language) {
+				baseFile = tsResolveClassFile(idx, base, typeFile)
+			}
+			if inherited := filterCandidatesByFile(filterByParent(pool, base), baseFile); len(inherited) > 0 {
+				return inherited
+			}
+			next = append(next, baseClassesFor(idx, caller.Language, base, dirOf(baseFile))...)
+			if baseFile != "" {
+				typeFile = baseFile
+			}
+		}
+		bases = next
+	}
+	return nil
 }
 
 func csharpExtensionTargets(cands []*core.SymbolRecord, receiverType string) []*core.SymbolRecord {

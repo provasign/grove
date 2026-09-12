@@ -18,6 +18,12 @@ func (idx *edgeIndex) assignPyImportOwners() {
 			for i := range bindings {
 				bestSize := int(^uint(0) >> 1)
 				for _, symbol := range idx.byFile[file] {
+					// The synthetic module body spans the whole file, but it is
+					// not a lexical function scope. Imports owned by it are module
+					// bindings and must remain visible to every real declaration.
+					if symbol.Name == "<top-level>" {
+						continue
+					}
 					if bindings[i].line < symbol.Span.Start || bindings[i].line > symbol.Span.End {
 						continue
 					}
