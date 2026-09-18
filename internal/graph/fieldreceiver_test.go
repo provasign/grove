@@ -62,6 +62,58 @@ func TestBuildCalls_JavaFieldReceiverType(t *testing.T) {
 	}
 }
 
+func TestBuildCalls_JavaMultiDeclaratorFieldReceiverType(t *testing.T) {
+	base := core.SymbolRecord{
+		ID: "JsonSerializer.java::JsonSerializer@1", FilePath: "JsonSerializer.java", Language: "java", Kind: core.KindClass,
+		Name: "JsonSerializer", QualifiedName: "JsonSerializer", Signature: "public abstract class JsonSerializer<T>",
+		RawText: "public abstract class JsonSerializer<T> {\n    public abstract void serialize(T value, JsonGenerator gen, SerializerProvider serializers);\n}",
+	}
+	target := core.SymbolRecord{
+		ID: "JsonSerializer.java::JsonSerializer.serialize@1", FilePath: "JsonSerializer.java", Language: "java", Kind: core.KindMethod,
+		Name: "serialize", QualifiedName: "JsonSerializer.serialize", ParentSymbol: "JsonSerializer",
+		Signature: "public abstract void serialize(T value, JsonGenerator gen, SerializerProvider serializers)",
+	}
+	other := core.SymbolRecord{
+		ID: "Other.java::Other.serialize@1", FilePath: "Other.java", Language: "java", Kind: core.KindMethod,
+		Name: "serialize", QualifiedName: "Other.serialize", ParentSymbol: "Other",
+		Signature: "public void serialize(Object value, JsonGenerator gen, SerializerProvider serializers)",
+	}
+	decl := "protected JsonSerializer<Object> _keySerializer, _valueSerializer;"
+	owner := core.SymbolRecord{ID: "MapProperty.java::MapProperty@1", FilePath: "MapProperty.java", Language: "java", Kind: core.KindClass, Name: "MapProperty", QualifiedName: "MapProperty", RawText: "class MapProperty {\n    " + decl + "\n}"}
+	keyField := core.SymbolRecord{ID: "MapProperty.java::MapProperty._keySerializer@2", FilePath: "MapProperty.java", Language: "java", Kind: core.KindField, Name: "_keySerializer", QualifiedName: "MapProperty._keySerializer", ParentSymbol: "MapProperty", RawText: decl}
+	valueField := core.SymbolRecord{ID: "MapProperty.java::MapProperty._valueSerializer@2", FilePath: "MapProperty.java", Language: "java", Kind: core.KindField, Name: "_valueSerializer", QualifiedName: "MapProperty._valueSerializer", ParentSymbol: "MapProperty", RawText: decl}
+	caller := core.SymbolRecord{
+		ID: "MapProperty.java::MapProperty.serializeAsField@3", FilePath: "MapProperty.java", Language: "java", Kind: core.KindMethod,
+		Name: "serializeAsField", QualifiedName: "MapProperty.serializeAsField", ParentSymbol: "MapProperty",
+		RawText:   "void serializeAsField() {\n    _valueSerializer.serialize(value, gen, provider);\n}",
+		Imports:   []string{"JsonSerializer"},
+		CallSites: []core.CallSite{{Callee: "_valueSerializer.serialize", Line: 4, Argc: 3, Args: []string{"value", "gen", "provider"}}},
+	}
+	symbols := []core.SymbolRecord{base, target, other, owner, keyField, valueField, caller}
+	if got := javaIndexedFieldType(decl); got != "JsonSerializer<Object>" {
+		t.Fatalf("indexed multi-field type = %q", got)
+	}
+	if got := javaLocalTypes(newEdgeIndex(symbols), &caller)["_valueSerializer"]; got != "JsonSerializer" {
+		t.Fatalf("second declarator receiver type = %q", got)
+	}
+	edges := BuildEdges(symbols)
+	found := false
+	for _, edge := range edges {
+		if edge.Type != core.EdgeCalls || edge.From != caller.ID {
+			continue
+		}
+		if edge.To == target.ID {
+			found = true
+		}
+		if edge.To == other.ID {
+			t.Fatal("second declarator resolved to an unrelated same-named method")
+		}
+	}
+	if !found {
+		t.Fatal("second Java field declarator did not retain the shared receiver type")
+	}
+}
+
 // A file that OVERRIDES a method still calls other types' same-named method
 // through typed receivers: same-file shadowing must not hide the cross-file
 // declaration from `serializer.serialize(...)` when the local variable's

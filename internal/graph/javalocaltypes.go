@@ -51,9 +51,22 @@ var (
 	javaFieldRe = regexp.MustCompile(`(?m)^\s+(?:@[\w.]+(?:\([^)]*\))?\s+)*(?:(?:public|private|protected|static|final|transient|volatile)\s+)*([A-Z]\w*)(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?(?:\[\])?\s+(\w+)\s*[;=]`)
 	// field declaration line, primitives included, raw type token kept —
 	// for overload matching (AT_SIGN is a char; javaFieldRe skips it)
-	javaFieldArgRe      = regexp.MustCompile(`(?m)^\s+(?:@[\w.]+(?:\([^)]*\))?\s+)*(?:(?:public|private|protected|static|final|transient|volatile)\s+)*((?:boolean|byte|char|short|int|long|float|double|[A-Z]\w*)(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?(?:\[\])?)\s+(\w+)\s*[;=]`)
-	javaQualifiedCallRe = regexp.MustCompile(`\b([A-Za-z_]\w*)(?:\s*\[[^\]\n]+\])?\s*\.\s*([A-Za-z_]\w*)\s*\(`)
+	javaFieldArgRe = regexp.MustCompile(`(?m)^\s+(?:@[\w.]+(?:\([^)]*\))?\s+)*(?:(?:public|private|protected|static|final|transient|volatile)\s+)*((?:boolean|byte|char|short|int|long|float|double|[A-Z]\w*)(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?(?:\[\])?)\s+(\w+)\s*[;=]`)
+	// Type prefix for an indexed field symbol. The symbol already supplies the
+	// declarator name, so this deliberately accepts a comma after the first
+	// declarator: `JsonSerializer<Object> key, value;` gives both indexed field
+	// symbols the same raw declaration and therefore the same receiver type.
+	javaIndexedFieldTypeRe = regexp.MustCompile(`(?m)^\s+(?:@[\w.]+(?:\([^)]*\))?\s+)*(?:(?:public|private|protected|static|final|transient|volatile)\s+)*((?:boolean|byte|char|short|int|long|float|double|[A-Z]\w*)(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?(?:\[\])?)\s+\w+\s*[,;=]`)
+	javaQualifiedCallRe    = regexp.MustCompile(`\b([A-Za-z_]\w*)(?:\s*\[[^\]\n]+\])?\s*\.\s*([A-Za-z_]\w*)\s*\(`)
 )
+
+func javaIndexedFieldType(raw string) string {
+	m := javaIndexedFieldTypeRe.FindStringSubmatch(" " + strings.TrimSpace(raw))
+	if m == nil {
+		return ""
+	}
+	return m[1]
+}
 
 // javaArgTypes infers identifier → raw type token (primitives and arrays
 // preserved: "long[]", "int") for overload matching, from parameters and
@@ -122,8 +135,8 @@ func javaArgTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 						if _, exists := out[f.Name]; exists {
 							continue
 						}
-						if m := javaFieldArgRe.FindStringSubmatch(" " + strings.TrimSpace(f.RawText)); m != nil && m[2] == f.Name {
-							record(m[1], m[2])
+						if typ := javaIndexedFieldType(f.RawText); typ != "" {
+							record(typ, f.Name)
 						}
 					}
 				}
@@ -841,6 +854,20 @@ func javaLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string
 							if _, exists := out[m[2]]; !exists {
 								out[m[2]] = t
 							}
+						}
+					}
+					// Multi-declarator fields only let javaFieldRe see the first
+					// name. Indexed field symbols retain every declarator; recover
+					// their shared type from the declaration prefix.
+					for _, f := range idx.byFile[cls.FilePath] {
+						if f.Kind != core.KindField || (f.ParentSymbol != className && f.ParentSymbol != cls.Name && f.ParentSymbol != cls.QualifiedName) {
+							continue
+						}
+						if _, exists := out[f.Name]; exists {
+							continue
+						}
+						if t := javaBareType(javaIndexedFieldType(f.RawText)); t != "" {
+							out[f.Name] = t
 						}
 					}
 				}

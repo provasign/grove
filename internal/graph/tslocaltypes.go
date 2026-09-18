@@ -694,6 +694,17 @@ func javaClassFieldTypes(idx *edgeIndex, className, preferFile string, out map[s
 				}
 			}
 		}
+		for _, f := range idx.byFile[cls.FilePath] {
+			if f.Kind != core.KindField || (f.ParentSymbol != className && f.ParentSymbol != cls.Name && f.ParentSymbol != cls.QualifiedName) {
+				continue
+			}
+			if _, exists := out[f.Name]; exists {
+				continue
+			}
+			if t := javaBareType(javaIndexedFieldType(f.RawText)); t != "" {
+				out[f.Name] = t
+			}
+		}
 		break
 	}
 	return classFile
