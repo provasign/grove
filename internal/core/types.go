@@ -228,6 +228,7 @@ const (
 	ReasonTestEvidence   EdgeReason = "test-evidence"   // tests edge (annotation/name/call-derived)
 	ReasonMethodSet      EdgeReason = "method-set"      // overrides/implements by method-set inclusion
 	ReasonDecorator      EdgeReason = "decorator"       // decorator/wrapper call edge
+	ReasonFunctionRef    EdgeReason = "function-ref"    // C/C++ function passed as an argument (function-pointer reach)
 	ReasonImplicitDunder EdgeReason = "implicit-dunder" // language-implicit protocol method (e.g. Python __setattr__ on "x.y = v") with no call site in source
 )
 

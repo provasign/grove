@@ -2,10 +2,36 @@ package graph
 
 import (
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/provasign/grove/internal/core"
 )
+
+// javaFunctionalInterfaceArity maps a common JDK functional interface's
+// bare (generic-stripped) name to its single abstract method's parameter
+// count. Covers java.util.function.* plus the older Runnable/Callable/
+// Comparator idioms; unlisted (including any custom @FunctionalInterface)
+// returns unknown, which the caller treats as neutral rather than a guess.
+var javaFunctionalInterfaceArityTable = map[string]int{
+	"Runnable": 0, "Callable": 0, "Supplier": 0,
+	"BooleanSupplier": 0, "IntSupplier": 0, "LongSupplier": 0, "DoubleSupplier": 0,
+	"Function": 1, "Consumer": 1, "Predicate": 1, "UnaryOperator": 1,
+	"IntFunction": 1, "LongFunction": 1, "DoubleFunction": 1,
+	"ToIntFunction": 1, "ToLongFunction": 1, "ToDoubleFunction": 1,
+	"IntConsumer": 1, "LongConsumer": 1, "DoubleConsumer": 1,
+	"IntPredicate": 1, "LongPredicate": 1, "DoublePredicate": 1,
+	"IntUnaryOperator": 1, "LongUnaryOperator": 1, "DoubleUnaryOperator": 1,
+	"BiFunction": 2, "BiConsumer": 2, "BiPredicate": 2, "BinaryOperator": 2,
+	"Comparator": 2, "IntBinaryOperator": 2, "LongBinaryOperator": 2, "DoubleBinaryOperator": 2,
+	"ToIntBiFunction": 2, "ToLongBiFunction": 2, "ToDoubleBiFunction": 2,
+	"ObjIntConsumer": 2, "ObjLongConsumer": 2, "ObjDoubleConsumer": 2,
+}
+
+func javaFunctionalInterfaceArity(paramType string) (int, bool) {
+	n, ok := javaFunctionalInterfaceArityTable[paramType]
+	return n, ok
+}
 
 // Java local type inference: parameter declarations ("final CharSequence
 // seq" — type precedes name), typed locals, and field declarations from the
@@ -189,6 +215,34 @@ func javaDeclSource(s *core.SymbolRecord) string {
 }
 
 // javaParamTypes parses a candidate's declared parameter type tokens.
+// javaCollapseGenericSpaces removes whitespace that occurs at angle-bracket
+// depth > 0, so "Function<Integer, T>" tokenizes as one field the same as
+// the no-space style "Function<Integer,T>" does.
+func javaCollapseGenericSpaces(s string) string {
+	if !strings.ContainsAny(s, "<") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch c {
+		case '<':
+			depth++
+		case '>':
+			if depth > 0 {
+				depth--
+			}
+		}
+		if depth > 0 && (c == ' ' || c == '\t') {
+			continue
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
 func javaParamTypes(s *core.SymbolRecord) []string {
 	src := javaDeclSource(s)
 	params := tsDeclParams(src)
@@ -197,7 +251,16 @@ func javaParamTypes(s *core.SymbolRecord) []string {
 	}
 	var out []string
 	for _, g := range splitTopLevel(params, ',') {
-		fields := strings.Fields(strings.TrimSpace(g))
+		// strings.Fields splits on ANY whitespace: "Function<Integer, T>
+		// allocator" (the conventional space-after-comma generic style)
+		// tore into four fields ("Function<Integer,", "T>", "allocator")
+		// instead of two, and the strip-loop below then discarded the
+		// wrong ones — misparsing the type as "T>" and silently
+		// defeating overload disambiguation for every multi-arg-generic
+		// parameter (Function/BiFunction/Map/... with a space after the
+		// comma). Collapse whitespace INSIDE angle brackets first so the
+		// generic argument list can never split a field.
+		fields := strings.Fields(javaCollapseGenericSpaces(strings.TrimSpace(g)))
 		for len(fields) > 2 || (len(fields) == 2 && (fields[0] == "final" || strings.HasPrefix(fields[0], "@"))) {
 			fields = fields[1:]
 		}
@@ -256,8 +319,16 @@ func narrowOverloadsByArgTypes(cands []*core.SymbolRecord, args []string, argTyp
 				continue
 			}
 			var argType string
+			lambdaArity := -1
 			if argName[0] == '#' {
-				argType = javaNormalizeTypeToken(argName[1:])
+				if strings.HasPrefix(argName, "#lambda:") {
+					if n, err := strconv.Atoi(argName[len("#lambda:"):]); err == nil {
+						lambdaArity = n
+					}
+					argType = "lambda"
+				} else {
+					argType = javaNormalizeTypeToken(argName[1:])
+				}
 			} else if strings.HasPrefix(argName, "call:") {
 				t, known := argTypes[argName] // pre-resolved return type
 				if !known {
@@ -286,6 +357,17 @@ func narrowOverloadsByArgTypes(cands []*core.SymbolRecord, args []string, argTyp
 				continue
 			}
 			allExact = false
+			if argType == "lambda" && lambdaArity >= 0 {
+				if want, known := javaFunctionalInterfaceArity(paramTypes[pi]); known && want != lambdaArity {
+					// Same-arity overloads differing only by functional-
+					// interface shape (arraycopy's Function<Integer,T> vs
+					// Supplier<T> allocator): the lambda's own bound
+					// parameter count picks the one overload javac would
+					// bind, the same signal a real compiler uses.
+					conflict = true
+					break
+				}
+			}
 			if javaShapeMismatch(argType, paramTypes[pi], cand) ||
 				(argType != "lambda" && !javaWildcardParam(paramTypes[pi], cand) &&
 					!javaLiteralCompatible(argType, paramTypes[pi], argName[0] == '#')) {

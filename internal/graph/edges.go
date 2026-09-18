@@ -2088,6 +2088,24 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			if cs.ReferenceOnly {
 				continue
 			}
+			if symbol.Language == "csharp" && cs.Argc > 0 && hasUnknownArg(cs.Args, cs.Argc) {
+				if csArgTypeCache == nil {
+					csArgTypeCache = csharpArgTypes(idx, &symbol)
+				}
+				if recovered := csRecoverArgs(idx, &symbol, cs, csArgTypeCache); recovered != nil {
+					if len(cs.Args) != len(recovered) {
+						cs.Args = recovered
+					} else {
+						merged := append([]string(nil), cs.Args...)
+						for i, a := range merged {
+							if a == "" {
+								merged[i] = recovered[i]
+							}
+						}
+						cs.Args = merged
+					}
+				}
+			}
 			calleeName := cs.Callee
 			// Split receiver prefix (e.g. "user.save" → qualifier "user",
 			// name "save"); chains keep only the last segment ("a.b.Get" → "b").
@@ -2556,7 +2574,19 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				if traceCalls {
 					fmt.Fprintf(os.Stderr, "grove-trace %s: super bases=%v matched=%d\n", symbol.QualifiedName, baseClassesFor(idx, symbol.Language, symbol.ParentSymbol, dirOf(symbol.FilePath)), len(narrowBySuper(idx, &symbol, cands)))
 				}
-				for _, cand := range narrowBySuper(idx, &symbol, cands) {
+				viaSuper := narrowBySuper(idx, &symbol, cands)
+				// `base.WriteValue(x)` binds ONE overload on the base type,
+				// exactly as a typed-receiver call does: apply the same
+				// arity + argument-type narrowing here. Without it every
+				// base-call fanned out to all ~35 JsonWriter.WriteValue
+				// overloads (635 false edges on Newtonsoft.Json).
+				switch symbol.Language {
+				case "java":
+					viaSuper = narrowJavaCall(viaSuper, cs, scope)
+				case "csharp":
+					viaSuper = narrowDispatch(viaSuper, cs)
+				}
+				for _, cand := range viaSuper {
 					addEdge(symbol.ID, cand.ID, 0.85, core.EvidenceSourceHeuristic, core.ReasonInheritance)
 				}
 				continue
@@ -2570,10 +2600,13 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				}
 			}
 			if calleeName == "super()" && symbol.ParentSymbol != "" {
-				for _, base := range baseClassesFor(idx, symbol.Language, symbol.ParentSymbol, dirOf(symbol.FilePath)) {
+				for _, base := range constructorBaseClasses(idx, symbol.Language, symbol.ParentSymbol, dirOf(symbol.FilePath)) {
 					targets := constructorTargets(idx, base, scope)
-					if symbol.Language == "java" || symbol.Language == "csharp" {
-						targets = filterByArgc(targets, cs.Argc)
+					switch symbol.Language {
+					case "java":
+						targets = narrowJavaCall(targets, cs, scope)
+					case "csharp":
+						targets = narrowDispatch(targets, cs)
 					}
 					if len(targets) == 0 {
 						// Inheritance crosses imports — but prefer the twin
@@ -2595,7 +2628,14 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			if calleeName == "this()" && symbol.ParentSymbol != "" &&
 				(symbol.Language == "java" || symbol.Language == "csharp") {
 				targets := constructorTargets(idx, symbol.ParentSymbol, scope)
-				targets = filterByArgc(targets, cs.Argc)
+				// this(...) picks one sibling constructor by arity AND
+				// argument types, like any other overloaded call.
+				switch symbol.Language {
+				case "java":
+					targets = narrowJavaCall(targets, cs, scope)
+				case "csharp":
+					targets = narrowDispatch(targets, cs)
+				}
 				for _, ctor := range targets {
 					if ctor.ID != symbol.ID {
 						addEdge(symbol.ID, ctor.ID, 0.95, core.EvidenceSourceASTKit, core.ReasonConstructor)
@@ -2630,8 +2670,13 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					// Not a method on the caller's own class: inheritance
 					// reaches files import scope never sees.
 					inherited := inheritedTargets(idx, &symbol, calleeName, false)
-					if symbol.Language == "java" {
+					switch symbol.Language {
+					case "java":
 						inherited = narrowJavaCall(inherited, cs, scope)
+					case "csharp":
+						// SetToken(JsonToken.None) inherited from JsonReader
+						// binds the one-parameter overload, not all three.
+						inherited = narrowDispatch(inherited, cs)
 					}
 					if len(inherited) > 0 {
 						// A monorepo declares `Transport` in both the client
@@ -2710,6 +2755,14 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// behavior until type evidence pins the overload set down.
 				narrowed = nil
 			}
+			if symbol.Language == "java" && len(narrowed) > 4 && sameOverloadSet(narrowed) {
+				// javac binds exactly one of these; when neither arity nor
+				// argument types could tell StrBuilder's fourteen one-arg
+				// `append` overloads apart (`append(System.lineSeparator())`
+				// — a JDK return type), emitting all of them is 13 false
+				// edges per call site. Precision-first, as for C#.
+				narrowed = nil
+			}
 			if len(narrowed) > maxCalleeFanout {
 				// Still unresolvably broad after every narrowing pass:
 				// drop (the dispatch rescue below may still apply).
@@ -2731,6 +2784,31 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					addEdge(symbol.ID, cand.ID, 0.7, core.EvidenceSourceHeuristic, core.ReasonDispatch)
 				} else {
 					addEdge(symbol.ID, cand.ID, 0.95, core.EvidenceSourceASTKit, core.ReasonASTNarrowed)
+				}
+			}
+			if symbol.Language == "c" || symbol.Language == "cpp" {
+				// A function passed as an argument (`qsort(keys, n, sz,
+				// compare_keys)`, `json_dump_callback(json, dump_to_file,
+				// ...)`) is reached through that pointer: the same
+				// "may affect" altitude as a call, and what the C oracle
+				// records. Only an identifier that names exactly one
+				// in-scope function and no local/parameter qualifies.
+				for _, arg := range cs.Args {
+					if arg == "" || arg[0] == '#' || arg[0] == '%' || strings.HasPrefix(arg, "call:") || arg == calleeName {
+						continue
+					}
+					if _, local := localTypes[arg]; local {
+						continue
+					}
+					refs, over := resolveCallees(idx, &symbol, arg, scope, true, true)
+					if over || len(refs) == 0 || len(refs) > 2 {
+						continue
+					}
+					for _, ref := range refs {
+						if ref.Kind == core.KindFunction && ref.ID != symbol.ID {
+							addEdge(symbol.ID, ref.ID, 0.7, core.EvidenceSourceASTKit, core.ReasonFunctionRef)
+						}
+					}
 				}
 			}
 			// Class instantiation: "Flask(...)" executes Flask.__init__.
@@ -2939,7 +3017,7 @@ func narrowByReceiver(cands []*core.SymbolRecord, caller *core.SymbolRecord, qua
 		return cands
 	}
 	if byType := filterByParent(cands, qualifier); len(byType) > 0 {
-		return byType
+		return preferSameFileParent(byType, caller.FilePath)
 	}
 	return cands
 }
@@ -3756,3 +3834,53 @@ func javaPackageSuffix(dir string) (string, bool) {
 }
 
 var javaSrcRootRe = regexp.MustCompile(`(^|/)src/[^/]+/java/`)
+
+// preferSameFileParent keeps, among candidates already narrowed to a
+// receiver type's members, those declared in the caller's own file when
+// any are. A file that declares its own `Config` and calls
+// `Config::default()` means that Config, not the six other `Config`
+// structs across the workspace (ripgrep's printer/searcher/regex crates
+// each declare one).
+func preferSameFileParent(cands []*core.SymbolRecord, file string) []*core.SymbolRecord {
+	if len(cands) < 2 {
+		return cands
+	}
+	var same []*core.SymbolRecord
+	for _, cand := range cands {
+		if cand.FilePath == file {
+			same = append(same, cand)
+		}
+	}
+	if len(same) > 0 {
+		return same
+	}
+	return cands
+}
+
+// hasUnknownArg reports whether at least one of argc argument slots has
+// no extractor classification (nil Args, or an empty slot).
+func hasUnknownArg(args []string, argc int) bool {
+	if len(args) < argc {
+		return true
+	}
+	for _, a := range args {
+		if a == "" {
+			return true
+		}
+	}
+	return false
+}
+
+// sameOverloadSet reports whether every candidate is an overload of one
+// member: same declaring type and name.
+func sameOverloadSet(cands []*core.SymbolRecord) bool {
+	if len(cands) == 0 {
+		return false
+	}
+	for _, c := range cands[1:] {
+		if c.ParentSymbol != cands[0].ParentSymbol || c.Name != cands[0].Name {
+			return false
+		}
+	}
+	return true
+}

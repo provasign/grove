@@ -69,21 +69,7 @@ func tsBareType(ann string) string {
 // interfaces participate because callers use this ancestry for inherited
 // members and dynamic-dispatch expansion, not only class inheritance.
 func tsBaseClasses(idx *edgeIndex, className, preferDir string) []string {
-	var chosen *core.SymbolRecord
-	for _, cand := range namedSymbols(idx, className) {
-		switch cand.Kind {
-		case core.KindClass, core.KindStruct, core.KindInterface, core.KindTrait:
-		default:
-			continue
-		}
-		if dirOf(cand.FilePath) == preferDir {
-			chosen = cand
-			break
-		}
-		if chosen == nil {
-			chosen = cand
-		}
-	}
+	chosen := tsChosenTypeDecl(idx, className, preferDir)
 	if chosen == nil {
 		return nil
 	}
@@ -876,4 +862,43 @@ func tsDeclParams(rawText string) string {
 		}
 	}
 	return ""
+}
+
+// tsChosenTypeDecl picks the declaration that tsBaseClasses reads
+// inheritance clauses from: a class/struct/interface/trait named className,
+// preferring one in preferDir when the name is declared in several places.
+func tsChosenTypeDecl(idx *edgeIndex, className, preferDir string) *core.SymbolRecord {
+	var chosen *core.SymbolRecord
+	for _, cand := range namedSymbols(idx, className) {
+		switch cand.Kind {
+		case core.KindClass, core.KindStruct, core.KindInterface, core.KindTrait:
+		default:
+			continue
+		}
+		if dirOf(cand.FilePath) == preferDir {
+			return cand
+		}
+		if chosen == nil {
+			chosen = cand
+		}
+	}
+	return chosen
+}
+
+// constructorBaseClasses is baseClassesFor restricted to the classes a
+// `super(...)` constructor call can reach. An implemented interface has no
+// constructor, and resolving through its NAME bound commons-lang's
+// `CompareToBuilder implements Builder<Integer>` to every nested `Builder`
+// class in the package (42 false constructor edges).
+func constructorBaseClasses(idx *edgeIndex, language, className, preferDir string) []string {
+	switch language {
+	case "java", "typescript", "tsx", "javascript", "php":
+		chosen := tsChosenTypeDecl(idx, className, preferDir)
+		if chosen == nil {
+			return nil
+		}
+		sig := stripLeadingGenericParams(chosen.Signature)
+		return uniqueStrings(inheritanceClauseTypes(sig, "extends", "implements"))
+	}
+	return baseClassesFor(idx, language, className, preferDir)
 }

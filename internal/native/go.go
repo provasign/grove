@@ -524,7 +524,7 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 								Confidence: 0.99, Source: core.EvidenceSourceNative, Reason: core.ReasonMethodSet})
 						}
 					}
-					if callee, ok := goResolveCall(dir, n.Fun, info, symbolIdx, pkgDirsByImport); ok && callee.ID != caller.ID {
+					if callee, ok := goResolveCall(dir, n.Fun, info, symbolIdx, pkgDirsByImport, pkg); ok && callee.ID != caller.ID {
 						add(core.Edge{
 							From:       caller.ID,
 							To:         callee.ID,
@@ -534,7 +534,7 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 						})
 					}
 				case *ast.Ident:
-					if typ, ok := goResolveType(dir, n, info, symbolIdx, pkgDirsByImport); ok && typ.ID != caller.ID {
+					if typ, ok := goResolveType(dir, n, info, symbolIdx, pkgDirsByImport, pkg); ok && typ.ID != caller.ID {
 						add(core.Edge{
 							From:       caller.ID,
 							To:         typ.ID,
@@ -562,37 +562,37 @@ func goCallerSymbolAt(relPath string, fn *ast.FuncDecl, symbolIdx goSymbolIndex)
 	return symbol, ok
 }
 
-func goResolveCall(currentDir string, expr ast.Expr, info *types.Info, symbolIdx goSymbolIndex, pkgDirsByImport map[string][]string) (core.SymbolRecord, bool) {
+func goResolveCall(currentDir string, expr ast.Expr, info *types.Info, symbolIdx goSymbolIndex, pkgDirsByImport map[string][]string, selfPkg *types.Package) (core.SymbolRecord, bool) {
 	switch fun := expr.(type) {
 	case *ast.IndexExpr:
-		return goResolveCall(currentDir, fun.X, info, symbolIdx, pkgDirsByImport)
+		return goResolveCall(currentDir, fun.X, info, symbolIdx, pkgDirsByImport, selfPkg)
 	case *ast.IndexListExpr:
-		return goResolveCall(currentDir, fun.X, info, symbolIdx, pkgDirsByImport)
+		return goResolveCall(currentDir, fun.X, info, symbolIdx, pkgDirsByImport, selfPkg)
 	case *ast.Ident:
 		obj, ok := info.Uses[fun].(*types.Func)
 		if !ok {
 			return core.SymbolRecord{}, false
 		}
-		return goSymbolForFunc(currentDir, obj, symbolIdx, pkgDirsByImport)
+		return goSymbolForFunc(currentDir, obj, symbolIdx, pkgDirsByImport, selfPkg)
 	case *ast.SelectorExpr:
 		if sel := info.Selections[fun]; sel != nil {
 			if fn, ok := sel.Obj().(*types.Func); ok {
-				return goSymbolForFunc(currentDir, fn, symbolIdx, pkgDirsByImport)
+				return goSymbolForFunc(currentDir, fn, symbolIdx, pkgDirsByImport, selfPkg)
 			}
 		}
 		if fn, ok := info.Uses[fun.Sel].(*types.Func); ok {
-			return goSymbolForFunc(currentDir, fn, symbolIdx, pkgDirsByImport)
+			return goSymbolForFunc(currentDir, fn, symbolIdx, pkgDirsByImport, selfPkg)
 		}
 	}
 	return core.SymbolRecord{}, false
 }
 
-func goResolveType(currentDir string, ident *ast.Ident, info *types.Info, symbolIdx goSymbolIndex, pkgDirsByImport map[string][]string) (core.SymbolRecord, bool) {
+func goResolveType(currentDir string, ident *ast.Ident, info *types.Info, symbolIdx goSymbolIndex, pkgDirsByImport map[string][]string, selfPkg *types.Package) (core.SymbolRecord, bool) {
 	obj, ok := info.Uses[ident].(*types.TypeName)
 	if !ok {
 		return core.SymbolRecord{}, false
 	}
-	dirs := goObjectDirs(currentDir, obj.Pkg(), pkgDirsByImport)
+	dirs := goObjectDirs(currentDir, obj.Pkg(), pkgDirsByImport, selfPkg)
 	for _, dir := range dirs {
 		if symbol, ok := symbolIdx.byType[dir+"\x00"+obj.Name()]; ok {
 			return symbol, true
@@ -601,8 +601,8 @@ func goResolveType(currentDir string, ident *ast.Ident, info *types.Info, symbol
 	return core.SymbolRecord{}, false
 }
 
-func goSymbolForFunc(currentDir string, fn *types.Func, symbolIdx goSymbolIndex, pkgDirsByImport map[string][]string) (core.SymbolRecord, bool) {
-	dirs := goObjectDirs(currentDir, fn.Pkg(), pkgDirsByImport)
+func goSymbolForFunc(currentDir string, fn *types.Func, symbolIdx goSymbolIndex, pkgDirsByImport map[string][]string, selfPkg *types.Package) (core.SymbolRecord, bool) {
+	dirs := goObjectDirs(currentDir, fn.Pkg(), pkgDirsByImport, selfPkg)
 	recv := goFuncReceiverName(fn)
 	for _, dir := range dirs {
 		if symbol, ok := symbolIdx.byFunc[goCallableKey(dir, recv, fn.Name())]; ok {
@@ -612,14 +612,33 @@ func goSymbolForFunc(currentDir string, fn *types.Func, symbolIdx goSymbolIndex,
 	return core.SymbolRecord{}, false
 }
 
-func goObjectDirs(currentDir string, pkg *types.Package, pkgDirsByImport map[string][]string) []string {
+// goObjectDirs maps a resolved object's package to the repo-relative
+// directories it lives in. selfPkg is the package currently being
+// analyzed (from this pass's own types.Config.Check) — its path can
+// legitimately be missing from pkgDirsByImport (a synthetic/no-go.mod
+// analysis, or a types.Package path that doesn't match go list's module-
+// qualified naming for the SAME package), so a same-package reference
+// still resolves via currentDir. Any OTHER unmapped, non-nil package is
+// external (stdlib or a third-party module): go/types resolved it
+// exactly, so guessing "maybe it's the caller's own package" would
+// override a precise negative with a wrong positive — html/template.New
+// defaulting to currentDir matched gin's own same-directory New(), the
+// single biggest gin false positive this pass produced.
+func goObjectDirs(currentDir string, pkg *types.Package, pkgDirsByImport map[string][]string, selfPkg *types.Package) []string {
 	if pkg == nil {
+		// A true universe-scope builtin (len, append, new, ...) has no
+		// package at all; these never collide with an indexed symbol name
+		// in practice, and the caller's own directory is the only
+		// plausible guess left.
 		return []string{currentDir}
 	}
 	if dirs := pkgDirsByImport[pkg.Path()]; len(dirs) > 0 {
 		return dirs
 	}
-	return []string{currentDir}
+	if selfPkg != nil && pkg == selfPkg {
+		return []string{currentDir}
+	}
+	return nil
 }
 
 func goReceiverName(fn *ast.FuncDecl) string {

@@ -1,8 +1,8 @@
 {
  "gin": {
   "commit": "d75fcd4",
-  "precision": 0.9339,
-  "recall": 0.9488,
+  "precision": 0.9522,
+  "recall": 0.9505,
   "tolerance": 0.005,
   "minUniverse": 0.99
  },
@@ -29,36 +29,36 @@
  },
  "commons-lang": {
   "commit": "44298fe",
-  "precision": 0.8563,
-  "recall": 0.8958,
+  "precision": 0.9355,
+  "recall": 0.9202,
   "minUniverse": 0.96,
   "tolerance": 0.005
  },
  "ripgrep": {
   "commit": "82313cf",
-  "precision": 0.8987,
-  "recall": 0.8957,
+  "precision": 0.9304,
+  "recall": 0.8947,
   "tolerance": 0.005,
   "minUniverse": 0.98
  },
  "newtonsoft": {
   "commit": "0a2e291",
-  "precision": 0.8491,
-  "recall": 0.8158,
+  "precision": 0.9009,
+  "recall": 0.9481,
   "tolerance": 0.005,
   "minUniverse": 0.99
  },
  "php-parser": {
   "commit": "8eea230",
-  "precision": 0.8254,
-  "recall": 0.5709,
+  "precision": 0.8323,
+  "recall": 0.6010,
   "tolerance": 0.005,
   "minUniverse": 0.99
  },
  "jansson": {
   "commit": "684e18c",
-  "precision": 0.8758,
-  "recall": 0.8674,
+  "precision": 0.8767,
+  "recall": 0.9294,
   "tolerance": 0.005,
   "minUniverse": 0.96
  }

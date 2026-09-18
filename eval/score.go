@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -74,8 +75,20 @@ func ScoreCalls(ctx context.Context, repoRoot string, header TruthFile, truth []
 	groveSet := map[[2]string]core.Edge{}
 	staticOracle := staticGenerator(header.Generator)
 	ignoredDispatch := 0
+	fileOf := map[string]string{}
+	for i := range symbols {
+		fileOf[symbols[i].ID] = filepath.ToSlash(symbols[i].FilePath)
+	}
 	for _, e := range edges {
 		if e.Type != core.EdgeCalls {
+			continue
+		}
+		if header.Generator == "scip-clang" && cfamilyIsHeader(fileOf[e.From]) {
+			// The C-family oracle asserts nothing about calls made FROM
+			// header bodies (see truth_cfamily.go: header attribution is
+			// unreliable, so header references are skipped). A Grove edge
+			// out of a static-inline header function is therefore
+			// unscorable, not false.
 			continue
 		}
 		if staticOracle && e.Reason == core.ReasonDispatch {

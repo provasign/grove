@@ -809,11 +809,63 @@ func mergeSymbols(astSyms, regexSyms []core.SymbolRecord) []core.SymbolRecord {
 		if cFamilyControlKeywordPhantom(&s) {
 			continue
 		}
+		if cFamilyStatementPhantom(&s, astSyms) {
+			continue
+		}
 		if !seen[s.Name] {
+			cFamilyMarkPrototype(&s)
 			merged = append(merged, s)
 		}
 	}
 	return merged
+}
+
+// cFamilyStatementPhantom reports a C/C++ regex-recovered callable that
+// starts inside an AST callable's span. The line-scanning fallback reads
+// `return json_null();` and `json_object_foreach(root, key, value) {` as
+// old-style definitions; the enclosing AST function proves they are
+// statements. mergeSymbolsByShape applies this on the clean path; the
+// syntax-recovery path (jansson's macro-heavy files) merged by name alone
+// and let these twins steal every call to the real function.
+func cFamilyStatementPhantom(s *core.SymbolRecord, astSyms []core.SymbolRecord) bool {
+	if (s.Language != "c" && s.Language != "cpp") || !isCallableKind(s.Kind) {
+		return false
+	}
+	for i := range astSyms {
+		a := &astSyms[i]
+		if isCallableKind(a.Kind) && s.Span.Start > a.Span.Start && s.Span.Start <= a.Span.End {
+			return true
+		}
+	}
+	return false
+}
+
+// cFamilyMarkPrototype annotates a C/C++ regex-recovered callable whose
+// declarator ends in `;` before any `{` as a "declaration": a prototype,
+// never a call target while the definition exists. The brace scanner had
+// also run past the prototype to the next `{` in the file, so the span is
+// clamped to the prototype's own lines.
+func cFamilyMarkPrototype(s *core.SymbolRecord) {
+	if (s.Language != "c" && s.Language != "cpp") || !isCallableKind(s.Kind) {
+		return
+	}
+	for _, a := range s.Annotations {
+		if a == "declaration" {
+			return
+		}
+	}
+	body := stripCppCommentsAndStrings(s.RawText)
+	semi := strings.IndexByte(body, ';')
+	brace := strings.IndexByte(body, '{')
+	if semi < 0 || (brace >= 0 && brace < semi) {
+		return
+	}
+	s.Annotations = append(s.Annotations, "declaration")
+	lines := strings.Count(body[:semi], "\n")
+	s.Span.End = s.Span.Start + lines
+	if raw := strings.Split(s.RawText, "\n"); len(raw) > lines {
+		s.RawText = strings.Join(raw[:lines+1], "\n")
+	}
 }
 
 func mergeSymbolsByShape(astSyms, regexSyms []core.SymbolRecord) []core.SymbolRecord {

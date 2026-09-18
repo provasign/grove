@@ -123,6 +123,49 @@ func goLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 	return out
 }
 
+// goReturnType parses one Go function/method symbol's declared first
+// return value to a bare, indexed type name; "" when it has no return, the
+// signature doesn't parse, or the return isn't an indexed type (including
+// a stdlib type that happens to share a bare name with one of ours, like
+// context.Context vs a package's own Context — the qualifier is stripped
+// only after confirming the SAME bare name resolves to something we
+// actually declared, via typeSymbolExists).
+func goReturnType(idx *edgeIndex, f *core.SymbolRecord) string {
+	sig := f.Signature
+	close := strings.IndexByte(sig, ')')
+	if close < 0 {
+		return ""
+	}
+	// Skip a leading receiver's parens for methods.
+	rest := strings.TrimSpace(sig[close+1:])
+	if strings.HasPrefix(rest, "(") {
+		rest = strings.TrimPrefix(rest, "(")
+	}
+	rest = strings.TrimSpace(rest)
+	if rest == "" || rest == "{" {
+		return ""
+	}
+	first := rest
+	if i := strings.IndexAny(first, ",)"); i >= 0 {
+		first = first[:i]
+	}
+	// "c *Context" or "*Context" — take the last token, strip decorations.
+	fields := strings.Fields(first)
+	if len(fields) == 0 {
+		return ""
+	}
+	tok := fields[len(fields)-1]
+	tok = strings.TrimLeft(tok, "*&[]")
+	if i := strings.LastIndexByte(tok, '.'); i >= 0 {
+		tok = tok[i+1:]
+	}
+	tok = strings.TrimRight(tok, "{")
+	if tok != "" && typeSymbolExists(idx, tok) {
+		return tok
+	}
+	return ""
+}
+
 // goFirstReturnType resolves an indexed Go FUNCTION's first return type to a
 // bare, indexed type name; "" when the callee is unknown, not a function, or
 // the return does not parse to an indexed type.
@@ -136,37 +179,8 @@ func goFirstReturnType(idx *edgeIndex, fnName string) string {
 		default:
 			continue
 		}
-		sig := f.Signature
-		close := strings.IndexByte(sig, ')')
-		if close < 0 {
-			continue
-		}
-		// Skip a leading receiver's parens for methods.
-		rest := strings.TrimSpace(sig[close+1:])
-		if strings.HasPrefix(rest, "(") {
-			rest = strings.TrimPrefix(rest, "(")
-		}
-		rest = strings.TrimSpace(rest)
-		if rest == "" || rest == "{" {
-			continue
-		}
-		first := rest
-		if i := strings.IndexAny(first, ",)"); i >= 0 {
-			first = first[:i]
-		}
-		// "c *Context" or "*Context" — take the last token, strip decorations.
-		fields := strings.Fields(first)
-		if len(fields) == 0 {
-			continue
-		}
-		tok := fields[len(fields)-1]
-		tok = strings.TrimLeft(tok, "*&[]")
-		if i := strings.LastIndexByte(tok, '.'); i >= 0 {
-			tok = tok[i+1:]
-		}
-		tok = strings.TrimRight(tok, "{")
-		if tok != "" && typeSymbolExists(idx, tok) {
-			return tok
+		if t := goReturnType(idx, f); t != "" {
+			return t
 		}
 	}
 	return ""
@@ -282,15 +296,30 @@ func goParamList(signature string) (string, bool) {
 // splitTopLevel splits on sep outside any (), [], {} nesting.
 func splitTopLevel(s string, sep byte) []string {
 	var out []string
-	depth, last := 0, 0
+	depth, angle, last := 0, 0, 0
 	for i := 0; i < len(s); i++ {
 		switch s[i] {
 		case '(', '[', '{':
 			depth++
 		case ')', ']', '}':
 			depth--
+		case '<':
+			// Generic argument list depth, tracked separately from
+			// depth so an unbalanced '<'/'>' (a stray comparison —
+			// this is never a real risk in a parameter or argument
+			// list, but the floor guard below costs nothing) can't
+			// desync the paren/bracket tracking it shares the loop
+			// with. Every caller here parses a parameter, argument, or
+			// type list, where '<'/'>' are always generic brackets —
+			// "Function<Integer, T>" has an internal top-level-looking
+			// comma that must NOT split the group.
+			angle++
+		case '>':
+			if angle > 0 {
+				angle--
+			}
 		case sep:
-			if depth == 0 {
+			if depth == 0 && angle == 0 {
 				out = append(out, s[last:i])
 				last = i + 1
 			}

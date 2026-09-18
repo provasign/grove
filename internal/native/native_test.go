@@ -374,17 +374,25 @@ func TestGoObjectDirsAllBranches(t *testing.T) {
 	pkg := types.NewPackage("github.com/example/auth", "auth")
 	m := map[string][]string{"github.com/example/auth": {"src/auth"}}
 
-	// pkg == nil
-	if got := goObjectDirs("src", nil, m); len(got) != 1 || got[0] != "src" {
+	// pkg == nil: a universe-scope builtin (len, append, ...).
+	if got := goObjectDirs("src", nil, m, nil); len(got) != 1 || got[0] != "src" {
 		t.Fatalf("nil pkg: got %v", got)
 	}
 	// pkg found in map
-	if got := goObjectDirs("src", pkg, m); len(got) != 1 || got[0] != "src/auth" {
+	if got := goObjectDirs("src", pkg, m, nil); len(got) != 1 || got[0] != "src/auth" {
 		t.Fatalf("found in map: got %v", got)
 	}
-	// pkg not found — returns currentDir
-	if got := goObjectDirs("src", pkg, map[string][]string{}); len(got) != 1 || got[0] != "src" {
-		t.Fatalf("not found: got %v", got)
+	// pkg not found anywhere, and not the package under analysis: external
+	// (stdlib/third-party) — unresolved, not a currentDir guess.
+	if got := goObjectDirs("src", pkg, map[string][]string{}, nil); got != nil {
+		t.Fatalf("external pkg: expected nil, got %v", got)
+	}
+	// pkg not found in the map, but IS the package under analysis (selfPkg):
+	// falls back to currentDir — a synthetic/no-go.mod analysis, or a
+	// types.Package path that doesn't match go list's naming for the SAME
+	// package under analysis.
+	if got := goObjectDirs("src", pkg, map[string][]string{}, pkg); len(got) != 1 || got[0] != "src" {
+		t.Fatalf("self pkg not in map: got %v", got)
 	}
 }
 
@@ -1271,7 +1279,7 @@ func TestGoSymbolForMethodNeverFallsBackToPackageFunction(t *testing.T) {
 	free := core.SymbolRecord{ID: "g.go::Run@1", FilePath: "g.go", Language: "go", Kind: core.KindFunction, Name: "Run"}
 	idx := newGoSymbolIndex([]core.SymbolRecord{free})
 
-	if got, ok := goSymbolForFunc(".", method, idx, map[string][]string{pkg.Path(): {"."}}); ok {
+	if got, ok := goSymbolForFunc(".", method, idx, map[string][]string{pkg.Path(): {"."}}, nil); ok {
 		t.Fatalf("method resolved to receiver-less package function: %+v", got)
 	}
 }

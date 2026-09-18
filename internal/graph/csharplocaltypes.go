@@ -609,7 +609,16 @@ func csNarrowOverloads(idx *edgeIndex, cands []*core.SymbolRecord, args []string
 	}
 	var narrowed []*core.SymbolRecord
 	for _, c := range kept {
-		if _, v := csParamTypes(c); v && normalOn[c.ParentSymbol] {
+		pt, v := csParamTypes(c)
+		if v && normalOn[c.ParentSymbol] {
+			continue
+		}
+		if v && len(args) == len(pt)-1 && csNormalFormSibling(kept, c, pt[:len(pt)-1]) {
+			// Zero params elements: DeserializeObject<T>(value) is
+			// applicable to both DeserializeObject<T>(string) and
+			// DeserializeObject<T>(string, params JsonConverter[]); C#
+			// prefers the normal form whenever the fixed prefix matches
+			// (§12.6.4.3), regardless of how well the arguments are typed.
 			continue
 		}
 		narrowed = append(narrowed, c)
@@ -895,6 +904,193 @@ func csBclAssignable(argType, paramType string) bool {
 	a, p := strings.TrimSuffix(argType, "[]"), strings.TrimSuffix(paramType, "[]")
 	for _, b := range csBclBases[a] {
 		if b == p {
+			return true
+		}
+	}
+	return false
+}
+
+// csRecoverArgs re-derives argument markers from the call's own source line
+// when the extractor reported none (every argument was a complex
+// expression). Two shapes matter for overload binding and are language
+// semantics rather than library knowledge:
+//
+//   - `x.Value` / `x.GetValueOrDefault()` on a local whose declared type is
+//     a value type: Nullable<T> unwrapping, typed T. TraceJsonWriter's
+//     `base.WriteValue(value.GetValueOrDefault())` inside
+//     `WriteValue(DateTime? value)` binds WriteValue(DateTime), not all 35
+//     overloads.
+//   - `(T)expr`: an explicit cast, typed T.
+//
+// Anything else stays "" (unknown). Returns nil when nothing is recovered
+// or the argument list does not match cs.Argc.
+func csRecoverArgs(idx *edgeIndex, symbol *core.SymbolRecord, cs core.CallSite, argTypes map[string]string) []string {
+	if cs.Argc == 0 || cs.Line < symbol.Span.Start || symbol.RawText == "" {
+		return nil
+	}
+	lines := strings.Split(symbol.RawText, "\n")
+	off := cs.Line - symbol.Span.Start
+	if off < 0 || off >= len(lines) {
+		return nil
+	}
+	line := lines[off]
+	callee := cs.Callee
+	if i := strings.LastIndexByte(callee, '.'); i >= 0 {
+		callee = callee[i+1:]
+	}
+	if callee == "" {
+		return nil
+	}
+	// Locate `callee(` at a word boundary; a generic call is `callee<...>(`.
+	start := -1
+	for from := 0; from < len(line); {
+		i := strings.Index(line[from:], callee)
+		if i < 0 {
+			break
+		}
+		i += from
+		before := i == 0 || !csIdentByte(line[i-1])
+		j := i + len(callee)
+		if j < len(line) && line[j] == '<' {
+			depth := 0
+			for ; j < len(line); j++ {
+				if line[j] == '<' {
+					depth++
+				} else if line[j] == '>' {
+					depth--
+					if depth == 0 {
+						j++
+						break
+					}
+				}
+			}
+		}
+		if before && j < len(line) && line[j] == '(' {
+			start = j + 1
+			break
+		}
+		from = i + len(callee)
+	}
+	if start < 0 {
+		return nil
+	}
+	depth, end := 1, -1
+	for k := start; k < len(line); k++ {
+		switch line[k] {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			depth--
+			if depth == 0 {
+				end = k
+			}
+		case '"', '\'':
+			// Skip a literal: overload-relevant literals were already
+			// classified by the extractor, so any call reaching here has
+			// none at top level worth parsing exactly.
+			q := line[k]
+			for k++; k < len(line) && line[k] != q; k++ {
+				if line[k] == '\\' {
+					k++
+				}
+			}
+		}
+		if end >= 0 {
+			break
+		}
+	}
+	if end < 0 {
+		return nil
+	}
+	groups := splitTopLevel(line[start:end], ',')
+	if len(groups) != cs.Argc {
+		return nil
+	}
+	out := make([]string, len(groups))
+	known := false
+	for i, g := range groups {
+		g = strings.TrimSpace(g)
+		if strings.HasPrefix(g, "typeof(") {
+			out[i] = "#Type"
+			known = true
+			continue
+		}
+		if strings.HasPrefix(g, "(") {
+			// (T)expr cast.
+			if close := strings.IndexByte(g, ')'); close > 1 {
+				if t := csNormalizeType(g[1:close]); t != "" && csSimpleTypeName(t) && close+1 < len(g) {
+					out[i] = "#" + t
+					known = true
+				}
+			}
+			continue
+		}
+		if csIdentString(g) {
+			out[i] = g
+			known = true
+			continue
+		}
+		recv, member, ok := strings.Cut(g, ".")
+		if !ok || !csIdentString(recv) {
+			continue
+		}
+		if member != "Value" && member != "GetValueOrDefault()" {
+			continue
+		}
+		t, typed := argTypes[recv]
+		if !typed || t == "" || strings.HasSuffix(t, "[]") {
+			continue
+		}
+		if csIsPrimitive(t) || csValueType(idx, t) {
+			out[i] = "#" + t
+			known = true
+		}
+	}
+	if !known {
+		return nil
+	}
+	return out
+}
+
+func csIdentByte(b byte) bool {
+	return b == '_' || b >= '0' && b <= '9' || b >= 'A' && b <= 'Z' || b >= 'a' && b <= 'z'
+}
+
+func csIdentString(s string) bool {
+	if s == "" || (s[0] >= '0' && s[0] <= '9') {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if !csIdentByte(s[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func csSimpleTypeName(t string) bool {
+	return csIdentString(strings.TrimSuffix(t, "[]"))
+}
+
+// csNormalFormSibling reports whether kept holds a non-params overload on
+// the same type whose parameter list equals prefix exactly.
+func csNormalFormSibling(kept []*core.SymbolRecord, params *core.SymbolRecord, prefix []string) bool {
+	for _, c := range kept {
+		if c == params || c.ParentSymbol != params.ParentSymbol {
+			continue
+		}
+		pt, v := csParamTypes(c)
+		if v || len(pt) != len(prefix) {
+			continue
+		}
+		same := true
+		for i := range pt {
+			if pt[i] != prefix[i] {
+				same = false
+				break
+			}
+		}
+		if same {
 			return true
 		}
 	}

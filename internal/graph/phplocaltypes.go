@@ -448,7 +448,46 @@ func phpNarrowNewByNamespace(idx *edgeIndex, symbol *core.SymbolRecord, cs core.
 	if len(out) > 0 {
 		return out
 	}
+	// The named class declares no constructor of its own
+	// (`new Scalar\MagicConst\Class_(...)` runs MagicConst::__construct):
+	// resolve the class the namespace names and take the constructors it
+	// inherits, instead of falling back to every same-named class.
+	for _, cls := range idx.byName[strings.ToLower(name)] {
+		if cls.Name != name || (cls.Kind != core.KindClass && cls.Kind != core.KindStruct) {
+			continue
+		}
+		if !strings.HasSuffix(strings.ToLower(cls.FilePath), suffix) {
+			continue
+		}
+		if inherited := inheritedConstructors(idx, cls); len(inherited) > 0 {
+			return inherited
+		}
+	}
 	return ctors
+}
+
+// inheritedConstructors walks cls's base classes (up to three levels) and
+// returns the first level's constructors.
+func inheritedConstructors(idx *edgeIndex, cls *core.SymbolRecord) []*core.SymbolRecord {
+	bases := baseClassesFor(idx, languageOfFile(idx, cls.FilePath), cls.Name, dirOf(cls.FilePath))
+	for level := 0; level < 3 && len(bases) > 0; level++ {
+		var out []*core.SymbolRecord
+		var next []string
+		for _, base := range bases {
+			for _, baseCls := range idx.byName[strings.ToLower(base)] {
+				if baseCls.Name == base && baseCls.Kind == core.KindClass {
+					out = append(out, classConstructors(idx, base, baseCls.FilePath)...)
+					next = append(next, baseClassesFor(idx, languageOfFile(idx, baseCls.FilePath), base, dirOf(baseCls.FilePath))...)
+					break
+				}
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
+		bases = next
+	}
+	return nil
 }
 
 // phpNarrowMethodsByImport disambiguates same-named classes through a file's
