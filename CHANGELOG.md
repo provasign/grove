@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.58.0 - 2026-09-19
+
+Java bare-call overload fan-out (commons-io P 0.876 → 0.894; commons-lang
+unaffected). A bare call unresolved on the caller's own class or its
+resolvable ancestors now drops rather than falls through to same-package
+name matching — but only when the caller's own class extends a base Grove
+cannot resolve in-repo, the positive signal that distinguishes
+`IORandomAccessFile extends java.io.RandomAccessFile`'s bare `write(...)`
+(really `RandomAccessFile.write`, wrongly fanning into every same-arity
+`IOUtils`/`FileUtils`/`FilesUncheck` overload sharing the package) from
+`StrSubstitutor`'s `new StrBuilder(n).append(x)` (chained onto a
+constructor, also arrives bare, but `StrSubstitutor` has no unresolved
+superclass, and the import-scoped fallback keeps resolving it correctly).
+`this` as a constructor argument (`new WildcardFileFilter(this)`) now types
+as the enclosing class (astkit v0.14.4: a keyword node, not an identifier
+node, in every grammar). Resolver `v21`, extractor `2026-09-19.12`.
+
 ## v0.57.0 - 2026-09-19
 
 C preprocessor call-through (cJSON R 0.646 → 0.999 at P 0.998; jansson R

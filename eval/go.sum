@@ -22,6 +22,8 @@ github.com/provasign/astkit v0.14.2 h1:+VswZ76XEWTKo15RZN6GDT1m0lmb+WgopPI4Yu4/N
 github.com/provasign/astkit v0.14.2/go.mod h1:uSQxIxw3dVpK/6KmHvqIE8+DK/nhxDuPklKv7g96Jr4=
 github.com/provasign/astkit v0.14.3 h1:+63DIY0IRdynyI+SWTbZheKk6Nj36e0MUFYgj80FRMo=
 github.com/provasign/astkit v0.14.3/go.mod h1:uSQxIxw3dVpK/6KmHvqIE8+DK/nhxDuPklKv7g96Jr4=
+github.com/provasign/astkit v0.14.4 h1:dT/uAInwRVmYv0gg7RnJD9mu5YSD4gfpNma+j+tTTp0=
+github.com/provasign/astkit v0.14.4/go.mod h1:uSQxIxw3dVpK/6KmHvqIE8+DK/nhxDuPklKv7g96Jr4=
 github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec h1:W09IVJc94icq4NjY3clb7Lk8O1qJ8BdBEF8z0ibU0rE=
 github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec/go.mod h1:qqbHyh8v60DhA7CoWK5oRCqLrMHRGoxYCSS9EjAz6Eo=
 github.com/scip-code/scip/bindings/go/scip v0.8.1 h1:ZkyT9RDgkbd6ffvMbi9nYdwh7+gLoz8Z9ftFMxgUiVs=

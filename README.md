@@ -200,7 +200,7 @@ the first (also gated):
 | Language | Second corpus | Precision | Recall |
 |---|---|---|---|
 | Go | cobra | 0.983 | 0.952 |
-| Java | commons-io | 0.876 | 0.913 |
+| Java | commons-io | 0.894 | 0.912 |
 | C | cJSON | 0.998 | 0.999 |
 | Rust | fd | 0.952 | 0.913 |
 | TypeScript | p-queue | 0.959 | 1.000 |

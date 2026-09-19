@@ -74,6 +74,13 @@ func javaIndexedFieldType(raw string) string {
 // class names for receiver narrowing.
 func javaArgTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 	out := map[string]string{}
+	if symbol.ParentSymbol != "" {
+		// `new WildcardFileFilter(this)` inside `Builder.get()`: the bare
+		// "this" argument's type is the enclosing class, exactly like any
+		// other typed argument — without it the sole matching constructor
+		// couldn't be told apart from five unrelated overloads.
+		out["this"] = symbol.ParentSymbol
+	}
 	record := func(typ, name string) {
 		typ = strings.TrimSpace(typ)
 		if i := strings.IndexByte(typ, '<'); i > 0 {
@@ -805,6 +812,28 @@ func javaBareType(t string) string {
 // javaOwnerType resolves both simple and nested parent identities. Astkit uses
 // qualified parents for nested methods (`Outer.Builder`) while the name index
 // is keyed by the declaration's simple name (`Builder`).
+// javaExtendsUnresolvedExternally reports whether className's own extends
+// clause names a base type Grove cannot find indexed in the repo (a JDK or
+// other external superclass) — positive evidence that an otherwise
+// unresolvable bare call belongs to that unseen base, not to a same-package
+// sibling's unrelated method of the same name.
+func javaExtendsUnresolvedExternally(idx *edgeIndex, className, preferFile string) bool {
+	owner := javaOwnerType(idx, className, preferFile)
+	if owner == nil {
+		return false
+	}
+	supers := classExtendsNames(owner)
+	if len(supers) == 0 {
+		return false
+	}
+	for _, base := range supers {
+		if javaOwnerType(idx, base, preferFile) != nil {
+			return false // at least one base resolves in-repo
+		}
+	}
+	return true
+}
+
 func javaOwnerType(idx *edgeIndex, className, preferFile string) *core.SymbolRecord {
 	if idx == nil || className == "" {
 		return nil

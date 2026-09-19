@@ -75,7 +75,7 @@ sit beside the first corpus's under `testdata/`.
 | Corpus (pin) | Language | Oracle | Universe | P | R | First corpus P / R |
 |---|---|---|---|---|---|---|
 | cobra (`adbc881`) | Go | SSA + VTA | 100% | 0.9828 | 0.9518 | 0.9522 / 0.9505 |
-| commons-io (`8ad9867d`) | Java | javac + javap | 94.5% | 0.8756 | 0.9128 | 0.9381 / 0.9517 |
+| commons-io (`8ad9867d`) | Java | javac + javap | 94.5% | 0.8936 | 0.9121 | 0.9381 / 0.9517 |
 | cJSON (`6d9f244`) | C | clang AST | 100% | 0.9982 | 0.9991 | 0.9991 / 0.9837 |
 | fd (`5bbfa3e`) | Rust | rust-analyzer SCIP | 100% | 0.9516 | 0.9130 | 0.9364 / 0.9045 |
 | p-queue (`180ab9e`) | TypeScript | tsc checker | 100% | 0.9592 | 1.0000 | 0.9029 / 0.9917 |
@@ -135,11 +135,33 @@ Closed the day after:
   false edges are `UnityFail` through `TEST_ASSERT_DOUBLE_WITHIN`, whose
   expansion branches on a runtime condition.
 
+Also closed the day after:
+
+- **Java bare-call overload fan-out** (commons-io P 0.876 → 0.894). A bare
+  call unresolved on the caller's own class or its resolvable ancestors used
+  to fall through to same-package name matching: `IORandomAccessFile`
+  extends `java.io.RandomAccessFile` (external, unindexed) and its bare
+  `write(buf, 0, n)` fanned out to every same-arity `IOUtils`/`FileUtils`/
+  `FilesUncheck` overload sharing the package. The fix fires only when the
+  caller's own class extends a base Grove cannot resolve in-repo — that
+  positive signal ("this is inherited from somewhere Grove can't see") is
+  what distinguishes it from `StrSubstitutor`'s `new StrBuilder(n)
+  .append(x)` (chained onto a constructor, so the call also arrives bare,
+  but `StrSubstitutor` has no unresolved superclass), which the existing
+  import-scoped fallback keeps resolving correctly. Also: `new
+  WildcardFileFilter(this)` — `this` is a keyword node in every grammar
+  here, not an identifier node, so it carried no argument type and its five
+  constructor overloads couldn't be told apart; `this` now types as the
+  enclosing class, like any other argument.
+
 What they left open:
 
-- **Java overload fan-out** (commons-io P 0.876): `IOUtils.write`/`toString`/
-  `close` families with untyped arguments; the same territory as newtonsoft's
-  constructor overloads.
+- **Java overload fan-out, the untyped-argument kind** (`IOUtils.toString`/
+  `close` families, `AbstractStreamBuilder.setBufferSize`'s `int`/`Integer`
+  boxing pair): a same-class field reference used as a call argument
+  (`DEFAULT_BUFFER_SIZE`, `private static final int`) isn't typed the way a
+  local variable or parameter is, so overload narrowing sees no argument
+  type at all.
 - **Objective-C property reads** (CocoaLumberjack R 0.80, universe 79%):
   `info.fileName` lowers to a getter message the oracle records; Grove
   records no call for a property read, and category/extension methods

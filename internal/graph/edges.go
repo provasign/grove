@@ -3134,6 +3134,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			implicitSelf := qualifier == "" && symbol.ParentSymbol != "" &&
 				(symbol.Kind == core.KindMethod || symbol.Kind == core.KindConstructor) &&
 				implicitSelfLanguage(symbol.Language)
+			javaBareUnresolved := false
 			if implicitSelf {
 				if own := filterByParent(cands, symbol.ParentSymbol); len(own) > 0 {
 					narrowed = own
@@ -3183,6 +3184,30 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 							continue
 						}
 					}
+					if symbol.Language == "java" && implicitSelf && calleeName != "" && calleeName[0] >= 'a' && calleeName[0] <= 'z' &&
+						javaExtendsUnresolvedExternally(idx, symbol.ParentSymbol, symbol.FilePath) {
+						// Lowercase-initial only: Java convention reserves
+						// capitalized bare names for a constructor call
+						// (`new IORandomAccessFile(...)`), which the
+						// class-instantiation fallback further down already
+						// resolves correctly by matching the class name —
+						// this gate is for a same-named METHOD nobody here
+						// declares or inherits. implicitSelf only (qualifier
+						// ""): a qualified `Outer.this.append(...)` collapses
+						// to qualifier "this" at the call site, isSelf true
+						// but implicitSelf false, and resolves through a
+						// different, already-correct path below. Fires only
+						// when the caller's own class extends a base Grove
+						// cannot resolve in-repo (IORandomAccessFile extends
+						// java.io.RandomAccessFile): that is when a bare
+						// name is actually inherited from outside, not a
+						// same-package sibling's unrelated same-named method
+						// (StrSubstitutor's chained `new StrBuilder(x)
+						// .append(y)`, which the import-scoped fallback
+						// below already resolves correctly and must keep
+						// doing for classes with no unresolved superclass).
+						javaBareUnresolved = true
+					}
 				} else {
 					// Template method: self.to_json() inside the base class
 					// runs whichever subclass override the instance carries
@@ -3195,6 +3220,21 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 						}
 					}
 				}
+			}
+			if javaBareUnresolved {
+				// A bare call resolved to neither the caller's own class nor
+				// a resolvable ancestor (inherited/outer already tried and
+				// found nothing): javac binds it to a base class Grove
+				// cannot see (a JDK type, e.g. IORandomAccessFile extends
+				// java.io.RandomAccessFile) or nothing at all — never to a
+				// same-named method on an unrelated class. Neither the
+				// name-only overload fallback below nor the capped-dispatch
+				// and constructor-guess rescues further down may run on a
+				// bare name alone: "write" fanned into every IOUtils/
+				// FileUtils/FilesUncheck overload, and "Builder" (a nested
+				// class name shared by dozens of unrelated
+				// types) into every same-named constructor.
+				continue
 			}
 			if len(narrowed) == len(cands) {
 				// Receiver narrowing didn't fire; try the inferred type of

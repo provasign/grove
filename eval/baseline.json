@@ -92,8 +92,8 @@
  },
  "commons-io": {
   "commit": "8ad9867d",
-  "precision": 0.8756,
-  "recall": 0.9128,
+  "precision": 0.8936,
+  "recall": 0.9121,
   "tolerance": 0.005,
   "minUniverse": 0.93
  },
