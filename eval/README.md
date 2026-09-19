@@ -55,7 +55,7 @@ traces candidate narrowing per call site to stderr).
 | socket.io (`3ad4e1f2`) | TypeScript | tsc checker (`tstruth/gen_truth.mjs`) | 98.3% | 0.9029 | 0.9917 | 0.9452 |
 | express (`dae209ae`) | JavaScript | tsc `checkJs` (`tstruth/gen_truth.mjs`) | 90.3% | 0.8400 | 1.0000 | 0.9130 |
 | ripgrep (`82313cf`) | Rust | rust-analyzer SCIP (`rust`) | 100% | 0.9364 | 0.9045 | 0.9202 |
-| jansson (`684e18c`) | C | clang AST (`clang`) | 97.7% | 0.9991 | 0.9247 | 0.9605 |
+| jansson (`684e18c`) | C | clang AST (`clang`) | 97.7% | 0.9991 | 0.9837 | 0.9913 |
 | SwiftyJSON (`3d25441`) | Swift | SourceKit index (`swift`) | 100% | 0.9355 | 1.0000 | 0.9667 |
 | turtle (`3cfc963`) | Kotlin | kotlinc + javap (`kotlin`) | 76.8% | 1.0000 | 0.9881 | 0.9940 |
 | json-framework (`93e4ca5`) | Objective-C | clang AST (`objc`) | 98.7% | 1.0000 | 0.9914 | 0.9957 |
@@ -76,7 +76,7 @@ sit beside the first corpus's under `testdata/`.
 |---|---|---|---|---|---|---|
 | cobra (`adbc881`) | Go | SSA + VTA | 100% | 0.9828 | 0.9518 | 0.9522 / 0.9505 |
 | commons-io (`8ad9867d`) | Java | javac + javap | 94.5% | 0.8756 | 0.9128 | 0.9381 / 0.9517 |
-| cJSON (`6d9f244`) | C | clang AST | 100% | 1.0000 | 0.6462 | 0.9991 / 0.9247 |
+| cJSON (`6d9f244`) | C | clang AST | 100% | 0.9982 | 0.9991 | 0.9991 / 0.9837 |
 | fd (`5bbfa3e`) | Rust | rust-analyzer SCIP | 100% | 0.9516 | 0.9130 | 0.9364 / 0.9045 |
 | p-queue (`180ab9e`) | TypeScript | tsc checker | 100% | 0.9592 | 1.0000 | 0.9029 / 0.9917 |
 | Files (`e85f2b4`) | Swift | SourceKit index | 97.0% | 0.9881 | 0.9222 | 0.9355 / 1.0000 |
@@ -115,13 +115,28 @@ corpora of each language:
   include-path heuristic now adds the parent of each header directory.
   CocoaLumberjack parsed 17 functions before, 321 after.
 
+Closed the day after:
+
+- **C preprocessor call-through** (cJSON R 0.646 → 0.999, jansson R 0.925 →
+  0.984). Every in-repo `#define` is a `macro` symbol whose call sites are
+  the body's lexical calls and whose signature lists its parameters. At an
+  invocation the graph layer expands the body's calls with the invocation's
+  arguments substituted for the parameters — transitively through nested
+  macros (depth 4, cycle-guarded, every definition of a name when it is
+  defined under several preprocessor conditions) — and a body call whose
+  callee is itself a parameter (`#define CALL(f) f(x)`) calls the argument.
+  `RUN_TEST(f)` therefore yields `UnityDefaultTestRun` and `f`;
+  `json_object_foreach(o, k, v)` yields the four iterator calls. Two
+  extraction holes hid most of it: the C grammar hands the rest of a header
+  to the `declaration_list` of an `extern "C" {` opened under `#ifdef
+  __cplusplus` (all of `unity.h` was invisible), and `int CJSON_CDECL
+  main(void)` parses as a declaration plus a definition whose *type* is
+  `main` (every test `main` had no call sites). The two remaining cJSON
+  false edges are `UnityFail` through `TEST_ASSERT_DOUBLE_WITHIN`, whose
+  expansion branches on a runtime condition.
+
 What they left open:
 
-- **C preprocessor** (cJSON R 0.646): the Unity test framework is entirely
-  macros (`RUN_TEST(f)`, `TEST_ASSERT_*`) expanding to calls; Grove has no
-  symbol for a function-like macro. jansson's `json_object_foreach` is the
-  same gap. The fix is macro symbols plus call-through of a macro body's
-  calls to the invoking function — the next C item.
 - **Java overload fan-out** (commons-io P 0.876): `IOUtils.write`/`toString`/
   `close` families with untyped arguments; the same territory as newtonsoft's
   constructor overloads.
@@ -662,12 +677,15 @@ Pin: jansson (zero-dependency C, CMake — `cmake -B build
 |---|---|---|---|---|
 | jansson (`684e18c`) | 97.2% | 0.8793 | 0.5642 | 0.6874 |
 
-Current (2026-09-19, clang-AST truth): jansson 97.7% / P 0.9991 / R 0.9247.
+Current (2026-09-19, clang-AST truth): jansson 97.7% / P 0.9991 / R 0.9837.
 The pinned `eval/testdata/jansson@684e18c/calls-truth.jsonl.gz` is now the
 clang-AST snapshot (generator `clang-ast`). The one false edge is a
 `static` test-file function (`position`) a same-named call in error.c
-resolves to; the misses are macro expansions (`json_object_foreach`, the
-`run_tests` entry point macro) — Grove has no symbol for a macro.
+resolves to. Macro call-through (see the second-corpus section) resolved
+`json_object_foreach`; the remaining misses are the 17 `run_tests` entry
+points — each test file's `main` is produced by a macro that *defines* a
+function (`#define RUN_TESTS() int main(..) { return run_tests(..); }`),
+and a definition inside a macro body is not a symbol.
 
 Day-one progression (0.3911 → 0.6874, scip-clang truth), each step measured:
 
@@ -691,10 +709,10 @@ Findings:
    position. This is exact for C; header files (macros, prototypes, inline
    functions) break the partition and are excluded from the truth.
 
-Residual gap: the C preprocessor. `json_array_append` and friends are
-function-like macros expanding to `*_new` calls; Grove has no symbol for a
-macro, so calls through them are absent — the structural ceiling for a
-source-level graph of C.
+Residual gap at the time: the C preprocessor. `json_array_append` and
+friends are function-like macros expanding to `*_new` calls, and Grove had
+no symbol for a macro. Closed by macro call-through (2026-09-19, R 0.925 →
+0.984).
 
 ## Swift (SourceKit index oracle)
 

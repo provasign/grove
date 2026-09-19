@@ -20,6 +20,7 @@ const (
 	KindDecorator   SymbolKind = "decorator"
 	KindAnnotation  SymbolKind = "annotation"
 	KindFile        SymbolKind = "file"
+	KindMacro       SymbolKind = "macro" // C-family #define; not callable, but its body's calls attach to invokers
 	KindDocument    SymbolKind = "document"
 )
 

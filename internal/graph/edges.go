@@ -2236,7 +2236,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			}
 			return cands
 		}
-		for _, cs := range symbol.CallSites {
+		for _, cs := range expandMacroCallSites(idx, &symbol) {
 			if cs.ReferenceOnly {
 				continue
 			}

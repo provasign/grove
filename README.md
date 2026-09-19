@@ -187,7 +187,7 @@ Current call-edge accuracy against each language's compiler or runtime oracle
 | TypeScript | socket.io | TypeScript checker | 0.903 | 0.992 |
 | JavaScript | express | TypeScript checker (`checkJs`) | 0.840 | 1.000 |
 | Rust | ripgrep | rust-analyzer SCIP | 0.936 | 0.905 |
-| C | jansson | clang AST | 0.999 | 0.925 |
+| C | jansson | clang AST | 0.999 | 0.984 |
 | Swift | SwiftyJSON | SourceKit index | 0.936 | 1.000 |
 | Kotlin | turtle | kotlinc + javap | 1.000 | 0.988 |
 | Objective-C | SBJson | clang AST | 1.000 | 0.991 |
@@ -201,7 +201,7 @@ the first (also gated):
 |---|---|---|---|
 | Go | cobra | 0.983 | 0.952 |
 | Java | commons-io | 0.876 | 0.913 |
-| C | cJSON | 1.000 | 0.646 (Unity test macros) |
+| C | cJSON | 0.998 | 0.999 |
 | Rust | fd | 0.952 | 0.913 |
 | TypeScript | p-queue | 0.959 | 1.000 |
 | Swift | Files | 0.988 | 0.922 |

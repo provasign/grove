@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.57.0 - 2026-09-19
+
+C preprocessor call-through (cJSON R 0.646 → 0.999 at P 0.998; jansson R
+0.925 → 0.984). Every in-repo `#define` is now a `macro` symbol (astkit
+v0.14.3) carrying its body's calls and its parameter list; at an invocation
+the graph layer expands those calls with the arguments substituted for the
+parameters, transitively through nested macros and every conditional
+definition of a name, and a body call whose callee is a parameter calls the
+argument — so `RUN_TEST(f)` reaches both `UnityDefaultTestRun` and `f`, and
+`json_object_foreach` reaches its iterator functions. Two C extraction holes
+found on the way: declarations inside an `extern "C" {` block opened under
+`#ifdef __cplusplus` were invisible (the grammar hands the rest of the header
+to the block), and a calling-convention macro between return type and name
+(`int CJSON_CDECL main(void)`) lost the function's body. Both are fixed.
+Resolver `v20`, extractor `2026-09-19.11`.
+
 ## v0.56.0 - 2026-09-19
 
 A second, untuned accuracy corpus per language (cobra, commons-io, cJSON, fd,
