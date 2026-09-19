@@ -2390,6 +2390,66 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				}
 			}
 			cands, capped := resolveCallees(idx, &symbol, calleeName, scope, true, sameFileWins)
+			if symbol.Language == "csharp" && len(cands) > 0 {
+				// Namespace lookup order (see csnamespace.go): whole-repo
+				// scope reaches every namespace, so a bare name resolves
+				// first in the caller's own, enclosing and `using`
+				// namespaces. `new Person()` in a file that imports
+				// TestObjects means that Person — and when it declares no
+				// constructor, the call has no symbol to bind at all.
+				kept := cands[:0:0]
+				for _, cand := range cands {
+					if !csExplicitInterfaceImpl(cand) {
+						kept = append(kept, cand)
+					}
+				}
+				cands = kept
+				if qualifier == "" {
+					// `new X(..)` resolves by the type name. Any constructor
+					// among the candidates marks a construction: same-named
+					// methods (test methods called JValue, conversion
+					// operators) are not what `new JValue(1)` binds.
+					var ctors []*core.SymbolRecord
+					for _, cand := range cands {
+						if cand.Kind == core.KindConstructor {
+							ctors = append(ctors, cand)
+						}
+					}
+					allCtors := len(ctors) > 0
+					if allCtors {
+						cands = ctors
+					}
+					switch {
+					case allCtors && csImplicitConstructorShadows(idx, &symbol, calleeName, cands):
+						if traceCalls {
+							fmt.Fprintf(os.Stderr, "grove-trace %s: callee=%q dropped: implicit constructor of a namespace-visible class shadows %d\n", symbol.QualifiedName, cs.Callee, len(cands))
+						}
+						continue
+					case allCtors:
+						// The fan-out cap is re-evaluated only when
+						// namespace evidence removed candidates; a broad
+						// unresolved overload set stays capped as it came.
+						before := len(cands)
+						if cands = csNarrowByNamespace(idx, &symbol, cands); len(cands) < before {
+							capped = len(cands) > maxCalleeFanout
+						}
+					default:
+						before := len(cands)
+						if cands = csNarrowBareCall(idx, &symbol, cands); len(cands) == 0 {
+							if traceCalls {
+								fmt.Fprintf(os.Stderr, "grove-trace %s: callee=%q dropped: bare call, none of %d candidates on the own type chain\n", symbol.QualifiedName, cs.Callee, before)
+							}
+							continue
+						}
+						if len(cands) < before {
+							capped = len(cands) > maxCalleeFanout
+						}
+					}
+				}
+				if len(cands) == 0 {
+					continue
+				}
+			}
 			if calleeName == symbol.Name {
 				_, ownReceiver := selfVars[qualifier]
 				if qualifier == "" || ownReceiver {
@@ -2797,7 +2857,19 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// local, the receiver is a library object (sb.Append,
 				// $logger->info) whose method isn't ours — a same-name
 				// match is noise: drop. A resolvable type narrows by parent.
-				if held, ok := localTypes[qualifier]; ok {
+				held, ok := localTypes[qualifier]
+				if symbol.Language == "csharp" && strings.HasSuffix(qualifier, "[]") {
+					// `o["x"].Children()`: the receiver is an element of
+					// o — typed by o's array element type or indexer
+					// declaration, else unknown (drop, like any untyped
+					// C# receiver).
+					held = csElementChainType(idx, &symbol, localTypes, qualifier)
+					ok = held != ""
+					if !ok {
+						cands = nil
+					}
+				}
+				if ok {
 					byType := filterByParent(cands, held)
 					if symbol.Language == "csharp" && len(byType) == 0 {
 						byType = csharpExtensionTargets(cands, held)
@@ -2821,8 +2893,30 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					}
 				} else if byQual := filterByParent(cands, qualifier); len(byQual) > 0 {
 					cands = byQual
+				} else if symbol.Language == "csharp" && (csIsPrimitive(qualifier) || qualifier == "string" || qualifier == "object") {
+					// A runtime type as receiver (`"{0}".FormatWith(..)`,
+					// `string.Join(..)`): only an in-repo extension method
+					// on that type can be the target.
+					cands = csharpExtensionTargets(cands, csNormalizeType(qualifier))
 				} else if !typeSymbolExists(idx, qualifier) {
 					cands = nil
+				} else {
+					// The qualifier IS an indexed type, but declares no
+					// member of this name: an inherited one may — walk
+					// the bases — else the member is the runtime's
+					// (`NamingStrategy.GetType()` is object.GetType, not
+					// the repo's ReflectionObject.GetType).
+					var byBase []*core.SymbolRecord
+					bases := baseClassesFor(idx, symbol.Language, qualifier, dirOf(symbol.FilePath))
+					for level := 0; level < 4 && len(bases) > 0 && len(byBase) == 0; level++ {
+						var next []string
+						for _, b := range bases {
+							byBase = append(byBase, filterByParent(cands, b)...)
+							next = append(next, baseClassesFor(idx, symbol.Language, b, dirOf(symbol.FilePath))...)
+						}
+						bases = next
+					}
+					cands = byBase
 				}
 			}
 			if symbol.Language == "rust" && qualifier != "" && len(cands) > 1 {

@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.55.0 - 2026-09-19
+
+C# precision (Newtonsoft.Json: P 0.901 → 0.935, R 0.947). Resolution now
+follows C#'s simple-name lookup order — the caller's own type, its
+namespace, then enclosing and `using` namespaces — so `new Person()` binds
+the imported class (and binds nothing when that class has only an implicit
+constructor), a class no visible namespace declares is the runtime's, and a
+receiver-less call reaches only the caller's own type chain, same-file
+functions or an in-repo extension method. Explicit interface implementations
+are never direct targets. A qualifier that is an indexed type without the
+member (nor any base) is the runtime's member. astkit v0.14.2 types literal,
+cast, `predefined_type` and element-access receivers (indexers are symbols;
+`o["x"].Children()` resolves through `JObject`'s indexer), classifies
+verbatim and interpolated strings, and reads `using` directives under a
+file-level `#if` — every newtonsoft async test file previously indexed with
+no imports. Requires astkit v0.14.2.
+
 ## v0.54.0 - 2026-09-19
 
 PHP accuracy baseline re-pinned. The Xdebug oracle's snapshot for PHP-Parser

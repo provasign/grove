@@ -43,14 +43,14 @@
  },
  "newtonsoft": {
   "commit": "0a2e291",
-  "precision": 0.9009,
-  "recall": 0.9481,
+  "precision": 0.9352,
+  "recall": 0.947,
   "tolerance": 0.005,
   "minUniverse": 0.99
  },
  "php-parser": {
   "commit": "8eea230",
-  "precision": 0.9141,
+  "precision": 0.9176,
   "recall": 0.6471,
   "tolerance": 0.005,
   "minUniverse": 0.99

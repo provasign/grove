@@ -51,7 +51,7 @@ traces candidate narrowing per call site to stderr).
 |---|---|---|---|---|---|---|
 | gin (`d75fcd4`) | Go | SSA + VTA (default) | 99.7% | 0.9522 | 0.9505 | 0.9513 |
 | commons-lang (`44298fe`) | Java | javac + javap (`java`) | 97.1% | 0.9355 | 0.9202 | 0.9278 |
-| newtonsoft (`0a2e291`) | C# | Roslyn (`csharp`) | 99.7% | 0.9009 | 0.9481 | 0.9239 |
+| newtonsoft (`0a2e291`) | C# | Roslyn (`csharp`) | 99.7% | 0.9352 | 0.9470 | 0.9411 |
 | socket.io (`3ad4e1f2`) | TypeScript | tsc checker (`tstruth/gen_truth.mjs`) | 98.3% | 0.9029 | 0.9917 | 0.9452 |
 | express (`dae209ae`) | JavaScript | tsc `checkJs` (`tstruth/gen_truth.mjs`) | 90.3% | 0.8400 | 1.0000 | 0.9130 |
 | ripgrep (`82313cf`) | Rust | rust-analyzer SCIP (`rust`) | 100% | 0.9364 | 0.9047 | 0.9203 |
@@ -60,7 +60,7 @@ traces candidate narrowing per call site to stderr).
 | turtle (`3cfc963`) | Kotlin | kotlinc + javap (`kotlin`) | 76.8% | 1.0000 | 0.9881 | 0.9940 |
 | json-framework (`93e4ca5`) | Objective-C | clang AST (`objc`) | 98.7% | 1.0000 | 0.9914 | 0.9957 |
 | flask (`36e4a824`) | Python | pytest trace (`pytruth`, dynamic) | 97.9% | 0.8522 | 0.7164 | 0.7784 |
-| php-parser (`8eea230`) | PHP | Xdebug trace (`php`, dynamic) | 100% | 0.9141 | 0.6471 | 0.7578 |
+| php-parser (`8eea230`) | PHP | Xdebug trace (`php`, dynamic) | 100% | 0.9176 | 0.6471 | 0.7590 |
 
 Every row is gated in `baseline.json`; the per-language sections below hold
 the progression that produced each number and what remains.
@@ -382,6 +382,32 @@ multi-target `#if`-laden codebase that stress-tests conditional compilation).
 | Repo | Universe match | Precision | Recall | F1 |
 |---|---|---|---|---|
 | Newtonsoft.Json (`0a2e291`) | 99.6% | 0.6617 | 0.7021 | 0.6813 |
+
+Current (2026-09-19): P 0.9352 / R 0.9470 (from 0.9009 / 0.9481). The
+precision sweep bucketed the 1,317 false edges and fixed what C#'s own
+lookup rules say, each step re-gated on every corpus:
+
+| Step | P | R | What changed |
+|---|---|---|---|
+| namespace lookup order | 0.9031 | 0.9478 | a simple name resolves in the caller's own type, own namespace, then enclosing/`using` namespaces (innermost rank wins); `new Person()` binds the imported TestObjects.Person — and when it declares no constructor, the call has no symbol at all; a class no visible namespace declares is the runtime's; a qualifier that IS an indexed type but declares no such member (and no base does) is `object.GetType()`, not the repo's same-named method |
+| bare calls, explicit interfaces | 0.9258 | 0.8701* | a receiver-less call binds only the caller's own type chain, same-file local functions or an in-repo extension method (C# has no free functions); explicit interface implementations are never direct targets |
+| typed receivers the extractor used to drop | 0.9294 | 0.9454 | astkit types string/char/bool literal receivers (`"{0}".FormatWith(..)` → the string extension), `predefined_type` statics (`string.Join`), cast receivers (`((ICollection<JToken>)a).CopyTo`) and element access (`o["x"].Children()` → "o[]", typed by o's indexer declaration, now a symbol; `rss["a"]["b"]` chains one level per index) |
+| `#if`-wrapped imports | 0.9352 | 0.9470 | astkit reads `using` directives under a file-level `#if` (every newtonsoft async test file) — they had no imports at all, so every namespace looked invisible |
+
+*the recall dip in step 2 was `new JValue(..)` calls, where a same-named
+test method among the candidates disabled the constructor path; any
+constructor candidate now marks a construction.
+
+What remains (828 false edges): `ExceptionAssert.ThrowsAsync`/`Throws`
+(151) — the Roslyn snapshot records no call to them from async tests
+(`ThrowsAsync` is `#if !(NET20 || NET35 || NET40 || PORTABLE40)`-guarded
+and the snapshot's compilation evidently did not resolve it; regenerating
+needs `dotnet`); the `#if !HAVE_LINQ` LinqBridge polyfill (`ToList`,
+`Select`, `ToArray`, `MinMaxImpl`… ≈200) which the library's net20 target
+compiles and the tests' net46 target does not — target-dependent, and the
+same edges are true for library-internal callers; and constructor/overload
+sets whose arguments the extractor cannot type (`new JValue(x)`,
+`WriteValue(v)`, `SerializeObject(x, converter)`).
 
 Day-one progression (0.2632 → 0.6813), each step measured:
 

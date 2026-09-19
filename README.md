@@ -183,7 +183,7 @@ Current call-edge accuracy against each language's compiler or runtime oracle
 |---|---|---|---|---|
 | Go | gin | SSA + VTA | 0.952 | 0.951 |
 | Java | commons-lang | javac + javap | 0.936 | 0.920 |
-| C# | Newtonsoft.Json | Roslyn | 0.901 | 0.948 |
+| C# | Newtonsoft.Json | Roslyn | 0.935 | 0.947 |
 | TypeScript | socket.io | TypeScript checker | 0.903 | 0.992 |
 | JavaScript | express | TypeScript checker (`checkJs`) | 0.840 | 1.000 |
 | Rust | ripgrep | rust-analyzer SCIP | 0.936 | 0.905 |
@@ -192,7 +192,7 @@ Current call-edge accuracy against each language's compiler or runtime oracle
 | Kotlin | turtle | kotlinc + javap | 1.000 | 0.988 |
 | Objective-C | SBJson | clang AST | 1.000 | 0.991 |
 | Python | flask | pytest trace (dynamic) | 0.852 | 0.716 |
-| PHP | PHP-Parser | Xdebug trace (dynamic) | 0.914 | 0.647 |
+| PHP | PHP-Parser | Xdebug trace (dynamic) | 0.918 | 0.647 |
 
 The dynamic oracles record only paths the test suites execute and count
 reflection-driven dispatch a static graph cannot name, so their recall is a
