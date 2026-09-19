@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.51.0 - 2026-09-19
+
+Swift, Kotlin and Objective-C are now measured languages: each scores against
+a compiler oracle on a pinned corpus and is gated in CI's baseline. Swift
+(SwiftyJSON, SourceKit index) P 0.936 / R 1.000; Kotlin (turtle, kotlinc +
+javap) P 1.000 / R 0.988; Objective-C (SBJson, clang AST) P 1.000 / R 0.991.
+Kotlin resolution narrows overloads by declared parameter type, types
+receivers from parameters, locals and class properties, resolves extension
+functions, call-result receivers and constructor delegation, and desugars
+`in`/`+` operators; Objective-C types receivers from ivars and properties,
+walks `super` through the superclass chain, treats `id`/protocol receivers
+as dynamic, and types `[[Type alloc] init]` results.
+
+Existing languages: TypeScript inherited-member lookup resolves a base class
+through the subclass file's imports (socket.io P 0.898 → 0.903); Rust bare
+calls never bind methods, and const-slice elements, enum-variant patterns
+and tuple-struct fields type their receivers (ripgrep P 0.930 / R 0.895 →
+0.936 / 0.905); C's jansson corpus is re-pinned against a new clang-AST
+oracle after scip-clang was found to omit plain call occurrences (P 0.877 →
+0.999). The PHP oracle now attributes closure bodies to the function that
+defines them (php-parser's snapshot awaits regeneration). C# record base
+lists with constructor arguments parse; `.h` files are content-sniffed for
+Objective-C; the eval harness re-indexes unconditionally.
+
+Requires astkit v0.14.1.
+
+## v0.50.0 - 2026-09-19
+
+Swift, Kotlin and Objective-C parsing and graph support (astkit v0.13.0):
+symbols, imports, call sites, inheritance/conformance edges, local-type
+inference and change-impact for all three. Java multi-declarator field
+receivers resolve; overload narrowing, chained-call receivers and C phantom
+symbols are corrected; stale graph indexes refresh once under the new
+extractor and resolver stamps.
+
 ## v0.49.0 - 2026-09-12
 
 Java call resolution now preserves overload identity through dynamic dispatch,

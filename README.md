@@ -114,8 +114,13 @@ The package also exposes snapshots and structural diffs for integrations that ne
 | C / C++ | `.c`, `.h`, `.cc`, `.cpp`, `.cxx`, `.hh`, `.hpp` |
 | C# | `.cs` |
 | PHP | `.php`, `.phtml` |
+| Swift | `.swift` |
+| Kotlin | `.kt`, `.kts` |
+| Objective-C | `.m`, `.mm`, `.h` (content-sniffed) |
+| COBOL | `.cbl`, `.cob`, `.cpy` and copybook variants |
+| JCL | `.jcl`, `.prc` |
 
-Common non-code files are indexed as document symbols for lexical retrieval. Native analyzers can enrich the graph when the relevant language tooling is available.
+Common non-code files are indexed as document symbols for lexical retrieval. Native analyzers can enrich the graph when the relevant language tooling is available. `grove capabilities` reports each language's resolution tier and known limitations.
 
 ## Accuracy and testing
 
@@ -125,6 +130,28 @@ Grove's graph operations are scored against independent or typed-toolchain groun
 make test
 go test ./internal/parser/... -v
 ```
+
+Current call-edge accuracy against each language's compiler or runtime oracle
+(pinned corpora, CI-gated floors in `eval/baseline.json`; 2026-09-19):
+
+| Language | Corpus | Oracle | Precision | Recall |
+|---|---|---|---|---|
+| Go | gin | SSA + VTA | 0.952 | 0.951 |
+| Java | commons-lang | javac + javap | 0.936 | 0.920 |
+| C# | Newtonsoft.Json | Roslyn | 0.901 | 0.948 |
+| TypeScript | socket.io | TypeScript checker | 0.903 | 0.992 |
+| JavaScript | express | TypeScript checker (`checkJs`) | 0.840 | 1.000 |
+| Rust | ripgrep | rust-analyzer SCIP | 0.936 | 0.905 |
+| C | jansson | clang AST | 0.999 | 0.925 |
+| Swift | SwiftyJSON | SourceKit index | 0.936 | 1.000 |
+| Kotlin | turtle | kotlinc + javap | 1.000 | 0.988 |
+| Objective-C | SBJson | clang AST | 1.000 | 0.991 |
+| Python | flask | pytest trace (dynamic) | 0.852 | 0.716 |
+| PHP | PHP-Parser | Xdebug trace (dynamic) | 0.832 | 0.601 |
+
+The dynamic oracles record only paths the test suites execute and count
+reflection-driven dispatch a static graph cannot name, so their recall is a
+floor rather than a ceiling.
 
 See [eval/README.md](eval/README.md) for Grove's engine evaluation and progression history.
 

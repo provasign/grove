@@ -41,7 +41,29 @@ cd eval && go build -o grove-eval ./cmd/grove-eval
 ```
 
 Outputs `scorecard.json` and `scorecard.md` with precision/recall/F1 plus
-capped false-positive/false-negative examples for debugging.
+capped false-positive/false-negative examples for debugging
+(`GROVE_EVAL_MAX_EXAMPLES=100000` lists every one; `GROVE_TRACE_CALLS=1`
+traces candidate narrowing per call site to stderr).
+
+## Current scores (2026-09-19, calls edges)
+
+| Corpus (pin) | Language | Oracle (`--lang`) | Universe | P | R | F1 |
+|---|---|---|---|---|---|---|
+| gin (`d75fcd4`) | Go | SSA + VTA (default) | 99.7% | 0.9522 | 0.9505 | 0.9513 |
+| commons-lang (`44298fe`) | Java | javac + javap (`java`) | 97.1% | 0.9355 | 0.9202 | 0.9278 |
+| newtonsoft (`0a2e291`) | C# | Roslyn (`csharp`) | 99.7% | 0.9009 | 0.9481 | 0.9239 |
+| socket.io (`3ad4e1f2`) | TypeScript | tsc checker (`tstruth/gen_truth.mjs`) | 98.3% | 0.9029 | 0.9917 | 0.9452 |
+| express (`dae209ae`) | JavaScript | tsc `checkJs` (`tstruth/gen_truth.mjs`) | 90.3% | 0.8400 | 1.0000 | 0.9130 |
+| ripgrep (`82313cf`) | Rust | rust-analyzer SCIP (`rust`) | 100% | 0.9364 | 0.9047 | 0.9203 |
+| jansson (`684e18c`) | C | clang AST (`clang`) | 97.7% | 0.9991 | 0.9247 | 0.9605 |
+| SwiftyJSON (`3d25441`) | Swift | SourceKit index (`swift`) | 100% | 0.9355 | 1.0000 | 0.9667 |
+| turtle (`3cfc963`) | Kotlin | kotlinc + javap (`kotlin`) | 76.8% | 1.0000 | 0.9881 | 0.9940 |
+| json-framework (`93e4ca5`) | Objective-C | clang AST (`objc`) | 98.7% | 1.0000 | 0.9914 | 0.9957 |
+| flask (`36e4a824`) | Python | pytest trace (`pytruth`, dynamic) | 97.9% | 0.8522 | 0.7164 | 0.7784 |
+| php-parser (`8eea230`) | PHP | Xdebug trace (`php`, dynamic) | 100% | 0.8323 | 0.6010 | 0.6980 |
+
+Every row is gated in `baseline.json`; the per-language sections below hold
+the progression that produced each number and what remains.
 
 ## Baseline progression (calls edges, Go)
 
