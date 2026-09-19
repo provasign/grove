@@ -48,6 +48,11 @@ type edgeIndex struct {
 	// baseToFiles maps lowercase basename without extension to files.
 	baseToFiles map[string][]string
 
+	// wholeRepoScope is the single every-file set shared by all files of
+	// whole-repo-scope languages (see importedFiles); built lazily.
+	wholeRepoScope map[string]struct{}
+	// rustCrateScope is the shared crate-closure set per Rust crate root.
+	rustCrateScope map[string]map[string]struct{}
 	// importedFilesCache memoizes the result of importedFiles() per file.
 	importedFilesCache map[string]map[string]struct{}
 
@@ -804,11 +809,20 @@ func (idx *edgeIndex) importedFiles(fromFile string) map[string]struct{} {
 		// declaration (@interface, .h) and its implementation (@implementation,
 		// .m) live in two DIFFERENT files with no shared directory convention,
 		// and #import resolves headers rather than mapping to a directory.
-		for f := range idx.byFile {
-			out[f] = struct{}{}
+		//
+		// One shared set for every such file, never a copy per file: a
+		// per-file copy is O(files²) memory — 25,849² ≈ 668M map entries,
+		// ~19 GB, on a C# monorepo (measured in production; 37% of the
+		// resolve-phase heap even on a 971-file repo). Callers only read
+		// the set.
+		if idx.wholeRepoScope == nil {
+			idx.wholeRepoScope = make(map[string]struct{}, len(idx.byFile))
+			for f := range idx.byFile {
+				idx.wholeRepoScope[f] = struct{}{}
+			}
 		}
-		idx.importedFilesCache[fromFile] = out
-		return out
+		idx.importedFilesCache[fromFile] = idx.wholeRepoScope
+		return idx.wholeRepoScope
 	}
 
 	// Same-package scope (Go only): a Go file does not import its own package,
@@ -870,6 +884,14 @@ func (idx *edgeIndex) importedFiles(fromFile string) map[string]struct{} {
 		// grep-printer) and paths through a re-export reach the underlying
 		// crate's items directly.
 		ownRoot := idx.rustCrateOfFile[fromFile]
+		// The closure depends only on the crate root (every file of the
+		// crate, plus the crates its imports reach): one shared set per
+		// crate, not a copy per file — a per-file copy is O(files × crate
+		// size), the C# lesson above in Rust form.
+		if cached, ok := idx.rustCrateScope[ownRoot]; ok {
+			idx.importedFilesCache[fromFile] = cached
+			return cached
+		}
 		visited := map[string]bool{}
 		queue := []string{ownRoot}
 		for len(queue) > 0 {
@@ -880,9 +902,7 @@ func (idx *edgeIndex) importedFiles(fromFile string) map[string]struct{} {
 			}
 			visited[root] = true
 			for _, f := range idx.rustCrateFiles[root] {
-				if f != fromFile {
-					out[f] = struct{}{}
-				}
+				out[f] = struct{}{}
 				imps := make([]string, 0, len(idx.fileImports[f])+len(idx.rustInlineRefs[f]))
 				for imp := range idx.fileImports[f] {
 					imps = append(imps, imp)
@@ -927,6 +947,10 @@ func (idx *edgeIndex) importedFiles(fromFile string) map[string]struct{} {
 			sort.Strings(roots)
 			fmt.Fprintf(os.Stderr, "grove-trace rust-scope-done %s files=%d roots=%v\n", fromFile, len(out), roots)
 		}
+		if idx.rustCrateScope == nil {
+			idx.rustCrateScope = map[string]map[string]struct{}{}
+		}
+		idx.rustCrateScope[ownRoot] = out
 		idx.importedFilesCache[fromFile] = out
 		return out
 	}

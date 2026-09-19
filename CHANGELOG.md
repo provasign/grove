@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.53.0 - 2026-09-19
+
+Resolve-phase memory. Files of whole-repo-scope languages (C#, PHP, C/C++,
+Swift, Objective-C) and files within a Rust crate each materialized their
+own copy of the visible-file set — O(files²), 25,849² map entries on the
+C# monorepo behind the v0.52.0 field report and 37% of the heap even on a
+971-file repository. Every such file now shares one set per repository (or
+per crate). C# type-fragment lookup no longer copies a class body per call
+site. On a synthetic 4,800-file / 848k-edge C# corpus: peak heap 3.99 GB →
+1.3 GB, max RSS 4.45 → 2.24 GB, wall 78 → 57 s; every accuracy corpus
+scores byte-identically. `cmd/memprobe` reproduces the measurement.
+
 ## v0.52.0 - 2026-09-19
 
 Operability for large repositories, from a production field report. `grove
