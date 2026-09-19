@@ -29,21 +29,21 @@
  },
  "commons-lang": {
   "commit": "44298fe",
-  "precision": 0.9355,
-  "recall": 0.9202,
+  "precision": 0.9381,
+  "recall": 0.9517,
   "minUniverse": 0.96,
   "tolerance": 0.005
  },
  "ripgrep": {
   "commit": "82313cf",
   "precision": 0.9364,
-  "recall": 0.9047,
+  "recall": 0.9045,
   "tolerance": 0.005,
   "minUniverse": 0.98
  },
  "newtonsoft": {
   "commit": "0a2e291",
-  "precision": 0.9352,
+  "precision": 0.9346,
   "recall": 0.947,
   "tolerance": 0.005,
   "minUniverse": 0.99
@@ -82,5 +82,61 @@
   "recall": 0.9914,
   "tolerance": 0.02,
   "minUniverse": 0.97
+ },
+ "cobra": {
+  "commit": "adbc881",
+  "precision": 0.9828,
+  "recall": 0.9518,
+  "tolerance": 0.005,
+  "minUniverse": 0.99
+ },
+ "commons-io": {
+  "commit": "8ad9867d",
+  "precision": 0.8756,
+  "recall": 0.9128,
+  "tolerance": 0.005,
+  "minUniverse": 0.93
+ },
+ "cJSON": {
+  "commit": "6d9f244",
+  "precision": 1.0,
+  "recall": 0.6462,
+  "tolerance": 0.02,
+  "minUniverse": 0.99
+ },
+ "fd": {
+  "commit": "5bbfa3e",
+  "precision": 0.9516,
+  "recall": 0.913,
+  "tolerance": 0.005,
+  "minUniverse": 0.99
+ },
+ "p-queue": {
+  "commit": "180ab9e",
+  "precision": 0.9592,
+  "recall": 1.0,
+  "tolerance": 0.02,
+  "minUniverse": 0.99
+ },
+ "Files": {
+  "commit": "e85f2b4",
+  "precision": 0.9881,
+  "recall": 0.9222,
+  "tolerance": 0.02,
+  "minUniverse": 0.95
+ },
+ "CocoaLumberjack": {
+  "commit": "f54de25f",
+  "precision": 0.9557,
+  "recall": 0.7989,
+  "tolerance": 0.02,
+  "minUniverse": 0.78
+ },
+ "csv": {
+  "commit": "89ac08c",
+  "precision": 0.8892,
+  "recall": 0.7016,
+  "tolerance": 0.005,
+  "minUniverse": 0.99
  }
 }

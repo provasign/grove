@@ -88,6 +88,33 @@ func swiftLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]strin
 
 	if symbol.ParentSymbol != "" {
 		out["self"] = symbol.ParentSymbol
+		// Properties of the enclosing type — declared in the type, in an
+		// extension, or as a protocol requirement (`var storage:
+		// Storage<Self> { get }` in `protocol Location`, used from
+		// `extension Location`) — are receivers in every member body.
+		for _, cand := range idx.byFile[symbol.FilePath] {
+			if cand.Kind != core.KindField || cand.ParentSymbol != symbol.ParentSymbol || cand.Language != "swift" {
+				continue
+			}
+			if _, shadowed := out[cand.Name]; shadowed {
+				continue
+			}
+			if m := swiftLetTypedRe.FindStringSubmatch(cand.Signature); m != nil {
+				if typ := swiftShapeType(m[2]); typ != "" {
+					out[cand.Name] = typ
+				}
+			} else if m := swiftLetCtorRe.FindStringSubmatch(cand.Signature); m != nil {
+				out[cand.Name] = m[2]
+			}
+		}
+	}
+	// A generic instantiation (`Storage<Self>`, `Result<T, E>`) receives
+	// the generic type's members: drop the arguments. Container shapes
+	// (`[T]`) stay, per the note above.
+	for name, typ := range out {
+		if i := strings.IndexByte(typ, '<'); i > 0 && typ[0] != '[' {
+			out[name] = typ[:i]
+		}
 	}
 	return out
 }
@@ -122,6 +149,32 @@ func swiftShapeType(t string) string {
 		}
 	}
 	return strings.Join(strings.Fields(t), " ")
+}
+
+var swiftTypealiasRe = regexp.MustCompile(`\btypealias\s+([A-Za-z_]\w*)\s*(?:<[^=]*>)?\s*=\s*([A-Za-z_][\w.]*)`)
+
+// swiftTypealiasTarget resolves a Swift `typealias Name = Target<...>`
+// declared in the index to Target's bare name, or "".
+func swiftTypealiasTarget(idx *edgeIndex, name string) string {
+	for _, cand := range namedSymbols(idx, name) {
+		if cand.Language != "swift" || cand.Kind != core.KindType {
+			continue
+		}
+		m := swiftTypealiasRe.FindStringSubmatch(cand.Signature)
+		if m == nil {
+			m = swiftTypealiasRe.FindStringSubmatch(firstLine(cand.RawText))
+		}
+		if m != nil && m[1] == name {
+			target := m[2]
+			if i := strings.LastIndexByte(target, '.'); i >= 0 {
+				target = target[i+1:]
+			}
+			if target != name {
+				return target
+			}
+		}
+	}
+	return ""
 }
 
 // swiftTypeIndexed reports whether name is a type this index declares

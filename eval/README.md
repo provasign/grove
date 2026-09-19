@@ -50,11 +50,11 @@ traces candidate narrowing per call site to stderr).
 | Corpus (pin) | Language | Oracle (`--lang`) | Universe | P | R | F1 |
 |---|---|---|---|---|---|---|
 | gin (`d75fcd4`) | Go | SSA + VTA (default) | 99.7% | 0.9522 | 0.9505 | 0.9513 |
-| commons-lang (`44298fe`) | Java | javac + javap (`java`) | 97.1% | 0.9355 | 0.9202 | 0.9278 |
-| newtonsoft (`0a2e291`) | C# | Roslyn (`csharp`) | 99.7% | 0.9352 | 0.9470 | 0.9411 |
+| commons-lang (`44298fe`) | Java | javac + javap (`java`) | 97.0% | 0.9381 | 0.9517 | 0.9449 |
+| newtonsoft (`0a2e291`) | C# | Roslyn (`csharp`) | 99.7% | 0.9346 | 0.9470 | 0.9408 |
 | socket.io (`3ad4e1f2`) | TypeScript | tsc checker (`tstruth/gen_truth.mjs`) | 98.3% | 0.9029 | 0.9917 | 0.9452 |
 | express (`dae209ae`) | JavaScript | tsc `checkJs` (`tstruth/gen_truth.mjs`) | 90.3% | 0.8400 | 1.0000 | 0.9130 |
-| ripgrep (`82313cf`) | Rust | rust-analyzer SCIP (`rust`) | 100% | 0.9364 | 0.9047 | 0.9203 |
+| ripgrep (`82313cf`) | Rust | rust-analyzer SCIP (`rust`) | 100% | 0.9364 | 0.9045 | 0.9202 |
 | jansson (`684e18c`) | C | clang AST (`clang`) | 97.7% | 0.9991 | 0.9247 | 0.9605 |
 | SwiftyJSON (`3d25441`) | Swift | SourceKit index (`swift`) | 100% | 0.9355 | 1.0000 | 0.9667 |
 | turtle (`3cfc963`) | Kotlin | kotlinc + javap (`kotlin`) | 76.8% | 1.0000 | 0.9881 | 0.9940 |
@@ -64,6 +64,88 @@ traces candidate narrowing per call site to stderr).
 
 Every row is gated in `baseline.json`; the per-language sections below hold
 the progression that produced each number and what remains.
+
+### Second corpus per language (2026-09-19)
+
+Every rule above was tuned against one repository per language. A second
+pin per language is the overfitting check: the same binary, a repository
+the rules never saw. All are gated in `baseline.json`; the snapshot files
+sit beside the first corpus's under `testdata/`.
+
+| Corpus (pin) | Language | Oracle | Universe | P | R | First corpus P / R |
+|---|---|---|---|---|---|---|
+| cobra (`adbc881`) | Go | SSA + VTA | 100% | 0.9828 | 0.9518 | 0.9522 / 0.9505 |
+| commons-io (`8ad9867d`) | Java | javac + javap | 94.5% | 0.8756 | 0.9128 | 0.9381 / 0.9517 |
+| cJSON (`6d9f244`) | C | clang AST | 100% | 1.0000 | 0.6462 | 0.9991 / 0.9247 |
+| fd (`5bbfa3e`) | Rust | rust-analyzer SCIP | 100% | 0.9516 | 0.9130 | 0.9364 / 0.9045 |
+| p-queue (`180ab9e`) | TypeScript | tsc checker | 100% | 0.9592 | 1.0000 | 0.9029 / 0.9917 |
+| Files (`e85f2b4`) | Swift | SourceKit index | 97.0% | 0.9881 | 0.9222 | 0.9355 / 1.0000 |
+| CocoaLumberjack (`f54de25f`) | Objective-C | clang AST | 79.2% | 0.9557 | 0.7989 | 1.0000 / 0.9914 |
+| csv (`89ac08c`) | PHP | Xdebug trace (dynamic) | 100% | 0.8892 | 0.7016 | 0.9176 / 0.6471 |
+
+What the second corpora found, all fixed the same day and re-gated on both
+corpora of each language:
+
+- **The Java oracle dropped every method with a `throws` clause.**
+  `javapMethodRe` required the header line to end in `);`; a throws clause
+  ends it in `IOException;`, the header went unrecognized, and that method's
+  invokes were attributed to the previous method. commons-io declares throws
+  on most of its API, so its truth had 1,687 edges and Grove's recall read
+  0.649 — against the corrected oracle the truth has 2,707 edges and the same
+  build scores R 0.913. The **commons-lang snapshot was re-pinned** with the
+  corrected oracle too: R 0.9202 → 0.9517 on an unchanged Grove build (its
+  gate moves up accordingly).
+- **Implicit super-constructor calls** (Java, C#): a constructor with no
+  `super(...)`/`this(...)` calls the superclass's parameterless constructor,
+  which javac emits and the oracle records — 89 of commons-io's misses. The
+  base class is resolved from the constructor's own file first, because
+  nested helper types (`Builder`, `AbstractBuilder`) reuse simple names
+  across a package.
+- **Cargo integration tests are crates** (Rust): files under `tests/`,
+  `benches/` and `examples/` had no crate root, so `TestEnv::new` from
+  `tests/tests.rs` scoped to its own file — 93 of fd's 138 misses.
+- **Swift**: a `typealias` constructs the aliased type (`throw
+  LocationError(..)` → `FilesError.init`); properties of the enclosing type
+  or protocol (`var storage: Storage<Self> { get }`) type receivers, generic
+  arguments dropped; an in-repo extension of an external type
+  (`extension String`) is reachable from a `String` receiver. Files.swift
+  R 0.533 → 0.922.
+- **Objective-C oracle**: SwiftPM/CocoaPods lay headers out as
+  `include/<Module>/X.h` and sources write `#import <Module/X.h>`; the
+  include-path heuristic now adds the parent of each header directory.
+  CocoaLumberjack parsed 17 functions before, 321 after.
+
+What they left open:
+
+- **C preprocessor** (cJSON R 0.646): the Unity test framework is entirely
+  macros (`RUN_TEST(f)`, `TEST_ASSERT_*`) expanding to calls; Grove has no
+  symbol for a function-like macro. jansson's `json_object_foreach` is the
+  same gap. The fix is macro symbols plus call-through of a macro body's
+  calls to the invoking function — the next C item.
+- **Java overload fan-out** (commons-io P 0.876): `IOUtils.write`/`toString`/
+  `close` families with untyped arguments; the same territory as newtonsoft's
+  constructor overloads.
+- **Objective-C property reads** (CocoaLumberjack R 0.80, universe 79%):
+  `info.fileName` lowers to a getter message the oracle records; Grove
+  records no call for a property read, and category/extension methods
+  declared in `.m` class extensions are outside the matched universe.
+- **JavaScript object-literal modules**: koa's `module.exports = { get
+  foo() {..}, bar() {..} }` produced an 18% universe (no symbols for the
+  members, and the checker names accessors `get`/`set`); not pinned until
+  the extractor models them.
+- No second corpus yet for C# (needs `dotnet` for the Roslyn oracle) or
+  Kotlin (a kotlinc-2.4-compilable dependency-free repository is rare).
+
+Two rows are dynamic oracles (flask's pytest trace, php-parser's Xdebug
+trace) and are read differently from the rest. A dynamic trace records only
+the paths the test suite executes, and records reflection-driven and
+dynamic-name dispatch (`$this->{'p' . $type}($node)`, werkzeug's
+`LocalProxy`) that no static graph can name. Their **recall is therefore
+not a target**: the gate holds it from regressing, but raising it would
+mean either fabricating dynamic-dispatch edges or chasing untested paths,
+and their precision is a lower bound (a correct static edge on an untested
+path scores as false). Precision and recall targets apply to the static,
+compiler-backed rows.
 
 ## Baseline progression (calls edges, Go)
 

@@ -21,7 +21,13 @@ import (
 var (
 	javapSourceRe = regexp.MustCompile(`^\s*Compiled from "([^"]+)"`)
 	// "  public int run(java.lang.String);"  /  "  public demo.Demo();"
-	javapMethodRe = regexp.MustCompile(`^  [\w<>\[\].$, ]*?([\w$.]+|"<init>")\((.*)\);$`)
+	// A `throws` clause follows the parameter list (`public static long
+	// lastModified(java.io.File) throws java.io.IOException;`); without
+	// allowing it the header was missed and the method's invokes were
+	// attributed to the previous method — commons-io declares throws on
+	// most of its API, and its misses looked like calls from the wrong
+	// caller.
+	javapMethodRe = regexp.MustCompile(`^  [\w<>\[\].$, ]*?([\w$.]+|"<init>")\((.*)\)(?: throws [\w.$, ]+)?;$`)
 	// 5: invokevirtual #16  // Method demo/Helper.size:(...)I
 	javapInvokeRe = regexp.MustCompile(`// (?:Interface)?Method (?:([\w/$]+)\.)?"?([\w$<>]+)"?:(\(.*?\)\S+)`)
 	javapLineRe   = regexp.MustCompile(`^\s+line (\d+): \d+`)

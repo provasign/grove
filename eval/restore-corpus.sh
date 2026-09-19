@@ -24,6 +24,17 @@ newtonsoft|https://github.com/JamesNK/Newtonsoft.Json.git|0a2e291
 php-parser|https://github.com/nikic/PHP-Parser.git|8eea230
 jansson|https://github.com/akheron/jansson.git|684e18c
 commons-lang|https://github.com/apache/commons-lang.git|44298fe
+cobra|https://github.com/spf13/cobra.git|adbc881
+commons-io|https://github.com/apache/commons-io.git|8ad9867d
+cJSON|https://github.com/DaveGamble/cJSON.git|6d9f244
+fd|https://github.com/sharkdp/fd.git|5bbfa3e
+p-queue|https://github.com/sindresorhus/p-queue.git|180ab9e
+Files|https://github.com/JohnSundell/Files.git|e85f2b4
+CocoaLumberjack|https://github.com/CocoaLumberjack/CocoaLumberjack.git|f54de25f
+csv|https://github.com/thephpleague/csv.git|89ac08c
+SwiftyJSON|https://github.com/SwiftyJSON/SwiftyJSON.git|3d25441
+turtle|https://github.com/lordcodes/turtle.git|3cfc963
+json-framework|https://github.com/SBJson/json-framework.git|93e4ca5
 "
 
 while IFS='|' read -r name url pin; do

@@ -182,7 +182,7 @@ Current call-edge accuracy against each language's compiler or runtime oracle
 | Language | Corpus | Oracle | Precision | Recall |
 |---|---|---|---|---|
 | Go | gin | SSA + VTA | 0.952 | 0.951 |
-| Java | commons-lang | javac + javap | 0.936 | 0.920 |
+| Java | commons-lang | javac + javap | 0.938 | 0.952 |
 | C# | Newtonsoft.Json | Roslyn | 0.935 | 0.947 |
 | TypeScript | socket.io | TypeScript checker | 0.903 | 0.992 |
 | JavaScript | express | TypeScript checker (`checkJs`) | 0.840 | 1.000 |
@@ -193,6 +193,20 @@ Current call-edge accuracy against each language's compiler or runtime oracle
 | Objective-C | SBJson | clang AST | 1.000 | 0.991 |
 | Python | flask | pytest trace (dynamic) | 0.852 | 0.716 |
 | PHP | PHP-Parser | Xdebug trace (dynamic) | 0.918 | 0.647 |
+
+A second, untuned corpus per language guards against rules that only fit
+the first (also gated):
+
+| Language | Second corpus | Precision | Recall |
+|---|---|---|---|
+| Go | cobra | 0.983 | 0.952 |
+| Java | commons-io | 0.876 | 0.913 |
+| C | cJSON | 1.000 | 0.646 (Unity test macros) |
+| Rust | fd | 0.952 | 0.913 |
+| TypeScript | p-queue | 0.959 | 1.000 |
+| Swift | Files | 0.988 | 0.922 |
+| Objective-C | CocoaLumberjack | 0.956 | 0.799 (property reads) |
+| PHP | league/csv (dynamic) | 0.889 | 0.702 |
 
 The dynamic oracles record only paths the test suites execute and count
 reflection-driven dispatch a static graph cannot name, so their recall is a

@@ -730,6 +730,14 @@ func (idx *edgeIndex) buildRustCrates() {
 		if base := baseNameNoExt(f); base == "lib" || base == "main" {
 			roots[dirOf(f)] = true
 		}
+		// Cargo's integration tests, benches and examples are crates of
+		// their own: every file directly under tests/ is a crate root,
+		// sharing the directory's `mod` helpers (tests/testenv/mod.rs).
+		// Without a root they scoped to their own file only (fd's
+		// TestEnv::new from tests/tests.rs resolved nothing).
+		if d := baseOf(dirOf(f)); d == "tests" || d == "benches" || d == "examples" {
+			roots[dirOf(f)] = true
+		}
 	}
 	if len(roots) == 0 {
 		return
@@ -2516,6 +2524,14 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				}
 				fmt.Fprintf(os.Stderr, "grove-trace %s: callee=%q qual=%q args=%v cands=%d capped=%v scope=%d first=%v\n", symbol.QualifiedName, cs.Callee, qualifier, cs.Args, len(cands), capped, len(scope), ids)
 			}
+			if symbol.Language == "swift" && qualifier == "" && len(cands) == 0 {
+				// `throw LocationError(path:..)` where `typealias
+				// LocationError = FilesError<LocationErrorReason>`: the
+				// call constructs the aliased type.
+				if target := swiftTypealiasTarget(idx, calleeName); target != "" {
+					cands, capped = resolveCallees(idx, &symbol, target, scope, true, sameFileWins)
+				}
+			}
 			if symbol.Language == "swift" {
 				// Swift overloads are told apart by argument LABELS —
 				// they are part of a function's identity, and a type's
@@ -2566,10 +2582,17 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				typ, typed := localTypes[qualifier]
 				external := !typed && !swiftTypeIndexed(idx, qualifier) || typed && !swiftTypeIndexed(idx, typ)
 				if !isSelf && external {
-					// Stop here: the inheritance fallbacks below re-source
-					// same-name members for an empty set, and they cannot
-					// know the receiver any better.
-					continue
+					// Except an in-repo extension of that external type:
+					// `path.appendingSuffixIfNeeded("/")` on a String
+					// parameter runs `extension String`'s method.
+					if ext := filterByParent(cands, typ); typed && len(ext) > 0 {
+						cands = ext
+					} else {
+						// Stop here: the inheritance fallbacks below
+						// re-source same-name members for an empty set,
+						// and they cannot know the receiver any better.
+						continue
+					}
 				}
 			}
 			if symbol.Language == "kotlin" && qualifier != "" && qualifier != "this" && qualifier != "super" &&

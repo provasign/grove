@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.56.0 - 2026-09-19
+
+A second, untuned accuracy corpus per language (cobra, commons-io, cJSON, fd,
+p-queue, Files, CocoaLumberjack, league/csv), each pinned and gated, as the
+overfitting check on rules tuned against one repository. They found and
+this release fixes: the Java oracle silently dropped every method with a
+`throws` clause and charged its calls to the previous method (commons-lang's
+snapshot is re-pinned — recall 0.920 → 0.952 on an unchanged build); Java
+and C# constructors without `super(...)` now call the superclass's
+parameterless constructor, with nested helper types resolved from the
+constructor's own file; Cargo `tests/`, `benches/` and `examples/` files
+form crates (fd R 0.73 → 0.91); Swift resolves `typealias` constructions,
+types receivers from the enclosing type's or protocol's properties, and
+reaches in-repo extensions of external types (Files R 0.53 → 0.92); the
+Objective-C oracle handles `include/<Module>/` header layouts. Remaining
+second-corpus gaps are documented: C function-like macros (cJSON R 0.65),
+Java overload fan-out, Objective-C property reads, and JavaScript
+object-literal modules.
+
 ## v0.55.0 - 2026-09-19
 
 C# precision (Newtonsoft.Json: P 0.901 → 0.935, R 0.947). Resolution now

@@ -99,7 +99,15 @@ func ClangCallTruth(repoRoot string, exts []string) (TruthFile, []TruthEdge, err
 					sources = append(sources, filepath.ToSlash(rel))
 				}
 			case strings.HasSuffix(path, ".h"):
-				includeDirs[filepath.Dir(rel)] = true
+				dir := filepath.Dir(rel)
+				includeDirs[dir] = true
+				// SwiftPM/CocoaPods layout: headers live in
+				// include/<Module>/X.h and sources write
+				// `#import <Module/X.h>`, which resolves against the
+				// parent of the module directory.
+				if parent := filepath.Dir(dir); parent != "." && parent != "" {
+					includeDirs[parent] = true
+				}
 			}
 			return nil
 		})

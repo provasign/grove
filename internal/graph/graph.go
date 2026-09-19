@@ -253,6 +253,8 @@ func BuildEdgesWithProgress(symbols []core.SymbolRecord, report ProgressFunc) []
 	tick("mainframe-data")
 	edges = append(edges, buildFrameworkEdges(idx, symbols)...)
 	tick("framework")
+	edges = append(edges, buildImplicitSuperCalls(idx, symbols)...)
+	tick("implicit-super")
 	decoEdges := buildDecoratorEdges(idx, symbols, callEdges)
 	edges = append(edges, decoEdges...)
 	tick("decorators")

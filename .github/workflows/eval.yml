@@ -18,6 +18,7 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
   GO_VERSION: "1.26.3"
   GIN_COMMIT: d75fcd4
+  COBRA_COMMIT: adbc881
 jobs:
   calls-accuracy:
     name: calls edges vs go-ssa-vta (gin)
@@ -43,6 +44,15 @@ jobs:
         run: /tmp/grove-eval truth --repo /tmp/gin --commit "$GIN_COMMIT" --out /tmp/calls-truth.jsonl
       - name: Score against baseline
         run: /tmp/grove-eval score --repo /tmp/gin --truth /tmp/calls-truth.jsonl --out-dir /tmp/eval-out --baseline eval/baseline.json
+      - name: Clone cobra at corpus pin (second Go corpus)
+        run: |
+          git clone --quiet https://github.com/spf13/cobra.git /tmp/cobra
+          git -C /tmp/cobra checkout --quiet "$COBRA_COMMIT"
+          (cd /tmp/cobra && go mod download)
+      - name: Generate cobra ground truth
+        run: /tmp/grove-eval truth --repo /tmp/cobra --commit "$COBRA_COMMIT" --out /tmp/cobra-truth.jsonl
+      - name: Score cobra against baseline
+        run: /tmp/grove-eval score --repo /tmp/cobra --truth /tmp/cobra-truth.jsonl --out-dir /tmp/eval-out/cobra --baseline eval/baseline.json
       - name: Upload scorecard
         if: always()
         uses: actions/upload-artifact@v4
@@ -86,6 +96,7 @@ jobs:
     env:
       SOCKETIO_COMMIT: 3ad4e1f2
       EXPRESS_COMMIT: dae209ae
+      PQUEUE_COMMIT: 180ab9e
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -101,6 +112,8 @@ jobs:
           git -C /tmp/socket.io checkout --quiet "$SOCKETIO_COMMIT"
           git clone --quiet https://github.com/expressjs/express.git /tmp/express
           git -C /tmp/express checkout --quiet "$EXPRESS_COMMIT"
+          git clone --quiet https://github.com/sindresorhus/p-queue.git /tmp/p-queue
+          git -C /tmp/p-queue checkout --quiet "$PQUEUE_COMMIT"
       - name: Build grove-eval
         working-directory: eval
         run: go build -o /tmp/grove-eval ./cmd/grove-eval
@@ -108,6 +121,8 @@ jobs:
         run: /tmp/grove-eval score --repo /tmp/socket.io --truth eval/testdata/socket.io@$SOCKETIO_COMMIT/calls-truth.jsonl.gz --out-dir /tmp/eval-out/socketio --baseline eval/baseline.json
       - name: Score express against snapshot baseline
         run: /tmp/grove-eval score --repo /tmp/express --truth eval/testdata/express@$EXPRESS_COMMIT/calls-truth.jsonl.gz --out-dir /tmp/eval-out/express --baseline eval/baseline.json
+      - name: Score p-queue against snapshot baseline (second TS corpus)
+        run: /tmp/grove-eval score --repo /tmp/p-queue --truth eval/testdata/p-queue@$PQUEUE_COMMIT/calls-truth.jsonl.gz --out-dir /tmp/eval-out/p-queue --baseline eval/baseline.json
       - name: Upload scorecards
         if: always()
         uses: actions/upload-artifact@v4
@@ -120,6 +135,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RIPGREP_COMMIT: 82313cf
+      FD_COMMIT: 5bbfa3e
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -138,6 +154,12 @@ jobs:
         run: go build -o /tmp/grove-eval ./cmd/grove-eval
       - name: Score against snapshot baseline
         run: /tmp/grove-eval score --repo /tmp/ripgrep --truth eval/testdata/ripgrep@$RIPGREP_COMMIT/calls-truth.jsonl.gz --out-dir /tmp/eval-out --baseline eval/baseline.json
+      - name: Clone fd at corpus pin (second Rust corpus)
+        run: |
+          git clone --quiet https://github.com/sharkdp/fd.git /tmp/fd
+          git -C /tmp/fd checkout --quiet "$FD_COMMIT"
+      - name: Score fd against snapshot baseline
+        run: /tmp/grove-eval score --repo /tmp/fd --truth eval/testdata/fd@$FD_COMMIT/calls-truth.jsonl.gz --out-dir /tmp/eval-out/fd --baseline eval/baseline.json
       - name: Upload scorecard
         if: always()
         uses: actions/upload-artifact@v4
@@ -180,6 +202,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PHPPARSER_COMMIT: 8eea230
+      CSV_COMMIT: 89ac08c
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -198,6 +221,12 @@ jobs:
         run: go build -o /tmp/grove-eval ./cmd/grove-eval
       - name: Score against snapshot baseline
         run: /tmp/grove-eval score --repo /tmp/php-parser --truth eval/testdata/php-parser@$PHPPARSER_COMMIT/calls-truth.jsonl.gz --out-dir /tmp/eval-out --baseline eval/baseline.json
+      - name: Clone league/csv at corpus pin (second PHP corpus)
+        run: |
+          git clone --quiet https://github.com/thephpleague/csv.git /tmp/csv
+          git -C /tmp/csv checkout --quiet "$CSV_COMMIT"
+      - name: Score csv against snapshot baseline
+        run: /tmp/grove-eval score --repo /tmp/csv --truth eval/testdata/csv@$CSV_COMMIT/calls-truth.jsonl.gz --out-dir /tmp/eval-out/csv --baseline eval/baseline.json
       - name: Upload scorecard
         if: always()
         uses: actions/upload-artifact@v4
@@ -210,6 +239,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       JANSSON_COMMIT: 684e18c
+      CJSON_COMMIT: 6d9f244
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -228,6 +258,12 @@ jobs:
         run: go build -o /tmp/grove-eval ./cmd/grove-eval
       - name: Score against snapshot baseline
         run: /tmp/grove-eval score --repo /tmp/jansson --truth eval/testdata/jansson@$JANSSON_COMMIT/calls-truth.jsonl.gz --out-dir /tmp/eval-out --baseline eval/baseline.json
+      - name: Clone cJSON at corpus pin (second C corpus)
+        run: |
+          git clone --quiet https://github.com/DaveGamble/cJSON.git /tmp/cJSON
+          git -C /tmp/cJSON checkout --quiet "$CJSON_COMMIT"
+      - name: Score cJSON against snapshot baseline
+        run: /tmp/grove-eval score --repo /tmp/cJSON --truth eval/testdata/cJSON@$CJSON_COMMIT/calls-truth.jsonl.gz --out-dir /tmp/eval-out/cJSON --baseline eval/baseline.json
       - name: Upload scorecard
         if: always()
         uses: actions/upload-artifact@v4
@@ -240,6 +276,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       COMMONSLANG_COMMIT: 44298fe
+      COMMONSIO_COMMIT: 8ad9867d
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -258,6 +295,12 @@ jobs:
         run: go build -o /tmp/grove-eval ./cmd/grove-eval
       - name: Score against snapshot baseline
         run: /tmp/grove-eval score --repo /tmp/commons-lang --truth eval/testdata/commons-lang@$COMMONSLANG_COMMIT/calls-truth.jsonl.gz --out-dir /tmp/eval-out --baseline eval/baseline.json
+      - name: Clone commons-io at corpus pin (second Java corpus)
+        run: |
+          git clone --quiet https://github.com/apache/commons-io.git /tmp/commons-io
+          git -C /tmp/commons-io checkout --quiet "$COMMONSIO_COMMIT"
+      - name: Score commons-io against snapshot baseline
+        run: /tmp/grove-eval score --repo /tmp/commons-io --truth eval/testdata/commons-io@$COMMONSIO_COMMIT/calls-truth.jsonl.gz --out-dir /tmp/eval-out/commons-io --baseline eval/baseline.json
       # Every other language job uploads its scorecard; this one did not, so a
       # java regression failed the build and took the evidence with it.
       - name: Upload scorecard
