@@ -192,7 +192,7 @@ Current call-edge accuracy against each language's compiler or runtime oracle
 | Kotlin | turtle | kotlinc + javap | 1.000 | 0.988 |
 | Objective-C | SBJson | clang AST | 1.000 | 0.991 |
 | Python | flask | pytest trace (dynamic) | 0.852 | 0.716 |
-| PHP | PHP-Parser | Xdebug trace (dynamic) | 0.832 | 0.601 |
+| PHP | PHP-Parser | Xdebug trace (dynamic) | 0.914 | 0.647 |
 
 The dynamic oracles record only paths the test suites execute and count
 reflection-driven dispatch a static graph cannot name, so their recall is a

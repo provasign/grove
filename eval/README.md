@@ -60,7 +60,7 @@ traces candidate narrowing per call site to stderr).
 | turtle (`3cfc963`) | Kotlin | kotlinc + javap (`kotlin`) | 76.8% | 1.0000 | 0.9881 | 0.9940 |
 | json-framework (`93e4ca5`) | Objective-C | clang AST (`objc`) | 98.7% | 1.0000 | 0.9914 | 0.9957 |
 | flask (`36e4a824`) | Python | pytest trace (`pytruth`, dynamic) | 97.9% | 0.8522 | 0.7164 | 0.7784 |
-| php-parser (`8eea230`) | PHP | Xdebug trace (`php`, dynamic) | 100% | 0.8323 | 0.6010 | 0.6980 |
+| php-parser (`8eea230`) | PHP | Xdebug trace (`php`, dynamic) | 100% | 0.9141 | 0.6471 | 0.7578 |
 
 Every row is gated in `baseline.json`; the per-language sections below hold
 the progression that produced each number and what remains.
@@ -440,8 +440,14 @@ reconstructs caller→callee edges from the trace's call-stack levels. This is
 a dynamic, exact-but-partial oracle — the same design as Python's pytruth:
 every asserted edge really executed, untested paths are absent, so **recall
 is the headline and precision a lower bound** (a correct static edge on an
-untested path scores as a false positive). In-repo closures collapse to their
-enclosing function, mirroring Grove; vendored dependencies are excluded.
+untested path scores as a false positive). A closure's calls attribute to
+the function whose body *defines* it — Xdebug 3 names the frame
+`{closure:/abs/file.php:START-END}`, and the definer is the in-repo
+declaration nearest above START in that file — which is what Grove
+records; the 2026-06 snapshot attributed them to the *invoking* frame
+instead, so PHP-Parser's reduce callbacks (defined in
+`Php8::initReduceCallbacks`, run from `ParserAbstract::doParse`) scored as
+295 false edges plus 148 misses. Vendored dependencies are excluded.
 
 Generating the snapshot needs php with xdebug and the repo's dev
 dependencies (`composer install`); CI scores the committed snapshot with
@@ -456,6 +462,17 @@ suite for broad dynamic coverage).
 | PHP-Parser (`8eea230`) | 100% | 0.7701 | 0.5357 | 0.6319 |
 
 *lower bound — see the partial-oracle caveat above.
+
+Current (2026-09-19, re-pinned snapshot with lexical closure attribution):
+P 0.9141 / R 0.6471 (from 0.8323 / 0.6010 against the old snapshot; the
+Grove build is unchanged). The remaining 227 false edges are dominated by
+`Php7::initReduceCallbacks` (80) — the PHP 7 parser's reduce closures,
+which the suite never executes (it drives the Php8 parser) — and builder
+tests' constructor calls on untested paths. The 1,317 misses are
+dynamic-name dispatch the static graph cannot express: `$this->{'p' .
+$node->getType()}($node)` in `PrettyPrinterAbstract::p` (445), reflection
+over `getSubNodeNames()` in `NodeDumper::dumpRecursive` (281) and
+`NodeTraverser::traverseNode` (124).
 
 Day-one progression (0.2028 → 0.6319), each step measured:
 
@@ -781,14 +798,10 @@ the sweep.
   with `ForceIndex`, which re-extracts and rebuilds every edge unconditionally.
 - (done 2026-09-19) Objective-C truth oracle — `clang -ast-dump=json`
   turned out to be enough; no libclang bindings needed
-- php-parser: regenerate the pinned Xdebug snapshot with the lexical closure
-  attribution now in `truth_php.go` (needs `composer install` in the
-  corpus). 295 of its 443 false edges are reduce-callback bodies the old
-  snapshot attributes to `doParse` (the invoker) where Grove and the new
-  oracle attribute them to `initReduceCallbacks` (the definer); 148 misses
-  are the same edges from the other side. Its recall floor after that is
-  dynamic-name dispatch (`$this->{'p' . $type}($node)` in the pretty
-  printer, reflection in NodeDumper) — 726 of 1460 misses.
+- (done 2026-09-19) php-parser snapshot re-pinned with lexical closure
+  attribution: P 0.83 → 0.91. Its recall floor is dynamic-name dispatch
+  (`$this->{'p' . $type}($node)` in the pretty printer, reflection in
+  NodeDumper/NodeTraverser) — 850 of 1,317 misses.
 - flask: the misses are werkzeug proxy/descriptor access (`AppContext.request`
   through a LocalProxy, `ConfigAttribute.__get__`, `with` → `__enter__`/
   `__exit__`); `with`-statement context managers are the one modelable

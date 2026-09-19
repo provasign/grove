@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.54.0 - 2026-09-19
+
+PHP accuracy baseline re-pinned. The Xdebug oracle's snapshot for PHP-Parser
+is regenerated with the lexical closure attribution introduced in v0.51.0
+(a closure's calls belong to the function that defines it, as Grove
+records, not the frame that invokes it). Against the corrected truth the
+unchanged Grove build scores P 0.914 / R 0.647 (was 0.832 / 0.601); the
+CI gate moves with it. Remaining misses are dynamic-name dispatch and
+reflection the static graph cannot express.
+
 ## v0.53.0 - 2026-09-19
 
 Resolve-phase memory. Files of whole-repo-scope languages (C#, PHP, C/C++,
