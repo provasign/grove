@@ -28,7 +28,7 @@ func TestObjCCalls_CrossFileWholeRepoScope(t *testing.T) {
 			Language: "objc", Kind: core.KindMethod, Name: "personWithName:", QualifiedName: "personWithName:",
 			ParentSymbol: "App", Signature: "+ (instancetype)personWithName:(NSString *)name",
 			RawText:   "+ (instancetype)personWithName:(NSString *)name { return [[Person alloc] initWithName:name]; }",
-			CallSites: []core.CallSite{{Callee: "Person.alloc", Line: 1}, {Callee: "alloc().initWithName:", Line: 1}},
+			CallSites: []core.CallSite{{Callee: "Person.alloc", Line: 1}, {Callee: "Person().initWithName:", Line: 1}},
 		},
 	}
 	g.Replace(syms, 3)

@@ -314,7 +314,8 @@ func writeExamples(b *strings.Builder, title string, ex []EdgeExample) {
 // computing reachable targets (pytest/xdebug traces, Go's VTA callgraph).
 func staticGenerator(g string) bool {
 	switch g {
-	case "javac-javap", "ts-compiler-api", "roslyn", "rust-analyzer-scip", "scip-clang":
+	case "javac-javap", "ts-compiler-api", "roslyn", "rust-analyzer-scip", "scip-clang",
+		"sourcekitten-index", "kotlinc-javap", "clang-ast":
 		return true
 	}
 	return false

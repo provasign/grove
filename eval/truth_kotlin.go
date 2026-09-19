@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -90,18 +91,31 @@ func KotlinCallTruth(repoRoot string) (TruthFile, []TruthEdge, error) {
 		return nil
 	})
 
-	methods := map[string]*javaMethod{} // FQN.name:descriptor → method
+	methods := map[string]*javaMethod{}       // FQN.name:descriptor → method
+	byClassName := map[string][]*javaMethod{} // FQN.name → overloads
 	var ordered []*javaMethod
+	parsedByClass := map[string][]*javaMethod{}
+	var classOrder []string
 	for _, cf := range classFiles {
 		fqn := strings.TrimSuffix(filepath.ToSlash(strings.TrimPrefix(cf, classesDir+string(filepath.Separator))), ".class")
 		if isSyntheticKotlinName(lastSegment(fqn, '/')) {
 			continue
 		}
-		out, err := exec.Command("javap", "-v", "-p", cf).Output()
+		out, err := exec.Command(jdkTool("javap"), "-v", "-p", cf).Output()
 		if err != nil {
 			continue
 		}
-		parsed := parseJavap(string(out), strings.ReplaceAll(fqn, "/", "."))
+		dotted := strings.ReplaceAll(fqn, "/", ".")
+		parsedByClass[dotted] = parseJavap(string(out), dotted)
+		classOrder = append(classOrder, dotted)
+	}
+	anonymous := kotlinFoldAnonymousClasses(parsedByClass)
+	for _, dotted := range classOrder {
+		if anonymous[dotted] {
+			continue
+		}
+		parsed := parsedByClass[dotted]
+		kotlinFoldLambdas(parsed)
 		for _, m := range parsed {
 			if m.file == "" || m.line == 0 || isSyntheticKotlinName(m.name) {
 				continue
@@ -120,6 +134,7 @@ func KotlinCallTruth(repoRoot string) (TruthFile, []TruthEdge, error) {
 			}
 			m.file = filepath.ToSlash(rel)
 			methods[m.classFQN+"."+m.name+":"+m.descriptor] = m
+			byClassName[m.classFQN+"."+m.name] = append(byClassName[m.classFQN+"."+m.name], m)
 			ordered = append(ordered, m)
 		}
 	}
@@ -141,10 +156,17 @@ func KotlinCallTruth(repoRoot string) (TruthFile, []TruthEdge, error) {
 		caller := refOf(m)
 		funcs[caller.funcKey()] = true
 		for _, inv := range m.invokes {
-			if isSyntheticKotlinName(inv.name) {
-				continue
+			cls := strings.ReplaceAll(inv.classFQN, "/", ".")
+			var target *javaMethod
+			if base, ok := strings.CutSuffix(inv.name, "$default"); ok {
+				// f(a, b = x) called as f(a): kotlinc emits a static
+				// f$default(receiver?, a, b, mask, marker) dispatcher that
+				// fills the default and calls f. The source-level call is
+				// to f — resolve it there.
+				target = kotlinDefaultTarget(byClassName[cls+"."+base], inv.descriptor)
+			} else if !isSyntheticKotlinName(inv.name) {
+				target = methods[cls+"."+inv.name+":"+inv.descriptor]
 			}
-			target := methods[strings.ReplaceAll(inv.classFQN, "/", ".")+"."+inv.name+":"+inv.descriptor]
 			if target == nil {
 				continue // outside the repo (kotlin-stdlib, JDK, deps)
 			}
@@ -189,6 +211,126 @@ func kotlinFindSource(sources []string, base string) string {
 		}
 	}
 	return ""
+}
+
+// kotlinFoldLambdas attributes the invokes of a compiled lambda body
+// (`open$lambda$0`, nested `open$lambda$0$lambda$1`) to the method that
+// lexically contains it: at the source level `shell.run { build() }` is a
+// call from `open`, and that is what Grove records. Among same-named
+// overloads, the one declared closest above the lambda's line wins.
+func kotlinFoldLambdas(parsed []*javaMethod) {
+	for _, lam := range parsed {
+		name := lam.name
+		var host *javaMethod
+		for host == nil {
+			i := strings.LastIndex(name, "$lambda$")
+			if i < 0 {
+				break
+			}
+			name = name[:i]
+			for _, cand := range parsed {
+				if cand.name != name || strings.Contains(cand.name, "$lambda$") {
+					continue
+				}
+				if host == nil || (cand.line <= lam.line && (host.line > lam.line || cand.line > host.line)) {
+					host = cand
+				}
+			}
+		}
+		if host != nil && host != lam {
+			host.invokes = append(host.invokes, lam.invokes...)
+		}
+	}
+}
+
+var kotlinAnonymousClassRe = regexp.MustCompile(`^(.+)\$([A-Za-z_]\w*)\$\d+$`)
+
+// kotlinFoldAnonymousClasses attributes the invokes of a lambda kotlinc
+// compiled into its own class — a suspend lambda (`sequence { ... }`
+// becomes `Outer$method$1` with an invokeSuspend method), an object
+// expression — to the method the class is named after, when the outer
+// class declares it. Returns the set of folded class FQNs, which are not
+// callers in their own right.
+func kotlinFoldAnonymousClasses(parsedByClass map[string][]*javaMethod) map[string]bool {
+	folded := map[string]bool{}
+	for fqn, anon := range parsedByClass {
+		m := kotlinAnonymousClassRe.FindStringSubmatch(fqn)
+		if m == nil {
+			continue
+		}
+		outer, ok := parsedByClass[m[1]]
+		if !ok {
+			continue
+		}
+		var host *javaMethod
+		firstLine := 0
+		for _, am := range anon {
+			if am.line > 0 && (firstLine == 0 || am.line < firstLine) {
+				firstLine = am.line
+			}
+		}
+		for _, cand := range outer {
+			if cand.name != m[2] {
+				continue
+			}
+			if host == nil || (cand.line <= firstLine && (host.line > firstLine || cand.line > host.line)) {
+				host = cand
+			}
+		}
+		if host == nil {
+			continue
+		}
+		for _, am := range anon {
+			host.invokes = append(host.invokes, am.invokes...)
+		}
+		folded[fqn] = true
+	}
+	return folded
+}
+
+// kotlinDefaultTarget picks, among overloads of f, the one an f$default
+// dispatcher with the given descriptor calls: its descriptor is f's
+// parameters plus an Int bitmask and an Object marker, with the receiver
+// prepended for instance methods.
+func kotlinDefaultTarget(overloads []*javaMethod, defaultDesc string) *javaMethod {
+	if len(overloads) == 1 {
+		return overloads[0]
+	}
+	n := jvmParamCount(defaultDesc)
+	var hit *javaMethod
+	for _, m := range overloads {
+		k := jvmParamCount(m.descriptor)
+		if k == n-2 || k == n-3 {
+			if hit != nil {
+				return nil // ambiguous
+			}
+			hit = m
+		}
+	}
+	return hit
+}
+
+// jvmParamCount counts the parameters in a JVM method descriptor.
+func jvmParamCount(desc string) int {
+	end := strings.IndexByte(desc, ')')
+	if !strings.HasPrefix(desc, "(") || end < 0 {
+		return -1
+	}
+	n := 0
+	for i := 1; i < end; i++ {
+		switch desc[i] {
+		case '[':
+			continue
+		case 'L':
+			j := strings.IndexByte(desc[i:], ';')
+			if j < 0 {
+				return -1
+			}
+			i += j
+		}
+		n++
+	}
+	return n
 }
 
 // isSyntheticKotlinName excludes compiler-generated members that have no

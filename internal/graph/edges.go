@@ -2159,6 +2159,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 		}
 		var javaArgTypeCache map[string]string
 		var csArgTypeCache map[string]string
+		var ktShapeCache map[string]string
 		narrowJavaCall := func(cands []*core.SymbolRecord, cs core.CallSite, scope map[string]struct{}) []*core.SymbolRecord {
 			cands = javaKnownArityCandidates(cands, cs)
 			if len(cands) > 1 && len(cs.Args) > 0 {
@@ -2224,6 +2225,37 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			fullChain = qualifier
 			if j := strings.LastIndexByte(qualifier, '.'); j >= 0 {
 				qualifier = qualifier[j+1:]
+			}
+			// Swift delegating initializers (`self.init(...)`, a same-type
+			// overload; `super.init(...)`, the superclass's) literally write
+			// the word "init" at the call site — unlike a direct
+			// construction call (`Type(...)`), which writes the type name
+			// and so already resolves through the ordinary name-indexed
+			// lookup now that astkit names every constructor after its
+			// type. "init" itself is never a real declaration name, so
+			// this must run before the generic qualifier-based resolution
+			// below, which would otherwise look up a symbol literally
+			// named "init" and find nothing (or match every completely
+			// unrelated `init` elsewhere in scope, once such calls are
+			// allowed through unqualified). Mirrors the Java/C#
+			// `this()`/`super()` special forms just below.
+			if symbol.Language == "swift" && calleeName == "init" && symbol.ParentSymbol != "" {
+				switch qualifier {
+				case "self":
+					ctors, _ := swiftNarrowCall(constructorTargets(idx, symbol.ParentSymbol, scope), cs, &symbol)
+					for _, ctor := range ctors {
+						addEdge(symbol.ID, ctor.ID, 0.9, core.EvidenceSourceASTKit, core.ReasonASTNarrowed)
+					}
+					continue
+				case "super":
+					for _, base := range constructorBaseClasses(idx, "swift", symbol.ParentSymbol, dirOf(symbol.FilePath)) {
+						ctors, _ := swiftNarrowCall(constructorTargets(idx, base, scope), cs, &symbol)
+						for _, ctor := range ctors {
+							addEdge(symbol.ID, ctor.ID, 0.85, core.EvidenceSourceHeuristic, core.ReasonInheritance)
+						}
+					}
+					continue
+				}
 			}
 			pyCallName := calleeName
 			if symbol.Language == "python" && qualifier == "" {
@@ -2387,7 +2419,30 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				}
 				fmt.Fprintf(os.Stderr, "grove-trace %s: callee=%q qual=%q args=%v cands=%d capped=%v scope=%d first=%v\n", symbol.QualifiedName, cs.Callee, qualifier, cs.Args, len(cands), capped, len(scope), ids)
 			}
-			if symbol.Language == "csharp" || symbol.Language == "php" ||
+			if symbol.Language == "swift" {
+				// Swift overloads are told apart by argument LABELS —
+				// they are part of a function's identity, and a type's
+				// `init`s (which astkit names after the type itself, so
+				// they collide on name like C#'s constructor overloads)
+				// routinely share an arity and a value shape while
+				// differing only in label. Arity is the fallback.
+				var decided bool
+				if cands, decided = swiftNarrowCall(cands, cs, &symbol); decided && len(cands) == 0 {
+					continue
+				}
+			} else if symbol.Language == "kotlin" {
+				// Kotlin overloads: arity first, then declared argument
+				// types — `key in args` desugars to args.contains(key)
+				// and turtle's Command has four `operator fun contains`
+				// overloads told apart only by parameter type.
+				cands = filterByArgc(cands, cs.Argc)
+				if len(cands) > 1 && len(cs.Args) > 0 {
+					if ktShapeCache == nil {
+						ktShapeCache = kotlinArgShapes(&symbol)
+					}
+					cands = kotlinNarrowByArgShapes(idx, cands, cs.Args, ktShapeCache)
+				}
+			} else if symbol.Language == "csharp" || symbol.Language == "php" ||
 				symbol.Language == "c" || symbol.Language == "cpp" {
 				// Overload disambiguation by arity. C#: JsonConvert has
 				// five DeserializeObject overloads, Roslyn picks one by
@@ -2395,8 +2450,149 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// mean a same-named method on an unrelated class with a
 				// different arity is still a wrong candidate. filterByArgc
 				// keeps variadic/default-friendly candidates and never
-				// zeroes the set.
+				// zeroes the set. Kotlin's overloaded functions need the
+				// same narrowing.
 				cands = filterByArgc(cands, cs.Argc)
+			}
+			if symbol.Language == "swift" && qualifier != "" && qualifier != "self" && qualifier != "super" &&
+				!strings.HasSuffix(qualifier, "()") && !strings.HasPrefix(qualifier, "$") &&
+				qualifier[0] >= 'a' && qualifier[0] <= 'z' {
+				// Static typing makes an unknown receiver meaningful (the
+				// Java rule below, applied to Swift): a lowercase receiver
+				// that is no local, parameter, self alias, or indexed type
+				// is a stored property or library value whose type we do
+				// not carry — `rawArray[idx]` on a `[Any]` field resolved
+				// "subscript" against every JSON subscript overload in the
+				// repo. Closure shorthand ($0) stays neutral: it is a real
+				// in-repo value, just an untyped one.
+				_, isSelf := selfVars[qualifier]
+				typ, typed := localTypes[qualifier]
+				external := !typed && !swiftTypeIndexed(idx, qualifier) || typed && !swiftTypeIndexed(idx, typ)
+				if !isSelf && external {
+					// Stop here: the inheritance fallbacks below re-source
+					// same-name members for an empty set, and they cannot
+					// know the receiver any better.
+					continue
+				}
+			}
+			if symbol.Language == "kotlin" && qualifier != "" && qualifier != "this" && qualifier != "super" &&
+				!strings.HasSuffix(qualifier, "()") && qualifier[0] >= 'a' && qualifier[0] <= 'z' {
+				// The Swift rule for Kotlin: a lowercase receiver that is
+				// no local, parameter, property of the enclosing class, or
+				// indexed type is a library value (`command.contains(x)` on
+				// a String parameter resolved against every in-repo
+				// `contains` overload). A typed receiver whose type is not
+				// indexed is external too.
+				_, isSelf := selfVars[qualifier]
+				typ, typed := localTypes[qualifier]
+				if !typed {
+					typ = kotlinFieldType(idx, symbol.ParentSymbol, qualifier)
+					typed = typ != ""
+				}
+				external := !typed && !kotlinTypeIndexed(idx, qualifier) || typed && !kotlinTypeIndexed(idx, typ)
+				if !isSelf && external {
+					// Except an in-repo extension function on that
+					// (external or unknown) receiver type.
+					if ext := kotlinExtensionCandidates(cands, typ); len(ext) > 0 {
+						cands = ext
+					} else {
+						continue
+					}
+				}
+			}
+			if symbol.Language == "kotlin" && strings.HasSuffix(qualifier, "()") && len(cands) > 0 {
+				// Call-result receiver: `Executable("ls") + args` narrows
+				// plus to Executable's; `processBuilder.command(x).start()`
+				// is nobody's result we can type — external, unless an
+				// extension function is what the chain reaches.
+				rets := kotlinCallResultTypes(idx, qualifier)
+				var byType []*core.SymbolRecord
+				for t := range rets {
+					byType = append(byType, filterByParent(cands, t)...)
+					byType = append(byType, kotlinExtensionCandidates(cands, t)...)
+				}
+				if len(rets) == 0 {
+					byType = kotlinExtensionCandidates(cands, "")
+				}
+				if len(byType) == 0 {
+					continue
+				}
+				cands = byType
+			}
+			if symbol.Language == "kotlin" && qualifier == "" && len(cands) > 0 {
+				// A bare call resolves against the implicit receivers in
+				// scope: the enclosing class and, in an extension
+				// function, its receiver type. Outside both — a top-level
+				// function, or an extension on an external type (`Any.
+				// asArgumentOrNull` calling toString()) — only free
+				// functions and constructors are reachable by name.
+				recv := kotlinExtensionReceiver(symbol.Signature)
+				if symbol.ParentSymbol == "" || recv != "" {
+					var reachable []*core.SymbolRecord
+					for _, cand := range cands {
+						switch {
+						case cand.Kind == core.KindFunction || cand.Kind == core.KindConstructor:
+							reachable = append(reachable, cand)
+						case symbol.ParentSymbol != "" && cand.ParentSymbol == symbol.ParentSymbol:
+							reachable = append(reachable, cand)
+						case recv != "" && cand.ParentSymbol == recv && kotlinTypeIndexed(idx, recv):
+							reachable = append(reachable, cand)
+						}
+					}
+					if len(reachable) == 0 {
+						continue
+					}
+					cands = reachable
+				}
+			}
+			if symbol.Language == "objc" && len(cands) > 0 {
+				// Objective-C receivers, at the altitude clang's typed AST
+				// reports (the oracle): a message to `super` binds the
+				// superclass chain; a message to an ivar, property or
+				// local binds its declared class (and that class's
+				// ancestors) — an `id`/protocol-typed or undeclared
+				// receiver is dynamic dispatch nothing static can name;
+				// a bare identifier call is a C function.
+				switch {
+				case qualifier == "":
+					var functions []*core.SymbolRecord
+					for _, cand := range cands {
+						if cand.Kind == core.KindFunction {
+							functions = append(functions, cand)
+						}
+					}
+					if len(functions) == 0 {
+						continue
+					}
+					cands = functions
+				case qualifier == "super":
+					if byType := objcCandidatesOfClassChain(idx, cands, baseClassesFor(idx, "objc", symbol.ParentSymbol, "")); len(byType) > 0 {
+						cands = byType
+					} else {
+						continue
+					}
+				case strings.HasSuffix(qualifier, "()"):
+					// `[[Type alloc] init]` is written Type(); `[[self alloc]
+					// init]` self(); `[[self foo] bar]` foo(), typed by
+					// foo's declared return type when it is ours.
+					classes := objcCallResultClasses(idx, strings.TrimSuffix(qualifier, "()"), &symbol)
+					if byType := objcCandidatesOfClassChain(idx, cands, classes); len(byType) > 0 {
+						cands = byType
+					} else {
+						continue
+					}
+				case qualifier != "self" && !strings.HasSuffix(qualifier, "()") &&
+					(qualifier[0] >= 'a' && qualifier[0] <= 'z' || qualifier[0] == '_'):
+					typ, typed := localTypes[qualifier]
+					if !typed || !namedSymbolIsClass(idx, typ) {
+						continue
+					}
+					if byType := objcCandidatesOfClassChain(idx, cands, []string{typ}); len(byType) > 0 {
+						cands = byType
+					} else {
+						continue
+					}
+				}
 			}
 			if phpTraitCall {
 				for _, cand := range cands {
@@ -2713,6 +2909,8 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 						targets = narrowJavaCall(targets, cs, scope)
 					case "csharp":
 						targets = narrowDispatch(targets, cs)
+					case "kotlin":
+						targets = filterByArgc(targets, cs.Argc)
 					}
 					if len(targets) == 0 {
 						// Inheritance crosses imports — but prefer the twin
@@ -2732,7 +2930,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				continue
 			}
 			if calleeName == "this()" && symbol.ParentSymbol != "" &&
-				(symbol.Language == "java" || symbol.Language == "csharp") {
+				(symbol.Language == "java" || symbol.Language == "csharp" || symbol.Language == "kotlin") {
 				targets := constructorTargets(idx, symbol.ParentSymbol, scope)
 				// this(...) picks one sibling constructor by arity AND
 				// argument types, like any other overloaded call.
@@ -2741,6 +2939,8 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					targets = narrowJavaCall(targets, cs, scope)
 				case "csharp":
 					targets = narrowDispatch(targets, cs)
+				case "kotlin":
+					targets = filterByArgc(targets, cs.Argc)
 				}
 				for _, ctor := range targets {
 					if ctor.ID != symbol.ID {
@@ -3760,18 +3960,28 @@ func stripPythonBase(b string) string {
 // comma-separated names after the top-level `:`, stopping at a `where`
 // constraint clause or the body brace. [ \t] (not \s) keeps it on the
 // declaration line even if the signature carries a trailing newline.
-var csharpBaseListRe = regexp.MustCompile(`\b(?:class|struct|record|interface)\s+[A-Za-z_]\w*(?:<[^>{}]+>)?(?:\([^)]*\))?[ \t]*:[ \t]*([A-Za-z_][\w.,<> \t]*?)(?:[ \t]+where\b|[ \t]*[;{]|$)`)
+//
+// A record's base may carry primary-constructor arguments
+// (`record Student(string Name) : Person(Name)`), so a base entry may
+// contain a balanced paren group; the capture admits it and csharpBaseNames
+// splits paren-aware. Without this a record with base arguments matched
+// nothing and got no extends edge at all.
+var csharpBaseListRe = regexp.MustCompile(`\b(?:class|struct|record|interface)\s+[A-Za-z_]\w*(?:<[^>{}]+>)?(?:\([^)]*\))?[ \t]*:[ \t]*([A-Za-z_](?:[\w.,<> \t]|\([^)]*\))*?)(?:[ \t]+where\b|[ \t]*[;{]|$)`)
 
 // csharpBaseNames extracts the simple base-type names from a C# declaration
-// signature (generic arguments and namespace qualifiers stripped).
+// signature (generic arguments, base-constructor arguments, and namespace
+// qualifiers stripped).
 func csharpBaseNames(text string) []string {
 	m := csharpBaseListRe.FindStringSubmatch(text)
 	if len(m) != 2 {
 		return nil
 	}
 	var out []string
-	for _, part := range strings.Split(stripAngleBrackets(m[1]), ",") {
+	for _, part := range splitTopLevel(stripAngleBrackets(m[1]), ',') {
 		part = strings.TrimSpace(part)
+		if i := strings.IndexByte(part, '('); i >= 0 {
+			part = strings.TrimSpace(part[:i])
+		}
 		if i := strings.LastIndexByte(part, '.'); i >= 0 {
 			part = part[i+1:]
 		}

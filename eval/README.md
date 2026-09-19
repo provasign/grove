@@ -517,11 +517,53 @@ separate symbol for them, so scoring against them would fault Grove for a
 structural gap the extractor doesn't claim to close. Needs Xcode or the
 Swift toolchain (`sourcekitten`, `swiftc`, `xcrun`) — Darwin only.
 
-No CI job or baseline yet — a corpus repo pin is a separate decision (see
-Roadmap). Verified against small hand-written fixtures: whole-module scope,
-free/instance/static/constructor calls, and self-qualified calls all
-resolve correctly end to end (truth generation → Grove indexing → scoring),
-at 1.00/1.00 precision/recall on those fixtures.
+Pin: SwiftyJSON (zero-dependency, one 1.4k-line file, and the overload
+stress test — nine `init`s and six `subscript`s that all take one
+argument). Point `--repo` at `Source/SwiftyJSON`: the repo's Example app
+imports UIKit, which a flat-module index cannot see.
+
+### Baseline (2026-09-19, calls edges)
+
+| Repo | Universe match | Precision | Recall | F1 |
+|---|---|---|---|---|
+| SwiftyJSON (`3d25441`) | 100% | 0.9355 | 1.0000 | 0.9667 |
+
+Day-one progression (0.1802 → 0.9667), each step measured with a fresh
+index (see the cache note under Roadmap):
+
+| Fix | P | R | F1 |
+|---|---|---|---|
+| baseline: every constructor named "init", no overload narrowing | 0.1029 | 0.7241 | 0.1802 |
+| constructors named after their type (Java/C# convention) + `self.init`/`super.init` delegation | 0.1058 | 0.6897 | 0.1835 |
+| overload narrowing by argument LABEL (astkit records `label:value` per Swift argument) | 0.9545 | 0.7241 | 0.8235 |
+| `x[i]` subscript access recorded as a call to `subscript`; subscript bodies as callers | 0.6304 | 1.0000 | 0.7733 |
+| unknown static receiver drops (Java rule); label mismatch decisive even for a lone sibling; trailing closures | 0.9032 | 0.9655 | 0.9333 |
+| argument-shape narrowing (`T...` is `[T]` in its body); `let x = self` aliases; container receivers are external | 0.9355 | 1.0000 | **0.9667** |
+
+Findings:
+
+1. **Labels, not arity or types, are a Swift overload's identity.** Nine
+   `init`s and six `subscript`s of one arity collapse under arity narrowing
+   (P 0.10). The compiler tells them apart by argument labels first, and so
+   does Grove now: astkit's Swift call sites record `label:value` per
+   argument, declarations parse their labels (default, variadic, and
+   trailing-closure parameters may be omitted), and a label mismatch is
+   decisive — it is swiftc's own "not this function", so unlike arity it
+   may empty the set, even for a lone same-name sibling.
+2. **Constructors are named after their type.** `JSON(x)` writes the type
+   name; naming every `init` literally "init" made them unfindable by name
+   and interchangeable by label. `self.init(...)`/`super.init(...)` write
+   "init" and get their own special form, like Java's `this()`/`super()`.
+3. **Subscripts are calls.** `x[i]` is a `call_expression` with a
+   bracketed suffix; read literally it was a call to a function named `x`.
+4. **A typed receiver whose type is not indexed is external.** `path[0]`
+   on `path: [T]` subscripts an Array, not T — local types keep container
+   shape, and the Java unknown-receiver rule applies to Swift's static
+   typing too.
+
+Residual: the two remaining false edges are `self[key]` with `key` bound
+by `for (key, _) in other` — typing it needs the Sequence's Element, which
+the extractor does not model.
 
 ## Kotlin (kotlinc + javap bytecode oracle)
 
@@ -532,32 +574,93 @@ disassembly, reused unchanged), since Kotlin compiles to ordinary class
 files javap disassembles identically. Source discovery has no
 package-must-match-directory convention to rely on (unlike Java), so a
 `javap`-reported "Compiled from" basename is resolved against the actual
-source file list instead of a reconstructed package path. Kotlin generates
-callable JVM methods astkit's Kotlin strategy does not model as separate
-symbols — every declared property's getter/setter, and a class's
-compiler-synthesized primary constructor (astkit only extracts an explicit
-`init` block, not the implicit one every class gets) — so calls to/from
-those show up as recall misses, not false positives; this is the known,
-accepted limitation already noted in `internal/core/capabilities.go`.
+source file list instead of a reconstructed package path.
 
-No CI job or baseline yet (see Roadmap). Verified against a small
-hand-written fixture (a class, a companion-object factory method, a
-top-level caller) end to end at 1.00/1.00 precision/recall, with the
-constructor-call gap above showing up exactly as expected (80% symbol
-match rate, not 100%).
+Three kotlinc code-generation habits would otherwise misattribute
+source-level calls, and the oracle undoes each: a lambda body compiles to a
+synthetic `outer$lambda$N` method (its invokes fold into `outer`); a
+suspend lambda or object expression compiles to its own `Outer$method$N`
+class (folded likewise); and a function with default parameters is called
+through a static `f$default` dispatcher (resolved to the `f` overload whose
+parameter count matches the dispatcher's, minus the mask and marker). What
+remains unmodeled is every declared property's getter/setter, so calls
+to/from those are recall misses, not false positives.
 
-## Objective-C: deferred
+Pin: lordcodes/turtle (a shell-command library: single JVM target,
+standard `src/main/kotlin` layout, kotlin-stdlib its only dependency).
+Point `--repo` at the `turtle/` module. Corpus choice was constrained by
+the toolchain: Homebrew's `kotlinc` is 2.4.x, which rejects most older
+public Kotlin repos outright (removed stdlib APIs are hard errors,
+multiplatform `expect`/`actual` needs the Gradle plugin) — a
+`src/main/kotlin`, recently-maintained, dependency-free library is what
+compiles.
 
-No truth oracle. `scip-clang` — already used for the C/C++ oracle above, and
-clang-based — was the obvious first attempt, but it rejects `.m`/`.mm` files
-at the compilation-database-parsing stage outright ("compilation database
-has no entries that could be processed"), before ever invoking clang: it is
-a C/C++-only tool despite sharing a compiler. `sourcekitten index` (the
-Swift oracle's mechanism) is Swift-frontend-only and rejects clang-style
-arguments. A real Objective-C oracle needs libclang's indexing API directly
-(`clang_indexSourceFile` + `CXIndexerCallbacks`, the purpose-built C API for
-exactly this) via cgo bindings — a separate, sizable piece of work, not
-attempted here.
+### Baseline (2026-09-19, calls edges)
+
+| Repo | Universe match | Precision | Recall | F1 |
+|---|---|---|---|---|
+| turtle (`3cfc963`) | 76.8% | 1.0000 | 0.9881 | 0.9940 |
+
+Progression, same day, same pin (oracle edges grew 41 → 84 as the lambda,
+anonymous-class and `$default` folds landed, so the columns are against a
+moving-but-truer target):
+
+| Step | Universe | P | R | What changed |
+|---|---|---|---|---|
+| day one | 63.2% | 0.5846 | 0.9268 | name + arity only |
+| constructors, `in`, oracle folds | 76.0% | 0.8488 | 0.8795 | astkit emits primary/secondary/implicit constructors (call sites from parameter defaults, property initializers, `init` blocks) and desugars `a in b` → `b.contains(a)`; arg-type narrowing; unknown-receiver drop; lambda/`$default` folds |
+| extension functions, chains | 76.0% | 0.8723 | 0.9880 | an in-repo extension function survives an untyped receiver; a call-result receiver resolves through the callee's declared return type (or a constructor) and drops otherwise; bare calls in top-level/extension functions reach only free functions, constructors and the receiver's own methods |
+| operators, properties, `Any` | 76.8% | 1.0000 | 0.9881 | `a + b` → `a.plus(b)` (also `- * / %`); class properties type a receiver like locals; overload scoring ranks an exact/erasure match above a `vararg Any?` catch-all; annotation-prefixed signatures parse; chained-call qualifiers keep the leaf name only |
+
+The universe gap is now only property accessors (kotlinc's getters and
+setters have no astkit symbol). The one miss is a bare `command(...)` inside
+a receiver lambda (`shellRun(...) { command(command, arguments) }`) — typing
+it needs the lambda parameter's `ShellScript.() -> T` receiver type.
+
+## Objective-C (clang AST oracle)
+
+`grove-eval truth --lang objc` runs `clang -fsyntax-only -fmodules
+-fobjc-arc -Xclang -ast-dump=json` on every non-test `.m` file (with `-I`
+for every directory holding a header and `-isysroot $(xcrun
+--show-sdk-path)`) and reads the typed AST back. clang has already resolved
+each message send's receiver — `ObjCMessageExpr` carries the selector, the
+receiver kind (instance / class / super) and the receiver's static type —
+so the oracle binds an instance message to the selector's implementation on
+the receiver's declared class or the nearest superclass implementing it, a
+class message to the class method, `super` to the enclosing class's
+superclass chain, and a `CallExpr` to its `FunctionDecl`. An `id`- or
+protocol-typed receiver has no static class and records nothing: the same
+"declared receiver type" altitude as the Java and Kotlin bytecode oracles.
+The JSON dump is location-sparse (file and line print only when they
+change), so the walk carries them along in document order. Files that do
+not compile in isolation (`main.m` with app-target dependencies) are
+skipped. No new tooling: clang ships with the Command Line Tools.
+
+`scip-clang` (the C/C++ oracle) rejects `.m` inputs before invoking clang
+and `sourcekitten` only indexes Swift, which is why this reads clang's AST
+directly rather than reusing either.
+
+Pin: SBJson/json-framework (SBJson 5: a streaming JSON parser/writer, five
+`.m` files under `Classes/`, no dependencies beyond Foundation).
+
+### Baseline (2026-09-19, calls edges)
+
+| Repo | Universe match | Precision | Recall | F1 |
+|---|---|---|---|---|
+| json-framework (`93e4ca5`) | 98.7% | 1.0000 | 0.9914 | 0.9957 |
+
+Progression, same day, same pin:
+
+| Step | P | R | What changed |
+|---|---|---|---|
+| day one | 0.7770 | 0.9914 | name + arity; every same-name method across the repo |
+| receiver rules | 0.9583 | 0.5948 | `super` walks the superclass chain; a lowercase/underscore receiver binds its declared class (and ancestors) or drops; a bare call is a C function; `id<Protocol>` is dynamic — but ivars were invisible, so most `_state` calls dropped |
+| ivars and properties | 0.8099 | 0.9914 | astkit emits a field per declarator for `{ Type *a, *b; }` blocks in `@interface`/`@implementation` and for multi-declarator `@property` lines; Grove types `name` and `_name` from them |
+| alloc/init, dispatch | 1.0000 | 0.9914 | `[[Type alloc] init]` is extracted with receiver `Type()` (and `[[self alloc] init]` as `self()`), typed by the class or by an in-repo method's declared return type; the scorer treats `clang-ast`, `sourcekitten-index` and `kotlinc-javap` as static oracles, so Grove's reason=dispatch override fan-out is unscored against them as it already was for javac/tsc/Roslyn |
+
+The one miss is `self.error = ...` — property dot-syntax, which clang lowers
+to a `setError:` message to the custom setter; astkit records no call for
+an assignment.
 
 ## Impact (blast radius) accuracy
 
@@ -593,8 +696,18 @@ the sweep.
 - Go tests-edge truth (`go test -coverprofile` per package)
 - django pin once flask recall improves (same patterns, 100× the surface)
 - tests-edge baseline + CI gate once the metric stabilizes
-- pin a Swift and a Kotlin corpus repo, measure a first baseline, and add
-  `swift-accuracy`/`kotlin-accuracy` CI jobs (macOS runners; `sourcekitten`
-  and `kotlinc` need installing there) once one is picked
-- Objective-C truth oracle: needs libclang indexing-API bindings (cgo),
-  `scip-clang` and `sourcekitten` both rejected `.m`/`.mm` outright
+- `swift-accuracy`/`kotlin-accuracy`/`objc-accuracy` CI jobs for the pinned
+  SwiftyJSON, turtle and json-framework baselines (entries are in
+  baseline.json; the jobs need a macOS runner with `sourcekitten`, `kotlinc`
+  + a JDK, and the Command Line Tools' `clang` installed)
+- Kotlin property-accessor symbols (turtle's remaining universe gap) and
+  receiver-lambda typing (`T.() -> R` parameters) for its one miss
+- Swift: type `for (key, _) in other` bindings by Sequence element (the two
+  residual SwiftyJSON false edges)
+- (fixed 2026-09-19) `grove-eval score` reused the repo's persistent
+  `.grove` index across runs, so a rebuilt binary's edge-resolution changes
+  were not measured until `ResolverVersion` was bumped or `.grove` deleted —
+  it cost real time during the Swift baseline. The harness now opens Grove
+  with `ForceIndex`, which re-extracts and rebuilds every edge unconditionally.
+- (done 2026-09-19) Objective-C truth oracle — `clang -ast-dump=json`
+  turned out to be enough; no libclang bindings needed

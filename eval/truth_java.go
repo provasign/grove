@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 )
@@ -78,7 +79,7 @@ func JavaCallTruth(repoRoot string) (TruthFile, []TruthEdge, error) {
 	if err := os.WriteFile(listFile, []byte(strings.Join(sources, "\n")), 0o644); err != nil {
 		return TruthFile{}, nil, err
 	}
-	cmd := exec.Command("javac", "-g", "-nowarn", "-proc:none", "-d", classesDir, "@"+listFile)
+	cmd := exec.Command(jdkTool("javac"), "-g", "-nowarn", "-proc:none", "-d", classesDir, "@"+listFile)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return TruthFile{}, nil, fmt.Errorf("javac: %v\n%s", err, lastLines(string(out), 8))
 	}
@@ -98,7 +99,7 @@ func JavaCallTruth(repoRoot string) (TruthFile, []TruthEdge, error) {
 		if isSyntheticJavaName(lastSegment(fqn, '/')) {
 			continue
 		}
-		out, err := exec.Command("javap", "-v", "-p", cf).Output()
+		out, err := exec.Command(jdkTool("javap"), "-v", "-p", cf).Output()
 		if err != nil {
 			continue
 		}
@@ -234,7 +235,48 @@ func parseJavap(out, classFQN string) []*javaMethod {
 	return methods
 }
 
+// jdkTool locates a JDK executable, in order: $JAVA_HOME/bin (the JDK's own
+// convention); macOS's `/usr/libexec/java_home` (a JDK linked into
+// /Library/Java/JavaVirtualMachines); PATH — except that on macOS
+// /usr/bin/{java,javac,javap} are Apple stubs that only print "Unable to
+// locate a Java Runtime" when java_home finds nothing, so a PATH hit there
+// is skipped; then a Homebrew keg-only JDK (`brew install openjdk` installs
+// to /opt/homebrew/opt/openjdk* and deliberately does not link it). Returns
+// the bare name when nothing applies so exec reports the usual not-found.
+func jdkTool(name string) string {
+	if home := os.Getenv("JAVA_HOME"); home != "" {
+		if p := filepath.Join(home, "bin", name); fileExists(p) {
+			return p
+		}
+	}
+	javaHomeFound := false
+	if runtime.GOOS == "darwin" {
+		if out, err := exec.Command("/usr/libexec/java_home").Output(); err == nil {
+			if p := filepath.Join(strings.TrimSpace(string(out)), "bin", name); fileExists(p) {
+				return p
+			}
+			javaHomeFound = true
+		}
+	}
+	if p, err := exec.LookPath(name); err == nil {
+		stub := runtime.GOOS == "darwin" && !javaHomeFound && strings.HasPrefix(p, "/usr/bin/")
+		if !stub {
+			return p
+		}
+	}
+	for _, pattern := range []string{"/opt/homebrew/opt/openjdk*/bin/" + name, "/usr/local/opt/openjdk*/bin/" + name} {
+		if matches, _ := filepath.Glob(pattern); len(matches) > 0 {
+			sort.Strings(matches) // "openjdk" (current) sorts before "openjdk@17"
+			return matches[0]
+		}
+	}
+	return name
+}
 
+func fileExists(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && !st.IsDir()
+}
 
 func isSyntheticJavaName(name string) bool {
 	return strings.Contains(name, "lambda$") || strings.Contains(name, "access$") ||

@@ -71,6 +71,13 @@ type Config struct {
 	NativeDisabledLanguages []string
 	// NativeTimeout bounds each analyzer invocation. Zero uses Grove's default.
 	NativeTimeout time.Duration
+	// ForceIndex makes every Index call re-extract every file and rebuild
+	// every edge, bypassing the blobSHA/version shortcuts. For callers that
+	// must measure the CURRENT binary's behavior (the eval harness): the
+	// shortcuts are keyed on ExtractorVersion/ResolverVersion stamps, so a
+	// rebuilt binary whose stamps were not bumped is otherwise scored against
+	// the previous run's persisted edges.
+	ForceIndex bool
 }
 
 // Engine is the embedded Grove API consumed by Prism, Fuse, and Relay.
@@ -80,6 +87,7 @@ type Engine struct {
 	store  *store.Store
 	parser *parser.Engine
 	idx    *index.Indexer
+	force  bool // Config.ForceIndex
 
 	// indexMu serializes Index calls: two concurrent walks would interleave
 	// per-file store writes and race on the final edge rewrite.
@@ -106,6 +114,7 @@ func Open(ctx context.Context, cfg Config) (*Engine, error) {
 		store:  st,
 		parser: p,
 		idx:    index.NewWithNativeConfig(p, st, nativeConfigFromPublic(cfg)),
+		force:  cfg.ForceIndex,
 	}
 	// The graph starts nil and is rehydrated lazily on first access (see
 	// currentGraph). Eager rehydration here made every Open pay the full
@@ -218,7 +227,7 @@ func (e *Engine) Index(ctx context.Context, dir string) (IndexResult, error) {
 	// reloading all stored symbols+edges. If a resident graph exists it is
 	// kept (set-equal to the store by the stored-edge invariant); if none
 	// exists yet, the first query rehydrates lazily via currentGraph.
-	opts := index.Options{SkipNoopGraph: true}
+	opts := index.Options{SkipNoopGraph: true, Force: e.force}
 	if os.Getenv("GROVE_INCREMENTAL") != "0" {
 		// Incremental edge construction uses the resident graph as the
 		// previous-state baseline. Snapshot under the read lock; the

@@ -312,6 +312,12 @@ func baseClassesFor(idx *edgeIndex, language, className, preferDir string) []str
 		return tsBaseClasses(idx, className, preferDir)
 	case "csharp":
 		return csBaseClasses(idx, className, preferDir)
+	case "swift":
+		return swiftBaseClasses(idx, className, preferDir)
+	case "kotlin":
+		return kotlinBaseClasses(idx, className, preferDir)
+	case "objc":
+		return objcBaseClasses(idx, className)
 	}
 	return nil
 }

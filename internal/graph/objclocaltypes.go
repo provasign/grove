@@ -44,8 +44,130 @@ func objcLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string
 
 	if symbol.ParentSymbol != "" {
 		out["self"] = symbol.ParentSymbol
+		for name, typ := range objcIvarTypes(idx, symbol.ParentSymbol, symbol.FilePath) {
+			if _, shadowed := out[name]; !shadowed {
+				out[name] = typ
+			}
+		}
 	}
 	return out
+}
+
+// objcMemberDeclRe matches the single-declarator Signature astkit gives an
+// instance variable or @property: `SBState *state;`,
+// `__weak id<Del> _delegate;`, `@property (readonly) NSMutableArray *stack;`.
+var objcMemberDeclRe = regexp.MustCompile(`^\s*(?:@property\s*(?:\([^)]*\))?\s*)?(?:(?:__weak|__strong|__unsafe_unretained|IBOutlet|const)\s+)*([A-Za-z_]\w*(?:<[^>]*>)?)\s*\*?\s*(_?[A-Za-z_]\w*)\s*;`)
+
+// objcIvarTypes maps a class's instance variables and properties — under
+// both spellings a method body uses, `name` (self.name, or a bare ivar) and
+// `_name` (the synthesized backing ivar) — to their bare types, read off
+// the field symbols every @interface, class extension and @implementation
+// of the class declares: in the method's own file and in the files of the
+// class's declarations (its header). A member typed `id<Protocol>` maps to
+// the protocol, which the receiver rule treats as dynamic dispatch.
+func objcIvarTypes(idx *edgeIndex, class, file string) map[string]string {
+	files := map[string]bool{file: true}
+	for _, decl := range namedSymbols(idx, class) {
+		if decl.Language == "objc" && decl.Kind == core.KindClass {
+			files[decl.FilePath] = true
+		}
+	}
+	out := map[string]string{}
+	for f := range files {
+		for _, field := range idx.byFile[f] {
+			if field.Kind != core.KindField || field.ParentSymbol != class || field.Language != "objc" {
+				continue
+			}
+			m := objcMemberDeclRe.FindStringSubmatch(field.Signature)
+			if m == nil {
+				continue
+			}
+			typ := objcBareType(m[1])
+			if typ == "" {
+				continue
+			}
+			name := m[2]
+			out[name] = typ
+			if strings.HasPrefix(name, "_") {
+				out[name[1:]] = typ
+			} else {
+				out["_"+name] = typ
+			}
+		}
+	}
+	return out
+}
+
+// objcReturnTypeRe captures a method declaration's return type:
+// `- (SBJson5Writer *)writer` → "SBJson5Writer *".
+var objcReturnTypeRe = regexp.MustCompile(`^\s*[-+]\s*\(([^)]+)\)`)
+
+// objcCallResultClasses resolves a call-result receiver name: a class
+// (`[[Type alloc] init]`), `self` (the enclosing class), or an in-repo
+// method whose declared return type names a class. `id`/`instancetype`
+// results and library methods yield nothing.
+func objcCallResultClasses(idx *edgeIndex, name string, caller *core.SymbolRecord) []string {
+	if name == "self" {
+		if caller.ParentSymbol != "" {
+			return []string{caller.ParentSymbol}
+		}
+		return nil
+	}
+	if namedSymbolIsClass(idx, name) {
+		return []string{name}
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, cand := range namedSymbols(idx, name) {
+		if cand.Language != "objc" || cand.Kind != core.KindMethod {
+			continue
+		}
+		m := objcReturnTypeRe.FindStringSubmatch(cand.Signature)
+		if m == nil {
+			continue
+		}
+		if typ := objcBareType(m[1]); typ != "" && !seen[typ] && namedSymbolIsClass(idx, typ) {
+			seen[typ] = true
+			out = append(out, typ)
+		}
+	}
+	return out
+}
+
+// objcCandidatesOfClassChain keeps the candidates declared on the first
+// class, walking from the given classes up their superclass chains, that
+// declares any of them — the method the runtime would find first.
+func objcCandidatesOfClassChain(idx *edgeIndex, cands []*core.SymbolRecord, classes []string) []*core.SymbolRecord {
+	for level := 0; level < 8 && len(classes) > 0; level++ {
+		var next []string
+		for _, cls := range classes {
+			if byType := filterByParent(cands, cls); len(byType) > 0 {
+				return byType
+			}
+			next = append(next, objcBaseClasses(idx, cls)...)
+		}
+		classes = next
+	}
+	return nil
+}
+
+// objcBaseClasses returns the superclass an Objective-C class's @interface
+// names (`@interface Sub : Base`), looking across every declaration of the
+// class since a class extension (`@interface Sub ()`) names none.
+func objcBaseClasses(idx *edgeIndex, className string) []string {
+	for _, decl := range namedSymbols(idx, className) {
+		if decl.Language != "objc" || decl.Kind != core.KindClass {
+			continue
+		}
+		text := decl.Signature
+		if text == "" {
+			text = firstLine(decl.RawText)
+		}
+		if m := objcSuperclassRe.FindStringSubmatch(text); len(m) == 2 {
+			return []string{m[1]}
+		}
+	}
+	return nil
 }
 
 // objcPrimitives are C/ObjC scalar type keywords that look like types but

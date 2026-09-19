@@ -13,7 +13,9 @@ import (
 // loadGraph indexes the repo with Grove and returns the graph's symbols and
 // edges (including the lazily-computed tests view).
 func loadGraph(ctx context.Context, repoRoot string) ([]core.SymbolRecord, []core.Edge, error) {
-	engine, err := grove.Open(ctx, grove.Config{RepoRoot: repoRoot})
+	// ForceIndex: a scorecard must reflect the binary that produced it, not
+	// whatever edges a previous run left in the repo's .grove store.
+	engine, err := grove.Open(ctx, grove.Config{RepoRoot: repoRoot, ForceIndex: true})
 	if err != nil {
 		return nil, nil, fmt.Errorf("grove open: %w", err)
 	}

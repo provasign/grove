@@ -1,7 +1,7 @@
 {
  "gin": {
   "commit": "d75fcd4",
-  "precision": 0.9520,
+  "precision": 0.952,
   "recall": 0.9452,
   "tolerance": 0.005,
   "minUniverse": 0.99
@@ -51,7 +51,7 @@
  "php-parser": {
   "commit": "8eea230",
   "precision": 0.8323,
-  "recall": 0.6010,
+  "recall": 0.601,
   "tolerance": 0.005,
   "minUniverse": 0.99
  },
@@ -61,5 +61,26 @@
   "recall": 0.9294,
   "tolerance": 0.005,
   "minUniverse": 0.96
+ },
+ "SwiftyJSON": {
+  "commit": "3d25441",
+  "precision": 0.9355,
+  "recall": 1.0,
+  "tolerance": 0.005,
+  "minUniverse": 0.99
+ },
+ "turtle": {
+  "commit": "3cfc963",
+  "precision": 1.0,
+  "recall": 0.9881,
+  "tolerance": 0.02,
+  "minUniverse": 0.75
+ },
+ "json-framework": {
+  "commit": "93e4ca5",
+  "precision": 1.0,
+  "recall": 0.9914,
+  "tolerance": 0.02,
+  "minUniverse": 0.97
  }
 }

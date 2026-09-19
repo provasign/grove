@@ -35,16 +35,16 @@ import (
 // symbol for them, so treating a "get"/"set" body as a caller/callee would
 // score against a Grove decl that structurally cannot exist.
 var swiftCallableKinds = map[string]bool{
-	"source.lang.swift.decl.function.free":          true,
+	"source.lang.swift.decl.function.free":            true,
 	"source.lang.swift.decl.function.method.instance": true,
 	"source.lang.swift.decl.function.method.static":   true,
-	"source.lang.swift.decl.function.method.class":     true,
-	"source.lang.swift.decl.function.constructor":      true,
-	"source.lang.swift.decl.function.destructor":       true,
-	"source.lang.swift.decl.function.subscript":        true,
-	"source.lang.swift.ref.function.free":            true,
-	"source.lang.swift.ref.function.method.instance": true,
-	"source.lang.swift.ref.function.method.static":   true,
+	"source.lang.swift.decl.function.method.class":    true,
+	"source.lang.swift.decl.function.constructor":     true,
+	"source.lang.swift.decl.function.destructor":      true,
+	"source.lang.swift.decl.function.subscript":       true,
+	"source.lang.swift.ref.function.free":             true,
+	"source.lang.swift.ref.function.method.instance":  true,
+	"source.lang.swift.ref.function.method.static":    true,
 	"source.lang.swift.ref.function.method.class":     true,
 	"source.lang.swift.ref.function.constructor":      true,
 	"source.lang.swift.ref.function.destructor":       true,
@@ -54,10 +54,10 @@ var swiftCallableKinds = map[string]bool{
 // swiftTypeKinds are the declaration kinds that open a new qualifying scope
 // for display names ("Type.method") — class/struct/enum/protocol/extension.
 var swiftTypeKinds = map[string]bool{
-	"source.lang.swift.decl.class":           true,
-	"source.lang.swift.decl.struct":          true,
-	"source.lang.swift.decl.enum":            true,
-	"source.lang.swift.decl.protocol":        true,
+	"source.lang.swift.decl.class":            true,
+	"source.lang.swift.decl.struct":           true,
+	"source.lang.swift.decl.enum":             true,
+	"source.lang.swift.decl.protocol":         true,
 	"source.lang.swift.decl.extension.class":  true,
 	"source.lang.swift.decl.extension.struct": true,
 	"source.lang.swift.decl.extension.enum":   true,
@@ -197,6 +197,13 @@ func swiftDisplayName(typeName, raw string) string {
 	name := raw
 	if i := strings.IndexByte(name, '('); i >= 0 {
 		name = name[:i]
+	}
+	if name == "init" && typeName != "" {
+		// astkit names every Swift constructor after its enclosing type
+		// (Person(...), never init(...), is what a caller actually
+		// writes) — matched here so matchDecls's base-name comparison
+		// agrees with what Grove records.
+		name = typeName
 	}
 	if typeName == "" {
 		return name
