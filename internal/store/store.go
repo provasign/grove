@@ -941,6 +941,17 @@ func (s *Store) EdgesBySource(ctx context.Context, source string) ([]core.Edge, 
 	return edges, rows.Err()
 }
 
+// Vacuum rebuilds the database file, returning the pages a re-index's
+// deleted rows and the bulk edge load's dropped indexes left free. It
+// needs free disk for a full copy and cannot run inside a transaction.
+func (s *Store) Vacuum(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `VACUUM`)
+	return err
+}
+
 func (s *Store) Status(ctx context.Context) (core.Status, error) {
 	var status core.Status
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM file_index`).Scan(&status.FilesIndexed); err != nil {
@@ -951,6 +962,28 @@ func (s *Store) Status(ctx context.Context) (core.Status, error) {
 	}
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM edges`).Scan(&status.EdgeCount); err != nil {
 		return status, err
+	}
+	// Run state the indexer records as it goes (see index.indexProgress):
+	// the counts above freeze for the whole edge-construction phase, so
+	// these are what distinguish a busy index from a wedged one, and the
+	// native verdict says which analyzer tier built the stored edges.
+	meta := map[string]*string{
+		core.MetaIndexPhase:    &status.Phase,
+		core.MetaIndexProgress: &status.Progress,
+		core.MetaIndexStarted:  &status.IndexStarted,
+		core.MetaIndexFinished: &status.IndexFinished,
+	}
+	for key, dst := range meta {
+		v, _, err := s.GetMeta(ctx, key)
+		if err != nil {
+			return status, err
+		}
+		*dst = v
+	}
+	if raw, ok, err := s.GetMeta(ctx, core.MetaIndexNative); err != nil {
+		return status, err
+	} else if ok && raw != "" {
+		_ = json.Unmarshal([]byte(raw), &status.Native)
 	}
 	return status, nil
 }

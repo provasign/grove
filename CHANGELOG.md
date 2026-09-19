@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.52.0 - 2026-09-19
+
+Operability for large repositories, from a production field report. `grove
+status` now reports the index run's `phase`, a monotonic `progress` counter
+(symbols resolved during edge construction, the phase where the counts used
+to freeze for minutes), `indexStarted`/`indexFinished`, and the per-analyzer
+`native` verdict of the run that built the stored edges — all persisted in
+the database, so a supervisor polling status or a consumer reading `grove.db`
+later can tell a busy index from a wedged one and a Roslyn-resolved index
+from a grammar-only one. `grove index --vacuum` compacts the database after
+the write; `--min-confidence` drops edges below a persisted floor. The README
+documents what each native analyzer needs on disk and measured sizing
+(peak memory, database size, edge row counts). The release adds a fully
+static linux/amd64 musl binary for images whose glibc predates 2.34.
+
 ## v0.51.0 - 2026-09-19
 
 Swift, Kotlin and Objective-C are now measured languages: each scores against

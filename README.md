@@ -6,7 +6,7 @@ Grove is the graph engine embedded by [Prism](https://github.com/provasign/prism
 
 ## What it provides
 
-- Tree-sitter extraction across ten languages, with native semantic enrichment when the local toolchain is available
+- Tree-sitter extraction across sixteen languages, with native semantic enrichment when the local toolchain is available
 - Type-resolved calls, imports, inheritance, implementation, type-use, and test relationships
 - Incremental indexing by content hash
 - Deterministic change-impact, rename, missing-implementation, and dead-code operations
@@ -51,6 +51,51 @@ grove deps internal/service/query.go .
 ```
 
 Grove stores the index in `.grove/grove.db`. Re-running `grove index` hashes the working tree and updates changed files and affected packages. See [incremental indexing](docs/INCREMENTAL_INDEXING.md) for the invariants and verification strategy.
+
+### Watching an index run
+
+`grove status` reads the database only, so it is safe to poll while `grove index` runs in another process. Besides the three counts it reports the run state the indexer records as it goes:
+
+```json
+{
+  "filesIndexed": 25849, "symbolCount": 353362, "edgeCount": 0,
+  "phase": "resolving",
+  "progress": "118272/353362 symbols resolved (calls)",
+  "indexStarted": "2026-09-19T17:02:11Z",
+  "native": ["csharp: skipped: no .csproj file", "go: resolved 1 native call edge(s)"]
+}
+```
+
+- `phase` moves through `walking`, `parsing`, `persisting`, `native`, `resolving`, `writing-edges`, then `complete` (or `failed: <error>`). `filesIndexed`/`symbolCount` only move during `persisting` and `edgeCount` only at the end, so on a large repository the counts freeze for the whole `resolving` phase.
+- `progress` is a monotonic counter within the phase, refreshed at least every second while it moves — the number to watch to tell a busy index from a wedged one. Do not use a "no change in N minutes" kill on the counts alone.
+- `indexStarted`/`indexFinished` bracket the current or last run (`indexFinished` is empty while a run is in flight).
+- `native` is the per-analyzer verdict of the run that produced the stored edges, persisted in the database, so a consumer reading `grove.db` later knows which tier built it. A no-change re-index keeps the previous verdict.
+
+### What the native tier needs on disk
+
+The grammar tier always runs. The native tier runs a language's own toolchain and only when the repository carries its project files and the tool is installed; otherwise it is skipped and says so in the `native` verdict. A fresh clone without a dependency install is the common way to lose it:
+
+| Analyzer | Project file(s) required | Tool required |
+|---|---|---|
+| go | `go.mod` or `go.work` | `go` |
+| js-ts | `package.json`, `tsconfig.json` or `jsconfig.json` | `node`, and `typescript` resolvable from the project (i.e. installed in `node_modules`) |
+| java | `pom.xml` or Gradle build/settings files | `jdtls`, `mvn`, `gradle` or `javac` |
+| csharp | a `.csproj` | none |
+| c-cpp | `compile_commands.json` | none |
+| php | `composer.json` | none |
+| python | `pyproject.toml`, `setup.py`, `setup.cfg` or `requirements.txt` | `python3` |
+| rust | `Cargo.toml` | `cargo` |
+
+`GROVE_NATIVE=false`, `GROVE_NATIVE_LANGUAGES` and `GROVE_NATIVE_DISABLED_LANGUAGES` select analyzers; unset means all of them.
+
+### Sizing
+
+Indexing holds every symbol (with its source text) and every edge in memory while edges are resolved, then writes them in one transaction. Measured on a 25,849-file C# monorepo (353k symbols, 3.9M edges): peak RSS ≈ 19.5 GB, `grove.db` ≈ 6.6 GB, roughly 750 KB of peak memory per indexed file and a database around 5× the working tree. `GOMEMLIMIT` does not lower the peak (the working set is live, not garbage). Plan one `grove index` at a time per host, and expect `edges` to hold millions of rows on large repositories — read it with a streaming cursor, not `SELECT *` into memory. Edges are already unique per (from, type, to) with the best-confidence copy kept.
+
+Two `grove index` flags trade graph breadth for size:
+
+- `--vacuum` compacts the database after the write (a re-index leaves deleted rows' pages behind; VACUUM rewrites the file, so it needs that much free disk and takes minutes on a multi-GB index).
+- `--min-confidence=0.6` drops every edge below that confidence from the graph and the store and persists the floor for later runs (`--min-confidence=0` clears it). The heuristic tiers — dispatch fan-out at 0.7, type-use at 0.5 — are the bulk of a monorepo's rows; a consumer that only reads resolved calls (0.85–0.95) can roughly halve the database. Impact and dead-code answers change accordingly, so treat it as a per-deployment setting, not a default.
 
 ## Task-shaped operations
 

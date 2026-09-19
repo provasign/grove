@@ -7,8 +7,10 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/provasign/grove/internal/core"
@@ -59,7 +61,25 @@ type Options struct {
 	// kept edge. Nil disables the incremental path (full rebuild).
 	PrevEdges   []core.Edge
 	PrevSymbols []core.SymbolRecord
+
+	// Vacuum runs SQLite VACUUM after the edge write, returning the space
+	// a re-index's deleted rows left behind. Off by default: it rewrites
+	// the whole database file (needs that much free disk, and minutes on
+	// a multi-GB index).
+	Vacuum bool
+	// MinConfidence, when MinConfidenceSet, drops every edge below it from
+	// the graph and the store and persists the threshold, so later runs
+	// keep applying it until reset with MinConfidenceSet and 0. Heuristic
+	// tiers (dispatch fan-out at 0.7, uses-type at 0.5) are the bulk of a
+	// monorepo's rows; a consumer that only reads resolved calls can halve
+	// the database. Query results change accordingly.
+	MinConfidence    float64
+	MinConfidenceSet bool
 }
+
+// MetaMinConfidence is the persisted edge-confidence floor (see
+// Options.MinConfidence); absent or "0" means keep everything.
+const MetaMinConfidence = "edge-min-confidence"
 
 // spliceEdgeWrite persists an incremental delta's write-set: rows touching
 // changed files were already deleted by the persist phase; here the
@@ -167,7 +187,27 @@ func (i *Indexer) Index(ctx context.Context, root string) (*graph.CodeGraph, cor
 	return i.IndexWithOptions(ctx, root, Options{})
 }
 
+// IndexWithOptions runs an index and records its phase, progress and native
+// verdicts in the store's meta table as it goes (see core.Status): a
+// supervisor polling `grove status` during the minutes edge construction
+// takes on a monorepo sees a moving counter instead of frozen totals, and a
+// consumer reading the database later sees which analyzer tier built it.
 func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Options) (*graph.CodeGraph, core.IndexResult, error) {
+	prog := newIndexProgress(i.store)
+	cg, result, err := i.indexWithOptions(ctx, root, opts, prog)
+	if err == nil && opts.Vacuum {
+		prog.phase("vacuum", "")
+		if verr := i.store.Vacuum(ctx); verr != nil {
+			result.Native = append(result.Native, "vacuum failed: "+verr.Error())
+		} else {
+			result.Native = append(result.Native, "vacuum: database compacted")
+		}
+	}
+	prog.finish(err)
+	return cg, result, err
+}
+
+func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Options, prog *indexProgress) (*graph.CodeGraph, core.IndexResult, error) {
 	var result core.IndexResult
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
@@ -187,7 +227,11 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 		return nil, result, err
 	}
 	defer releaseIndexLock()
+	// Only the lock holder writes run state: a second process queued on
+	// the lock must not overwrite the running index's phase.
+	prog.start(ctx)
 	tick := phaseTimer()
+	prog.phase("walking", "")
 	// Remove per-repo Go caches left behind by earlier Grove versions
 	// before walking, so they are neither indexed nor left to grow.
 	native.CleanupLegacyCaches(root)
@@ -326,6 +370,7 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 		return nil, result, err
 	}
 	tick("walk+sha-scan")
+	prog.phase("parsing", fmt.Sprintf("0/%d changed files parsed", len(tasks)))
 
 	// Phase 2 (parallel): parse changed files. Tree-sitter parsing is the
 	// dominant cold-index cost and astkit engines are safe for concurrent
@@ -337,6 +382,7 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 		err     error
 	}
 	outcomes := make([]parseOutcome, len(tasks))
+	var parsed atomic.Int64
 	if len(tasks) > 0 {
 		workers := runtime.GOMAXPROCS(0)
 		if workers > len(tasks) {
@@ -357,6 +403,9 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 					}
 					symbols, parseErr := i.parser.ExtractFile(tasks[idx].absPath, root)
 					outcomes[idx] = parseOutcome{symbols: symbols, err: parseErr}
+					if n := parsed.Add(1); n&255 == 0 {
+						prog.progressAsync(fmt.Sprintf("%d/%d changed files parsed", n, len(tasks)))
+					}
 				}
 			}()
 		}
@@ -367,6 +416,8 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 		wg.Wait()
 	}
 	tick("parse-changed")
+	prog.flush(ctx)
+	prog.phase("persisting", fmt.Sprintf("0/%d changed files written", len(tasks)))
 
 	// Phase 3 (serial): persist. SQLite has one writer; ordered writes keep
 	// the run reproducible.
@@ -393,6 +444,9 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 		}
 		changedLanguages[language] = true
 		result.FilesUpdated++
+		if result.FilesUpdated&255 == 0 {
+			prog.progress(fmt.Sprintf("%d/%d changed files written", result.FilesUpdated, len(tasks)))
+		}
 	}
 	// Shield stored files under unreadable subtrees from pruning: their
 	// absence from currentFiles reflects a read failure, not deletion.
@@ -491,8 +545,13 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 		allFiles = append(allFiles, file)
 	}
 	sort.Strings(allFiles)
+	prog.phase("native", "")
 	nativeResult := native.AnalyzeChangedFiles(ctx, root, symbols, i.nativeConfig, scope, changedRel, allFiles)
 	result.Native = append(result.Native, nativeResult.Diagnostics...)
+	// The analyzers ran: their verdict is what this database's native
+	// edges reflect from now on (a no-change re-index returns above and
+	// leaves the stored verdict alone).
+	prog.native(nativeResult.Diagnostics)
 	tick("native-analyzers")
 
 	// Carry forward stored native edges for the skipped analyzers' languages:
@@ -524,6 +583,10 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 	codeGraph := graph.New()
 	var deltaMeta *graph.DeltaMeta
 	nativeResult.Edges = graph.CurrentNativeEdges(symbols, nativeResult.Edges)
+	prog.phase("resolving", fmt.Sprintf("0/%d symbols resolved", len(symbols)))
+	report := func(step string, done, total int) {
+		prog.progress(fmt.Sprintf("%d/%d symbols resolved (%s)", done, total, step))
+	}
 	if incrementalEnabled() && opts.PrevEdges != nil && scope != nil {
 		// Incremental edge construction: recompute only affected owners'
 		// call/test edges (graph.BuildEdgesDelta). Natively re-analyzed
@@ -545,10 +608,19 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 		result.Native = append(result.Native, "edge construction: incremental (GROVE_INCREMENTAL=1)")
 		deltaMeta = meta
 	} else {
-		codeGraph.ReplaceWithEdges(symbols, nativeResult.Edges, result.FilesSeen)
+		codeGraph.ReplaceWithEdgesProgress(symbols, nativeResult.Edges, result.FilesSeen, report)
 	}
 	tick("edge-construction")
+	minConf, err := i.minConfidence(ctx, opts)
+	if err != nil {
+		return nil, result, err
+	}
+	if minConf > 0 {
+		dropped := codeGraph.DropBelowConfidence(minConf)
+		result.Native = append(result.Native, fmt.Sprintf("edge floor: dropped %d edges below confidence %.2f", dropped, minConf))
+	}
 	edges := codeGraph.EdgesSnapshot()
+	prog.phase("writing-edges", fmt.Sprintf("%d edges", len(edges)))
 	if deltaMeta != nil {
 		// Splice write: apply the known write-set instead of diffing the
 		// whole table, then verify with a COUNT(*) invariant. Any mismatch
@@ -567,6 +639,26 @@ func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Option
 	result.SymbolCount = len(symbols)
 	result.EdgeCount = len(edges)
 	return codeGraph, result, nil
+}
+
+// minConfidence resolves the edge floor for this run: the option when set
+// (and persists it), else the stored setting from an earlier run.
+func (i *Indexer) minConfidence(ctx context.Context, opts Options) (float64, error) {
+	if opts.MinConfidenceSet {
+		if opts.MinConfidence < 0 || opts.MinConfidence > 1 {
+			return 0, fmt.Errorf("min confidence %.2f out of range [0,1]", opts.MinConfidence)
+		}
+		return opts.MinConfidence, i.store.SetMeta(ctx, MetaMinConfidence, strconv.FormatFloat(opts.MinConfidence, 'f', -1, 64))
+	}
+	raw, ok, err := i.store.GetMeta(ctx, MetaMinConfidence)
+	if err != nil || !ok || raw == "" {
+		return 0, err
+	}
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return 0, nil // an unreadable setting keeps everything rather than failing the index
+	}
+	return v, nil
 }
 
 // carriedNativeEdges returns the stored native-analyzer edges whose source

@@ -45,7 +45,13 @@ func (g *CodeGraph) Replace(symbols []core.SymbolRecord, filesIndexed int) {
 }
 
 func (g *CodeGraph) ReplaceWithEdges(symbols []core.SymbolRecord, extraEdges []core.Edge, filesIndexed int) {
-	g.install(symbols, mergeEdges(BuildEdges(symbols), extraEdges), filesIndexed)
+	g.ReplaceWithEdgesProgress(symbols, extraEdges, filesIndexed, nil)
+}
+
+// ReplaceWithEdgesProgress is ReplaceWithEdges reporting edge-construction
+// progress through report (nil for none); see ProgressFunc.
+func (g *CodeGraph) ReplaceWithEdgesProgress(symbols []core.SymbolRecord, extraEdges []core.Edge, filesIndexed int, report ProgressFunc) {
+	g.install(symbols, mergeEdges(BuildEdgesWithProgress(symbols, report), extraEdges), filesIndexed)
 }
 
 // ReplaceWithBaseEdges installs a precomputed BASE edge set (a
@@ -200,27 +206,49 @@ func mergeEdges(base, enriched []core.Edge) []core.Edge {
 // "calls" and "uses-type" are scoped to same-file + imported-file symbols
 // per the non-negotiable accuracy rule in the plan.
 func BuildEdges(symbols []core.SymbolRecord) []core.Edge {
+	return BuildEdgesWithProgress(symbols, nil)
+}
+
+// ProgressFunc receives edge-construction progress: the builder step now
+// running and, for the call resolver (the step that takes minutes on a
+// monorepo), how many of total symbols it has resolved so far. Calls are
+// made from the constructing goroutine, at most a few per second.
+type ProgressFunc func(step string, done, total int)
+
+// BuildEdgesWithProgress is BuildEdges reporting through report (nil for
+// none).
+func BuildEdgesWithProgress(symbols []core.SymbolRecord, report ProgressFunc) []core.Edge {
+	if report == nil {
+		report = func(string, int, int) {}
+	}
 	tick := edgeTimer()
+	report("edge-index", 0, len(symbols))
 	idx := newEdgeIndex(symbols)
 	tick("edge-index")
 
 	edges := make([]core.Edge, 0, len(symbols)*4)
+	report("defines+imports", 0, len(symbols))
 	edges = append(edges, buildDefinesAndImports(symbols)...)
 	tick("defines+imports")
+	report("contains", 0, len(symbols))
 	edges = append(edges, buildContains(idx, symbols)...)
 	tick("contains")
+	report("extends+implements", 0, len(symbols))
 	inheritanceEdges := buildExtendsImplements(idx, symbols)
 	edges = append(edges, inheritanceEdges...)
 	edges = append(edges, buildJavaOverrideEdges(idx, symbols, inheritanceEdges)...)
 	tick("extends+implements")
+	report("uses-type", 0, len(symbols))
 	edges = append(edges, buildUsesType(idx, symbols)...)
 	tick("uses-type")
+	report("interface-satisfaction", 0, len(symbols))
 	sat, satEdges := buildInterfaceSatisfaction(idx, symbols)
 	edges = append(edges, satEdges...)
 	tick("interface-satisfaction")
-	callEdges := buildCalls(idx, symbols, sat)
+	callEdges := buildCalls(idx, symbols, sat, report)
 	edges = append(edges, callEdges...)
 	tick("calls")
+	report("post-call builders", len(symbols), len(symbols))
 	edges = append(edges, buildMainframeDataEdges(idx, symbols)...)
 	tick("mainframe-data")
 	edges = append(edges, buildFrameworkEdges(idx, symbols)...)
@@ -251,6 +279,33 @@ func (g *CodeGraph) EdgesSnapshot() []core.Edge {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	return append([]core.Edge(nil), g.edges...)
+}
+
+// DropBelowConfidence removes every edge whose confidence is below min and
+// rebuilds the adjacency indexes. Returns the number dropped. The stored
+// edge set is written from EdgesSnapshot afterwards, so store and graph
+// stay set-equal.
+func (g *CodeGraph) DropBelowConfidence(min float64) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	kept := g.edges[:0]
+	for _, e := range g.edges {
+		if e.Confidence >= min {
+			kept = append(kept, e)
+		}
+	}
+	dropped := len(g.edges) - len(kept)
+	if dropped == 0 {
+		return 0
+	}
+	g.edges = kept
+	g.inbound = make(map[string][]int, len(g.edges))
+	g.outbound = make(map[string][]int, len(g.edges))
+	for i := range g.edges {
+		g.inbound[g.edges[i].To] = append(g.inbound[g.edges[i].To], i)
+		g.outbound[g.edges[i].From] = append(g.outbound[g.edges[i].From], i)
+	}
+	return dropped
 }
 
 // BaselineRef returns the live symbol and edge slices WITHOUT copying, for

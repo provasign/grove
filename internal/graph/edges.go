@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/provasign/grove/internal/core"
 	"sort"
@@ -1984,10 +1985,11 @@ func hasAnnotation(symbol *core.SymbolRecord, wanted string) bool {
 // idx/sat are read-only here), so symbols resolve in parallel; results
 // concatenate in symbol order, keeping output byte-identical to the previous
 // sequential build.
-func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatisfaction) []core.Edge {
+func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatisfaction, report ProgressFunc) []core.Edge {
 	// Pre-warm the importedFiles memo for every file serially: it is the
 	// only lazily-written edgeIndex state, and warming it here makes the
 	// index strictly read-only for the parallel workers below.
+	report("calls: import scope", 0, len(symbols))
 	for f := range idx.byFile {
 		idx.importedFiles(f)
 	}
@@ -1998,20 +2000,31 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 	}
 	taskCh := make(chan int)
 	var wg sync.WaitGroup
+	var resolved atomic.Int64
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for i := range taskCh {
 				results[i] = resolveCallEdges(idx, symbols[i], sat)
+				resolved.Add(1)
 			}
 		}()
 	}
+	// Progress from the feeder: the count of resolved symbols is the
+	// monotonic counter a supervisor can watch through the minutes this
+	// phase takes on a monorepo. Reported every 512 dispatches and when
+	// the workers drain.
+	report("calls", 0, len(symbols))
 	for i := range symbols {
 		taskCh <- i
+		if i&511 == 511 {
+			report("calls", int(resolved.Load()), len(symbols))
+		}
 	}
 	close(taskCh)
 	wg.Wait()
+	report("calls", len(symbols), len(symbols))
 	var edges []core.Edge
 	for _, r := range results {
 		edges = append(edges, r...)

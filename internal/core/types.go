@@ -119,7 +119,35 @@ type Status struct {
 	EdgeCount    int `json:"edgeCount"`
 	SkippedFiles int `json:"skippedFiles,omitempty"`
 	UpdatedFiles int `json:"updatedFiles,omitempty"`
+	// Phase is the running or last index run's phase: walking, parsing,
+	// persisting, native, resolving, writing-edges, complete, or failed.
+	// The three counts above only move while files are being persisted;
+	// during resolving they freeze for minutes on a monorepo, so Phase and
+	// Progress are what tell a supervisor "busy" from "wedged".
+	Phase string `json:"phase,omitempty"`
+	// Progress is a monotonic counter within the phase ("12000/353362
+	// symbols resolved"), refreshed at least every second while it moves.
+	Progress string `json:"progress,omitempty"`
+	// IndexStarted / IndexFinished are RFC 3339 timestamps of the current or
+	// last run; IndexFinished is empty while a run is in progress.
+	IndexStarted  string `json:"indexStarted,omitempty"`
+	IndexFinished string `json:"indexFinished,omitempty"`
+	// Native is the per-analyzer verdict of the run that produced the stored
+	// edges — "csharp: skipped: no .csproj file", "go: resolved 1 native
+	// call edge(s)" — so a consumer reading the database later knows which
+	// tier built it. A no-change re-index leaves the previous verdict.
+	Native []string `json:"native,omitempty"`
 }
+
+// Index meta keys the store persists so `grove status` can report a running
+// or finished index run.
+const (
+	MetaIndexPhase    = "index-phase"
+	MetaIndexProgress = "index-progress"
+	MetaIndexStarted  = "index-started"
+	MetaIndexFinished = "index-finished"
+	MetaIndexNative   = "index-native"
+)
 
 type IndexResult struct {
 	Root         string   `json:"root"`

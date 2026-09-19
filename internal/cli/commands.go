@@ -590,6 +590,15 @@ func parseNativeIndexArgs(args []string) (string, native.Config, index.Options, 
 		switch {
 		case arg == "--force":
 			opts.Force = true
+		case arg == "--vacuum":
+			opts.Vacuum = true
+		case strings.HasPrefix(arg, "--min-confidence="):
+			value := strings.TrimPrefix(arg, "--min-confidence=")
+			f, err := strconv.ParseFloat(value, 64)
+			if err != nil || f < 0 || f > 1 {
+				return "", cfg, opts, fmt.Errorf("invalid --min-confidence: %s (want 0..1)", value)
+			}
+			opts.MinConfidence, opts.MinConfidenceSet = f, true
 		case arg == "--no-native":
 			cfg.Enabled = false
 		case strings.HasPrefix(arg, "--native="):
@@ -730,7 +739,9 @@ func usage() {
 Usage:
   grove version
   grove init [dir]
-  grove index [dir] [--force] [--no-native] [--native=false] [--native-languages=go,rust] [--native-disabled-languages=python] [--native-timeout=5s]
+  grove index [dir] [--force] [--vacuum] [--min-confidence=0.6] [--no-native] [--native=false] [--native-languages=go,rust] [--native-disabled-languages=python] [--native-timeout=5s]
+      --vacuum           compact the database after writing (rewrites the file; needs that much free disk)
+      --min-confidence   drop edges below this confidence and persist the floor for later runs (0 resets)
   grove status [dir] [--refresh]
   grove doctor [dir]
   grove symbols <query> [dir] [--refresh]        lexical substring search over names/paths/signatures

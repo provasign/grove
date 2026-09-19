@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -266,7 +267,7 @@ func TestQuickStatusMatchesEngineStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if quick != full {
+	if !reflect.DeepEqual(quick, full) {
 		t.Fatalf("QuickStatus = %+v, Engine.Status = %+v", quick, full)
 	}
 	if quick.SymbolCount == 0 || quick.EdgeCount == 0 {
