@@ -37,6 +37,88 @@ var (
 	rustBuilderChainRe = regexp.MustCompile(`(?ms)\blet\s+(?:mut\s+)?([a-z_]\w*)\s*=\s*(?:[A-Za-z_]\w*::)*([A-Z]\w*?)Builder::(?:new|default)\b[^;]*?\.build\(`)
 )
 
+var (
+	// for x in NAME / for x in &NAME / for x in NAME.iter() — NAME a
+	// SCREAMING_CASE const or static.
+	rustForConstRe = regexp.MustCompile(`\bfor\s+(?:mut\s+)?([a-z_]\w*)\s+in\s+&?([A-Z][A-Z0-9_]+)\b`)
+	// Enum::Variant(ref mut x) / Self::Variant(x) — a single-binding
+	// tuple-variant pattern.
+	rustVariantPatternRe = regexp.MustCompile(`\b([A-Z]\w*)::([A-Z]\w*)\(\s*(?:ref\s+)?(?:mut\s+)?([a-z_]\w*)\s*\)`)
+)
+
+// rustConstElementType returns the element type of a const/static slice or
+// Vec item (`const FLAGS: &[&dyn Flag]` → Flag), or "".
+func rustConstElementType(idx *edgeIndex, name string) string {
+	for _, cand := range namedSymbols(idx, name) {
+		if cand.Kind != core.KindVariable || cand.Language != "rust" {
+			continue
+		}
+		sig := cand.Signature
+		colon := strings.IndexByte(sig, ':')
+		if colon < 0 {
+			continue
+		}
+		typ := sig[colon+1:]
+		if eq := strings.IndexByte(typ, '='); eq >= 0 {
+			typ = typ[:eq]
+		}
+		typ = strings.TrimSpace(typ)
+		for strings.HasPrefix(typ, "&") || strings.HasPrefix(typ, "'") || strings.HasPrefix(typ, "mut ") {
+			typ = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(typ, "&"), "mut "))
+			if strings.HasPrefix(typ, "'") {
+				if i := strings.IndexAny(typ, " \t"); i >= 0 {
+					typ = strings.TrimSpace(typ[i+1:])
+				} else {
+					return ""
+				}
+			}
+		}
+		inner := ""
+		switch {
+		case strings.HasPrefix(typ, "[") && strings.HasSuffix(typ, "]"):
+			inner = typ[1 : len(typ)-1]
+			if i := strings.LastIndexByte(inner, ';'); i >= 0 {
+				inner = inner[:i] // [T; N]
+			}
+		case strings.HasPrefix(typ, "Vec<") && strings.HasSuffix(typ, ">"):
+			inner = typ[4 : len(typ)-1]
+		default:
+			continue
+		}
+		if elem := rustBareType(inner); elem != "" {
+			return elem
+		}
+	}
+	return ""
+}
+
+// rustEnumVariantType returns the bare payload type of a single-field tuple
+// variant (`Standard(grep::printer::Standard<W>)` → Standard), or "".
+func rustEnumVariantType(idx *edgeIndex, enumName, variant, preferFile string) string {
+	if enumName == "" {
+		return ""
+	}
+	var decl *core.SymbolRecord
+	for _, cand := range namedSymbols(idx, enumName) {
+		if cand.Kind != core.KindEnum || cand.Language != "rust" {
+			continue
+		}
+		if decl == nil || cand.FilePath == preferFile {
+			decl = cand
+		}
+	}
+	if decl == nil {
+		return ""
+	}
+	body := stripCommentsAndStrings(decl.RawText)
+	re := regexp.MustCompile(`\b` + regexp.QuoteMeta(variant) + `\s*\(([^()]*)\)`)
+	m := re.FindStringSubmatch(body)
+	if m == nil || strings.ContainsRune(m[1], ',') {
+		return ""
+	}
+	return rustBareType(m[1])
+}
+
 // rustPrimitives are lowercase tokens that look like types but can never
 // resolve to an indexed declaration's methods.
 var rustPrimitives = map[string]bool{
@@ -109,6 +191,28 @@ func rustLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string
 				if typ := rustBareType(g[colon+1:]); typ != "" {
 					lets[name] = typ
 				}
+			}
+		}
+	}
+	if symbol.RawText != "" {
+		body := stripCommentsAndStrings(symbol.RawText)
+		// `for flag in FLAGS.iter()` over a const/static slice: the element
+		// type is the declared item type's (`&[&dyn Flag]` → Flag), and a
+		// trait element dispatches through the trait's declarations.
+		for _, m := range rustForConstRe.FindAllStringSubmatch(body, -1) {
+			if typ := rustConstElementType(idx, m[2]); typ != "" {
+				lets[m[1]] = typ
+			}
+		}
+		// `Printer::Standard(ref mut p) => p.sink_with_path(..)`: an
+		// enum-variant pattern binds the variant's payload type.
+		for _, m := range rustVariantPatternRe.FindAllStringSubmatch(body, -1) {
+			enumName := m[1]
+			if enumName == "Self" {
+				enumName = symbol.ParentSymbol
+			}
+			if typ := rustEnumVariantType(idx, enumName, m[2], symbol.FilePath); typ != "" {
+				lets[m[3]] = typ
 			}
 		}
 	}
@@ -349,12 +453,15 @@ func rustFieldTypes(idx *edgeIndex, typeName, preferFile string) map[string]stri
 		if cand.Kind != core.KindField || cand.ParentSymbol != typeName {
 			continue
 		}
-		// Field signature: "pub mode: Mode," / "haystack: PathBuf,"
+		// Field signature: "pub mode: Mode," / "haystack: PathBuf," — or,
+		// for a tuple struct's positional field (`struct Override(Gitignore)`,
+		// reached as `self.0`), the bare type alone.
 		sig := cand.Signature
 		if i := strings.IndexByte(sig, ':'); i >= 0 {
-			if typ := rustBareType(sig[i+1:]); typ != "" {
-				out[cand.Name] = typ
-			}
+			sig = sig[i+1:]
+		}
+		if typ := rustBareType(sig); typ != "" {
+			out[cand.Name] = typ
 		}
 	}
 	return out

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -84,7 +85,7 @@ func PHPCallTruth(repoRoot string) (TruthFile, []TruthEdge, error) {
 		return TruthFile{}, nil, fmt.Errorf("no trace produced (xdebug enabled? phpunit said:\n%s, runErr=%v)", tailBytes(out), runErr)
 	}
 
-	edges, err := parsePHPTrace(tracePath, refl)
+	edges, err := parsePHPTrace(tracePath, refl, root)
 	if err != nil {
 		return TruthFile{}, nil, err
 	}
@@ -118,10 +119,17 @@ func loadPHPRefl(path string) (map[string]phpReflEntry, error) {
 
 // parsePHPTrace reconstructs caller→callee edges from an Xdebug format-1
 // trace. Each entry record (type field "0") names the called function and
-// its stack level; the caller is the nearest enclosing non-closure frame, so
-// in-repo closures attribute to the function that defines them (as Grove
-// does) while internal higher-order frames terminate attribution.
-func parsePHPTrace(path string, refl map[string]phpReflEntry) ([]TruthEdge, error) {
+// its stack level. A closure frame is attributed lexically — to the
+// function whose body defines it, which is what Grove records — using the
+// `{closure:/abs/file.php:START-END}` name Xdebug 3 gives it: the
+// in-repo function declared nearest above START in that file. php-parser's
+// reduce callbacks are defined in Php8::initReduceCallbacks and run from
+// ParserAbstract::doParse; the call to `new Node\Stmt\Class_` inside one is
+// initReduceCallbacks's. A closure the map cannot place (vendor code, a
+// file outside the repo) is transparent: the nearest enclosing non-closure
+// frame is the caller, so internal higher-order frames terminate
+// attribution as before.
+func parsePHPTrace(path string, refl map[string]phpReflEntry, root string) ([]TruthEdge, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -130,6 +138,7 @@ func parsePHPTrace(path string, refl map[string]phpReflEntry) ([]TruthEdge, erro
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 256*1024), 4*1024*1024)
 
+	definer := phpClosureDefiners(refl, root)
 	stack := make([]string, 0, 256) // index = level; value = function name
 	seen := map[[2]string]bool{}
 	var edges []TruthEdge
@@ -150,6 +159,12 @@ func parsePHPTrace(path string, refl map[string]phpReflEntry) ([]TruthEdge, erro
 			continue
 		}
 		fn := fields[5]
+		closureFrame := phpIsClosure(fn)
+		if closureFrame {
+			if host := definer(fn); host != "" {
+				fn = host
+			}
+		}
 		// Grow/seat the stack at this level.
 		for len(stack) <= level {
 			stack = append(stack, "")
@@ -157,6 +172,9 @@ func parsePHPTrace(path string, refl map[string]phpReflEntry) ([]TruthEdge, erro
 		stack[level] = fn
 		for i := level + 1; i < len(stack); i++ {
 			stack[i] = ""
+		}
+		if closureFrame {
+			continue // entering a closure is not a call to its definer
 		}
 
 		callee, ok := refl[fn]
@@ -208,6 +226,52 @@ func parsePHPTrace(path string, refl map[string]phpReflEntry) ([]TruthEdge, erro
 
 func phpIsClosure(name string) bool {
 	return strings.Contains(name, "{closure")
+}
+
+// phpClosureNameRe captures the defining file and start line Xdebug 3
+// embeds in a closure frame's name: `P->{closure:/abs/t.php:5-5}`.
+var phpClosureNameRe = regexp.MustCompile(`\{closure:(.+?):(\d+)-\d+\}`)
+
+// phpClosureDefiners returns a resolver from a closure frame name to the
+// reflection key of the in-repo function or method whose body defines it
+// (the declaration nearest above the closure's start line in that file),
+// or "" when the closure is defined outside the mapped repo.
+func phpClosureDefiners(refl map[string]phpReflEntry, root string) func(string) string {
+	type decl struct {
+		line int
+		key  string
+	}
+	byFile := map[string][]decl{}
+	for key, e := range refl {
+		byFile[e.File] = append(byFile[e.File], decl{e.Line, key})
+	}
+	for f := range byFile {
+		sort.Slice(byFile[f], func(i, j int) bool { return byFile[f][i].line < byFile[f][j].line })
+	}
+	realRoot := root
+	if r, err := filepath.EvalSymlinks(root); err == nil {
+		realRoot = r
+	}
+	return func(name string) string {
+		m := phpClosureNameRe.FindStringSubmatch(name)
+		if m == nil {
+			return ""
+		}
+		file := m[1]
+		for _, base := range []string{realRoot, root} {
+			if rel, err := filepath.Rel(base, file); err == nil && !strings.HasPrefix(rel, "..") {
+				file = filepath.ToSlash(rel)
+				break
+			}
+		}
+		line, _ := strconv.Atoi(m[2])
+		decls := byFile[file]
+		i := sort.Search(len(decls), func(i int) bool { return decls[i].line > line })
+		if i == 0 {
+			return ""
+		}
+		return decls[i-1].key
+	}
 }
 
 // phptruthBoot locates the auto-prepend bootstrap shipped with the harness.

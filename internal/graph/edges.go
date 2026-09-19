@@ -2894,6 +2894,20 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				continue
 			}
 			if symbol.Language == "rust" && qualifier == "" && len(cands) > 0 {
+				// A bare `stats(&low)` names a free function: Rust has no
+				// implicit self, so a method needs `self.stats()` and an
+				// associated function `Self::stats()`. Inside `impl HiArgs`
+				// the same-module preference used to pick the method
+				// `HiArgs::stats` over the free `fn stats` it shadows.
+				var functions []*core.SymbolRecord
+				for _, cand := range cands {
+					if cand.Kind == core.KindFunction || cand.Kind == core.KindMethod && cand.ParentSymbol == "" {
+						functions = append(functions, cand)
+					}
+				}
+				if len(functions) > 0 {
+					cands = functions
+				}
 				cands = rustPinBareImport(idx, &symbol, calleeName, cands)
 				if symbol.ParentSymbol != "" {
 					if sameModule := filterByParent(cands, symbol.ParentSymbol); len(sameModule) > 0 {

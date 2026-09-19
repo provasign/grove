@@ -172,6 +172,16 @@ attribute to the enclosing declaration.
 | socket.io (`3ad4e1f2`, TS monorepo) | 98.7% | 0.8407 | 0.9406 | 0.8878 |
 | express (`dae209ae`, CommonJS) | 90.3% | 0.7500 | 0.7143 | 0.7317 |
 
+Current (2026-09-19): socket.io P 0.9029 / R 0.9917, express P 0.8400 /
+R 1.0000. The socket.io step that crossed 0.9 precision: inherited-member
+lookup resolves a base class name through the subclass file's imports, so
+`this.onError()` in engine.io-client's Fetch transport binds the client's
+`Transport`, not the server package's same-named class (26 of 81 false
+edges were cross-package twins). Express's four remaining false edges are
+`this.send(...)` / `this.json(...)` inside `res.json = function json()`
+assignments — real calls the checker cannot type through an untyped
+`this`, an oracle floor on a 21-edge corpus.
+
 The TS ceiling round (same playbook as Python) added: typed-class-field
 local types (field symbols already carry "public transport: Transport"
 signatures; plain `this.x = param` ctor assignments inherit the param's
@@ -315,11 +325,20 @@ Day-one findings, all fixed same day:
    caller's body actually mentions (word-boundary exact — `Searcher` must
    not claim a body that only names `SearcherTester`).
 
-Residual gap: untyped flow the annotation surface can't see — match/loop
-bindings, iterator element types, `dyn Trait` lookups through collections
-(`flag.update()` via ripgrep's flag registry), and `?`-chained results.
-The same registry-dispatch territory as Python's ceiling, to revisit with
-measured variants rather than hope.
+Current (2026-09-19): P 0.9364 / R 0.9047 (from 0.9304 / 0.8947). The
+step: a bare `stats(&low)` names a free function, never a method (Rust has
+no implicit self; inside `impl HiArgs` the same-module preference had
+picked `HiArgs::stats`); `for flag in FLAGS.iter()` types `flag` from the
+const's declared `&[&dyn Flag]` (astkit now emits const/static items, and
+a trait element dispatches through the trait's declaration, which is what
+rust-analyzer records); `Printer::Standard(ref mut p)` binds `p` to the
+variant's payload type; `self.0` types as a tuple struct's field.
+
+Residual gap: untyped flow the annotation surface can't see — iterator
+element types (`for m in matches.iter()` over a `Vec<Match>` field),
+closure parameters (`sort_by(|h1, h2| h1.path()...)`), and `?`-chained
+results. The same registry-dispatch territory as Python's ceiling, to
+revisit with measured variants rather than hope.
 
 ## C# (Roslyn semantic-model oracle)
 
@@ -449,10 +468,32 @@ Findings:
    untested rules' closures are real call edges absent from the trace, so
    they score as false positives.
 
-## C / C++ (scip-clang SCIP oracle)
+## C / C++ (clang AST oracle; scip-clang retained for C++)
 
-`grove-eval truth --lang cfamily` runs scip-clang over the project's
-`compile_commands.json` (cmake generates it) and reads the SCIP index.
+`grove-eval truth --lang clang` (C, since 2026-09-19) parses every
+translation unit in the project's `compile_commands.json` with `clang
+-fsyntax-only -Xclang -ast-dump=json` — the entry's own defines and include
+paths, so headers resolve as the real build resolves them — and reads the
+typed AST: a `DeclRefExpr` to a `FunctionDecl` inside a function body is a
+call (or a function passed by pointer, the same "may affect" altitude
+scip-clang recorded), a `static` function binds within its own translation
+unit only, a `static inline` definition in an in-repo header is a callee,
+and a header the build system copied verbatim into `build/` maps back to
+the source file Grove indexes. This is the Objective-C oracle's walker; see
+that section for the location-sparse JSON handling.
+
+It replaced scip-clang for jansson because scip-clang's index carries no
+occurrence at all for some plain in-repo calls — `do_dump` calls
+`json_array_size` at dump.c:275 and `json_array_get` at :287, and the
+SCIP index has neither, while the same function's `hashtable_del` call is
+present. Every correct Grove edge to such a callee scored as a false
+positive (75 of jansson's 124 false edges pointed into value.c). Against
+the clang AST the same Grove build scores P 0.9991 / R 0.9247.
+
+`grove-eval truth --lang cfamily` still runs scip-clang over the project's
+`compile_commands.json` (cmake generates it) and reads the SCIP index —
+kept for C++, which the clang-AST walker does not yet model (methods,
+templates, overloads).
 scip-clang type-checks every translation unit, so each reference is a
 resolved use. Unlike rust-analyzer it emits neither enclosing ranges nor
 symbol kinds, so a function/method is recognized from its SCIP descriptor
@@ -474,7 +515,14 @@ Pin: jansson (zero-dependency C, CMake — `cmake -B build
 |---|---|---|---|---|
 | jansson (`684e18c`) | 97.2% | 0.8793 | 0.5642 | 0.6874 |
 
-Day-one progression (0.3911 → 0.6874), each step measured:
+Current (2026-09-19, clang-AST truth): jansson 97.7% / P 0.9991 / R 0.9247.
+The pinned `eval/testdata/jansson@684e18c/calls-truth.jsonl.gz` is now the
+clang-AST snapshot (generator `clang-ast`). The one false edge is a
+`static` test-file function (`position`) a same-named call in error.c
+resolves to; the misses are macro expansions (`json_object_foreach`, the
+`run_tests` entry point macro) — Grove has no symbol for a macro.
+
+Day-one progression (0.3911 → 0.6874, scip-clang truth), each step measured:
 
 | Fix | F1 |
 |---|---|
@@ -711,3 +759,15 @@ the sweep.
   with `ForceIndex`, which re-extracts and rebuilds every edge unconditionally.
 - (done 2026-09-19) Objective-C truth oracle — `clang -ast-dump=json`
   turned out to be enough; no libclang bindings needed
+- php-parser: regenerate the pinned Xdebug snapshot with the lexical closure
+  attribution now in `truth_php.go` (needs `composer install` in the
+  corpus). 295 of its 443 false edges are reduce-callback bodies the old
+  snapshot attributes to `doParse` (the invoker) where Grove and the new
+  oracle attribute them to `initReduceCallbacks` (the definer); 148 misses
+  are the same edges from the other side. Its recall floor after that is
+  dynamic-name dispatch (`$this->{'p' . $type}($node)` in the pretty
+  printer, reflection in NodeDumper) — 726 of 1460 misses.
+- flask: the misses are werkzeug proxy/descriptor access (`AppContext.request`
+  through a LocalProxy, `ConfigAttribute.__get__`, `with` → `__enter__`/
+  `__exit__`); `with`-statement context managers are the one modelable
+  bucket

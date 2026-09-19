@@ -110,6 +110,9 @@ func cmdTruth(args []string) error {
 	case "objc":
 		header, edges, err = eval.ObjCCallTruth(*repo)
 		header.Commit = *commit
+	case "clang":
+		header, edges, err = eval.CClangCallTruth(*repo)
+		header.Commit = *commit
 	default:
 		header, edges, err = generateTruth(*repo, *commit, *includeTests)
 	}

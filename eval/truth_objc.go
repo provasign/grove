@@ -30,72 +30,125 @@ import (
 // ObjCCallTruth parses every non-test .m file and derives caller→callee
 // edges between in-repo implementations.
 func ObjCCallTruth(repoRoot string) (TruthFile, []TruthEdge, error) {
+	return ClangCallTruth(repoRoot, []string{".m"})
+}
+
+// CClangCallTruth is the clang-AST oracle over .c (and .m) translation
+// units: the same walk as Objective-C, where a C call is a CallExpr to a
+// FunctionDecl. It exists beside the scip-clang oracle because scip-clang
+// omits some plain in-repo call references (jansson's do_dump calls
+// json_array_size at dump.c:275 and the SCIP index carries no occurrence
+// for it, while the same file's hashtable_del call is recorded) — a
+// missing truth edge that scores every correct Grove edge to that callee
+// as a false positive.
+func CClangCallTruth(repoRoot string) (TruthFile, []TruthEdge, error) {
+	return ClangCallTruth(repoRoot, []string{".c", ".m"})
+}
+
+// clangTU is one translation unit to parse: its repo-relative source, the
+// directory to run clang in, and the compiler arguments before the
+// oracle's own.
+type clangTU struct {
+	file string
+	dir  string
+	args []string
+}
+
+// ClangCallTruth parses every translation unit with the given extensions —
+// from build/compile_commands.json (or ./compile_commands.json) when the
+// repo has one, so defines and include paths match the real build, else
+// each non-test source with every header directory on the include path —
+// and derives caller→callee edges between in-repo implementations.
+func ClangCallTruth(repoRoot string, exts []string) (TruthFile, []TruthEdge, error) {
 	root, err := filepath.Abs(repoRoot)
 	if err != nil {
 		return TruthFile{}, nil, err
 	}
-	var sources []string
-	includeDirs := map[string]bool{}
-	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil
+	hasExt := func(path string) bool {
+		for _, ext := range exts {
+			if strings.HasSuffix(path, ext) {
+				return true
+			}
 		}
-		rel, _ := filepath.Rel(root, path)
-		if d.IsDir() {
-			if rel != "." && (strings.HasPrefix(d.Name(), ".") || objcSkipDir(d.Name())) {
-				return filepath.SkipDir
+		return false
+	}
+	var units []clangTU
+	for _, compdb := range []string{filepath.Join(root, "build", "compile_commands.json"), filepath.Join(root, "compile_commands.json")} {
+		if raw, err := os.ReadFile(compdb); err == nil {
+			units = clangUnitsFromCompDB(raw, root, hasExt)
+			break
+		}
+	}
+	if len(units) == 0 {
+		var sources []string
+		includeDirs := map[string]bool{}
+		_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			rel, _ := filepath.Rel(root, path)
+			if d.IsDir() {
+				if rel != "." && (strings.HasPrefix(d.Name(), ".") || objcSkipDir(d.Name())) {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			switch {
+			case hasExt(path):
+				if filepath.Base(path) != "main.m" {
+					sources = append(sources, filepath.ToSlash(rel))
+				}
+			case strings.HasSuffix(path, ".h"):
+				includeDirs[filepath.Dir(rel)] = true
 			}
 			return nil
+		})
+		sort.Strings(sources)
+		var incArgs []string
+		for dir := range includeDirs {
+			incArgs = append(incArgs, "-I"+dir)
 		}
-		switch {
-		case strings.HasSuffix(path, ".m"):
-			if filepath.Base(path) != "main.m" {
-				sources = append(sources, filepath.ToSlash(rel))
+		sort.Strings(incArgs)
+		for _, src := range sources {
+			args := append([]string{"-fmodules"}, incArgs...)
+			if strings.HasSuffix(src, ".m") || strings.HasSuffix(src, ".mm") {
+				args = append(args, "-fobjc-arc")
 			}
-		case strings.HasSuffix(path, ".h"):
-			includeDirs[filepath.Dir(rel)] = true
+			units = append(units, clangTU{file: src, dir: root, args: args})
 		}
-		return nil
-	})
-	if len(sources) == 0 {
-		return TruthFile{}, nil, fmt.Errorf("no .m sources under %s", root)
 	}
-	sort.Strings(sources)
-	var incArgs []string
-	for dir := range includeDirs {
-		incArgs = append(incArgs, "-I"+dir)
+	if len(units) == 0 {
+		return TruthFile{}, nil, fmt.Errorf("no %s sources under %s", strings.Join(exts, "/"), root)
 	}
-	sort.Strings(incArgs)
 
 	sdk := ""
 	if out, err := exec.Command("xcrun", "--show-sdk-path").Output(); err == nil {
 		sdk = strings.TrimSpace(string(out))
 	}
 
-	tus := make([]*objcTU, 0, len(sources))
-	for _, src := range sources {
-		args := []string{"-fsyntax-only", "-fmodules", "-fobjc-arc", "-Wno-everything", "-Xclang", "-ast-dump=json"}
-		if sdk != "" {
+	tus := make([]*objcTU, 0, len(units))
+	for _, unit := range units {
+		args := append([]string{"-fsyntax-only", "-Wno-everything", "-Xclang", "-ast-dump=json"}, unit.args...)
+		if sdk != "" && !containsArg(unit.args, "-isysroot") {
 			args = append(args, "-isysroot", sdk)
 		}
-		args = append(args, incArgs...)
-		args = append(args, src)
+		args = append(args, filepath.Join(root, unit.file))
 		cmd := exec.Command("clang", args...)
-		cmd.Dir = root
+		cmd.Dir = unit.dir
 		out, err := cmd.Output()
 		if err != nil {
-			continue // a file that does not compile in isolation has no truth
+			continue // a file that does not compile has no truth
 		}
 		var rootNode objcNode
 		if err := json.Unmarshal(out, &rootNode); err != nil {
 			continue
 		}
-		tu := &objcTU{file: src, supers: map[string]string{}}
+		tu := &objcTU{file: unit.file, root: root, supers: map[string]string{}}
 		tu.walk(&rootNode, &objcLoc{}, "", "", false)
 		tus = append(tus, tu)
 	}
 	if len(tus) == 0 {
-		return TruthFile{}, nil, fmt.Errorf("clang could not parse any of %d .m files (is Xcode or the Command Line Tools installed?)", len(sources))
+		return TruthFile{}, nil, fmt.Errorf("clang could not parse any of %d translation units (is Xcode or the Command Line Tools installed?)", len(units))
 	}
 
 	// Implementations across all translation units, keyed as clang names
@@ -103,8 +156,16 @@ func ObjCCallTruth(repoRoot string) (TruthFile, []TruthEdge, error) {
 	// C functions. The class hierarchy is the union of every TU's view.
 	impls := map[string]FuncRef{}
 	supers := map[string]string{}
+	remap := clangBuildCopyRemap(root)
 	for _, tu := range tus {
 		for key, ref := range tu.impls {
+			if src, ok := remap[ref.File]; ok {
+				ref.File = src
+				tu.impls[key] = ref
+			}
+			if tu.statics[key] {
+				continue // reachable only within its own translation unit
+			}
 			impls[key] = ref
 		}
 		for cls, super := range tu.supers {
@@ -132,10 +193,18 @@ func ObjCCallTruth(repoRoot string) (TruthFile, []TruthEdge, error) {
 	var edges []TruthEdge
 	for _, tu := range tus {
 		for _, call := range tu.calls {
+			if src, ok := remap[call.caller.File]; ok {
+				call.caller.File = src
+			}
 			var callee FuncRef
 			var ok bool
 			if call.function != "" {
-				callee, ok = impls[call.function]
+				// A `static` function is file-local: the translation
+				// unit's own definition (every test suite has a
+				// run_tests) wins over a same-named one elsewhere.
+				if callee, ok = tu.impls[call.function]; !ok {
+					callee, ok = impls[call.function]
+				}
 			} else {
 				callee, ok = resolveMethod(call.class, call.selector, call.instance)
 			}
@@ -175,6 +244,107 @@ func ObjCCallTruth(repoRoot string) (TruthFile, []TruthEdge, error) {
 	return header, edges, nil
 }
 
+// clangUnitsFromCompDB reads a JSON compilation database into translation
+// units whose source matches hasExt: the entry's own arguments minus the
+// output and compile flags (`-o x`, `-c`), run from the entry's directory.
+func clangUnitsFromCompDB(raw []byte, root string, hasExt func(string) bool) []clangTU {
+	var entries []struct {
+		Directory string   `json:"directory"`
+		File      string   `json:"file"`
+		Command   string   `json:"command"`
+		Arguments []string `json:"arguments"`
+	}
+	if err := json.Unmarshal(raw, &entries); err != nil {
+		return nil
+	}
+	var units []clangTU
+	seen := map[string]bool{}
+	for _, e := range entries {
+		file := e.File
+		if !filepath.IsAbs(file) {
+			file = filepath.Join(e.Directory, file)
+		}
+		rel, err := filepath.Rel(root, file)
+		if err != nil || strings.HasPrefix(rel, "..") || !hasExt(rel) || seen[rel] {
+			continue
+		}
+		seen[rel] = true
+		argv := e.Arguments
+		if len(argv) == 0 {
+			argv = strings.Fields(e.Command)
+		}
+		var args []string
+		for i := 1; i < len(argv); i++ { // argv[0] is the compiler
+			a := argv[i]
+			switch {
+			case a == "-o" || a == "-MF" || a == "-MT" || a == "-MQ":
+				i++
+			case a == "-c" || a == "-MD" || a == "-MMD" || strings.HasPrefix(a, "-o") && len(a) > 2 && !strings.HasPrefix(a, "-objc"):
+			case a == file || a == e.File:
+			default:
+				args = append(args, a)
+			}
+		}
+		units = append(units, clangTU{file: filepath.ToSlash(rel), dir: e.Directory, args: args})
+	}
+	sort.Slice(units, func(i, j int) bool { return units[i].file < units[j].file })
+	return units
+}
+
+// clangBuildCopyRemap maps headers a build system copied verbatim into its
+// build tree (jansson's cmake stages src/jansson.h as build/include/
+// jansson.h, which is what `-Ibuild/include` resolves) back to the source
+// file Grove indexes: same basename, identical bytes, outside build/.
+func clangBuildCopyRemap(root string) map[string]string {
+	byBase := map[string][]string{}
+	var copies []string
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		rel, _ := filepath.Rel(root, path)
+		if d.IsDir() {
+			if rel != "." && strings.HasPrefix(d.Name(), ".") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".h") {
+			return nil
+		}
+		rel = filepath.ToSlash(rel)
+		if strings.HasPrefix(rel, "build/") || strings.Contains(rel, "/build/") {
+			copies = append(copies, rel)
+		} else {
+			byBase[filepath.Base(rel)] = append(byBase[filepath.Base(rel)], rel)
+		}
+		return nil
+	})
+	out := map[string]string{}
+	for _, copy := range copies {
+		want, err := os.ReadFile(filepath.Join(root, copy))
+		if err != nil {
+			continue
+		}
+		for _, src := range byBase[filepath.Base(copy)] {
+			if have, err := os.ReadFile(filepath.Join(root, src)); err == nil && string(have) == string(want) {
+				out[copy] = src
+				break
+			}
+		}
+	}
+	return out
+}
+
+func containsArg(args []string, flag string) bool {
+	for _, a := range args {
+		if a == flag {
+			return true
+		}
+	}
+	return false
+}
+
 func objcSkipDir(name string) bool {
 	switch strings.ToLower(name) {
 	case "test", "tests", "example", "examples", "vendor", "pods", "carthage", "build", "node_modules":
@@ -188,6 +358,7 @@ type objcNode struct {
 	Kind         string     `json:"kind"`
 	Name         string     `json:"name"`
 	MangledName  string     `json:"mangledName"`
+	StorageClass string     `json:"storageClass"`
 	Loc          objcRawLoc `json:"loc"`
 	Range        objcRange  `json:"range"`
 	Instance     *bool      `json:"instance"`
@@ -259,10 +430,12 @@ type objcCall struct {
 }
 
 type objcTU struct {
-	file   string
-	impls  map[string]FuncRef // "-[Class sel]" / "+[Class sel]" / "func"
-	supers map[string]string  // class → superclass
-	calls  []objcCall
+	file    string             // repo-relative source of this translation unit
+	root    string             // absolute repo root
+	impls   map[string]FuncRef // "-[Class sel]" / "+[Class sel]" / "func"
+	statics map[string]bool    // file-local C functions, not callable elsewhere
+	supers  map[string]string  // class → superclass
+	calls   []objcCall
 }
 
 // walk visits nodes in document order, tracking the sparse location, the
@@ -293,7 +466,7 @@ func (tu *objcTU) walk(n *objcNode, loc *objcLoc, implClass string, caller strin
 			implClass = n.Interface.Name
 		}
 	case "ObjCMethodDecl":
-		if implClass != "" && objcHasBody(n) && tu.inFile(at.file) {
+		if file, ok := tu.repoFile(at.file); ok && implClass != "" && objcHasBody(n) {
 			key := n.MangledName
 			if key == "" {
 				prefix := "-"
@@ -305,16 +478,22 @@ func (tu *objcTU) walk(n *objcNode, loc *objcLoc, implClass string, caller strin
 			if tu.impls == nil {
 				tu.impls = map[string]FuncRef{}
 			}
-			tu.impls[key] = FuncRef{File: tu.file, Line: at.line, Name: implClass + "." + n.Name}
+			tu.impls[key] = FuncRef{File: file, Line: at.line, Name: implClass + "." + n.Name}
 			caller, hasCaller = key, true
 			callerRef, callerOK = tu.impls[key], true
 		}
 	case "FunctionDecl":
-		if objcHasBody(n) && tu.inFile(at.file) && n.Name != "" {
+		if file, ok := tu.repoFile(at.file); ok && objcHasBody(n) && n.Name != "" {
 			if tu.impls == nil {
 				tu.impls = map[string]FuncRef{}
 			}
-			tu.impls[n.Name] = FuncRef{File: tu.file, Line: at.line, Name: n.Name}
+			tu.impls[n.Name] = FuncRef{File: file, Line: at.line, Name: n.Name}
+			if n.StorageClass == "static" {
+				if tu.statics == nil {
+					tu.statics = map[string]bool{}
+				}
+				tu.statics[n.Name] = true
+			}
 			caller, hasCaller = n.Name, true
 			callerRef, callerOK = tu.impls[n.Name], true
 		}
@@ -325,11 +504,13 @@ func (tu *objcTU) walk(n *objcNode, loc *objcLoc, implClass string, caller strin
 				tu.calls = append(tu.calls, call)
 			}
 		}
-	case "CallExpr":
-		if callerOK {
-			if fn := objcCalledFunction(n); fn != "" {
-				tu.calls = append(tu.calls, objcCall{caller: callerRef, function: fn})
-			}
+	case "DeclRefExpr":
+		// A reference to a function — the callee of a CallExpr, or a
+		// function passed as an argument (`qsort(.., compare_keys)`),
+		// which the C oracles record at the same "may affect" altitude
+		// as a call, since it is reached through that pointer.
+		if callerOK && n.Referenced != nil && n.Referenced.Kind == "FunctionDecl" && n.Referenced.Name != "" {
+			tu.calls = append(tu.calls, objcCall{caller: callerRef, function: n.Referenced.Name})
 		}
 	}
 	for i := range n.Inner {
@@ -337,11 +518,26 @@ func (tu *objcTU) walk(n *objcNode, loc *objcLoc, implClass string, caller strin
 	}
 }
 
-// inFile reports whether the running location file is this TU's own
-// source (clang prints paths as given on its command line; the walk runs
-// from the repo root with a repo-relative path).
-func (tu *objcTU) inFile(file string) bool {
-	return file != "" && filepath.ToSlash(filepath.Clean(file)) == tu.file
+// repoFile maps the running location file to a repo-relative path when it
+// lies inside the repo — the TU's own source, or an in-repo header
+// carrying a `static inline` definition — and reports false for system
+// and SDK headers. clang prints paths as given: absolute from a
+// compilation database, else relative to the directory it ran in.
+func (tu *objcTU) repoFile(file string) (string, bool) {
+	if file == "" {
+		return "", false
+	}
+	if !filepath.IsAbs(file) {
+		if filepath.ToSlash(filepath.Clean(file)) == tu.file {
+			return tu.file, true
+		}
+		file = filepath.Join(tu.root, file)
+	}
+	rel, err := filepath.Rel(tu.root, file)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return "", false
+	}
+	return filepath.ToSlash(rel), true
 }
 
 func objcHasBody(n *objcNode) bool {

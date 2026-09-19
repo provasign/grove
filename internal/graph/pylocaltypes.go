@@ -834,10 +834,29 @@ func inheritedTargets(idx *edgeIndex, symbol *core.SymbolRecord, calleeName stri
 		return nil
 	}
 	bases := baseClassesFor(idx, symbol.Language, symbol.ParentSymbol, dirOf(symbol.FilePath))
+	// TS/JS: a base class name is resolved through the subclass file's
+	// imports. A monorepo declares `class Transport` in both engine.io and
+	// engine.io-client; `this.onError()` in the client's Fetch transport
+	// inherits the client's Transport, the one its module imports, not
+	// the server's same-named class.
+	resolveFile := tsFamilyLang(symbol.Language)
+	preferFile := symbol.FilePath
 	for level := 0; level < 4 && len(bases) > 0; level++ {
 		var matched []*core.SymbolRecord
+		nextPrefer := ""
 		for _, base := range bases {
-			matched = append(matched, filterByParent(all, base)...)
+			byBase := filterByParent(all, base)
+			if resolveFile && len(byBase) > 0 {
+				if baseFile := tsResolveClassFile(idx, base, preferFile); baseFile != "" {
+					if inFile := filterCandidatesByFile(byBase, baseFile); len(inFile) > 0 {
+						byBase = inFile
+					}
+					if nextPrefer == "" {
+						nextPrefer = baseFile
+					}
+				}
+			}
+			matched = append(matched, byBase...)
 		}
 		if len(matched) > 0 {
 			return matched
@@ -845,8 +864,14 @@ func inheritedTargets(idx *edgeIndex, symbol *core.SymbolRecord, calleeName stri
 		var next []string
 		for _, base := range bases {
 			next = append(next, baseClassesFor(idx, symbol.Language, base, dirOf(symbol.FilePath))...)
+			if resolveFile && nextPrefer == "" {
+				nextPrefer = tsResolveClassFile(idx, base, preferFile)
+			}
 		}
 		bases = next
+		if nextPrefer != "" {
+			preferFile = nextPrefer
+		}
 	}
 	return nil
 }
