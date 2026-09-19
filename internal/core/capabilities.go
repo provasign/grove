@@ -48,6 +48,9 @@ func CurrentCapabilities() CapabilityManifest {
 			{Language: "cpp", Indexing: "precise", Resolution: "measured", Limitations: "templates, overloads, and macros can degrade resolution"},
 			{Language: "csharp", Indexing: "precise", Resolution: "measured", Limitations: "native analysis is structural without Roslyn-backed resolution"},
 			{Language: "php", Indexing: "precise", Resolution: "measured", Limitations: "namespace and Composer scope are not complete"},
+			{Language: "swift", Indexing: "precise", Resolution: "structural", Limitations: "protocol extensions declared in other files, dynamic/@objc dispatch, and property-wrapper-driven access remain unresolved; not yet measured against a compiler oracle"},
+			{Language: "kotlin", Indexing: "precise", Resolution: "structural", Limitations: "extension functions declared in other files, reflection-based access, and coroutine dispatch remain unresolved; not yet measured against a compiler oracle"},
+			{Language: "objc", Indexing: "precise", Resolution: "structural", Limitations: "categories declared in other files, KVO/KVC and other runtime-driven dispatch, and Objective-C++ (.mm) constructs beyond plain Objective-C remain unresolved; not yet measured against a compiler oracle"},
 			{Language: "plaintext", Indexing: "structural", Resolution: "unsupported", Limitations: "whole-document indexing only"},
 		},
 		Operations: []OperationCapability{

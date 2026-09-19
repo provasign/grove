@@ -72,6 +72,12 @@ func localTypesForSymbol(idx *edgeIndex, symbol *core.SymbolRecord) map[string]s
 		return phpLocalTypes(idx, symbol)
 	case "c", "cpp":
 		return cFamilyLocalTypes(idx, symbol)
+	case "swift":
+		return swiftLocalTypes(idx, symbol)
+	case "kotlin":
+		return kotlinLocalTypes(idx, symbol)
+	case "objc":
+		return objcLocalTypes(idx, symbol)
 	}
 	return nil
 }

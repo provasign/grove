@@ -76,7 +76,7 @@ func cmdTruth(args []string) error {
 	repo := fs.String("repo", "", "repository root")
 	out := fs.String("out", "", "output truth JSONL path")
 	commit := fs.String("commit", "", "commit SHA recorded in the header")
-	lang := fs.String("lang", "go", "oracle language: go (ssa+vta), java (javac+javap), or rust (rust-analyzer scip)")
+	lang := fs.String("lang", "go", "oracle language: go (ssa+vta), java (javac+javap), rust (rust-analyzer scip), csharp (Roslyn), php, cfamily/c/cpp (scip-clang), swift (sourcekitten index), or kotlin (kotlinc+javap)")
 	includeTests := fs.Bool("include-tests", false, "include _test.go packages")
 	_ = fs.Parse(args)
 	if *repo == "" || *out == "" {
@@ -100,6 +100,12 @@ func cmdTruth(args []string) error {
 		header.Commit = *commit
 	case "cfamily", "c", "cpp":
 		header, edges, err = eval.CFamilyCallTruth(*repo)
+		header.Commit = *commit
+	case "swift":
+		header, edges, err = eval.SwiftCallTruth(*repo)
+		header.Commit = *commit
+	case "kotlin":
+		header, edges, err = eval.KotlinCallTruth(*repo)
 		header.Commit = *commit
 	default:
 		header, edges, err = generateTruth(*repo, *commit, *includeTests)

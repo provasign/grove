@@ -30,7 +30,24 @@ var (
 	sniffLevelLine = regexp.MustCompile(`(?m)^.{7}\s*\d{2}\s+[A-Z0-9][A-Z0-9-]*`)
 	sniffPIC       = regexp.MustCompile(`(?i)\bPIC(?:TURE)?\s+`)
 	sniffCPPHeader = regexp.MustCompile(`(?m)^\s*(?:template\s*<|namespace\b|class\s+[A-Za-z_]|extern\s+"C")`)
+	// Objective-C headers use a small set of `@`-prefixed keywords with no
+	// C or C++ equivalent — unambiguous even in a header carrying ordinary
+	// C declarations alongside them (the common case: Foundation-style
+	// headers mix @interface/@protocol with plain C typedefs/functions).
+	sniffObjCHeader = regexp.MustCompile(`(?m)^\s*@(?:interface|protocol|implementation|class)\b`)
 )
+
+// sniffHeader classifies a .h file's content as "objc", "cpp", or "" (plain
+// C, the default DetectLanguage/DetectLanguageFile already assume).
+func sniffHeader(content []byte) string {
+	if sniffObjCHeader.Match(content) {
+		return "objc"
+	}
+	if sniffCPPHeader.Match(content) {
+		return "cpp"
+	}
+	return ""
+}
 
 // sniffMainframe classifies head bytes as "cobol", "jcl", or "".
 func sniffMainframe(head []byte) string {
@@ -49,10 +66,22 @@ func sniffMainframe(head []byte) string {
 	return ""
 }
 
-// DetectLanguageFile is DetectLanguage plus the extensionless-file sniff.
-// It may read up to sniffHeadBytes from disk, only when the extension gives
-// no answer and the file has no extension at all.
+// DetectLanguageFile is DetectLanguage plus the extensionless-file sniff,
+// plus a bounded content sniff for the one extension DetectLanguage cannot
+// disambiguate by itself: a ".h" header may be C, C++, or Objective-C, and
+// only its content says which (DetectLanguage's own default, "c", stands
+// when nothing matches).
 func DetectLanguageFile(path string) string {
+	if strings.EqualFold(filepath.Ext(path), ".h") {
+		if f, err := os.Open(path); err == nil {
+			head := make([]byte, sniffHeadBytes)
+			n, _ := f.Read(head)
+			f.Close()
+			if lang := sniffHeader(head[:n]); lang != "" {
+				return lang
+			}
+		}
+	}
 	if lang := DetectLanguage(path); lang != "" {
 		return lang
 	}
@@ -73,11 +102,13 @@ func DetectLanguageFile(path string) string {
 	return sniffMainframe(head[:n])
 }
 
-// DetectLanguageContent is DetectLanguage plus the same sniff applied to
+// DetectLanguageContent is DetectLanguage plus the same sniffs applied to
 // in-memory content — for callers that already hold the bytes.
 func DetectLanguageContent(relPath string, content []byte) string {
-	if strings.EqualFold(filepath.Ext(relPath), ".h") && sniffCPPHeader.Match(content) {
-		return "cpp"
+	if strings.EqualFold(filepath.Ext(relPath), ".h") {
+		if lang := sniffHeader(content); lang != "" {
+			return lang
+		}
 	}
 	if lang := DetectLanguage(relPath); lang != "" {
 		return lang

@@ -66,6 +66,37 @@ func TestDetectLanguageFile_ExtensionlessMember(t *testing.T) {
 	}
 }
 
+// A ".h" header's language is ambiguous by extension alone (C, C++, or
+// Objective-C); DetectLanguageFile must sniff its content for real,
+// on-disk indexing exactly as DetectLanguageContent already does for
+// in-memory previews — both paths are asserted here so they can't drift.
+func TestDetectLanguageFile_HeaderSniff(t *testing.T) {
+	dir := t.TempDir()
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"plain-c.h", "int add(int a, int b);\n", "c"},
+		{"cpp.h", "namespace geo {\nclass Shape {};\n}\n", "cpp"},
+		{"objc-interface.h", "@interface Person : NSObject\n@end\n", "objc"},
+		{"objc-protocol.h", "@protocol Greeter\n- (void)greet;\n@end\n", "objc"},
+		{"objc-forward-decl.h", "@class Person;\nint helper(void);\n", "objc"},
+	}
+	for _, c := range cases {
+		path := filepath.Join(dir, c.name)
+		if err := os.WriteFile(path, []byte(c.body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if got := DetectLanguageFile(path); got != c.want {
+			t.Errorf("DetectLanguageFile(%s) = %q, want %q", c.name, got, c.want)
+		}
+		if got := DetectLanguageContent(c.name, []byte(c.body)); got != c.want {
+			t.Errorf("DetectLanguageContent(%s) = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
 // Field-reported: mainframe exports carry uppercase extensions; the language
 // switch is case-sensitive by design for modern code (.C means C++), so the
 // mainframe set gets a lowercase fallback. 32% -> 99% include resolution.

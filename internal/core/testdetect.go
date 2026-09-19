@@ -23,7 +23,10 @@ func IsTestPath(filePath string) bool {
 		strings.HasSuffix(lower, ".test.jsx"), strings.HasSuffix(lower, ".spec.jsx"),
 		strings.HasSuffix(base, "Test.java"), strings.HasSuffix(base, "Spec.java"),
 		strings.HasSuffix(base, "Tests.cs"), strings.HasSuffix(base, "Test.cs"),
-		strings.HasSuffix(base, "Test.php"):
+		strings.HasSuffix(base, "Test.php"),
+		strings.HasSuffix(base, "Tests.swift"), strings.HasSuffix(base, "Test.swift"),
+		strings.HasSuffix(base, "Test.kt"), strings.HasSuffix(base, "Tests.kt"),
+		strings.HasSuffix(base, "Tests.m"), strings.HasSuffix(base, "Test.m"):
 		return true
 	}
 

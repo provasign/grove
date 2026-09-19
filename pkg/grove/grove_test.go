@@ -2,6 +2,7 @@ package grove
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -39,6 +40,35 @@ func TestFileSymbols(t *testing.T) {
 	}
 	if got := fileSyms(t, ctx, eng, "missing.go"); len(got) != 0 {
 		t.Fatalf("missing file returned %+v", got)
+	}
+}
+
+func TestSymbolsScopedHonorsContextDuringLazyGraphLoad(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("package main\n\nfunc Target() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	indexed, err := Open(ctx, Config{RepoRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := indexed.Index(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := indexed.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	lazy, err := Open(ctx, Config{RepoRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lazy.Close()
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := lazy.SymbolsScoped(canceled, "Target", 10, []string{"a.go"}, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("lazy scoped search ignored cancellation: %v", err)
 	}
 }
 

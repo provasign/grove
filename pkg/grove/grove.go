@@ -160,6 +160,10 @@ func (e *Engine) Root() string { return e.root }
 // is cached, so the next call retries; a database failure must surface as an
 // error, never as an empty-but-successful graph.
 func (e *Engine) currentGraph() (*graph.CodeGraph, error) {
+	return e.currentGraphContext(context.Background())
+}
+
+func (e *Engine) currentGraphContext(ctx context.Context) (*graph.CodeGraph, error) {
 	e.mu.RLock()
 	g := e.graph
 	e.mu.RUnlock()
@@ -171,7 +175,6 @@ func (e *Engine) currentGraph() (*graph.CodeGraph, error) {
 	if e.graph != nil {
 		return e.graph, nil
 	}
-	ctx := context.Background()
 	status, err := e.store.Status(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("grove: graph rehydration failed: %w", err)
@@ -303,6 +306,20 @@ func (e *Engine) Symbols(ctx context.Context, query string, limit int) ([]Symbol
 		return nil, err
 	}
 	return g.Search(query, limit), nil
+}
+
+// SymbolsScoped is Symbols with path/glob predicates evaluated inside the
+// graph search, before ranking and limiting. Paths are repository-relative
+// file or directory prefixes; globs match either the basename or full path.
+func (e *Engine) SymbolsScoped(ctx context.Context, query string, limit int, paths, globs []string) ([]Symbol, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	g, err := e.currentGraphContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return g.SearchScoped(query, limit, paths, globs), nil
 }
 
 // Deps returns the outgoing dependency edges for filePath.

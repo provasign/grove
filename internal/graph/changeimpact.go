@@ -732,6 +732,44 @@ func declaredSuperNames(s *core.SymbolRecord) []string {
 			text = firstLine(s.RawText)
 		}
 		return csharpBaseNames(stripAngleBrackets(text))
+	case "swift":
+		if s.Kind != core.KindClass && s.Kind != core.KindStruct &&
+			s.Kind != core.KindEnum && s.Kind != core.KindInterface {
+			return nil
+		}
+		text := s.Signature
+		if text == "" {
+			text = firstLine(s.RawText)
+		}
+		return swiftBaseNames(text)
+	case "kotlin":
+		if s.Kind != core.KindClass && s.Kind != core.KindInterface {
+			return nil
+		}
+		text := s.Signature
+		if text == "" {
+			text = firstLine(s.RawText)
+		}
+		var out []string
+		for _, raw := range kotlinBaseNames(text) {
+			if name, _ := kotlinBaseNameAndCtor(raw); name != "" {
+				out = append(out, name)
+			}
+		}
+		return out
+	case "objc":
+		if s.Kind != core.KindClass && s.Kind != core.KindInterface {
+			return nil
+		}
+		text := s.Signature
+		if text == "" {
+			text = firstLine(s.RawText)
+		}
+		var out []string
+		if m := objcSuperclassRe.FindStringSubmatch(text); len(m) == 2 {
+			out = append(out, m[1])
+		}
+		return append(out, objcProtocolNames(text)...)
 	case "python":
 		if s.Kind != core.KindClass {
 			return nil

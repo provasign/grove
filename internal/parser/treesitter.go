@@ -66,6 +66,12 @@ func languageToKey(language string) (astkit.LanguageKey, bool) {
 		return astkit.LangCSharp, true
 	case "php":
 		return astkit.LangPHP, true
+	case "swift":
+		return astkit.LangSwift, true
+	case "kotlin":
+		return astkit.LangKotlin, true
+	case "objc":
+		return astkit.LangObjC, true
 	case "cobol":
 		return astkit.LangCOBOL, true
 	case "jcl":

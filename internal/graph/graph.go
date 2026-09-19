@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"path"
 	"sort"
 	"strings"
 	"sync"
@@ -359,6 +360,14 @@ func (g *CodeGraph) Status() core.Status {
 // alphabetical-by-path ordering, the exact-name match for a common query
 // could be cut off by substring hits in files that happened to sort earlier.
 func (g *CodeGraph) Search(query string, limit int) []core.SymbolRecord {
+	return g.SearchScoped(query, limit, nil, nil)
+}
+
+// SearchScoped is Search with repository-relative path and glob predicates
+// applied before name matching and ranking. This matters on large graphs:
+// callers that filter after Search must repeatedly materialize ever-larger
+// global prefixes just to discover a small result inside one directory.
+func (g *CodeGraph) SearchScoped(query string, limit int, paths, globs []string) []core.SymbolRecord {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
@@ -369,6 +378,9 @@ func (g *CodeGraph) Search(query string, limit int) []core.SymbolRecord {
 	}
 	hasCaseExact := false
 	for _, symbol := range g.symbols {
+		if !symbolPathInScope(symbol.FilePath, paths, globs) {
+			continue
+		}
 		if symbol.Name == rawQuery || symbol.QualifiedName == rawQuery || symbol.ID == rawQuery || symbol.FilePath == rawQuery {
 			hasCaseExact = true
 			break
@@ -381,6 +393,9 @@ func (g *CodeGraph) Search(query string, limit int) []core.SymbolRecord {
 	}
 	var results []rankedSymbol
 	for _, symbol := range g.symbols {
+		if !symbolPathInScope(symbol.FilePath, paths, globs) {
+			continue
+		}
 		if hasCaseExact && (strings.EqualFold(symbol.Name, rawQuery) || strings.EqualFold(symbol.QualifiedName, rawQuery) ||
 			strings.EqualFold(symbol.ID, rawQuery) || strings.EqualFold(symbol.FilePath, rawQuery)) &&
 			symbol.Name != rawQuery && symbol.QualifiedName != rawQuery && symbol.ID != rawQuery && symbol.FilePath != rawQuery {
@@ -409,6 +424,34 @@ func (g *CodeGraph) Search(query string, limit int) []core.SymbolRecord {
 		out = append(out, r.symbol)
 	}
 	return out
+}
+
+func symbolPathInScope(file string, paths, globs []string) bool {
+	file = strings.TrimPrefix(strings.ReplaceAll(file, "\\", "/"), "./")
+	ok := len(paths) == 0
+	for _, want := range paths {
+		want = strings.TrimSuffix(strings.TrimPrefix(strings.ReplaceAll(want, "\\", "/"), "./"), "/")
+		if file == want || strings.HasPrefix(file, want+"/") {
+			ok = true
+			break
+		}
+	}
+	if !ok || len(globs) == 0 {
+		return ok
+	}
+	base := file
+	if slash := strings.LastIndexByte(base, '/'); slash >= 0 {
+		base = base[slash+1:]
+	}
+	for _, glob := range globs {
+		if matched, _ := path.Match(glob, base); matched {
+			return true
+		}
+		if matched, _ := path.Match(glob, file); matched {
+			return true
+		}
+	}
+	return false
 }
 
 // searchRank scores how well a symbol matches a lowercase query; negative

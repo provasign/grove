@@ -1,6 +1,7 @@
 package graph
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/provasign/grove/internal/core"
@@ -30,6 +31,33 @@ func TestReplaceStatusAndSearch(t *testing.T) {
 	results := codeGraph.Search("auth", 10)
 	if len(results) != 1 || results[0].Name != "AuthService" {
 		t.Fatalf("unexpected search results: %+v", results)
+	}
+}
+
+func TestSearchScopedFiltersBeforeLimit(t *testing.T) {
+	codeGraph := New()
+	var symbols []core.SymbolRecord
+	for i := 0; i < 20; i++ {
+		symbols = append(symbols, core.SymbolRecord{
+			ID: fmt.Sprintf("outside/%02d.go::Target@sha", i), FilePath: fmt.Sprintf("outside/%02d.go", i),
+			Kind: core.KindFunction, Name: "Target", QualifiedName: "Target",
+		})
+	}
+	symbols = append(symbols,
+		core.SymbolRecord{ID: "inside/a.go::Target@sha", FilePath: "inside/a.go", Kind: core.KindFunction, Name: "Target", QualifiedName: "Target"},
+		core.SymbolRecord{ID: "inside/a_test.go::TargetTest@sha", FilePath: "inside/a_test.go", Kind: core.KindFunction, Name: "TargetTest", QualifiedName: "TargetTest"},
+	)
+	codeGraph.Replace(symbols, 22)
+
+	got := codeGraph.SearchScoped("Target", 2, []string{"inside"}, []string{"*.go"})
+	if len(got) != 2 || got[0].FilePath != "inside/a.go" || got[1].FilePath != "inside/a_test.go" {
+		t.Fatalf("scoped search was filtered after the global limit: %+v", got)
+	}
+	if got := codeGraph.SearchScoped("Target", 2, []string{"inside/a.go"}, nil); len(got) != 1 || got[0].FilePath != "inside/a.go" {
+		t.Fatalf("exact file scope failed: %+v", got)
+	}
+	if got := codeGraph.SearchScoped("Target", 2, nil, []string{"*_test.go"}); len(got) != 1 || got[0].FilePath != "inside/a_test.go" {
+		t.Fatalf("basename glob scope failed: %+v", got)
 	}
 }
 

@@ -30,7 +30,7 @@ var securityExtensions = map[string]bool{
 // detector fixes, synthesized records): the indexer re-extracts every file
 // when the stored stamp differs, because the blobSHA cache is otherwise
 // blind to binary upgrades and serves stale symbols indefinitely.
-const ExtractorVersion = "2026-09-11.7"
+const ExtractorVersion = "2026-09-19.1"
 
 // DetectLanguage returns the Grove language tag for a file path.
 // Returns "" for unsupported or security-excluded files.
@@ -81,6 +81,12 @@ func DetectLanguage(path string) string {
 		return "csharp"
 	case ".php", ".php3", ".php4", ".php5", ".phtml":
 		return "php"
+	case ".swift":
+		return "swift"
+	case ".kt", ".kts":
+		return "kotlin"
+	case ".m", ".mm":
+		return "objc"
 	case ".cbl", ".cob", ".cobol", ".cpy", ".ccp", ".cpb", ".copy":
 		return "cobol"
 	case ".jcl", ".prc":

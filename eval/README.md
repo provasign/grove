@@ -501,6 +501,64 @@ function-like macros expanding to `*_new` calls; Grove has no symbol for a
 macro, so calls through them are absent — the structural ceiling for a
 source-level graph of C.
 
+## Swift (SourceKit index oracle)
+
+`grove-eval truth --lang swift` runs `sourcekitten index` (a thin CLI over
+SourceKit's own `source.request.index`, the same request Xcode's indexer
+uses) once per file, with every `.swift` file under the repo passed as a
+compiler argument so cross-file/cross-type references resolve. Unlike the
+SCIP-based oracles, the output is one JSON entity tree per file with
+declarations and the references inside their bodies already properly
+nested — a reference's caller is just its nearest enclosing declaration
+entity, no separate span search needed. Property accessors (getter/setter,
+synthesized for every declared property, not just computed ones) are
+excluded from the truth universe: astkit's Swift strategy records no
+separate symbol for them, so scoring against them would fault Grove for a
+structural gap the extractor doesn't claim to close. Needs Xcode or the
+Swift toolchain (`sourcekitten`, `swiftc`, `xcrun`) — Darwin only.
+
+No CI job or baseline yet — a corpus repo pin is a separate decision (see
+Roadmap). Verified against small hand-written fixtures: whole-module scope,
+free/instance/static/constructor calls, and self-qualified calls all
+resolve correctly end to end (truth generation → Grove indexing → scoring),
+at 1.00/1.00 precision/recall on those fixtures.
+
+## Kotlin (kotlinc + javap bytecode oracle)
+
+`grove-eval truth --lang kotlin` compiles with `kotlinc`, then reads
+invoke* instructions and LineNumberTables out of `javap` — the exact
+mechanism `JavaCallTruth` uses (`parseJavap` is pure JVM bytecode
+disassembly, reused unchanged), since Kotlin compiles to ordinary class
+files javap disassembles identically. Source discovery has no
+package-must-match-directory convention to rely on (unlike Java), so a
+`javap`-reported "Compiled from" basename is resolved against the actual
+source file list instead of a reconstructed package path. Kotlin generates
+callable JVM methods astkit's Kotlin strategy does not model as separate
+symbols — every declared property's getter/setter, and a class's
+compiler-synthesized primary constructor (astkit only extracts an explicit
+`init` block, not the implicit one every class gets) — so calls to/from
+those show up as recall misses, not false positives; this is the known,
+accepted limitation already noted in `internal/core/capabilities.go`.
+
+No CI job or baseline yet (see Roadmap). Verified against a small
+hand-written fixture (a class, a companion-object factory method, a
+top-level caller) end to end at 1.00/1.00 precision/recall, with the
+constructor-call gap above showing up exactly as expected (80% symbol
+match rate, not 100%).
+
+## Objective-C: deferred
+
+No truth oracle. `scip-clang` — already used for the C/C++ oracle above, and
+clang-based — was the obvious first attempt, but it rejects `.m`/`.mm` files
+at the compilation-database-parsing stage outright ("compilation database
+has no entries that could be processed"), before ever invoking clang: it is
+a C/C++-only tool despite sharing a compiler. `sourcekitten index` (the
+Swift oracle's mechanism) is Swift-frontend-only and rejects clang-style
+arguments. A real Objective-C oracle needs libclang's indexing API directly
+(`clang_indexSourceFile` + `CXIndexerCallbacks`, the purpose-built C API for
+exactly this) via cgo bindings — a separate, sizable piece of work, not
+attempted here.
+
 ## Impact (blast radius) accuracy
 
 `grove-eval score-impact` measures reverse reachability: for every truth
@@ -535,3 +593,8 @@ the sweep.
 - Go tests-edge truth (`go test -coverprofile` per package)
 - django pin once flask recall improves (same patterns, 100× the surface)
 - tests-edge baseline + CI gate once the metric stabilizes
+- pin a Swift and a Kotlin corpus repo, measure a first baseline, and add
+  `swift-accuracy`/`kotlin-accuracy` CI jobs (macOS runners; `sourcekitten`
+  and `kotlinc` need installing there) once one is picked
+- Objective-C truth oracle: needs libclang indexing-API bindings (cgo),
+  `scip-clang` and `sourcekitten` both rejected `.m`/`.mm` outright

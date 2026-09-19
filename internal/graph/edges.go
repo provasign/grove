@@ -789,11 +789,20 @@ func (idx *edgeIndex) importedFiles(fromFile string) map[string]struct{} {
 	// whole repo; precision is held by type narrowing (qualified calls must
 	// resolve to a known type or an inferable local — see the csharp static
 	// block in buildCalls), not by scope.
-	if lang := fileLanguage(idx, fromFile); lang == "csharp" || lang == "php" || lang == "c" || lang == "cpp" {
+	if lang := fileLanguage(idx, fromFile); lang == "csharp" || lang == "php" || lang == "c" || lang == "cpp" || lang == "swift" || lang == "objc" {
 		// C#/PHP resolve types through namespace imports (`using`/`use`),
 		// which don't map to directories; within one library every type is
 		// mutually visible, so scope is the whole repo and precision is held
 		// by type narrowing (the static block in buildCalls), not by scope.
+		// Swift is the same shape for a different reason: `import Module`
+		// names a whole module (framework/SwiftPM target), not a file or
+		// directory, and every file within one module/target is mutually
+		// visible with no import needed at all — closer to Rust's crate-wide
+		// visibility than to Java's per-directory package scope. Objective-C
+		// gets the same whole-repo scope for its own reason: a class's
+		// declaration (@interface, .h) and its implementation (@implementation,
+		// .m) live in two DIFFERENT files with no shared directory convention,
+		// and #import resolves headers rather than mapping to a directory.
 		for f := range idx.byFile {
 			out[f] = struct{}{}
 		}
@@ -809,9 +818,11 @@ func (idx *edgeIndex) importedFiles(fromFile string) map[string]struct{} {
 	// explicit per file regardless of directory — so we gate on language to
 	// avoid linking unrelated same-folder modules there.
 	lang := fileLanguage(idx, fromFile)
-	if lang == "go" || lang == "java" {
+	if lang == "go" || lang == "java" || lang == "kotlin" {
 		// Go: a directory IS a package. Java: a directory is a package too —
-		// same-package classes need no import.
+		// same-package classes need no import. Kotlin's package/import model
+		// matches Java's closely (same-package files need no import), so it
+		// shares this branch.
 		fromDir := dirOf(fromFile)
 		for _, f := range idx.dirToFiles[fromDir] {
 			if f != fromFile {
@@ -829,8 +840,10 @@ func (idx *edgeIndex) importedFiles(fromFile string) map[string]struct{} {
 		// two-file fixture reproduced it (same-package caller missed,
 		// explicitly-imported caller found). Include every directory
 		// whose package path (the suffix after the src/<set>/java/
-		// source-root marker) matches.
-		if lang == "java" {
+		// source-root marker) matches. Kotlin's Gradle convention
+		// (src/main/kotlin, src/test/kotlin) is the same shape, so
+		// javaPackageSuffix also matches a "kotlin" source-root segment.
+		if lang == "java" || lang == "kotlin" {
 			if pkg, ok := javaPackageSuffix(fromDir); ok {
 				for dir, files := range idx.dirToFiles {
 					if dir == fromDir {
@@ -973,6 +986,9 @@ func (idx *edgeIndex) importedFiles(fromFile string) map[string]struct{} {
 		impNorm = strings.TrimSuffix(impNorm, ".jsx")
 		impNorm = strings.TrimSuffix(impNorm, ".java")
 		impNorm = strings.TrimSuffix(impNorm, ".rs")
+		impNorm = strings.TrimSuffix(impNorm, ".swift")
+		impNorm = strings.TrimSuffix(impNorm, ".kt")
+		impNorm = strings.TrimSuffix(impNorm, ".m")
 
 		// Java wildcard import: `import com.example.util.*;` names a package,
 		// not a class. The package path is a *suffix* of the repo-relative
@@ -1057,7 +1073,10 @@ func (idx *edgeIndex) importedFiles(fromFile string) map[string]struct{} {
 				strings.HasSuffix(lower, "/"+segLower+".js") ||
 				strings.HasSuffix(lower, "/"+segLower+".jsx") ||
 				strings.HasSuffix(lower, "/"+segLower+".java") ||
-				strings.HasSuffix(lower, "/"+segLower+".rs") {
+				strings.HasSuffix(lower, "/"+segLower+".rs") ||
+				strings.HasSuffix(lower, "/"+segLower+".swift") ||
+				strings.HasSuffix(lower, "/"+segLower+".kt") ||
+				strings.HasSuffix(lower, "/"+segLower+".m") {
 				out[c] = struct{}{}
 			}
 		}
@@ -1656,6 +1675,87 @@ func buildExtendsImplements(idx *edgeIndex, symbols []core.SymbolRecord) []core.
 				}
 				edges = append(edges, resolveTypeEdges(idx, symbol, traitName, core.EdgeImplements, 0.85)...)
 			}
+		case "swift":
+			// Swift has no extends/implements keywords: `class Foo: Base,
+			// ProtocolA` and `struct Point: Codable` both use one comma
+			// list after a colon, with no syntactic marker distinguishing a
+			// superclass from a protocol conformance. Only a class can have
+			// a superclass, and only its FIRST listed name may be one (Swift
+			// requires the superclass, if any, to come first) — resolved as
+			// EdgeExtends only when that name actually names an indexed
+			// class; every other name, and everything for a
+			// struct/enum/protocol (which can only conform to protocols),
+			// is a protocol conformance.
+			if symbol.Kind != core.KindClass && symbol.Kind != core.KindStruct &&
+				symbol.Kind != core.KindEnum && symbol.Kind != core.KindInterface {
+				continue
+			}
+			text := symbol.Signature
+			if text == "" {
+				text = firstLine(symbol.RawText)
+			}
+			for i, name := range swiftBaseNames(text) {
+				if name == "" {
+					continue
+				}
+				if symbol.Kind == core.KindClass && i == 0 && namedSymbolIsClass(idx, name) {
+					edges = append(edges, resolveTypeEdges(idx, symbol, name, core.EdgeExtends, 0.85)...)
+					continue
+				}
+				edges = append(edges, resolveTypeEdges(idx, symbol, name, core.EdgeImplements, 0.85)...)
+			}
+		case "kotlin":
+			// Kotlin uses `class Foo : Base(), IThing` (colon, like C#), but
+			// unlike C# the superclass is unambiguous syntactically: it is
+			// the one entry (if any) written with a constructor-call `()`.
+			// Every other entry is an interface.
+			if symbol.Kind != core.KindClass && symbol.Kind != core.KindInterface {
+				continue
+			}
+			text := symbol.Signature
+			if text == "" {
+				text = firstLine(symbol.RawText)
+			}
+			for _, raw := range kotlinBaseNames(text) {
+				name, isCtorCall := kotlinBaseNameAndCtor(raw)
+				if name == "" {
+					continue
+				}
+				edgeType := core.EdgeImplements
+				if symbol.Kind == core.KindClass && isCtorCall {
+					edgeType = core.EdgeExtends
+				}
+				edges = append(edges, resolveTypeEdges(idx, symbol, name, edgeType, 0.85)...)
+			}
+		case "objc":
+			// Objective-C cleanly separates the two: `@interface Foo :
+			// Superclass <ProtocolA, ProtocolB>` — a single optional
+			// superclass right after the colon, then an independent
+			// `<...>` protocol-conformance list. `@protocol Foo <Bar>`
+			// uses the same `<...>` list for protocol-to-protocol
+			// conformance, treated as EdgeExtends (matching how this
+			// function treats one interface extending another elsewhere).
+			switch symbol.Kind {
+			case core.KindClass:
+				text := symbol.Signature
+				if text == "" {
+					text = firstLine(symbol.RawText)
+				}
+				if m := objcSuperclassRe.FindStringSubmatch(text); len(m) == 2 {
+					edges = append(edges, resolveTypeEdges(idx, symbol, m[1], core.EdgeExtends, 0.85)...)
+				}
+				for _, name := range objcProtocolNames(text) {
+					edges = append(edges, resolveTypeEdges(idx, symbol, name, core.EdgeImplements, 0.85)...)
+				}
+			case core.KindInterface:
+				text := symbol.Signature
+				if text == "" {
+					text = firstLine(symbol.RawText)
+				}
+				for _, name := range objcProtocolNames(text) {
+					edges = append(edges, resolveTypeEdges(idx, symbol, name, core.EdgeExtends, 0.85)...)
+				}
+			}
 		case "go":
 			// Go has structural interface satisfaction; broad implements edges
 			// are emitted by buildInterfaceSatisfaction. Here we detect
@@ -2050,6 +2150,12 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			localTypes = phpLocalTypes(idx, &symbol)
 		case "c", "cpp":
 			localTypes = cFamilyLocalTypes(idx, &symbol)
+		case "swift":
+			localTypes = swiftLocalTypes(idx, &symbol)
+		case "kotlin":
+			localTypes = kotlinLocalTypes(idx, &symbol)
+		case "objc":
+			localTypes = objcLocalTypes(idx, &symbol)
 		}
 		var javaArgTypeCache map[string]string
 		var csArgTypeCache map[string]string
@@ -2942,13 +3048,13 @@ func pythonLexicalChild(idx *edgeIndex, caller *core.SymbolRecord, name string) 
 var astCallSiteLanguages = map[string]bool{
 	"go": true, "python": true, "javascript": true, "typescript": true,
 	"tsx": true, "java": true, "rust": true, "csharp": true, "php": true,
-	"c": true, "cpp": true,
+	"c": true, "cpp": true, "swift": true, "kotlin": true, "objc": true,
 }
 
 // classLanguage reports whether the language has class inheritance our
 // base-class parsers understand.
 func classLanguage(lang string) bool {
-	return lang == "python" || lang == "typescript" || lang == "javascript" || lang == "java" || lang == "csharp" || lang == "php" || lang == "cpp" || lang == "rust"
+	return lang == "python" || lang == "typescript" || lang == "javascript" || lang == "java" || lang == "csharp" || lang == "php" || lang == "cpp" || lang == "rust" || lang == "swift" || lang == "kotlin" || lang == "objc"
 }
 
 // implicitSelfLanguage reports whether a bare, unqualified call inside a method
@@ -2957,7 +3063,7 @@ func classLanguage(lang string) bool {
 // Excludes PHP/Python/JS/TS, where a bare call() is a free function or local,
 // not self.method(), so narrowing it to the caller's class would be wrong.
 func implicitSelfLanguage(lang string) bool {
-	return lang == "java" || lang == "csharp" || lang == "cpp"
+	return lang == "java" || lang == "csharp" || lang == "cpp" || lang == "swift" || lang == "kotlin"
 }
 
 // callerSelfQualifiers returns the receiver spellings that mean "a method on
@@ -3545,7 +3651,7 @@ func (idx *edgeIndex) computeImportFilesForQualifierForSymbol(symbol *core.Symbo
 		}
 		// Trim only known source extensions — a naive last-dot trim would
 		// truncate module paths at their domain ("example.com/…" → "example").
-		for _, ext := range []string{".go", ".py", ".ts", ".tsx", ".js", ".jsx", ".java", ".rs"} {
+		for _, ext := range []string{".go", ".py", ".ts", ".tsx", ".js", ".jsx", ".java", ".rs", ".swift", ".kt", ".m"} {
 			impNorm = strings.TrimSuffix(impNorm, ext)
 		}
 		for _, f := range idx.importPathToFiles[impNorm] {
@@ -3671,6 +3777,135 @@ func csharpBaseNames(text string) []string {
 		}
 		if part != "" {
 			out = append(out, part)
+		}
+	}
+	return out
+}
+
+// swiftBaseListRe captures a Swift declaration's base list — the
+// comma-separated superclass/protocol names after the top-level `:`,
+// running to end of string (a Signature already stops before the body).
+var swiftBaseListRe = regexp.MustCompile(`\b(?:class|struct|enum|protocol|actor)\s+[A-Za-z_]\w*(?:<[^>{}]*>)?[ \t]*:[ \t]*(.+)$`)
+
+// swiftBaseNames extracts the simple names from a Swift declaration's base
+// list (generic arguments and module qualifiers stripped). It does not
+// distinguish a superclass from a protocol conformance — callers do that
+// (see buildExtendsImplements's "swift" case).
+func swiftBaseNames(text string) []string {
+	m := swiftBaseListRe.FindStringSubmatch(text)
+	if len(m) != 2 {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(stripAngleBrackets(m[1]), ",") {
+		part = strings.TrimSpace(part)
+		if i := strings.LastIndexByte(part, '.'); i >= 0 {
+			part = part[i+1:]
+		}
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+// namedSymbolIsClass reports whether any indexed symbol named `name` is a
+// class — used to decide whether the first entry in a Swift base list is a
+// superclass (only classes have one) or just another protocol conformance.
+func namedSymbolIsClass(idx *edgeIndex, name string) bool {
+	for _, target := range namedSymbols(idx, name) {
+		if target.Kind == core.KindClass {
+			return true
+		}
+	}
+	return false
+}
+
+// kotlinBaseListRe captures a Kotlin declaration's base list — everything
+// after the top-level `:` to end of string (a Signature already stops
+// before the body). Unlike csharpBaseListRe, the captured text may itself
+// contain parentheses (`Base(x, y)`), so splitting is depth-aware
+// (kotlinBaseNames) rather than a plain comma split.
+var kotlinBaseListRe = regexp.MustCompile(`\b(?:class|interface|object)\s+[A-Za-z_]\w*(?:<[^>{}]*>)?(?:\([^)]*\))?[ \t]*:[ \t]*(.+)$`)
+
+// kotlinBaseNames splits a Kotlin declaration's base list into its raw
+// entries (e.g. "Base()", "IThing"), respecting paren/angle-bracket nesting
+// so a constructor call's own arguments don't fracture the split. Entries
+// keep any constructor-call parens — kotlinBaseNameAndCtor reads that
+// marker to tell the superclass apart from a plain interface reference.
+func kotlinBaseNames(text string) []string {
+	m := kotlinBaseListRe.FindStringSubmatch(text)
+	if len(m) != 2 {
+		return nil
+	}
+	list := m[1]
+	var out []string
+	depth := 0
+	last := 0
+	flush := func(end int) {
+		if part := strings.TrimSpace(list[last:end]); part != "" {
+			out = append(out, part)
+		}
+	}
+	for i := 0; i < len(list); i++ {
+		switch list[i] {
+		case '(', '<':
+			depth++
+		case ')', '>':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				flush(i)
+				last = i + 1
+			}
+		}
+	}
+	flush(len(list))
+	return out
+}
+
+// kotlinBaseNameAndCtor reduces one kotlinBaseNames entry to its simple
+// type name and reports whether it carried a constructor call (`Base()`,
+// the syntactic marker for Kotlin's superclass — every other entry in the
+// list is an interface).
+func kotlinBaseNameAndCtor(raw string) (name string, isCtorCall bool) {
+	raw = strings.TrimSpace(raw)
+	isCtorCall = strings.ContainsRune(raw, '(')
+	if i := strings.IndexByte(raw, '('); i >= 0 {
+		raw = raw[:i]
+	}
+	if i := strings.IndexByte(raw, '<'); i >= 0 {
+		raw = raw[:i]
+	}
+	raw = strings.TrimSpace(raw)
+	if i := strings.LastIndexByte(raw, '.'); i >= 0 {
+		raw = raw[i+1:]
+	}
+	return raw, isCtorCall
+}
+
+// objcSuperclassRe captures the single superclass name of an
+// `@interface Foo : Superclass ...` header (a class with no superclass —
+// a root class — has no match).
+var objcSuperclassRe = regexp.MustCompile(`@interface\s+[A-Za-z_]\w*\s*:\s*([A-Za-z_]\w*)`)
+
+// objcProtocolListRe captures the `<...>` protocol-conformance list of an
+// Objective-C @interface or @protocol header.
+var objcProtocolListRe = regexp.MustCompile(`<([^>]+)>`)
+
+// objcProtocolNames splits an Objective-C header's `<...>` protocol list
+// into simple names.
+func objcProtocolNames(text string) []string {
+	m := objcProtocolListRe.FindStringSubmatch(text)
+	if len(m) != 2 {
+		return nil
+	}
+	var out []string
+	for _, name := range splitTrim(m[1], ',') {
+		if name = strings.TrimSpace(name); name != "" {
+			out = append(out, name)
 		}
 	}
 	return out
@@ -3833,7 +4068,7 @@ func javaPackageSuffix(dir string) (string, bool) {
 	return "", false
 }
 
-var javaSrcRootRe = regexp.MustCompile(`(^|/)src/[^/]+/java/`)
+var javaSrcRootRe = regexp.MustCompile(`(^|/)src/[^/]+/(?:java|kotlin)/`)
 
 // preferSameFileParent keeps, among candidates already narrowed to a
 // receiver type's members, those declared in the caller's own file when
