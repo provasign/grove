@@ -74,13 +74,6 @@ func javaIndexedFieldType(raw string) string {
 // class names for receiver narrowing.
 func javaArgTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 	out := map[string]string{}
-	if symbol.ParentSymbol != "" {
-		// `new WildcardFileFilter(this)` inside `Builder.get()`: the bare
-		// "this" argument's type is the enclosing class, exactly like any
-		// other typed argument — without it the sole matching constructor
-		// couldn't be told apart from five unrelated overloads.
-		out["this"] = symbol.ParentSymbol
-	}
 	record := func(typ, name string) {
 		typ = strings.TrimSpace(typ)
 		if i := strings.IndexByte(typ, '<'); i > 0 {

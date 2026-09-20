@@ -2205,14 +2205,41 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 		var javaArgTypeCache map[string]string
 		var csArgTypeCache map[string]string
 		var ktShapeCache map[string]string
+		javaTypesFor := func(cands []*core.SymbolRecord, cs core.CallSite) map[string]string {
+			if javaArgTypeCache == nil {
+				javaArgTypeCache = javaArgTypes(idx, &symbol)
+			}
+			if symbol.ParentSymbol == "" {
+				return javaArgTypeCache
+			}
+			constructor := false
+			for _, cand := range cands {
+				if cand.Kind == core.KindConstructor {
+					constructor = true
+					break
+				}
+			}
+			if !constructor {
+				return javaArgTypeCache
+			}
+			for _, arg := range cs.Args {
+				if arg == "this" {
+					withThis := make(map[string]string, len(javaArgTypeCache)+1)
+					for name, typ := range javaArgTypeCache {
+						withThis[name] = typ
+					}
+					withThis["this"] = symbol.ParentSymbol
+					return withThis
+				}
+			}
+			return javaArgTypeCache
+		}
 		narrowJavaCall := func(cands []*core.SymbolRecord, cs core.CallSite, scope map[string]struct{}) []*core.SymbolRecord {
 			cands = javaKnownArityCandidates(cands, cs)
 			if len(cands) > 1 && len(cs.Args) > 0 {
-				if javaArgTypeCache == nil {
-					javaArgTypeCache = javaArgTypes(idx, &symbol)
-				}
-				javaResolveCallReturnTypes(idx, cs.Args, scope, javaArgTypeCache)
-				cands = narrowOverloadsByArgTypes(cands, cs.Args, javaArgTypeCache)
+				argTypes := javaTypesFor(cands, cs)
+				javaResolveCallReturnTypes(idx, cs.Args, scope, argTypes)
+				cands = narrowOverloadsByArgTypes(cands, cs.Args, argTypes)
 			}
 			return cands
 		}
@@ -2760,11 +2787,9 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// narrowOverloadsByArgTypes).
 				cands = filterByArgc(cands, cs.Argc)
 				if len(cands) > 1 && len(cs.Args) > 0 {
-					if javaArgTypeCache == nil {
-						javaArgTypeCache = javaArgTypes(idx, &symbol)
-					}
-					javaResolveCallReturnTypes(idx, cs.Args, scope, javaArgTypeCache)
-					cands = narrowOverloadsByArgTypes(cands, cs.Args, javaArgTypeCache)
+					argTypes := javaTypesFor(cands, cs)
+					javaResolveCallReturnTypes(idx, cs.Args, scope, argTypes)
+					cands = narrowOverloadsByArgTypes(cands, cs.Args, argTypes)
 				}
 				// Static typing makes unknowns meaningful: a lowercase
 				// receiver with no inferable type is almost always a JDK
@@ -3342,10 +3367,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					ctors = narrowByExplicitImport(idx, &symbol, ctorName, ctors)
 					ctors = filterByArgc(ctors, cs.Argc)
 					if len(ctors) > 1 && len(cs.Args) > 0 {
-						if javaArgTypeCache == nil {
-							javaArgTypeCache = javaArgTypes(idx, &symbol)
-						}
-						ctors = narrowOverloadsByArgTypes(ctors, cs.Args, javaArgTypeCache)
+						ctors = narrowOverloadsByArgTypes(ctors, cs.Args, javaTypesFor(ctors, cs))
 					}
 				}
 				if symbol.Language == "php" {

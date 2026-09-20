@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.58.1 - 2026-09-19
+
+Fixed v0.58.0's own bug the same day. Typing a bare `this` argument against
+the enclosing class was meant for constructor overloads
+(`new WildcardFileFilter(this)`) but applied to every call: on an ordinary
+method, `ser.serialize(null, gen, this)` lost the valid overload because the
+lightweight overload matcher checks argument-type equality, not
+assignability, and `this` (`Provider`) isn't equal to a parameter typed
+`SerializerProvider` even though it satisfies it. The fix now types `this`
+only when a constructor is among the call's candidates. commons-lang
+recovers exactly to its first-corpus baseline (R 0.9509 → 0.9517); the other
+19 corpora are unchanged. Resolver `v22`.
+
 ## v0.58.0 - 2026-09-19
 
 Java bare-call overload fan-out (commons-io P 0.876 → 0.894; commons-lang

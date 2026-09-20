@@ -75,7 +75,7 @@ sit beside the first corpus's under `testdata/`.
 | Corpus (pin) | Language | Oracle | Universe | P | R | First corpus P / R |
 |---|---|---|---|---|---|---|
 | cobra (`adbc881`) | Go | SSA + VTA | 100% | 0.9828 | 0.9518 | 0.9522 / 0.9505 |
-| commons-io (`8ad9867d`) | Java | javac + javap | 94.5% | 0.8936 | 0.9121 | 0.9381 / 0.9517 |
+| commons-io (`8ad9867d`) | Java | javac + javap | 94.5% | 0.8933 | 0.9121 | 0.9386 / 0.9517 |
 | cJSON (`6d9f244`) | C | clang AST | 100% | 0.9982 | 0.9991 | 0.9991 / 0.9837 |
 | fd (`5bbfa3e`) | Rust | rust-analyzer SCIP | 100% | 0.9516 | 0.9130 | 0.9364 / 0.9045 |
 | p-queue (`180ab9e`) | TypeScript | tsc checker | 100% | 0.9592 | 1.0000 | 0.9029 / 0.9917 |
@@ -137,7 +137,7 @@ Closed the day after:
 
 Also closed the day after:
 
-- **Java bare-call overload fan-out** (commons-io P 0.876 → 0.894). A bare
+- **Java bare-call overload fan-out** (commons-io P 0.876 → 0.893). A bare
   call unresolved on the caller's own class or its resolvable ancestors used
   to fall through to same-package name matching: `IORandomAccessFile`
   extends `java.io.RandomAccessFile` (external, unindexed) and its bare
@@ -152,7 +152,15 @@ Also closed the day after:
   WildcardFileFilter(this)` — `this` is a keyword node in every grammar
   here, not an identifier node, so it carried no argument type and its five
   constructor overloads couldn't be told apart; `this` now types as the
-  enclosing class, like any other argument.
+  enclosing class, like any other argument, but only when a constructor is
+  among the candidates. Typing it for every call, not just constructor
+  overloads, was the shipped fix's own bug: `ser.serialize(null, gen,
+  this)` on an ordinary method rejected a valid supertype-typed parameter
+  because the lightweight overload matcher checks type equality, not
+  assignability — `this` (`Provider`) isn't equal to a parameter typed
+  `SerializerProvider` even though it satisfies it. commons-lang recovers
+  the difference (R 0.9509 → 0.9517, matching its first-corpus baseline
+  exactly).
 
 What they left open:
 

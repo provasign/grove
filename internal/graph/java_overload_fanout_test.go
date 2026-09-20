@@ -72,6 +72,28 @@ func TestJavaBareCall_ChainedOnConstructorStillResolvesByImportScope(t *testing.
 	}
 }
 
+func TestJavaMethodArg_ThisDoesNotApplyConstructorOnlyTyping(t *testing.T) {
+	// Typing `this` was added for constructor overloads. Applying it to an
+	// ordinary method call can reject a valid supertype parameter when the
+	// lightweight overload matcher cannot prove assignability.
+	g := New()
+	syms := []core.SymbolRecord{
+		javaSym2("j.java::JsonSerializer@sha", "j.java", core.KindClass, "JsonSerializer", "", "public abstract class JsonSerializer", ""),
+		javaSym2("j.java::JsonSerializer.serialize@sha", "j.java", core.KindMethod, "serialize", "JsonSerializer", "public abstract void serialize(Object value, Generator gen, SerializerProvider provider)", ""),
+		javaSym2("o.java::Other.serialize@sha", "o.java", core.KindMethod, "serialize", "Other", "public void serialize(Object value, Generator gen, OtherProvider provider)", ""),
+		javaSym2("p.java::Provider@sha", "p.java", core.KindClass, "Provider", "", "public class Provider extends SerializerProvider", ""),
+		javaSym2("p.java::Provider.writeNull@sha", "p.java", core.KindMethod, "writeNull", "Provider",
+			"protected void writeNull()",
+			"protected void writeNull() { JsonSerializer ser = getSerializer(); ser.serialize(null, gen, this); }",
+			core.CallSite{Callee: "ser.serialize", Line: 1, Argc: 3, Args: []string{"", "gen", "this"}}),
+	}
+	g.Replace(syms, 2)
+
+	if !hasEdge(g, core.EdgeCalls, "p.java::Provider.writeNull@sha", "j.java::JsonSerializer.serialize@sha") {
+		t.Fatalf("ordinary ser.serialize(..., this) must retain the valid supertype overload")
+	}
+}
+
 func TestJavaArgTypes_ThisTypesTheEnclosingClass(t *testing.T) {
 	// Builder.get() does `new WildcardFileFilter(this)`: the bare "this"
 	// argument types as the enclosing Builder class, picking the one
