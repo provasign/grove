@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.58.2 - 2026-09-22
+
+`grove doctor`'s capability manifest was missing COBOL and JCL entries even
+though both have been fully registered, working astkit strategies since
+v0.13.0 -- a user report ("doctor doesn't say it supports COBOL") surfaced
+both this gap and a stale README line pointing at a nonexistent `grove
+capabilities` command (the real command has always been `grove doctor`; the
+capabilities field is one part of its JSON output). Added both languages to
+the manifest as structural/heuristic (no grammar, no published accuracy
+oracle yet, unlike the ten CI-gated languages). Docs-and-metadata only; no
+parser, graph, or resolution code changed. Full release gate (go test ./...,
+ci_invariants against a workspace-built candidate) green.
+
 ## v0.58.1 - 2026-09-19
 
 Fixed v0.58.0's own bug the same day. Typing a bare `this` argument against
