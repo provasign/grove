@@ -165,7 +165,7 @@ The package also exposes snapshots and structural diffs for integrations that ne
 | COBOL | `.cbl`, `.cob`, `.cpy` and copybook variants |
 | JCL | `.jcl`, `.prc` |
 
-Common non-code files are indexed as document symbols for lexical retrieval. Native analyzers can enrich the graph when the relevant language tooling is available. `grove capabilities` reports each language's resolution tier and known limitations.
+Common non-code files are indexed as document symbols for lexical retrieval. Native analyzers can enrich the graph when the relevant language tooling is available. `grove doctor` reports each language's resolution tier and known limitations.
 
 ## Accuracy and testing
 
