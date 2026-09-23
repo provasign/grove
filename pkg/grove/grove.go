@@ -43,7 +43,17 @@ type (
 	CertificationFinding = core.CertificationFinding
 	EvidenceRef          = core.EvidenceRef
 	Verdict              = core.Verdict
+	CapabilityManifest   = core.CapabilityManifest
+	LanguageCapability   = core.LanguageCapability
+	OperationCapability  = core.OperationCapability
 )
+
+// CurrentCapabilities returns Grove's release-level per-language and
+// per-operation quality manifest (indexing/resolution tier, limitations,
+// caveats). `grove doctor` reports it directly; consumers embedding Grove
+// (Prism's `prism doctor`) can surface the same manifest without duplicating
+// or hand-tracking it.
+var CurrentCapabilities = core.CurrentCapabilities
 
 // Edge-type constants re-exported so consumers can filter Neighbors() without
 // importing internal/core.
