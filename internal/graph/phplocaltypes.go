@@ -414,13 +414,25 @@ func phpNarrowNewByNamespace(idx *edgeIndex, symbol *core.SymbolRecord, cs core.
 		fqn = strings.TrimPrefix(expr, "\\")
 	default:
 		segs := strings.Split(expr, "\\")
-		for imp := range idx.fileImports[symbol.FilePath] {
+		// Imports come from a map (random order), and aliases are not kept
+		// (`use X\Middleware as MiddlewareAttribute` is stored as
+		// X\Middleware), so two imports can both end in the name. Picking the
+		// first match made `new Middleware` resolve differently on every
+		// index run (laravel: 263-345 edges changed between runs of one
+		// binary, 2026-09-26). Narrow only on a single match.
+		var matches []string
+		for _, imp := range idx.sortedFileImports(symbol.FilePath) {
 			if strings.HasSuffix(imp, "\\"+segs[0]) || imp == segs[0] {
-				fqn = imp
-				if len(segs) > 1 {
-					fqn += "\\" + strings.Join(segs[1:], "\\")
-				}
-				break
+				matches = append(matches, imp)
+			}
+		}
+		if len(matches) > 1 {
+			return ctors
+		}
+		if len(matches) == 1 {
+			fqn = matches[0]
+			if len(segs) > 1 {
+				fqn += "\\" + strings.Join(segs[1:], "\\")
 			}
 		}
 		if fqn == "" {
@@ -497,7 +509,7 @@ func phpNarrowMethodsByImport(idx *edgeIndex, symbol *core.SymbolRecord, typ str
 	if len(methods) < 2 || symbol == nil {
 		return methods
 	}
-	for imp := range idx.fileImports[symbol.FilePath] {
+	for _, imp := range idx.sortedFileImports(symbol.FilePath) {
 		clause := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(imp, "use "), ";"))
 		target := clause
 		alias := ""

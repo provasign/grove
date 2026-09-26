@@ -392,6 +392,18 @@ func anyInFile(cands []*core.SymbolRecord, file string) bool {
 	return false
 }
 
+// sortedFileImports returns a file's imports in a stable order. fileImports
+// is a map; any loop that stops at the first match must not depend on Go's
+// randomized map iteration, or the graph changes between index runs.
+func (idx *edgeIndex) sortedFileImports(file string) []string {
+	imps := make([]string, 0, len(idx.fileImports[file]))
+	for imp := range idx.fileImports[file] {
+		imps = append(imps, imp)
+	}
+	sort.Strings(imps)
+	return imps
+}
+
 // rustImportedExternal reports whether the file imports a bare name from
 // a crate outside the workspace (`use regex_syntax::escape;`,
 // `use std::mem::replace;`, grouped forms included).
@@ -399,7 +411,7 @@ func rustImportedExternal(idx *edgeIndex, symbol *core.SymbolRecord, name string
 	// The name must be a bound member: preceded by "::", "{" or ", " and
 	// followed by a delimiter — never a module segment of a longer path.
 	re := localFnRes.get(`(?:::|\{|,\s*)` + regexp.QuoteMeta(name) + `(?:\s*[,}]|\s+as\s|\s*$)`)
-	for imp := range idx.fileImports[symbol.FilePath] {
+	for _, imp := range idx.sortedFileImports(symbol.FilePath) {
 		imp = stripRustUsePrefix(imp)
 		if !re.MatchString(imp) {
 			continue
