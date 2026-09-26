@@ -156,11 +156,19 @@ public class Store implements Getter {
     static class Inner { void run() {} }
 }
 
-interface Getter { String get(String k); }
+interface Getter { int MAX = 3; String get(String k); }
+
+@interface Audited { String value(); }
+
+record Point(int x, int y) {
+    Point { check(x); }
+}
 `,
 		want: map[string]core.SymbolKind{
 			"Store": core.KindClass, "Store.LIMIT": core.KindField, "Store.size": core.KindField,
-			"Store.get": core.KindMethod, "Getter": core.KindInterface,
+			"Store.get": core.KindMethod, "Getter": core.KindInterface, "Getter.MAX": core.KindField,
+			"Audited": core.KindAnnotation, "Audited.value": core.KindMethod,
+			"Point.x": core.KindMethod, "Point.Point": core.KindConstructor,
 		},
 	},
 	"rust": {
@@ -255,12 +263,22 @@ struct Pair { int first; int (*cb)(int); };
         public int Size { get; set; }
         public Store(int size) { this.size = size; }
         public string Get(string k) { return k; }
+        public event EventHandler Changed;
+        public static Store operator +(Store a, Store b) => a;
+        ~Store() { }
     }
+
+    public record Person(string First, string Last);
+
+    public delegate void Notify(string msg);
 }
 `,
 		want: map[string]core.SymbolKind{
 			"IGetter": core.KindInterface, "Mode": core.KindEnum, "Store": core.KindClass,
 			"Store.size": core.KindField, "Store.Size": core.KindField, "Store.Get": core.KindMethod,
+			"Mode.Fast": core.KindConst, "Store.Changed": core.KindField, "Store.operator +": core.KindMethod,
+			"Store.Store": core.KindConstructor, "Store.~Store": core.KindMethod,
+			"Person.First": core.KindField, "Notify": core.KindType,
 		},
 	},
 	"php": {
@@ -301,11 +319,15 @@ struct Store: Getter {
     func get(_ k: String) -> String { return k }
 }
 
+protocol Repo { associatedtype Item }
+
 func make() -> Store { return Store(size: 1) }
 `,
 		want: map[string]core.SymbolKind{
 			"Getter": core.KindInterface, "Mode": core.KindEnum, "Store": core.KindStruct,
 			"Store.size": core.KindField, "Store.get": core.KindMethod, "make": core.KindFunction,
+			"limit": core.KindConst, "Mode.fast": core.KindConst, "Store.init": core.KindConstructor,
+			"Repo.Item": core.KindType,
 		},
 	},
 	"kotlin": {
@@ -323,16 +345,37 @@ class Store(val cap: Int) : Getter {
     override fun get(k: String): String = k
 }
 
+typealias Callback = (String) -> Unit
+
+fun interface Handler { fun handle(x: Int): Int }
+
+object Registry { val count = 1 }
+
+val defaultStore = Store(1)
+
 fun make(): Store = Store(1)
 `,
 		want: map[string]core.SymbolKind{
 			"Getter": core.KindInterface, "Mode": core.KindEnum, "Store": core.KindClass,
 			"Store.size": core.KindField, "Store.get": core.KindMethod, "make": core.KindFunction,
+			"LIMIT": core.KindConst, "Store.cap": core.KindField, "Mode.FAST": core.KindConst,
+			"Callback": core.KindType, "Handler": core.KindInterface, "Handler.handle": core.KindMethod,
+			"Registry.count": core.KindField, "defaultStore": core.KindVariable,
 		},
 	},
 	"objc": {
 		file: "P.m",
-		src: `@interface Store : NSObject {
+		src: `typedef NS_ENUM(NSInteger, Mode) { ModeFast, ModeSlow };
+
+typedef void (^Handler)(int);
+
+@protocol Getter
+@required
+- (NSString *)get:(NSString *)k;
+@property (nonatomic, readonly) int limit;
+@end
+
+@interface Store : NSObject <Getter> {
     int _size;
 }
 @property (nonatomic) int size;
@@ -345,6 +388,9 @@ fun make(): Store = Store(1)
 `,
 		want: map[string]core.SymbolKind{
 			"Store": core.KindClass, "Store._size": core.KindField, "Store.get:": core.KindMethod,
+			"Store.size": core.KindField, "Mode": core.KindEnum, "Mode.ModeFast": core.KindConst,
+			"Handler": core.KindType, "Getter": core.KindInterface, "Getter.get:": core.KindMethod,
+			"Getter.limit": core.KindField,
 		},
 	},
 }
