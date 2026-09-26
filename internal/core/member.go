@@ -32,3 +32,16 @@ type MemberOccurrence struct {
 	Language string `json:"language"`          // the file's language
 	Package  string `json:"package,omitempty"` // Go: the file's package clause name
 }
+
+// JSExportSpecifier is one `export { local as exported } [from "source"]`
+// specifier naming a queried identifier. Re-export barrels (zod's
+// mini/checks.ts is 32 lines of nothing else) hold no symbols, so these
+// lines are invisible to the symbol graph and must be found in source.
+type JSExportSpecifier struct {
+	File     string `json:"file"` // repo-relative, slash-separated
+	Line     int    `json:"line"` // 1-based line of the specifier
+	Local    string `json:"local"`
+	Exported string `json:"exported"`         // == Local when not aliased
+	Source   string `json:"source,omitempty"` // module specifier of `from "..."`, empty for a local export
+	Text     string `json:"text"`             // the specifier's source line, trimmed
+}

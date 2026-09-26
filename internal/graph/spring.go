@@ -312,18 +312,47 @@ func (g *CodeGraph) typeImpactLocked(query string) *ChangeImpactResult {
 			}
 		}
 	}
-	addFrom(typeID)
+	decls := []core.SymbolRecord{*typeSym}
+	anchors := []string{typeID}
+	// TS/JS declaration merging: `export interface $ZodCheckGreaterThan`
+	// and `export const $ZodCheckGreaterThan = core.$constructor(...)` are
+	// ONE exported name with a type side and a value side. The value side
+	// holds the behavior (zod pr6129's fix was inside the const's
+	// constructor body), so answering with the interface alone pointed the
+	// agent at the one declaration that could not need the edit.
+	if isJSLanguage(typeSym.Language) {
+		for _, id := range g.idsNamed(q) {
+			s := g.symbols[id]
+			if id == typeID || s.FilePath != typeSym.FilePath || s.ParentSymbol != "" {
+				continue
+			}
+			switch s.Kind {
+			case core.KindConst, core.KindVariable, core.KindClass, core.KindInterface, core.KindType, core.KindEnum:
+			default:
+				continue
+			}
+			seen[id] = true
+			decls = append(decls, s)
+			anchors = append(anchors, id)
+		}
+	}
+	for _, id := range anchors {
+		addFrom(id)
+	}
 	// Members (methods/fields/contains) are structurally part of the type —
 	// a caller of ANY member is a dependent of the type, not just direct
 	// references to the type name itself.
-	for _, ei := range g.outbound[typeID] {
-		if e := g.edges[ei]; e.Type == core.EdgeContains {
-			addFrom(e.To)
+	for _, anchor := range anchors {
+		for _, ei := range g.outbound[anchor] {
+			if e := g.edges[ei]; e.Type == core.EdgeContains {
+				addFrom(e.To)
+			}
 		}
 	}
+	sortSymbols(decls)
 	sortSymbols(callers)
 	return &ChangeImpactResult{
-		Query: query, Declarations: []core.SymbolRecord{*typeSym},
+		Query: query, Declarations: decls,
 		Callers: callers, Completeness: "type-level", HasHeuristicRefs: heuristicCallers,
 	}
 }

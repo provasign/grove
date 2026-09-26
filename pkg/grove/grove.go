@@ -29,6 +29,7 @@ import (
 type (
 	Symbol               = core.SymbolRecord
 	MemberAccess         = graph.MemberAccess
+	RelatedSite          = graph.RelatedSite
 	Reference            = parser.Reference
 	ReferenceResult      = parser.ReferenceResult
 	Edge                 = core.Edge
@@ -231,6 +232,7 @@ func (e *Engine) currentGraphContext(ctx context.Context) (*graph.CodeGraph, err
 		}
 	}
 	g.SetMemberScanner(e.memberScanner())
+	g.SetJSExportScanner(e.jsExportScanner())
 	e.graph = g
 	return g, nil
 }
@@ -269,6 +271,7 @@ func (e *Engine) Index(ctx context.Context, dir string) (IndexResult, error) {
 	}
 	if cg != nil {
 		cg.SetMemberScanner(e.memberScanner())
+		cg.SetJSExportScanner(e.jsExportScanner())
 		e.mu.Lock()
 		e.graph = cg
 		e.mu.Unlock()
@@ -422,6 +425,17 @@ type ChangeImpactResult struct {
 	ExcludedAccesses  int
 	AccessCoverage    string
 	AccessNote        string
+
+	// Related is a bounded (<= 8), informational group that is NOT part of
+	// the change set: other callers of what the target calls, and
+	// same-named methods in one hierarchy that lack a helper call their
+	// peers share. Sites() never includes it.
+	Related []RelatedSite
+	// ReExports are TS/JS export-specifier lines that re-export or alias
+	// the queried function (`export { _gte as gte } from "../core"`). They
+	// reference the declaration by name, so a rename or removal must edit
+	// them; they are not symbols, so Sites() does not include them.
+	ReExports []MemberAccess
 }
 
 // Sites returns the change-set methods (declarations ∪ family ∪ callers ∪
@@ -452,6 +466,24 @@ func (e *Engine) memberScanner() graph.MemberScanner {
 			skipped++
 		}
 		return occs, skipped
+	}
+}
+
+// jsExportScanner finds TS/JS `export { name as alias }` specifier lines
+// for function change impact (see graph/reexports.go).
+//
+// The tree is scanned once per installed graph, on the first TS/JS
+// function query: a new graph is installed whenever indexed files change,
+// so the cache is exactly as fresh as the graph it answers for. Measured on
+// grafana (8.8k TS/JS files): a per-query walk added ~1s to every call.
+func (e *Engine) jsExportScanner() graph.JSExportScanner {
+	root := e.root
+	var once sync.Once
+	var byName map[string][]core.JSExportSpecifier
+	var skipped int
+	return func(name string) ([]core.JSExportSpecifier, int) {
+		once.Do(func() { byName, skipped = parser.JSExportIndex(root) })
+		return byName[name], skipped
 	}
 }
 
@@ -491,6 +523,8 @@ func (e *Engine) ChangeImpactScoped(ctx context.Context, query, file string) (Ch
 		ExcludedAccesses:  raw.ExcludedAccesses,
 		AccessCoverage:    raw.AccessCoverage,
 		AccessNote:        raw.AccessNote,
+		Related:           g.RelatedSites(raw),
+		ReExports:         raw.ReExports,
 	}, nil
 }
 

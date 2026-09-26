@@ -39,6 +39,9 @@ type CodeGraph struct {
 	// field/variable change impact (see memberimpact.go). Nil in graphs
 	// built without source access; member queries then say so.
 	memberScanner MemberScanner
+	// jsExportScanner finds TS/JS export-specifier lines (re-export
+	// barrels) for function change impact (see reexports.go).
+	jsExportScanner JSExportScanner
 }
 
 func New() *CodeGraph {

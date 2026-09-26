@@ -80,6 +80,10 @@ type ChangeImpactResult struct {
 	// declaration could be typed), "declaration-only" (no source scan).
 	AccessCoverage string
 	AccessNote     string
+
+	// ReExports: TS/JS export-specifier lines that re-export or alias the
+	// queried function (reexports.go). Not symbols, so not in Sites().
+	ReExports []MemberAccess
 }
 
 // Sites returns every METHOD in the change-set — declarations, family,
@@ -1147,6 +1151,7 @@ func (g *CodeGraph) freeFunctionImpactLocked(query, file string) *ChangeImpactRe
 		Callers:          callers,
 		Completeness:     "callers-only",
 		HasHeuristicRefs: heuristicEdges,
+		ReExports:        g.jsReExportsLocked(decls),
 	}
 }
 
