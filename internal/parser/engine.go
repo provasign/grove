@@ -499,6 +499,7 @@ func extractSymbols(language, filePath, blobSHA, content string, fileImports []s
 		if language == "c" || language == "cpp" {
 			regexSyms := extractSymbolsRegex(language, filePath, blobSHA, content, fileImports)
 			if language == "cpp" {
+				regexSyms = dropCppNamespaceTwins(astSyms, regexSyms)
 				n := len(astSyms)
 				combined := enrichCppNamespaces(append(append([]core.SymbolRecord(nil), astSyms...), regexSyms...), content)
 				astSyms, regexSyms = combined[:n], combined[n:]
@@ -515,6 +516,7 @@ func extractSymbols(language, filePath, blobSHA, content string, fileImports []s
 		regexSyms[idx].Annotations = append(regexSyms[idx].Annotations, "syntax-recovery")
 	}
 	if language == "cpp" {
+		regexSyms = dropCppNamespaceTwins(astSyms, regexSyms)
 		n := len(astSyms)
 		combined := enrichCppNamespaces(append(append([]core.SymbolRecord(nil), astSyms...), regexSyms...), content)
 		astSyms, regexSyms = combined[:n], combined[n:]
@@ -525,6 +527,33 @@ func extractSymbols(language, filePath, blobSHA, content string, fileImports []s
 	}
 	attachDocstrings(language, content, merged)
 	return merged
+}
+
+// dropCppNamespaceTwins removes the line scanner's copy of every namespace
+// the AST also reports (same name, same first line). The copy's span is
+// wrong: with clang-format's `}  // namespace foo` its text runs past the
+// AST's closing brace, so it "strictly contained" its twin and every name in
+// the file became foo::foo::...; past 500 lines its brace scan stops early,
+// so it was the narrowest scope around the file's first 500 lines and
+// `namespace testing { namespace internal {` members landed in testing::.
+func dropCppNamespaceTwins(astSyms, regexSyms []core.SymbolRecord) []core.SymbolRecord {
+	astNamespaces := map[string]bool{}
+	for _, s := range astSyms {
+		if s.Kind == core.KindNamespace {
+			astNamespaces[s.Name+"\x00"+fmt.Sprint(s.Span.Start)] = true
+		}
+	}
+	if len(astNamespaces) == 0 {
+		return regexSyms
+	}
+	kept := regexSyms[:0:0]
+	for _, s := range regexSyms {
+		if s.Kind == core.KindNamespace && astNamespaces[s.Name+"\x00"+fmt.Sprint(s.Span.Start)] {
+			continue
+		}
+		kept = append(kept, s)
+	}
+	return kept
 }
 
 func enrichRecoveredClassParents(symbols []core.SymbolRecord) {
@@ -675,16 +704,14 @@ func enrichCppNamespaces(symbols []core.SymbolRecord, content string) []core.Sym
 			owner, name = symbol.Name[:split], symbol.Name[split+2:]
 		}
 		if owner != "" {
-			if namespace != "" && !strings.Contains(owner, "::") {
-				owner = namespace + "::" + owner
+			if namespace != "" {
+				owner = cppJoinScope(namespace, owner)
 			}
 			symbol.Name = name
 			symbol.ParentSymbol = owner
-			separator := "."
-			if namespace != "" || strings.Contains(owner, "::") {
-				separator = "::"
-			}
-			symbol.QualifiedName = owner + separator + name
+			// C++ spells every scope `::`; a class outside any namespace
+			// used to get `Global.g` while namespaced ones got `ns::A::g`.
+			symbol.QualifiedName = owner + "::" + name
 			if symbol.Kind == core.KindFunction {
 				ownerName := owner
 				if split := strings.LastIndex(owner, "::"); split >= 0 {
@@ -701,6 +728,33 @@ func enrichCppNamespaces(symbols []core.SymbolRecord, content string) []core.Sym
 		}
 	}
 	return symbols
+}
+
+// cppJoinScope qualifies an owner path written inside namespace ns. A bare
+// owner (`Circle`) or a nested class path from the extractor (`Box::Node`)
+// lives in ns; an owner that already spells some of ns (`detail::X` inside
+// `nlohmann::detail`, `nlohmann::X` inside `nlohmann`) is not repeated.
+func cppJoinScope(ns, owner string) string {
+	if strings.HasPrefix(owner, "::") {
+		return strings.TrimPrefix(owner, "::")
+	}
+	if !strings.Contains(owner, "::") {
+		return ns + "::" + owner
+	}
+	if strings.HasPrefix(owner, ns+"::") {
+		return owner
+	}
+	nsSegs := strings.Split(ns, "::")
+	ownerSegs := strings.Split(owner, "::")
+	for k := len(nsSegs); k > 0; k-- {
+		if k >= len(ownerSegs) {
+			continue
+		}
+		if strings.Join(nsSegs[len(nsSegs)-k:], "::") == strings.Join(ownerSegs[:k], "::") {
+			return strings.Join(append(append([]string(nil), nsSegs[:len(nsSegs)-k]...), ownerSegs...), "::")
+		}
+	}
+	return ns + "::" + owner
 }
 
 var (
@@ -900,6 +954,10 @@ func mergeSymbolsByShape(astSyms, regexSyms []core.SymbolRecord) []core.SymbolRe
 				insideASTCallable = true
 				break
 			}
+			if cFamilyASTTwin(&s, &astSymbol) {
+				insideASTCallable = true
+				break
+			}
 		}
 		if insideASTCallable {
 			// The C-family fallback scans lines without syntax context.
@@ -941,6 +999,27 @@ func mergeSymbolsByShape(astSyms, regexSyms []core.SymbolRecord) []core.SymbolRe
 		}
 	}
 	return merged
+}
+
+// cFamilyASTTwin reports a line-scanned C/C++ symbol that a clean AST
+// parse already accounts for: a callable on the first line of an AST
+// callable (`operator bool() const {` scanned as a method named bool), a
+// same-named symbol on an AST symbol's first line (a class the scanner cut
+// at its 500-line window), or anything inside an AST class/struct/enum body,
+// whose members the AST extracted itself (the scanner credited a nested
+// union's constructors to the outer class).
+func cFamilyASTTwin(s, a *core.SymbolRecord) bool {
+	if s.Language != "c" && s.Language != "cpp" {
+		return false
+	}
+	if s.Span.Start == a.Span.Start && (s.Name == a.Name || (isCallableKind(s.Kind) && isCallableKind(a.Kind))) {
+		return true
+	}
+	switch a.Kind {
+	case core.KindClass, core.KindStruct, core.KindEnum:
+		return s.Span.Start > a.Span.Start && s.Span.Start <= a.Span.End
+	}
+	return false
 }
 
 func cFamilyControlKeywordPhantom(symbol *core.SymbolRecord) bool {
@@ -1151,10 +1230,16 @@ func extractSymbolsRegex(language, filePath, blobSHA, content string, fileImport
 func extractCFamilySymbols(language, filePath, blobSHA, content string, fileImports []string) []core.SymbolRecord {
 	patterns := symbolPatterns(language)
 	lines := strings.Split(content, "\n")
+	// Patterns match, and braces are counted, on a copy with comments and
+	// string literals blanked (line numbers kept): the scanner read
+	// ` * Copyright (c) 2009` in license headers as a function named
+	// Copyright, and prose in block comments as functions spanning hundreds
+	// of lines. Signatures and bodies still come from the source.
+	clean := strings.Split(blankCFamilyComments(content), "\n")
 	var symbols []core.SymbolRecord
 
 	for i := 0; i < len(lines); i++ {
-		line := lines[i]
+		line := clean[i]
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" || strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "#") {
 			continue
@@ -1173,10 +1258,17 @@ func extractCFamilySymbols(language, filePath, blobSHA, content string, fileImpo
 			if name == "" {
 				continue
 			}
-			endLine, body := extractBody(lines, i, language)
-			if language == "cpp" && (pattern.kind == core.KindClass || pattern.kind == core.KindStruct) {
-				endLine, body = extractBraceBody(lines, i)
+			if isCallableKind(pattern.kind) && (cFamilyReservedName[name] || strings.HasPrefix(trimmed, "typedef")) {
+				// `typedef int (*compare_fn)(...)` matched as a function
+				// named int; a type keyword is never a function name.
+				continue
 			}
+			endLine, _ := extractBody(clean, i, language)
+			if language == "cpp" && (pattern.kind == core.KindClass || pattern.kind == core.KindStruct) {
+				endLine, _ = extractBraceBody(clean, i)
+			}
+			body := strings.Join(lines[i:endLine], "\n")
+			line := lines[i]
 			symbols = append(symbols, core.SymbolRecord{
 				ID:            fmt.Sprintf("%s::%s@%s", filePath, name, blobSHA),
 				FilePath:      filePath,
@@ -1194,7 +1286,7 @@ func extractCFamilySymbols(language, filePath, blobSHA, content string, fileImpo
 				TokenEstimate: estimateTokens(body),
 			})
 			if language == "cpp" && pattern.kind == core.KindClass {
-				symbols = append(symbols, extractCPPClassMembers(filePath, blobSHA, name, lines, i+1, endLine-1, fileImports)...)
+				symbols = append(symbols, extractCPPClassMembers(filePath, blobSHA, name, lines, clean, i+1, endLine-1, fileImports)...)
 			}
 			if (pattern.kind == core.KindClass || pattern.kind == core.KindStruct) && endLine > i+1 {
 				i = endLine - 1
@@ -1207,21 +1299,21 @@ func extractCFamilySymbols(language, filePath, blobSHA, content string, fileImpo
 
 var cppMemberPattern = regexp.MustCompile(`^\s*(?:(?:virtual|static|inline|constexpr|consteval|constinit|explicit|friend)\s+)*(?:(?:[\w:<>,~*&]+\s+)+)?(` + cppCallableNamePattern + `)\s*\([^;{}]*\)\s*(?:(?:const|volatile|override|final|noexcept(?:\s*\([^)]*\))?|&&?)\s*)*(?:->\s*[\w:<>,~*&\s]+\s*)?(?:=\s*(?:0|default|delete)\s*)?[;{]`)
 
-func extractCPPClassMembers(filePath, blobSHA, className string, lines []string, start, end int, fileImports []string) []core.SymbolRecord {
+func extractCPPClassMembers(filePath, blobSHA, className string, lines, clean []string, start, end int, fileImports []string) []core.SymbolRecord {
 	var symbols []core.SymbolRecord
 	for i := start; i < end && i < len(lines); i++ {
-		line := lines[i]
-		trimmed := strings.TrimSpace(line)
+		trimmed := strings.TrimSpace(clean[i])
 		if trimmed == "" || strings.HasPrefix(trimmed, "//") || strings.HasSuffix(trimmed, ":") {
 			continue
 		}
-		matches := cppMemberPattern.FindStringSubmatch(line)
+		matches := cppMemberPattern.FindStringSubmatch(clean[i])
 		if len(matches) != 2 {
 			continue
 		}
+		line := lines[i]
 		name := matches[1]
 		name = strings.ReplaceAll(name, " ", "")
-		if name == "" {
+		if name == "" || cFamilyReservedName[name] {
 			continue
 		}
 		kind := core.KindMethod
@@ -1229,8 +1321,9 @@ func extractCPPClassMembers(filePath, blobSHA, className string, lines []string,
 			kind = core.KindConstructor
 		}
 		qualifiedName := className + "." + name
-		bodyEnd, body := extractBody(lines, i, "cpp")
-		if bodyEnd > end || !strings.Contains(line, "{") {
+		bodyEnd, _ := extractBody(clean, i, "cpp")
+		body := strings.Join(lines[i:bodyEnd], "\n")
+		if bodyEnd > end || !strings.Contains(clean[i], "{") {
 			bodyEnd = i + 1
 			body = strings.TrimSpace(line)
 		}
@@ -1250,11 +1343,80 @@ func extractCPPClassMembers(filePath, blobSHA, className string, lines []string,
 			Imports:       fileImports,
 			TokenEstimate: estimateTokens(body),
 		})
-		if !strings.Contains(line, "{") {
+		if !strings.Contains(clean[i], "{") {
 			symbols[len(symbols)-1].Annotations = []string{"declaration"}
 		}
 	}
 	return symbols
+}
+
+// cFamilyReservedName lists C/C++ keywords and builtin type names the
+// line-scanning fallback must never report as a callable's name.
+var cFamilyReservedName = map[string]bool{
+	"auto": true, "bool": true, "char": true, "const": true, "double": true, "enum": true,
+	"extern": true, "float": true, "int": true, "long": true, "register": true, "short": true,
+	"signed": true, "static": true, "struct": true, "typedef": true, "union": true,
+	"unsigned": true, "void": true, "volatile": true, "inline": true, "else": true, "do": true,
+	"case": true, "goto": true, "break": true, "continue": true, "default": true,
+	"wchar_t": true, "char8_t": true, "char16_t": true, "char32_t": true, "namespace": true,
+	"class": true, "template": true, "typename": true, "using": true, "new": true, "delete": true,
+	"throw": true, "noexcept": true, "static_assert": true, "alignas": true,
+}
+
+// blankCFamilyComments returns content with every comment and string or
+// character literal replaced by spaces; newlines stay, so line numbers and
+// line lengths are unchanged. Unlike stripCppCommentsAndStrings a literal
+// never runs past the end of its line, so an apostrophe in prose
+// (`#error don't`) or a digit separator cannot swallow the rest of the file.
+func blankCFamilyComments(content string) string {
+	out := []byte(content)
+	for i := 0; i < len(out); {
+		switch {
+		case out[i] == '/' && i+1 < len(out) && out[i+1] == '/':
+			for i < len(out) && out[i] != '\n' {
+				out[i] = ' '
+				i++
+			}
+		case out[i] == '/' && i+1 < len(out) && out[i+1] == '*':
+			out[i], out[i+1] = ' ', ' '
+			i += 2
+			for i < len(out) && !(out[i] == '*' && i+1 < len(out) && out[i+1] == '/') {
+				if out[i] != '\n' {
+					out[i] = ' '
+				}
+				i++
+			}
+			if i+1 < len(out) {
+				out[i], out[i+1] = ' ', ' '
+				i += 2
+			} else {
+				i = len(out)
+			}
+		case out[i] == '"' || (out[i] == '\'' && !(i > 0 && isHexDigitByte(out[i-1]) && i+1 < len(out) && isHexDigitByte(out[i+1]))):
+			quote := out[i]
+			i++
+			for i < len(out) && out[i] != '\n' {
+				if out[i] == '\\' && i+1 < len(out) && out[i+1] != '\n' {
+					out[i], out[i+1] = ' ', ' '
+					i += 2
+					continue
+				}
+				if out[i] == quote {
+					i++
+					break
+				}
+				out[i] = ' '
+				i++
+			}
+		default:
+			i++
+		}
+	}
+	return string(out)
+}
+
+func isHexDigitByte(b byte) bool {
+	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')
 }
 
 // extractNameAndParent returns (name, parentSymbol) from regex matches.

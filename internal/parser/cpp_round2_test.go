@@ -22,7 +22,7 @@ Base& operator+(const Base& left, const Base& right);
 	for _, sym := range syms {
 		got[sym.QualifiedName] = sym.Kind
 	}
-	for _, name := range []string{"Base.~Base", "Base.operator+=", "Base.operator[]", "Base.operator()"} {
+	for _, name := range []string{"Base::~Base", "Base::operator+=", "Base::operator[]", "Base::operator()"} {
 		if got[name] != core.KindMethod {
 			t.Errorf("%s kind = %q; symbols=%v", name, got[name], got)
 		}
@@ -52,17 +52,17 @@ public:
 	for _, sym := range syms {
 		ids[sym.QualifiedName] = sym.ID
 	}
-	if ids["Owner.go"] == "" || ids["Widget.render"] == "" || ids["Other.render"] == "" {
+	if ids["Owner::go"] == "" || ids["Widget::render"] == "" || ids["Other::render"] == "" {
 		t.Fatalf("missing C++ fixture symbols: %v", ids)
 	}
 	for _, edge := range graph.BuildEdges(syms) {
-		if edge.Type != core.EdgeCalls || edge.From != ids["Owner.go"] {
+		if edge.Type != core.EdgeCalls || edge.From != ids["Owner::go"] {
 			continue
 		}
-		if edge.To == ids["Other.render"] {
+		if edge.To == ids["Other::render"] {
 			t.Fatal("C++ field receiver reached unrelated Other.render")
 		}
-		if edge.To == ids["Widget.render"] {
+		if edge.To == ids["Widget::render"] {
 			return
 		}
 	}
@@ -94,9 +94,9 @@ func TestCPPStructMethodsEndToEnd(t *testing.T) {
 `
 	syms := extractSymbols("cpp", "widget.cpp", "sha", source, nil)
 	want := map[string]core.SymbolKind{
-		"Widget":                 core.KindStruct,
-		"Widget.inlineMethod":    core.KindMethod,
-		"Widget.multilineMethod": core.KindMethod,
+		"Widget":                  core.KindStruct,
+		"Widget::inlineMethod":    core.KindMethod,
+		"Widget::multilineMethod": core.KindMethod,
 	}
 	for _, sym := range syms {
 		kind, ok := want[sym.QualifiedName]
@@ -129,12 +129,12 @@ private:
 	for _, sym := range syms {
 		byName[sym.QualifiedName] = sym
 	}
-	for _, name := range []string{"fileLocal", "Widget.protM", "Widget.privM"} {
+	for _, name := range []string{"fileLocal", "Widget::protM", "Widget::privM"} {
 		if sym, ok := byName[name]; !ok || sym.Exports {
 			t.Errorf("%s = %+v, want non-exported symbol", name, sym)
 		}
 	}
-	if sym := byName["Widget.pubM"]; !sym.Exports {
+	if sym := byName["Widget::pubM"]; !sym.Exports {
 		t.Errorf("Widget.pubM = %+v, want exported public method", sym)
 	}
 	g := graph.New()
@@ -143,12 +143,12 @@ private:
 	for _, sym := range g.DeadCode(nil).Dead {
 		dead[sym.QualifiedName] = true
 	}
-	for _, name := range []string{"fileLocal", "Widget.protM", "Widget.privM"} {
+	for _, name := range []string{"fileLocal", "Widget::protM", "Widget::privM"} {
 		if !dead[name] {
 			t.Errorf("%s not reported dead; dead=%v", name, dead)
 		}
 	}
-	if dead["Widget.pubM"] {
+	if dead["Widget::pubM"] {
 		t.Fatal("public C++ method reported as private dead code")
 	}
 }

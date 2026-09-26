@@ -1828,7 +1828,11 @@ func declarationOnlySymbol(s *core.SymbolRecord) bool {
 	case "go":
 		return s.Kind == core.KindField
 	case "c", "cpp":
-		return s.Kind == core.KindField || s.Kind == core.KindVariable
+		// Enum constants and type aliases (`using X = T;`, class-scope and
+		// function-pointer typedefs) were added 2026-09-26; aliases carry
+		// the "type-alias" modifier so pre-existing typedefs keep their edges.
+		return s.Kind == core.KindField || s.Kind == core.KindVariable || s.Kind == core.KindConst ||
+			(s.Kind == core.KindType && slices.Contains(s.Modifiers, "type-alias"))
 	case "php":
 		return s.Kind == core.KindField || s.Kind == core.KindConst
 	case "javascript", "typescript", "tsx":
