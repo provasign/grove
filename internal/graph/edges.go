@@ -1834,6 +1834,12 @@ func buildUsesType(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
 			// pre-existing language's counts stay byte-identical.
 			continue
 		}
+		if symbol.Language == "go" && symbol.Kind == core.KindField {
+			// Go struct fields (new 2026-09-25) are indexed so lookup and
+			// search can find them. Same rule as python fields: they add no
+			// uses-type edges, so pre-existing Go graphs stay byte-identical.
+			continue
+		}
 		scope := idx.importedFiles(symbol.FilePath)
 		matches := usesTypeIdent.FindAllStringSubmatch(symbol.Signature, -1)
 		for _, m := range matches {
