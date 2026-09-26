@@ -93,10 +93,22 @@ export class Store {
 }
 
 export function make() { return new Store(1); }
+
+const Anon = class { run() {} };
+exports.VERSION = "1";
+module.exports.Y = class { go() {} };
+module.exports = { build() {}, C: 5 };
+app.init = function () { this.settings = {}; };
+req.get = req.header = function () {};
+defineGetter(req, 'protocol', function () {});
 `,
 		want: map[string]core.SymbolKind{
 			"LIMIT": core.KindVariable, "Store": core.KindClass, "Store.size": core.KindField,
-			"Store.get": core.KindMethod, "make": core.KindFunction,
+			"Store.get": core.KindMethod, "make": core.KindFunction, "Store.cap": core.KindField,
+			"Anon": core.KindClass, "Anon.run": core.KindMethod, "VERSION": core.KindVariable,
+			"Y": core.KindClass, "Y.go": core.KindMethod, "build": core.KindFunction, "C": core.KindVariable,
+			"app.settings": core.KindField, "req.get": core.KindMethod, "req.header": core.KindMethod,
+			"req.protocol": core.KindMethod,
 		},
 	},
 	"typescript": {
@@ -116,11 +128,20 @@ export class Store implements Getter {
 }
 
 export function make(): Store { return new Store(1); }
+
+export interface Options { timeout?: number; }
+export const enum Flag { On = 1 }
+declare global { interface Window { myGlobal: string } }
+declare module "ext" { export function helper(): void; }
+export default { data() { return {}; } };
 `,
 		want: map[string]core.SymbolKind{
 			"LIMIT": core.KindVariable, "Getter": core.KindInterface, "Mode": core.KindEnum,
 			"Key": core.KindType, "Store": core.KindClass, "Store.size": core.KindField,
 			"Store.get": core.KindMethod, "make": core.KindFunction,
+			"Mode.Fast": core.KindConst, "Flag.On": core.KindConst, "Getter.get": core.KindMethod,
+			"Options.timeout": core.KindField, "Store.cap": core.KindField,
+			"Window.myGlobal": core.KindField, "helper": core.KindFunction, "data": core.KindFunction,
 		},
 	},
 	"tsx": {
@@ -133,10 +154,14 @@ export class Store {
 }
 
 export function View(): JSX.Element { return <div />; }
+
+interface Props { label: string; onClick(): void }
+enum Size { Small, Large }
 `,
 		want: map[string]core.SymbolKind{
 			"LIMIT": core.KindVariable, "Store": core.KindClass, "Store.size": core.KindField,
 			"Store.get": core.KindMethod, "View": core.KindFunction,
+			"Props.label": core.KindField, "Props.onClick": core.KindMethod, "Size.Small": core.KindConst,
 		},
 	},
 	"java": {
@@ -280,11 +305,23 @@ class Store implements Getter {
 }
 
 function make(): Store { return new Store(1); }
+
+define('LEGACY', 1);
+
+class Point { public function __construct(private int $x, public readonly int $y) {} }
+
+enum Suit: string {
+    case Hearts = 'H';
+    const Wild = self::Hearts;
+    public function color(): string { return 'Red'; }
+}
 `,
 		want: map[string]core.SymbolKind{
 			"LIMIT": core.KindConst, "Store.MODE": core.KindConst,
 			"Getter": core.KindInterface, "Store": core.KindClass, "Store.size": core.KindField,
 			"Store.get": core.KindMethod, "make": core.KindFunction,
+			"LEGACY": core.KindConst, "Point.x": core.KindField, "Point.y": core.KindField,
+			"Suit.Hearts": core.KindConst, "Suit.Wild": core.KindConst, "Suit.color": core.KindMethod,
 		},
 	},
 	"swift": {

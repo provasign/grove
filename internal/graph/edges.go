@@ -1818,7 +1818,12 @@ func declarationOnlySymbol(s *core.SymbolRecord) bool {
 	case "php":
 		return s.Kind == core.KindField || s.Kind == core.KindConst
 	case "javascript", "typescript", "tsx":
-		return s.Kind == core.KindVariable && slices.Contains(s.Modifiers, "module-value")
+		// module-value: module/namespace consts; member-value: enum members,
+		// interface properties, constructor parameter properties and
+		// `this.x` fields (added 2026-09-26); KindConst is only enum members.
+		return s.Kind == core.KindConst ||
+			(s.Kind == core.KindVariable && slices.Contains(s.Modifiers, "module-value")) ||
+			slices.Contains(s.Modifiers, "member-value")
 	}
 	return false
 }
