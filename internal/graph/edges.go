@@ -577,7 +577,9 @@ func (idx *edgeIndex) buildPyModuleGlobals(symbols []core.SymbolRecord) {
 	var ambiguous map[string]bool
 	for i := range symbols {
 		s := &symbols[i]
-		if s.Language != "python" || s.Kind != core.KindVariable {
+		if s.Language != "python" || s.Kind != core.KindVariable || slices.Contains(s.Modifiers, "module-value") {
+			// Plain module assignments (module-value) have no annotation;
+			// their "x = ..." signature is not a declared type.
 			continue
 		}
 		ct := pyModuleGlobalType(s.Signature)
@@ -1823,6 +1825,10 @@ func declarationOnlySymbol(s *core.SymbolRecord) bool {
 		// Enum members (C# `Mode.Fast`, ObjC NS_ENUM/NS_OPTIONS constants),
 		// new 2026-09-26; neither language emitted KindConst before.
 		return s.Kind == core.KindConst
+	case "python":
+		return slices.Contains(s.Modifiers, "module-value") || slices.Contains(s.Modifiers, "instance-attr")
+	case "rust":
+		return slices.Contains(s.Modifiers, "enum-variant")
 	}
 	return false
 }
@@ -1859,7 +1865,8 @@ func buildUsesType(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
 			// Fields, members and module values added 2026-09-25/26 so lookup
 			// and search can find them (Go struct fields; C/C++ members and
 			// file-scope variables; PHP properties and constants; JS/TS module
-			// values). Same rule as python fields: they add no uses-type edges,
+			// values; Python plain module assignments and __init__ instance
+			// attributes; Rust enum variants). Same rule as python fields: they add no uses-type edges,
 			// so pre-existing graphs keep their edges.
 			continue
 		}

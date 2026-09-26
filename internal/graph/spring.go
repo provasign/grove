@@ -2,6 +2,7 @@ package graph
 
 import (
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/provasign/grove/internal/core"
@@ -82,6 +83,12 @@ func buildFrameworkEdges(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edg
 		case "python":
 			isProp := s.Kind == core.KindMethod && hasPropertyDecorator(s.Annotations)
 			if s.Kind != core.KindField && !isProp {
+				continue
+			}
+			if slices.Contains(s.Modifiers, "instance-attr") {
+				// __init__ attributes (indexed since 2026-09-26) stay out:
+				// at django scale they pushed names like errors/formset past
+				// maxTemplateFanout and erased 288 existing template edges.
 				continue
 			}
 			accessors[strings.ToLower(s.Name)] = append(accessors[strings.ToLower(s.Name)], acc{s})

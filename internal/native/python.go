@@ -3,6 +3,7 @@ package native
 import (
 	"context"
 	"os/exec"
+	"slices"
 	"strings"
 
 	"github.com/provasign/grove/internal/core"
@@ -281,7 +282,18 @@ print(json.dumps({"edges": edges, "calls": calls, "types": types}))
 	// genuine "t.Iterable[Rule]" parameter was reported 82 lines away, on a
 	// method that does not mention Rule. js_ts has used the locator since it
 	// hit the same collision.
-	symbols := newSymbolLocator(req.Symbols, map[string]bool{"python": true})
+	//
+	// __init__ instance attributes (self.x = ..., indexed since 2026-09-26)
+	// are never a type-use endpoint; left in, a same-named attribute earlier
+	// in the file captured the name lookup (OrderedSet.dict took django's
+	// `class MultiValueDict(dict)` edge from MultiValueDict.dict).
+	locatable := make([]core.SymbolRecord, 0, len(req.Symbols))
+	for _, symbol := range req.Symbols {
+		if !slices.Contains(symbol.Modifiers, "instance-attr") {
+			locatable = append(locatable, symbol)
+		}
+	}
+	symbols := newSymbolLocator(locatable, map[string]bool{"python": true})
 	// A local re-export can point first at a module that contains only an import
 	// alias, not the original declaration (urllib3.connection.ProxyConfig is
 	// one). If direct file resolution misses, follow only a proven-local import
