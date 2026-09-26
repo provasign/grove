@@ -1,5 +1,50 @@
 # Changelog
 
+## v0.59.0 - 2026-09-26
+
+The index now contains the declarations each "precise" language was missing,
+and graph edges stay deterministic. Found by a declaration-coverage test
+(internal/parser/declaration_coverage_test.go, keyed to the capability
+manifest) and a four-way gap sweep of real agent transcripts, declaration
+kinds, lookup name forms and operations on the new kinds.
+
+- New symbols (astkit v0.15.0):
+  - Go struct fields, grouped/multi-name vars and consts, interface methods,
+    type aliases.
+  - C/C++ members, file-scope vars, enum constants, nested types, `using` and
+    class typedefs.
+  - Python module globals and `__init__` attributes.
+  - PHP properties, consts, enum cases, promoted properties, `define()`.
+  - JS/TS module values, enum and interface members, constructor parameter
+    fields, CommonJS and default exports, `this.x`.
+  - Rust enum variants, `macro_rules!`, associated items, unions.
+  - C#/ObjC/Java/Kotlin/Swift enum members, records, events, operators,
+    protocols, aliases.
+- New data-like kinds add no uses-type edges (`declarationOnlySymbol`), so
+  existing graphs keep their edges. Edge diffs before and after were
+  explained per repo on gin, jansson, typeorm, express, flask, django,
+  php-semver, flysystem, laravel, nlohmann/json, fmt, walkdir,
+  Newtonsoft.Json, SwiftyJSON, SBJson and moshi.
+- C++: a trailing `}  // namespace foo` no longer doubles qualified names.
+  Namespace/specifier macros (nlohmann, fmt) no longer collapse a file into
+  one pseudo-symbol. The regex fallback no longer makes symbols out of
+  comments ("Copyright", `int`). C++ names always use `::`.
+- Member change-impact: fields, properties, variables and constants now return
+  their read, write and initializer sites (parser.MemberOccurrences). Sites
+  with receiver or type evidence are confirmed; name-only matches are listed
+  as ambiguous. On 13 ground-truth targets across Go, Java, C, TS, PHP and
+  Python, recall went from 1 site per target to 100% at 100% precision.
+  rename-plan counts and the declaration edit are fixed.
+- Determinism: PHP `new X` narrowing and two import scans no longer depend on
+  Go map order. Laravel had 263-345 edges changing between runs of the same
+  binary; three cold indexes are now identical.
+- Symbol-scope search accepts `**` globs.
+
+Known limits: a C++ `#else` branch can lose a few call sites when the
+`#if`-only re-parse wins; ES5 constructor functions and anonymous
+`module.exports = class {}` are not indexed. Full release gate: go test
+./... green and ci_invariants all held.
+
 ## v0.58.2 - 2026-09-22
 
 `grove doctor`'s capability manifest was missing COBOL and JCL entries even
