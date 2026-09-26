@@ -35,6 +35,15 @@ const Limit = 10
 
 var Default = New()
 
+var (
+	ErrClosed = errors.New("closed")
+	C, D      = 1, 2
+)
+
+const E, F = 3, 4
+
+type ID = string
+
 type Store interface {
 	Get(k string) string
 }
@@ -54,11 +63,15 @@ func (c *Cache) Get(k string) string { return k }
 			"Limit": core.KindConst, "Default": core.KindVariable, "Store": core.KindInterface,
 			"Cache": core.KindStruct, "Cache.Size": core.KindField, "Cache.A": core.KindField,
 			"Cache.b": core.KindField, "New": core.KindFunction, "Cache.Get": core.KindMethod,
+			"ErrClosed": core.KindVariable, "C": core.KindVariable, "D": core.KindVariable,
+			"E": core.KindConst, "F": core.KindConst, "ID": core.KindType, "Store.Get": core.KindMethod,
 		},
 	},
 	"python": {
 		file: "p.py",
 		src: `LIMIT: int = 10
+MAX_RETRIES = 3
+square = lambda x: x * x
 
 class Store:
     size: int = 5
@@ -80,6 +93,7 @@ def make():
 		want: map[string]core.SymbolKind{
 			"LIMIT": core.KindVariable, "Store": core.KindClass, "Store.size": core.KindField,
 			"Store.name": core.KindField, "Store.get": core.KindMethod, "make": core.KindFunction,
+			"MAX_RETRIES": core.KindVariable, "square": core.KindFunction, "Store.cap": core.KindField,
 		},
 	},
 	"javascript": {
@@ -167,13 +181,23 @@ interface Getter { String get(String k); }
 		file: "p.rs",
 		src: `pub const LIMIT: usize = 10;
 
-pub trait Getter { fn get(&self, k: &str) -> String; }
+pub trait Getter { const CAP: usize; type Key; fn get(&self, k: &str) -> String; }
 
 pub struct Store { pub size: usize }
 
 pub enum Mode { Fast, Slow }
 
+pub union Bits { i: u32, f: f32 }
+
+macro_rules! my_vec { () => {}; }
+
+mod net {
+    pub struct Conn { addr: String }
+    impl Conn { pub fn open() {} }
+}
+
 impl Store {
+    pub const UNIT: u8 = 1;
     pub fn new(size: usize) -> Self { Store { size } }
 }
 
@@ -184,11 +208,15 @@ impl Getter for Store {
 pub fn make() -> Store { Store::new(1) }
 `,
 		want: map[string]core.SymbolKind{
-			// const is indexed as a variable (kind quirk, still findable by name);
-			// `fn new` is a constructor by convention.
-			"LIMIT": core.KindVariable, "Getter": core.KindTrait, "Store": core.KindStruct,
+			// `fn new` is a constructor by convention; enum variants are
+			// fields of the enum; items in an inline module keep their owner
+			// type under the module prefix.
+			"LIMIT": core.KindConst, "Getter": core.KindTrait, "Store": core.KindStruct,
 			"Store.size": core.KindField, "Mode": core.KindEnum, "Store.new": core.KindConstructor,
-			"make": core.KindFunction,
+			"make": core.KindFunction, "Mode.Fast": core.KindField, "Bits": core.KindStruct,
+			"Bits.i": core.KindField, "my_vec": core.KindMacro, "net.Conn.addr": core.KindField,
+			"net.Conn.open": core.KindMethod, "Store.UNIT": core.KindConst,
+			"Getter.CAP": core.KindConst, "Getter.Key": core.KindType,
 		},
 	},
 	"c": {

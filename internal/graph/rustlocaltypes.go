@@ -50,7 +50,7 @@ var (
 // Vec item (`const FLAGS: &[&dyn Flag]` → Flag), or "".
 func rustConstElementType(idx *edgeIndex, name string) string {
 	for _, cand := range namedSymbols(idx, name) {
-		if cand.Kind != core.KindVariable || cand.Language != "rust" {
+		if (cand.Kind != core.KindVariable && cand.Kind != core.KindConst) || cand.Language != "rust" {
 			continue
 		}
 		sig := cand.Signature
