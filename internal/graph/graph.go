@@ -507,8 +507,51 @@ func symbolPathInScope(file string, paths, globs []string) bool {
 		if matched, _ := path.Match(glob, file); matched {
 			return true
 		}
+		if scopeGlobMatch(glob, file) {
+			return true
+		}
 	}
 	return false
+}
+
+// scopeGlobMatch applies ripgrep --glob semantics to a repository-relative
+// path so symbol scope agrees with text scope: a "**" segment crosses any
+// number of directories (including zero) and a slash-free glob matches the
+// base name. path.Match alone treats "**" as "*", so "**/types.py" matched
+// no file in symbol scope while rg matched every types.py.
+func scopeGlobMatch(glob, file string) bool {
+	glob = strings.TrimPrefix(strings.TrimPrefix(strings.ReplaceAll(strings.TrimSpace(glob), "\\", "/"), "./"), "/")
+	if glob == "" || !strings.Contains(glob, "/") {
+		return false // base-name globs are handled by the caller
+	}
+	if strings.HasSuffix(glob, "/") {
+		glob += "**"
+	}
+	return scopeGlobSegments(strings.Split(glob, "/"), strings.Split(file, "/"))
+}
+
+func scopeGlobSegments(pat, segs []string) bool {
+	for len(pat) > 0 {
+		if pat[0] == "**" {
+			if len(pat) == 1 {
+				return true
+			}
+			for i := 0; i <= len(segs); i++ {
+				if scopeGlobSegments(pat[1:], segs[i:]) {
+					return true
+				}
+			}
+			return false
+		}
+		if len(segs) == 0 {
+			return false
+		}
+		if ok, _ := path.Match(pat[0], segs[0]); !ok {
+			return false
+		}
+		pat, segs = pat[1:], segs[1:]
+	}
+	return len(segs) == 0
 }
 
 // searchRank scores how well a symbol matches a lowercase query; negative
