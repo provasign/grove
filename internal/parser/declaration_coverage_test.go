@@ -1,0 +1,392 @@
+package parser
+
+import (
+	"fmt"
+	"os"
+	"sort"
+	"strings"
+	"testing"
+
+	"github.com/provasign/grove/internal/core"
+)
+
+// Declaration coverage: every language the capability manifest calls
+// "precise" must index each kind of declaration it has, under the qualified
+// name an agent would type (Type.member). Go struct fields went unindexed for
+// four months while the manifest said "precise" -- nothing checked the claim
+// against code, and the call graph never needed the symbols (2026-09-25).
+//
+// A kind a language genuinely does not index is listed in gaps with a reason.
+// A gap that starts being indexed fails the test, so the list cannot go stale.
+
+type declCase struct {
+	file string
+	src  string
+	want map[string]core.SymbolKind // qualified name -> kind
+	gaps map[string]string          // qualified name -> why it is not indexed
+}
+
+var declCoverage = map[string]declCase{
+	"go": {
+		file: "p.go",
+		src: `package p
+
+const Limit = 10
+
+var Default = New()
+
+type Store interface {
+	Get(k string) string
+}
+
+type Cache struct {
+	sync.Mutex
+	// Size is the entry cap.
+	Size  int ` + "`json:\"size\"`" + `
+	A, b  string
+}
+
+func New() *Cache { return &Cache{} }
+
+func (c *Cache) Get(k string) string { return k }
+`,
+		want: map[string]core.SymbolKind{
+			"Limit": core.KindConst, "Default": core.KindVariable, "Store": core.KindInterface,
+			"Cache": core.KindStruct, "Cache.Size": core.KindField, "Cache.A": core.KindField,
+			"Cache.b": core.KindField, "New": core.KindFunction, "Cache.Get": core.KindMethod,
+		},
+	},
+	"python": {
+		file: "p.py",
+		src: `LIMIT: int = 10
+
+class Store:
+    size: int = 5
+    name = "x"
+
+    def __init__(self, cap):
+        self.cap = cap
+
+    def get(self, k):
+        return k
+
+    class Inner:
+        def run(self):
+            pass
+
+def make():
+    return Store(1)
+`,
+		want: map[string]core.SymbolKind{
+			"LIMIT": core.KindVariable, "Store": core.KindClass, "Store.size": core.KindField,
+			"Store.name": core.KindField, "Store.get": core.KindMethod, "make": core.KindFunction,
+		},
+	},
+	"javascript": {
+		file: "p.js",
+		src: `export const LIMIT = 10;
+
+export class Store {
+  size = 5;
+  constructor(cap) { this.cap = cap; }
+  get(k) { return k; }
+}
+
+export function make() { return new Store(1); }
+`,
+		want: map[string]core.SymbolKind{
+			"LIMIT": core.KindVariable, "Store": core.KindClass, "Store.size": core.KindField,
+			"Store.get": core.KindMethod, "make": core.KindFunction,
+		},
+		gaps: map[string]string{"LIMIT": "module-level non-function consts are not indexed (found 2026-09-26)"},
+	},
+	"typescript": {
+		file: "p.ts",
+		src: `export const LIMIT = 10;
+
+export interface Getter { get(k: string): string; }
+
+export enum Mode { Fast, Slow }
+
+export type Key = string;
+
+export class Store implements Getter {
+  size: number = 5;
+  constructor(private cap: number) {}
+  get(k: string): string { return k; }
+}
+
+export function make(): Store { return new Store(1); }
+`,
+		want: map[string]core.SymbolKind{
+			"LIMIT": core.KindVariable, "Getter": core.KindInterface, "Mode": core.KindEnum,
+			"Key": core.KindType, "Store": core.KindClass, "Store.size": core.KindField,
+			"Store.get": core.KindMethod, "make": core.KindFunction,
+		},
+		gaps: map[string]string{"LIMIT": "module-level non-function consts are not indexed (found 2026-09-26)"},
+	},
+	"tsx": {
+		file: "p.tsx",
+		src: `export const LIMIT = 10;
+
+export class Store {
+  size: number = 5;
+  get(k: string): string { return k; }
+}
+
+export function View(): JSX.Element { return <div />; }
+`,
+		want: map[string]core.SymbolKind{
+			"LIMIT": core.KindVariable, "Store": core.KindClass, "Store.size": core.KindField,
+			"Store.get": core.KindMethod, "View": core.KindFunction,
+		},
+		gaps: map[string]string{"LIMIT": "module-level non-function consts are not indexed (found 2026-09-26)"},
+	},
+	"java": {
+		file: "p/Store.java",
+		src: `package p;
+
+public class Store implements Getter {
+    public static final int LIMIT = 10;
+    private int size;
+
+    public Store(int size) { this.size = size; }
+
+    public String get(String k) { return k; }
+
+    public enum Mode { FAST, SLOW }
+
+    static class Inner { void run() {} }
+}
+
+interface Getter { String get(String k); }
+`,
+		want: map[string]core.SymbolKind{
+			"Store": core.KindClass, "Store.LIMIT": core.KindField, "Store.size": core.KindField,
+			"Store.get": core.KindMethod, "Getter": core.KindInterface,
+		},
+	},
+	"rust": {
+		file: "p.rs",
+		src: `pub const LIMIT: usize = 10;
+
+pub trait Getter { fn get(&self, k: &str) -> String; }
+
+pub struct Store { pub size: usize }
+
+pub enum Mode { Fast, Slow }
+
+impl Store {
+    pub fn new(size: usize) -> Self { Store { size } }
+}
+
+impl Getter for Store {
+    fn get(&self, k: &str) -> String { k.to_string() }
+}
+
+pub fn make() -> Store { Store::new(1) }
+`,
+		want: map[string]core.SymbolKind{
+			// const is indexed as a variable (kind quirk, still findable by name);
+			// `fn new` is a constructor by convention.
+			"LIMIT": core.KindVariable, "Getter": core.KindTrait, "Store": core.KindStruct,
+			"Store.size": core.KindField, "Mode": core.KindEnum, "Store.new": core.KindConstructor,
+			"make": core.KindFunction,
+		},
+	},
+	"c": {
+		file: "p.c",
+		src: `#define LIMIT 10
+
+struct store {
+    int size;
+    char *name;
+};
+
+static int count = 0;
+
+int store_get(struct store *s) { return s->size; }
+`,
+		want: map[string]core.SymbolKind{
+			"store": core.KindStruct, "store.size": core.KindField, "store.name": core.KindField,
+			"store_get": core.KindFunction,
+		},
+		gaps: map[string]string{
+			"store.size": "C struct members are not indexed (found 2026-09-26)",
+			"store.name": "C struct members are not indexed (found 2026-09-26)",
+		},
+	},
+	"cpp": {
+		file: "p.cpp",
+		src: `namespace app {
+
+class Store {
+public:
+    Store(int size) : size_(size) {}
+    int get() const { return size_; }
+private:
+    int size_;
+};
+
+int make() { return Store(1).get(); }
+
+}
+`,
+		want: map[string]core.SymbolKind{
+			// C++ qualified names use the language's own :: separator.
+			"app::Store": core.KindClass, "app::Store::size_": core.KindField,
+			"app::Store::get": core.KindMethod, "app::make": core.KindFunction,
+		},
+		gaps: map[string]string{"app::Store::size_": "C++ member fields are not indexed (found 2026-09-26)"},
+	},
+	"csharp": {
+		file: "P.cs",
+		src: `namespace App {
+    public interface IGetter { string Get(string k); }
+
+    public enum Mode { Fast, Slow }
+
+    public class Store : IGetter {
+        public const int Limit = 10;
+        private int size;
+        public int Size { get; set; }
+        public Store(int size) { this.size = size; }
+        public string Get(string k) { return k; }
+    }
+}
+`,
+		want: map[string]core.SymbolKind{
+			"IGetter": core.KindInterface, "Mode": core.KindEnum, "Store": core.KindClass,
+			"Store.size": core.KindField, "Store.Size": core.KindField, "Store.Get": core.KindMethod,
+		},
+	},
+	"php": {
+		file: "p.php",
+		src: `<?php
+namespace App;
+
+const LIMIT = 10;
+
+interface Getter { public function get(string $k): string; }
+
+class Store implements Getter {
+    public int $size = 5;
+    const MODE = 'fast';
+    public function __construct(int $size) { $this->size = $size; }
+    public function get(string $k): string { return $k; }
+}
+
+function make(): Store { return new Store(1); }
+`,
+		want: map[string]core.SymbolKind{
+			"Getter": core.KindInterface, "Store": core.KindClass, "Store.size": core.KindField,
+			"Store.get": core.KindMethod, "make": core.KindFunction,
+		},
+		gaps: map[string]string{"Store.size": "PHP class properties are not indexed (found 2026-09-26)"},
+	},
+	"swift": {
+		file: "P.swift",
+		src: `let limit = 10
+
+protocol Getter { func get(_ k: String) -> String }
+
+enum Mode { case fast, slow }
+
+struct Store: Getter {
+    var size: Int
+    init(size: Int) { self.size = size }
+    func get(_ k: String) -> String { return k }
+}
+
+func make() -> Store { return Store(size: 1) }
+`,
+		want: map[string]core.SymbolKind{
+			"Getter": core.KindInterface, "Mode": core.KindEnum, "Store": core.KindStruct,
+			"Store.size": core.KindField, "Store.get": core.KindMethod, "make": core.KindFunction,
+		},
+	},
+	"kotlin": {
+		file: "P.kt",
+		src: `package app
+
+const val LIMIT = 10
+
+interface Getter { fun get(k: String): String }
+
+enum class Mode { FAST, SLOW }
+
+class Store(val cap: Int) : Getter {
+    var size: Int = 5
+    override fun get(k: String): String = k
+}
+
+fun make(): Store = Store(1)
+`,
+		want: map[string]core.SymbolKind{
+			"Getter": core.KindInterface, "Mode": core.KindEnum, "Store": core.KindClass,
+			"Store.size": core.KindField, "Store.get": core.KindMethod, "make": core.KindFunction,
+		},
+	},
+	"objc": {
+		file: "P.m",
+		src: `@interface Store : NSObject {
+    int _size;
+}
+@property (nonatomic) int size;
+- (NSString *)get:(NSString *)k;
+@end
+
+@implementation Store
+- (NSString *)get:(NSString *)k { return k; }
+@end
+`,
+		want: map[string]core.SymbolKind{
+			"Store": core.KindClass, "Store._size": core.KindField, "Store.get:": core.KindMethod,
+		},
+	},
+}
+
+func TestDeclarationCoverage(t *testing.T) {
+	engine := NewEngine()
+	for _, lang := range core.CurrentCapabilities().Languages {
+		if lang.Indexing != "precise" {
+			continue
+		}
+		c, ok := declCoverage[lang.Language]
+		if !ok {
+			t.Errorf("%s: manifest says indexing is precise but there is no declaration-coverage fixture", lang.Language)
+			continue
+		}
+		t.Run(lang.Language, func(t *testing.T) {
+			syms, err := engine.ExtractContent(c.file, []byte(c.src))
+			if err != nil {
+				t.Fatalf("extract: %v", err)
+			}
+			got := map[string]core.SymbolKind{}
+			for _, s := range syms {
+				got[s.QualifiedName] = s.Kind
+			}
+			if os.Getenv("DECL_DUMP") != "" {
+				keys := make([]string, 0, len(got))
+				for k := range got {
+					keys = append(keys, fmt.Sprintf("%s=%s", k, got[k]))
+				}
+				sort.Strings(keys)
+				t.Logf("%s extracted: %s", lang.Language, strings.Join(keys, " "))
+			}
+			for qn, kind := range c.want {
+				if reason, isGap := c.gaps[qn]; isGap {
+					if _, found := got[qn]; found {
+						t.Errorf("%s is now indexed; remove its gap entry (%s)", qn, reason)
+					}
+					continue
+				}
+				if k, found := got[qn]; !found {
+					t.Errorf("%s not indexed (want %s)", qn, kind)
+				} else if k != kind {
+					t.Errorf("%s indexed as %s, want %s", qn, k, kind)
+				}
+			}
+		})
+	}
+}
