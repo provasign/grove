@@ -17,6 +17,7 @@ type RenameEdit struct {
 	After    string // with the rename applied
 	SiteID   string // containing symbol ID
 	Site     string // "relpath:name" for relay
+	Reason   string // data-member plans: confirming evidence, or why the edit is ambiguous
 }
 
 // RenamePlanResult is the change-set of ChangeImpact converted into concrete
@@ -61,6 +62,10 @@ func (g *CodeGraph) RenamePlan(query, newName string) (*RenamePlanResult, error)
 	}
 	if newName == "" || newName == methodName {
 		return nil, fmt.Errorf("new name must be non-empty and different from %q", methodName)
+	}
+
+	if ci.MemberKind != "" {
+		return memberRenamePlan(ci, query, methodName, newName), nil
 	}
 
 	g.mu.RLock()
@@ -425,4 +430,79 @@ func sortEdits(es []RenameEdit) {
 		}
 		return es[i].Line < es[j].Line
 	})
+}
+
+// memberRenamePlan turns a data-member change-set into line edits. Each
+// edit rewrites exactly the columns classified as this member — never a
+// blanket word replace, because a line can hold same-named occurrences that
+// bind elsewhere (`c.Errors.Errors()` renames the field, not the method).
+// Confirmed accesses become Edits, name-only matches Ambiguous (with the
+// reason), and a declaration no edit covers is Unresolved. SitesTotal counts
+// the LINES across all three buckets, so it always equals what the buckets
+// hold (the old field plan reported "1 site" beside 22 edits).
+func memberRenamePlan(ci *ChangeImpactResult, query, name, newName string) *RenamePlanResult {
+	res := &RenamePlanResult{Query: query, NewName: newName, Completeness: ci.Completeness}
+	edit := func(a MemberAccess) (RenameEdit, bool) {
+		before := strings.TrimRight(a.Text, "\r")
+		cols := append([]int(nil), a.Cols...)
+		sort.Sort(sort.Reverse(sort.IntSlice(cols)))
+		after := before
+		last := -1
+		for _, col := range cols {
+			if col == last {
+				continue
+			}
+			last = col
+			start := col
+			if start < len(after) && after[start] == '#' && !strings.HasPrefix(name, "#") {
+				start++
+			}
+			if start < 0 || start > len(after) || !strings.HasPrefix(after[start:], name) {
+				return RenameEdit{}, false
+			}
+			after = after[:start] + newName + after[start+len(name):]
+		}
+		if len(cols) == 0 || after == before {
+			return RenameEdit{}, false
+		}
+		site := a.FilePath
+		if a.Enclosing.Name != "" {
+			site += ":" + a.Enclosing.Name
+		}
+		return RenameEdit{FilePath: a.FilePath, Line: a.Line, Before: before, After: after,
+			SiteID: a.Enclosing.ID, Site: site, Reason: a.Evidence}, true
+	}
+	covered := map[string]bool{}
+	for _, a := range ci.Accesses {
+		if e, ok := edit(a); ok {
+			res.Edits = append(res.Edits, e)
+			covered[fmt.Sprintf("%s:%d", a.FilePath, a.Line)] = true
+		} else {
+			res.Unresolved = append(res.Unresolved, fmt.Sprintf("%s:%d", a.FilePath, a.Line))
+		}
+	}
+	for _, a := range ci.AmbiguousAccesses {
+		if e, ok := edit(a); ok {
+			res.Ambiguous = append(res.Ambiguous, e)
+		} else {
+			res.Unresolved = append(res.Unresolved, fmt.Sprintf("%s:%d", a.FilePath, a.Line))
+		}
+	}
+	for _, d := range ci.Declarations {
+		hit := false
+		for line := d.Span.Start; line <= d.Span.End; line++ {
+			if covered[fmt.Sprintf("%s:%d", d.FilePath, line)] {
+				hit = true
+				break
+			}
+		}
+		if !hit {
+			res.Unresolved = append(res.Unresolved, d.FilePath+":"+d.Name)
+		}
+	}
+	sortEdits(res.Edits)
+	sortEdits(res.Ambiguous)
+	sort.Strings(res.Unresolved)
+	res.SitesTotal = len(res.Edits) + len(res.Ambiguous) + len(res.Unresolved)
+	return res
 }

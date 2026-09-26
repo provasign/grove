@@ -34,6 +34,11 @@ type CodeGraph struct {
 	// sort the result to undo the map's randomness. The index does both once
 	// per install instead of once per query.
 	byName map[string][]string
+
+	// memberScanner lists source occurrences of a data member's name for
+	// field/variable change impact (see memberimpact.go). Nil in graphs
+	// built without source access; member queries then say so.
+	memberScanner MemberScanner
 }
 
 func New() *CodeGraph {

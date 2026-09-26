@@ -28,6 +28,7 @@ import (
 // mirroring shapes.
 type (
 	Symbol               = core.SymbolRecord
+	MemberAccess         = graph.MemberAccess
 	Reference            = parser.Reference
 	ReferenceResult      = parser.ReferenceResult
 	Edge                 = core.Edge
@@ -229,6 +230,7 @@ func (e *Engine) currentGraphContext(ctx context.Context) (*graph.CodeGraph, err
 			g.ReplaceWithEdges(symbols, graph.CurrentNativeEdges(symbols, edges), 0)
 		}
 	}
+	g.SetMemberScanner(e.memberScanner())
 	e.graph = g
 	return g, nil
 }
@@ -266,6 +268,7 @@ func (e *Engine) Index(ctx context.Context, dir string) (IndexResult, error) {
 		return result, err
 	}
 	if cg != nil {
+		cg.SetMemberScanner(e.memberScanner())
 		e.mu.Lock()
 		e.graph = cg
 		e.mu.Unlock()
@@ -406,6 +409,19 @@ type ChangeImpactResult struct {
 	// name-derived edge (framework template/JPA references) rather than
 	// only AST-certain ones — over-inclusive by design, not certain.
 	HasHeuristicRefs bool
+
+	// Data-member anchors only (fields, properties, constants, variables):
+	// MemberKind is non-empty, Accesses are the confirmed read/write/init/
+	// declaration lines, AmbiguousAccesses match by name without receiver
+	// evidence, ExcludedAccesses counts same-named occurrences attributed
+	// elsewhere. AccessCoverage: receiver-typed | partial | name-matched |
+	// declaration-only.
+	MemberKind        string
+	Accesses          []MemberAccess
+	AmbiguousAccesses []MemberAccess
+	ExcludedAccesses  int
+	AccessCoverage    string
+	AccessNote        string
 }
 
 // Sites returns the change-set methods (declarations ∪ family ∪ callers ∪
@@ -424,6 +440,19 @@ func (r ChangeImpactResult) Sites() []Symbol {
 		}
 	}
 	return out
+}
+
+// memberScanner is the source pass data-member change impact runs over the
+// engine root (see graph/memberimpact.go).
+func (e *Engine) memberScanner() graph.MemberScanner {
+	root := e.root
+	return func(name string, languages []string) ([]core.MemberOccurrence, int) {
+		occs, skipped, err := parser.NewEngine().MemberOccurrences(root, name, languages)
+		if err != nil {
+			skipped++
+		}
+		return occs, skipped
+	}
 }
 
 // ChangeImpact resolves a "Type.method" or "Type.method(ParamType, ...)"
@@ -456,6 +485,12 @@ func (e *Engine) ChangeImpactScoped(ctx context.Context, query, file string) (Ch
 		Completeness:      raw.Completeness,
 		CallerCoverage:    raw.CallerCoverage,
 		HasHeuristicRefs:  raw.HasHeuristicRefs,
+		MemberKind:        raw.MemberKind,
+		Accesses:          raw.Accesses,
+		AmbiguousAccesses: raw.AmbiguousAccesses,
+		ExcludedAccesses:  raw.ExcludedAccesses,
+		AccessCoverage:    raw.AccessCoverage,
+		AccessNote:        raw.AccessNote,
 	}, nil
 }
 
@@ -467,6 +502,7 @@ type RenameEdit struct {
 	After    string // with the rename applied
 	SiteID   string // containing symbol ID
 	Site     string // "relpath:name" for relay
+	Reason   string // data-member plans: confirming evidence, or why the edit is ambiguous
 }
 
 // RenamePlanResult converts a ChangeImpact set into concrete line edits.

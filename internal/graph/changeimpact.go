@@ -63,6 +63,22 @@ type ChangeImpactResult struct {
 	// caller distinguishing "certain" from "probably right" should check
 	// this rather than parse Completeness.
 	HasHeuristicRefs bool
+
+	// Data-member anchors (fields, properties, constants, variables) only —
+	// see memberimpact.go. MemberKind is non-empty exactly for those.
+	MemberKind string
+	// Accesses are the source lines confirmed to read/write/initialize (or
+	// declare) the member; AmbiguousAccesses match by name but carry no
+	// receiver evidence; ExcludedAccesses counts same-named occurrences
+	// evidence attributes elsewhere.
+	Accesses          []MemberAccess
+	AmbiguousAccesses []MemberAccess
+	ExcludedAccesses  int
+	// AccessCoverage: "receiver-typed" (every occurrence decided),
+	// "partial" (some ambiguous), "name-matched" (nothing beyond the
+	// declaration could be typed), "declaration-only" (no source scan).
+	AccessCoverage string
+	AccessNote     string
 }
 
 // Sites returns every METHOD in the change-set — declarations, family,
@@ -143,6 +159,16 @@ func (g *CodeGraph) changeImpactScoped(query, file string) (*ChangeImpactResult,
 		return mf, nil
 	}
 
+	// Data members (fields, properties, constants, module variables) have
+	// no override family and no call edges: their impact is the set of
+	// source lines that read or write them. Methods of the same name keep
+	// priority — memberAnchorLocked returns nil for those.
+	if anchor, err := g.memberAnchorLocked(query, file); err != nil {
+		return nil, err
+	} else if anchor != nil {
+		return g.memberImpactLocked(anchor), nil
+	}
+
 	// Accept a bare member name or file:line and pin it to the canonical
 	// Type.method form (unambiguous only — see resolveLooseQueryLocked).
 	// Already-canonical queries pass through untouched.
@@ -158,18 +184,6 @@ func (g *CodeGraph) changeImpactScoped(query, file string) (*ChangeImpactResult,
 	// completeness downgraded so no consumer mistakes it for a closed set.
 	if free := g.freeFunctionImpactLocked(query, file); free != nil {
 		return free, nil
-	}
-
-	// A FIELD has no override family either — containedMethods only ever
-	// matched KindMethod/KindFunction, so a query naming a field (a class
-	// property an Angular template binds to, a Python model attribute a
-	// Jinja template reads) fell straight to "no method X", regardless of
-	// language, even though buildFrameworkEdges may have real inbound
-	// references to it. Field anchors are tried only when no method of that
-	// name exists on the type, so an ordinary Type.method query is never
-	// shadowed by a same-named field (rare, but the check is free).
-	if fld := g.fieldImpactLocked(query); fld != nil {
-		return fld, nil
 	}
 
 	typeName, methodName, queryParams, err := parseChangeImpactQuery(query)
@@ -352,7 +366,7 @@ func (g *CodeGraph) changeImpactScoped(query, file string) (*ChangeImpactResult,
 		}
 	}
 	if len(decls) == 0 && len(family) == 0 {
-		return nil, fmt.Errorf("change-impact: type %q declares no method %q and no subtype implements it", typeName, methodName)
+		return nil, fmt.Errorf("change-impact: type %q declares no method or data member %q and no subtype implements it", typeName, methodName)
 	}
 
 	// 5. Supers (upward, informational): same-signature declarations on
