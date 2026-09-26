@@ -288,3 +288,24 @@ func TestComputeICRNoMatchReturnsEmptyLowConfidenceRegion(t *testing.T) {
 		t.Fatalf("two no-match ICRs must not conflict, got %+v", conflict)
 	}
 }
+
+// click pr3471: scope=symbols glob=["**/types.py"] returned no symbols while
+// text scope (rg --glob) matched src/click/types.py.
+func TestSearchScopedDoubleStarGlob(t *testing.T) {
+	codeGraph := New()
+	codeGraph.Replace([]core.SymbolRecord{
+		{ID: "src/click/types.py::Choice.shell_complete@sha", FilePath: "src/click/types.py", Kind: core.KindMethod, Name: "shell_complete", QualifiedName: "Choice.shell_complete"},
+		{ID: "src/click/core.py::Option.shell_complete@sha", FilePath: "src/click/core.py", Kind: core.KindMethod, Name: "shell_complete", QualifiedName: "Option.shell_complete"},
+		{ID: "types.py::shell_complete@sha", FilePath: "types.py", Kind: core.KindFunction, Name: "shell_complete", QualifiedName: "shell_complete"},
+	}, 3)
+	got := codeGraph.SearchScoped("shell_complete", 10, nil, []string{"**/types.py"})
+	if len(got) != 2 {
+		t.Fatalf("**/types.py must match types.py at any depth (including the root): %+v", got)
+	}
+	if got := codeGraph.SearchScoped("shell_complete", 10, nil, []string{"src/**/core.py"}); len(got) != 1 || got[0].FilePath != "src/click/core.py" {
+		t.Fatalf("src/**/core.py: %+v", got)
+	}
+	if got := codeGraph.SearchScoped("shell_complete", 10, nil, []string{"src/**"}); len(got) != 2 {
+		t.Fatalf("src/** must select everything below src: %+v", got)
+	}
+}
