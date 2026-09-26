@@ -25,7 +25,8 @@ type ChangeImpactResult struct {
 
 	// DeclaringTypes: type declarations whose bodies contain a change-set
 	// member signature that is not indexed as its own symbol (Go and TS
-	// interface members). For those declarations the innermost enclosing
+	// interface members in indexes built before 2026-09-26, when both became
+	// real symbols). For those declarations the innermost enclosing
 	// symbol in the file IS the type, so the type's declaration block is
 	// the change site a diff, a scorer, or a reviewer names. Empty for
 	// languages whose member declarations are real symbols (Java, Python).
@@ -275,8 +276,10 @@ func (g *CodeGraph) changeImpactScoped(query, file string) (*ChangeImpactResult,
 				typeName, methodName, strings.Join(queryParams, ", "))
 		}
 	}
-	// TS and Go interface member signatures are not indexed as symbols.
-	// Synthesize them BEFORE anchoring the family so their source-declared
+	// TS and Go interface member signatures are indexed as symbols since
+	// 2026-09-26; an index built earlier (or a form the extractor still
+	// misses) has none, so when no declaration was found, synthesize them
+	// BEFORE anchoring the family so their source-declared
 	// parameter types constrain structural satisfaction just like a real
 	// declaration. Waiting until after the family walk made an unqualified Go
 	// query accept every same-named method, regardless of signature.
@@ -550,7 +553,7 @@ func impactCallerCoverage(r *ChangeImpactResult) string {
 
 // synthesizeMemberDecl builds the declaration record for a member that
 // exists in a type's source body but not as an indexed symbol (Go interface
-// specs, TS interface members). The record carries the declaring file so the
+// specs, TS interface members in pre-2026-09-26 indexes). The record carries the declaring file so the
 // change-set names it even without a real symbol.
 func synthesizeMemberDecl(t *core.SymbolRecord, methodName string) core.SymbolRecord {
 	signature := ""
