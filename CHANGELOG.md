@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.60.0 - 2026-09-26
+
+Change-impact gets new outputs, found by reviewing benchmark tasks both agents
+failed:
+
+- A "related" group: other callers, in the same type or file, of the
+  functions the target calls ("sites that reach the same effect"), plus
+  sibling implementations that lack a call their peers share (`peer-lacks` /
+  `target-lacks`). It is capped at 8 lines, labelled as not part of the
+  change set, and never enters Sites() or relaySites. jackson-databind pr6061:
+  `writeEmbeddedObject:541` is now named. pr5977:
+  `ObjectArraySerializer.createContextual` is flagged as the one container
+  serializer that doesn't call `_hasDynamicTypingOverride`.
+- TS/JS re-exports (`export { _gte as gte }`) count as reference sites, found
+  by module path. TS value and type declarations that share a name
+  (`$ZodCheckGreaterThan` interface and const) are both anchors.
+
+No edge construction changed. go-ssa-vta edge accuracy: gin P 0.9522 /
+R 0.9505, cobra P 0.9828 / R 0.9518 (identical to v0.59.1). ci_invariants
+all held. go test green on macOS and Linux.
+
 ## v0.59.1 - 2026-09-26
 
 Fixes a v0.59.0 regression caught by the Edge accuracy CI (go-ssa-vta, gin):
