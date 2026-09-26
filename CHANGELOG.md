@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.59.1 - 2026-09-26
+
+Fixes a v0.59.0 regression caught by the Edge accuracy CI (go-ssa-vta, gin):
+call-edge recall fell from 0.9452 to 0.9346. v0.59.0 indexed Go interface
+methods as ordinary methods, which made them call targets, so calls through an
+interface resolved to the contract instead of the concrete implementations.
+They are now declarations, the same as TS interface members (astkit v0.15.1).
+They stay indexed for lookup and change-impact but are excluded from call
+resolution. Measured locally with the CI oracle: gin 565 edges, P 0.9522,
+R 0.9505, and cobra 522 edges, P 0.9828, R 0.9518, both identical to v0.58.3.
+
 ## v0.59.0 - 2026-09-26
 
 The index now contains the declarations each "precise" language was missing,
