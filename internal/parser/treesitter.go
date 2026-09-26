@@ -121,6 +121,15 @@ func extractSymbolsFromAST(language, filePath, blobSHA string, src []byte, fileI
 	eng, reg := bridge()
 	ctx, cancel := context.WithTimeout(context.Background(), parseTimeout)
 	defer cancel()
+	// text is what symbol bodies and signatures are cut from. Blanking
+	// macro lines keeps every byte offset, so the tree parsed from the
+	// blanked copy still addresses the original text.
+	text := src
+	if key == astkit.LangC || key == astkit.LangCPP {
+		if blanked := blankCFamilyMacroLines(src); blanked != nil {
+			src = blanked
+		}
+	}
 	tree, err := eng.Parse(ctx, key, src)
 	if err != nil {
 		return nil, false, false
@@ -147,6 +156,9 @@ func extractSymbolsFromAST(language, filePath, blobSHA string, src []byte, fileI
 					if altErrs := countErrorNodes(altTree.RootNode()); altErrs < countErrorNodes(tree.RootNode()) {
 						tree.Close()
 						tree, src = altTree, alt
+						// Same line lengths as alt: macro blanking
+						// never touches a directive line.
+						text = blankPreprocessorBranches(text)
 						hasErrors = altErrs > 0
 					} else {
 						altTree.Close()
@@ -155,7 +167,7 @@ func extractSymbolsFromAST(language, filePath, blobSHA string, src []byte, fileI
 			}
 		}
 	}
-	akSyms, err := reg.Extract(key, tree, src)
+	akSyms, err := reg.Extract(key, tree, text)
 	if err != nil {
 		return nil, false, false
 	}
@@ -496,8 +508,18 @@ func blankPreprocessorBranches(src []byte) []byte {
 	lines := bytes.Split(src, []byte("\n"))
 	out := make([][]byte, len(lines))
 	var skipping []bool // per nesting level: are we inside a skipped branch
+	inDefine := false
 	for i, line := range lines {
 		t := bytes.TrimSpace(line)
+		// A #define (with its continuation lines) in a skipped branch
+		// stays: it is a real definition (`#else` / `#define JSON_CATCH
+		// ...`), and a directive line cannot unbalance the code around it.
+		keepDefine := inDefine || bytes.HasPrefix(t, []byte("#define"))
+		inDefine = keepDefine && bytes.HasSuffix(t, []byte("\\"))
+		if keepDefine {
+			out[i] = line
+			continue
+		}
 		switch {
 		case bytes.HasPrefix(t, []byte("#if")):
 			skipping = append(skipping, false)
@@ -530,6 +552,168 @@ func blankPreprocessorBranches(src []byte) []byte {
 		}
 	}
 	return bytes.Join(out, []byte("\n"))
+}
+
+// cMacroLineRe matches a line that is nothing but an upper-case macro name.
+// A trailing colon covers an access-specifier macro
+// (`JSON_PRIVATE_UNLESS_TESTED:`, expanding to `private:` or `public:`).
+var cMacroLineRe = regexp.MustCompile(`^[A-Z_][A-Z0-9_]*[A-Z][A-Z0-9_]*:?$`)
+
+// cMacroCallLineRe matches a line opening an upper-case macro invocation.
+var cMacroCallLineRe = regexp.MustCompile(`^[A-Z][A-Z0-9_]*_[A-Z0-9_]*\s*\(`)
+
+// cMacroSpecifierRe matches an upper-case specifier macro in front of a
+// declaration: `FMT_CONSTEXPR auto f()`, `FMT_API void g()`,
+// `FMT_CONSTEXPR typed_node(const Arg& arg)`.
+var cMacroSpecifierRe = regexp.MustCompile(`^([A-Z][A-Z0-9]*_[A-Z0-9_]*)\s+(?:auto|void|bool|char|int|long|short|unsigned|signed|float|double|const|constexpr|static|inline|virtual|explicit|friend|typename|struct|class|enum|template|extern|~?[A-Za-z_][A-Za-z0-9_]*\s*\()`)
+
+// blankCFamilyMacroLines returns src with the macro uses tree-sitter cannot
+// expand replaced by spaces, or nil when there is none. Line numbers and
+// byte offsets are unchanged. Three shapes are blanked:
+//
+//   - a line that is a lone upper-case identifier
+//     (`NLOHMANN_JSON_NAMESPACE_BEGIN`, `G_BEGIN_DECLS`, `Q_OBJECT`);
+//   - an upper-case macro invocation that is a whole line with no `;`, at
+//     file scope or right after a `template<...>` header
+//     (`FMT_PRAGMA_GCC(push_options)`, a multi-line
+//     `GTEST_DISABLE_MSC_WARNINGS_PUSH_(...)`, `JSON_HEDLEY_NON_NULL(1)`),
+//     followed by a declaration, not by `{` or an operator
+//     (`GTEST_CHECK_(x)` / `<< "msg";` is an expression whose call must
+//     stay);
+//   - an upper-case specifier macro before a declaration (`FMT_CONSTEXPR`).
+//
+// nlohmann/json opens every header with a namespace macro, and the grammar
+// read the macro, `namespace` and the whole namespace body as one function
+// named `namespace`, so every class and member inside vanished; one inside a
+// class body (`NLOHMANN_BASIC_JSON_TPL_DECLARATION` before `friend class
+// basic_json;`) cut the class short. An enumerator or initializer on its own
+// line looks the same, so inside braces a line qualifies only when the
+// previous code line does not end with `,` and the next one does not start
+// with `}`. Preprocessor lines (with continuations) never qualify.
+func blankCFamilyMacroLines(src []byte) []byte {
+	clean := blankCFamilyComments(string(src))
+	lines := strings.Split(clean, "\n")
+	starts := make([]int, len(lines))
+	for i, off := 0, 0; i < len(lines); i++ {
+		starts[i] = off
+		off += len(lines[i]) + 1
+	}
+	var out []byte
+	blank := func(from, to int) {
+		if out == nil {
+			out = append([]byte(nil), src...)
+		}
+		for k := from; k < to && k < len(out); k++ {
+			if out[k] != '\n' && out[k] != '\r' {
+				out[k] = ' '
+			}
+		}
+	}
+	braces, parens := 0, 0
+	continued := false
+	prevCode := ""
+	for i := 0; i < len(lines); i++ {
+		line := lines[i]
+		trimmed := strings.TrimSpace(line)
+		directive := continued || strings.HasPrefix(trimmed, "#")
+		continued = directive && strings.HasSuffix(trimmed, "\\")
+		if directive {
+			continue
+		}
+		standalone := braces == 0 || (!strings.HasSuffix(prevCode, ",") && !strings.HasPrefix(nextCodeLine(lines, i+1), "}"))
+		if parens == 0 && standalone {
+			if cMacroLineRe.MatchString(trimmed) {
+				blank(starts[i], starts[i]+len(line))
+				continue
+			}
+			if (braces == 0 || strings.HasSuffix(prevCode, ">")) && cMacroCallLineRe.MatchString(trimmed) {
+				if end, ok := cMacroCallEnd(clean, starts[i]+strings.Index(line, "(")); ok {
+					endLine := i
+					for endLine+1 < len(lines) && starts[endLine+1] <= end {
+						endLine++
+					}
+					rest := strings.TrimSpace(clean[end+1 : starts[endLine]+len(lines[endLine])])
+					if next := nextCodeLine(lines, endLine+1); rest == "" && (next == "" || cIdentStartByte(next[0]) || next[0] == '}') {
+						blank(starts[i], starts[endLine]+len(lines[endLine]))
+						if endLine > i {
+							prevCode = strings.TrimSpace(lines[endLine])
+						}
+						i = endLine
+						continue
+					}
+				}
+			}
+		}
+		if parens == 0 {
+			lead := len(line) - len(strings.TrimLeft(line, " \t"))
+			for {
+				m := cMacroSpecifierRe.FindStringSubmatchIndex(line[lead:])
+				if m == nil {
+					break
+				}
+				blank(starts[i]+lead+m[2], starts[i]+lead+m[3])
+				lead += m[3]
+				lead += len(line[lead:]) - len(strings.TrimLeft(line[lead:], " \t"))
+			}
+		}
+		for k := 0; k < len(line); k++ {
+			switch line[k] {
+			case '{':
+				braces++
+			case '}':
+				if braces > 0 {
+					braces--
+				}
+			case '(':
+				parens++
+			case ')':
+				if parens > 0 {
+					parens--
+				}
+			}
+		}
+		if trimmed != "" {
+			prevCode = trimmed
+		}
+	}
+	return out
+}
+
+func cIdentStartByte(b byte) bool {
+	return b == '_' || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
+}
+
+// cMacroCallEnd returns the offset of the parenthesis closing the one at
+// open in clean (comments and literals already blanked).
+func cMacroCallEnd(clean string, open int) (int, bool) {
+	depth := 0
+	for k := open; k < len(clean); k++ {
+		switch clean[k] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return k, true
+			}
+		case '#':
+			// A directive inside the argument list: give up.
+			if k == 0 || clean[k-1] == '\n' || strings.TrimSpace(clean[strings.LastIndexByte(clean[:k], '\n')+1:k]) == "" {
+				return 0, false
+			}
+		}
+	}
+	return 0, false
+}
+
+// nextCodeLine returns the next non-blank, non-directive line from i on.
+func nextCodeLine(lines []string, i int) string {
+	for ; i < len(lines); i++ {
+		if t := strings.TrimSpace(lines[i]); t != "" && !strings.HasPrefix(t, "#") {
+			return t
+		}
+	}
+	return ""
 }
 
 func countErrorNodes(n *sitter.Node) int {

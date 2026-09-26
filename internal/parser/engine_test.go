@@ -1449,7 +1449,7 @@ public:
 		t.Fatalf("Save parentSymbol = %q, want Repo", save.ParentSymbol)
 	}
 	byQualified := qualifiedNameIndex(syms)
-	ctor := byQualified["Repo.Repo"]
+	ctor := byQualified["Repo::Repo"]
 	if ctor.Kind != core.KindConstructor {
 		t.Fatalf("Repo constructor kind = %q, want %q", ctor.Kind, core.KindConstructor)
 	}

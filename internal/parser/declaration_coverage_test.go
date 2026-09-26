@@ -206,12 +206,28 @@ typedef struct {
     double x, y;
 } point;
 
+typedef int (*compare_fn)(const void *, const void *);
+
+enum color { RED, GREEN = 5 };
+
+typedef struct list {
+    struct node *head;
+    union { int i; float f; };
+    struct { int a; } inner;
+} list_t;
+
 int store_get(struct store *s) { return s->size; }
 `,
 		want: map[string]core.SymbolKind{
 			"store": core.KindStruct, "store.size": core.KindField, "store.name": core.KindField,
 			"store_get": core.KindFunction, "point": core.KindStruct, "count": core.KindVariable,
 			"point.x": core.KindField, "point.y": core.KindField,
+			// Added 2026-09-26: function-pointer typedefs, enum constants,
+			// the tag of a tagged typedef, anonymous nested members.
+			"compare_fn": core.KindType, "color": core.KindEnum, "color.RED": core.KindConst,
+			"color.GREEN": core.KindConst, "list": core.KindStruct, "list_t": core.KindStruct,
+			"list.head": core.KindField, "list_t.head": core.KindField, "list.i": core.KindField,
+			"list.inner.a": core.KindField,
 		},
 	},
 	"cpp": {
@@ -232,7 +248,21 @@ int make() { return Store(1).get(); }
 
 struct Pair { int first; int (*cb)(int); };
 
-}
+class Box {
+public:
+    using value_type = int;
+    typedef int* pointer;
+    operator bool() const { return true; }
+    struct Node { int val; };
+    enum class Kind { Small, Large };
+};
+
+using IntBox = Box;
+enum class Status : int { Ok = 0 };
+
+}  // namespace app
+
+class Global { int g; };
 `,
 		want: map[string]core.SymbolKind{
 			// C++ qualified names use the language's own :: separator.
@@ -240,6 +270,14 @@ struct Pair { int first; int (*cb)(int); };
 			"app::Store::get": core.KindMethod, "app::make": core.KindFunction,
 			"app::Pair::first": core.KindField, "app::Pair::cb": core.KindField,
 			"app::registry_size": core.KindVariable,
+			// Added 2026-09-26: aliases, nested types and their members, enum
+			// constants, conversion operators; `}  // namespace app` must not
+			// double the namespace; a class outside any namespace uses :: too.
+			"app::Box::value_type": core.KindType, "app::Box::pointer": core.KindType,
+			"app::Box::operator bool": core.KindMethod, "app::Box::Node": core.KindStruct,
+			"app::Box::Node::val": core.KindField, "app::Box::Kind": core.KindEnum,
+			"app::Box::Kind::Small": core.KindConst, "app::IntBox": core.KindType,
+			"app::Status::Ok": core.KindConst, "Global::g": core.KindField,
 		},
 	},
 	"csharp": {
