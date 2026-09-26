@@ -111,7 +111,7 @@ func TestBuildFrameworkEdges_PythonJinja(t *testing.T) {
 	}
 }
 
-func TestFieldImpactLocked(t *testing.T) {
+func TestFieldAnchorKeepsFrameworkReferences(t *testing.T) {
 	syms := []core.SymbolRecord{
 		{ID: "c1", Language: "typescript", Kind: core.KindClass, Name: "HeaderComponent", QualifiedName: "HeaderComponent", FilePath: "header.component.ts"},
 		{ID: "f1", Language: "typescript", Kind: core.KindField, Name: "currentUser", QualifiedName: "HeaderComponent.currentUser", ParentSymbol: "HeaderComponent", FilePath: "header.component.ts"},
@@ -123,15 +123,18 @@ func TestFieldImpactLocked(t *testing.T) {
 		{ID: "m1", Language: "typescript", Kind: core.KindMethod, Name: "currentUser", QualifiedName: "Other.currentUser", ParentSymbol: "Other", FilePath: "other.ts"},
 	}
 	// EdgeContains for the field: buildFrameworkEdges only emits CALLS
-	// edges, so fieldImpactLocked's own contains-scan needs its own edge —
+	// edges, so the member anchor's contains-scan needs its own edge —
 	// same as any real index (buildContains emits it from ParentSymbol).
 	extra := []core.Edge{{From: "c1", To: "f1", Type: core.EdgeContains}}
 	g := New()
 	g.ReplaceWithEdges(syms, extra, len(syms))
 
-	r := g.fieldImpactLocked("HeaderComponent.currentUser")
-	if r == nil {
-		t.Fatal("fieldImpactLocked returned nil for a real field")
+	// Field anchors take the data-member path (memberimpact.go): the
+	// template binding stays a reference, and with no source scanner
+	// attached the result says it did not search reads/writes.
+	r, err := g.ChangeImpact("HeaderComponent.currentUser")
+	if err != nil {
+		t.Fatal(err)
 	}
 	if len(r.Declarations) != 1 || r.Declarations[0].ID != "f1" {
 		t.Fatalf("declarations = %+v", r.Declarations)
@@ -139,14 +142,17 @@ func TestFieldImpactLocked(t *testing.T) {
 	if len(r.Callers) != 1 || r.Callers[0].ID != "t1" {
 		t.Fatalf("callers = %+v", r.Callers)
 	}
-	if r.Completeness != "callers-only" || !r.HasHeuristicRefs {
-		t.Fatalf("completeness=%s heuristic=%v", r.Completeness, r.HasHeuristicRefs)
+	if r.Completeness != "member-accesses" || r.MemberKind != "field" || !r.HasHeuristicRefs || r.AccessCoverage != "declaration-only" {
+		t.Fatalf("completeness=%s kind=%s heuristic=%v coverage=%s", r.Completeness, r.MemberKind, r.HasHeuristicRefs, r.AccessCoverage)
 	}
 
-	// A method of the same name on THIS type must win — nil defers to the
-	// normal method path.
-	if r2 := g.fieldImpactLocked("Other.currentUser"); r2 != nil {
-		t.Fatalf("field path fired despite a same-name method: %+v", r2)
+	// A method of the same name on THIS type must win: the member path
+	// defers to the normal method path.
+	g.mu.RLock()
+	a, err := g.memberAnchorLocked("Other.currentUser", "")
+	g.mu.RUnlock()
+	if err != nil || a != nil {
+		t.Fatalf("member path fired despite a same-name method: %+v %v", a, err)
 	}
 }
 

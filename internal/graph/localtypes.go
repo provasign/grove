@@ -132,11 +132,20 @@ func goLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 // actually declared, via typeSymbolExists).
 func goReturnType(idx *edgeIndex, f *core.SymbolRecord) string {
 	sig := f.Signature
+	// A method signature opens with its receiver list: skip it, or the
+	// receiver's ")" is mistaken for the end of the parameter list and the
+	// last PARAMETER's type ("uint16") is read as the return type —
+	// `c := router.allocateContext(0)` then never typed c as *Context.
+	if rest, ok := strings.CutPrefix(sig, "func ("); ok {
+		if end := strings.IndexByte(rest, ')'); end >= 0 {
+			sig = "func " + strings.TrimSpace(rest[end+1:])
+		}
+	}
 	close := strings.IndexByte(sig, ')')
 	if close < 0 {
 		return ""
 	}
-	// Skip a leading receiver's parens for methods.
+	// A parenthesized result list: "(c *Context, r *Engine)".
 	rest := strings.TrimSpace(sig[close+1:])
 	if strings.HasPrefix(rest, "(") {
 		rest = strings.TrimPrefix(rest, "(")
