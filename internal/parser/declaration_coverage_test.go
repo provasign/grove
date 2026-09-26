@@ -98,7 +98,6 @@ export function make() { return new Store(1); }
 			"LIMIT": core.KindVariable, "Store": core.KindClass, "Store.size": core.KindField,
 			"Store.get": core.KindMethod, "make": core.KindFunction,
 		},
-		gaps: map[string]string{"LIMIT": "module-level non-function consts are not indexed (found 2026-09-26)"},
 	},
 	"typescript": {
 		file: "p.ts",
@@ -123,7 +122,6 @@ export function make(): Store { return new Store(1); }
 			"Key": core.KindType, "Store": core.KindClass, "Store.size": core.KindField,
 			"Store.get": core.KindMethod, "make": core.KindFunction,
 		},
-		gaps: map[string]string{"LIMIT": "module-level non-function consts are not indexed (found 2026-09-26)"},
 	},
 	"tsx": {
 		file: "p.tsx",
@@ -140,7 +138,6 @@ export function View(): JSX.Element { return <div />; }
 			"LIMIT": core.KindVariable, "Store": core.KindClass, "Store.size": core.KindField,
 			"Store.get": core.KindMethod, "View": core.KindFunction,
 		},
-		gaps: map[string]string{"LIMIT": "module-level non-function consts are not indexed (found 2026-09-26)"},
 	},
 	"java": {
 		file: "p/Store.java",
@@ -205,20 +202,23 @@ struct store {
 
 static int count = 0;
 
+typedef struct {
+    double x, y;
+} point;
+
 int store_get(struct store *s) { return s->size; }
 `,
 		want: map[string]core.SymbolKind{
 			"store": core.KindStruct, "store.size": core.KindField, "store.name": core.KindField,
-			"store_get": core.KindFunction,
-		},
-		gaps: map[string]string{
-			"store.size": "C struct members are not indexed (found 2026-09-26)",
-			"store.name": "C struct members are not indexed (found 2026-09-26)",
+			"store_get": core.KindFunction, "point": core.KindStruct, "count": core.KindVariable,
+			"point.x": core.KindField, "point.y": core.KindField,
 		},
 	},
 	"cpp": {
 		file: "p.cpp",
 		src: `namespace app {
+
+static int registry_size = 0;
 
 class Store {
 public:
@@ -230,14 +230,17 @@ private:
 
 int make() { return Store(1).get(); }
 
+struct Pair { int first; int (*cb)(int); };
+
 }
 `,
 		want: map[string]core.SymbolKind{
 			// C++ qualified names use the language's own :: separator.
 			"app::Store": core.KindClass, "app::Store::size_": core.KindField,
 			"app::Store::get": core.KindMethod, "app::make": core.KindFunction,
+			"app::Pair::first": core.KindField, "app::Pair::cb": core.KindField,
+			"app::registry_size": core.KindVariable,
 		},
-		gaps: map[string]string{"app::Store::size_": "C++ member fields are not indexed (found 2026-09-26)"},
 	},
 	"csharp": {
 		file: "P.cs",
@@ -279,10 +282,10 @@ class Store implements Getter {
 function make(): Store { return new Store(1); }
 `,
 		want: map[string]core.SymbolKind{
+			"LIMIT": core.KindConst, "Store.MODE": core.KindConst,
 			"Getter": core.KindInterface, "Store": core.KindClass, "Store.size": core.KindField,
 			"Store.get": core.KindMethod, "make": core.KindFunction,
 		},
-		gaps: map[string]string{"Store.size": "PHP class properties are not indexed (found 2026-09-26)"},
 	},
 	"swift": {
 		file: "P.swift",

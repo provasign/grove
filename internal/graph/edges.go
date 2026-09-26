@@ -6,6 +6,7 @@ import (
 	"path"
 	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1806,6 +1807,22 @@ func buildExtendsImplements(idx *edgeIndex, symbols []core.SymbolRecord) []core.
 	return edges
 }
 
+// declarationOnlySymbol reports symbols indexed for lookup and search that
+// must not add uses-type edges; see buildUsesType.
+func declarationOnlySymbol(s *core.SymbolRecord) bool {
+	switch s.Language {
+	case "go":
+		return s.Kind == core.KindField
+	case "c", "cpp":
+		return s.Kind == core.KindField || s.Kind == core.KindVariable
+	case "php":
+		return s.Kind == core.KindField || s.Kind == core.KindConst
+	case "javascript", "typescript", "tsx":
+		return s.Kind == core.KindVariable && slices.Contains(s.Modifiers, "module-value")
+	}
+	return false
+}
+
 // buildUsesType emits uses-type edges from a symbol's signature, scoped to
 // same-file and imported-file symbols (per Implementation Plan). The "to"
 // side of each edge is a concrete symbol ID when resolvable.
@@ -1834,10 +1851,12 @@ func buildUsesType(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
 			// pre-existing language's counts stay byte-identical.
 			continue
 		}
-		if symbol.Language == "go" && symbol.Kind == core.KindField {
-			// Go struct fields (new 2026-09-25) are indexed so lookup and
-			// search can find them. Same rule as python fields: they add no
-			// uses-type edges, so pre-existing Go graphs stay byte-identical.
+		if declarationOnlySymbol(&symbol) {
+			// Fields, members and module values added 2026-09-25/26 so lookup
+			// and search can find them (Go struct fields; C/C++ members and
+			// file-scope variables; PHP properties and constants; JS/TS module
+			// values). Same rule as python fields: they add no uses-type edges,
+			// so pre-existing graphs keep their edges.
 			continue
 		}
 		scope := idx.importedFiles(symbol.FilePath)
