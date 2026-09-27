@@ -2608,6 +2608,13 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				}
 				fmt.Fprintf(os.Stderr, "grove-trace %s: callee=%q qual=%q args=%v cands=%d capped=%v scope=%d first=%v\n", symbol.QualifiedName, cs.Callee, qualifier, cs.Args, len(cands), capped, len(scope), ids)
 			}
+			if symbol.Language == "python" && qualifier != "" && cs.Argc > 0 && len(cands) > 0 &&
+				!pyCallHasSplat(&symbol, cs) {
+				// Python has no overloading: a method whose parameters cannot
+				// take this call's argument count is not its target (click:
+				// ctx.invoke(other_cmd, arg=42) is not Command.invoke(self, ctx)).
+				cands = pyArityCompatible(cands, cs.Argc)
+			}
 			if symbol.Language == "swift" && qualifier == "" && len(cands) == 0 {
 				// `throw LocationError(path:..)` where `typealias
 				// LocationError = FilesError<LocationErrorReason>`: the

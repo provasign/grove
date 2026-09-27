@@ -1362,6 +1362,9 @@ func paramTypesOf(s *core.SymbolRecord) []string {
 	if inner == "" {
 		return nil
 	}
+	if s.Language == "python" {
+		return pyParamTypeTokens(inner)
+	}
 	var out []string
 	for _, gr := range splitTopLevel(inner, ',') {
 		token := bareTypeToken(gr)
@@ -1369,6 +1372,39 @@ func paramTypesOf(s *core.SymbolRecord) []string {
 		case "typescript", "tsx", "javascript":
 			token = tsParamTypeToken(gr)
 		}
+		if token == "" {
+			return nil
+		}
+		out = append(out, token)
+	}
+	return out
+}
+
+// pyParamTypeTokens reads Python parameters by their annotations. An
+// unannotated parameter has no type evidence at all -- reading its NAME as a
+// type made `def invoke(self, ctx)` incompatible with `def invoke(self, ctx:
+// Context)`, dropping click's OptParseCommand.invoke override from
+// Command.invoke's family (2026-09-27 wide bed). Python has no overloading,
+// so one unannotated parameter makes the whole list neutral (nil).
+func pyParamTypeTokens(inner string) []string {
+	var out []string
+	for i, gr := range splitTopLevel(inner, ',') {
+		gr = strings.TrimSpace(gr)
+		name, ann, annotated := strings.Cut(gr, ":")
+		name = strings.TrimSpace(name)
+		if i == 0 && !annotated && (name == "self" || name == "cls") {
+			continue
+		}
+		if name == "*" || name == "/" {
+			continue // keyword-only / positional-only markers
+		}
+		if !annotated {
+			return nil
+		}
+		if eq := strings.Index(ann, "="); eq >= 0 {
+			ann = ann[:eq]
+		}
+		token := bareTypeToken(strings.TrimSpace(ann))
 		if token == "" {
 			return nil
 		}

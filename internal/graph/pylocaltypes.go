@@ -605,6 +605,18 @@ func pyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 		}
 	}
 
+	// Unannotated parameters that pytest fills from a fixture.
+	if pyIsTestModule(symbol.FilePath) {
+		for name := range pyParamNames(symbol.RawText) {
+			if _, typed := out[name]; typed || name == "self" || name == "cls" || name == "request" {
+				continue
+			}
+			if t := pyFixtureType(idx, symbol, name); t != "" {
+				out[name] = t
+			}
+		}
+	}
+
 	// Body declarations (highest precedence).
 	if symbol.RawText != "" {
 		body := stripCommentsAndStrings(symbol.RawText)
@@ -1295,4 +1307,196 @@ func subclassOverrides(idx *edgeIndex, language, className, calleeName, preferDi
 		frontier = next
 	}
 	return out
+}
+
+// pyFixtureValueRe finds the value a pytest fixture hands to a test: the
+// class constructed by its first `return X(` or `yield X(`.
+var pyFixtureValueRe = regexp.MustCompile(`(?m)^\s*(?:return|yield)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(`)
+
+// pyIsTestModule reports whether pytest injects fixtures into this file's
+// functions: test_*.py, *_test.py, conftest.py.
+func pyIsTestModule(path string) bool {
+	base := path[strings.LastIndexByte(path, '/')+1:]
+	return strings.HasPrefix(base, "test_") || strings.HasSuffix(base, "_test.py") || base == "conftest.py"
+}
+
+func pyIsFixture(s *core.SymbolRecord) bool {
+	for _, a := range s.Annotations {
+		a = strings.TrimSpace(a)
+		if strings.HasPrefix(a, "pytest.fixture") || strings.HasPrefix(a, "fixture") {
+			return true
+		}
+	}
+	return false
+}
+
+// pyFixtureType types an unannotated test-function parameter that pytest
+// fills from a fixture of the same name: the fixture in the same module,
+// else the one in the nearest conftest.py up the directory tree (pytest's
+// own lookup order). Its return annotation names the type; a generator
+// annotation or none falls back to the class its return/yield constructs.
+// click tests (2026-09-27 wide bed): `def test_x(runner): runner.invoke(cli)`
+// with conftest `def runner(request): return CliRunner()` bound every
+// invoke method in click instead of CliRunner.invoke.
+func pyFixtureType(idx *edgeIndex, symbol *core.SymbolRecord, param string) string {
+	if !pyIsTestModule(symbol.FilePath) {
+		return ""
+	}
+	callerDir := dirOf(symbol.FilePath)
+	var best *core.SymbolRecord
+	bestRank := -1
+	for _, cand := range namedSymbols(idx, param) {
+		if cand.Language != "python" || cand.Kind != core.KindFunction || !pyIsFixture(cand) {
+			continue
+		}
+		rank := -1
+		switch {
+		case cand.FilePath == symbol.FilePath:
+			rank = 1 << 20
+		case strings.HasSuffix(cand.FilePath, "/conftest.py") || cand.FilePath == "conftest.py":
+			dir := dirOf(cand.FilePath)
+			if dir == "" || dir == "." || callerDir == dir || strings.HasPrefix(callerDir+"/", dir+"/") {
+				rank = len(dir) // deeper conftest wins
+			}
+		}
+		if rank > bestRank {
+			best, bestRank = cand, rank
+		}
+	}
+	if best == nil || bestRank < 0 {
+		return ""
+	}
+	if t := pyReturnType(best); t != "" {
+		switch t {
+		case "Iterator", "Generator", "Iterable", "AsyncIterator", "AsyncGenerator", "Any", "None":
+		default:
+			if typeSymbolExists(idx, t) {
+				return t
+			}
+		}
+	}
+	if m := pyFixtureValueRe.FindStringSubmatch(stripCommentsAndStrings(best.RawText)); m != nil && typeSymbolExists(idx, m[1]) {
+		return m[1]
+	}
+	return ""
+}
+
+// pyTransparentDecorators do not change how a method is called.
+var pyTransparentDecorators = map[string]bool{
+	"staticmethod": true, "classmethod": true, "abstractmethod": true, "abc.abstractmethod": true,
+	"override": true, "typing.override": true, "typing_extensions.override": true,
+	"functools.cache": true, "functools.lru_cache": true, "cache": true, "lru_cache": true,
+}
+
+// pyArity is how many arguments a call may pass to a Python def (receiver
+// excluded): min required, max accepted (-1 = unbounded). ok=false when the
+// def is not Python, cannot be parsed, or carries a decorator that may
+// change its calling convention (click.pass_context injects ctx).
+func pyArity(s *core.SymbolRecord) (min, max int, ok bool) {
+	if s.Language != "python" || s.RawText == "" {
+		return 0, 0, false
+	}
+	static := false
+	for _, a := range s.Annotations {
+		name := strings.TrimSpace(a)
+		if i := strings.IndexByte(name, '('); i >= 0 {
+			name = name[:i]
+		}
+		if !pyTransparentDecorators[name] {
+			return 0, 0, false
+		}
+		if name == "staticmethod" {
+			static = true
+		}
+	}
+	params := pyDefParams(s.RawText)
+	if strings.TrimSpace(params) == "" && !strings.Contains(s.RawText, "()") {
+		return 0, 0, false
+	}
+	groups := pySplitParams(params)
+	if (s.Kind == core.KindMethod || s.Kind == core.KindConstructor) && s.ParentSymbol != "" && !static && len(groups) > 0 {
+		groups = groups[1:] // self / cls
+	}
+	for _, g := range groups {
+		g = strings.TrimSpace(g)
+		switch {
+		case g == "" || g == "/" || g == "*":
+			continue
+		case strings.HasPrefix(g, "**"), strings.HasPrefix(g, "*"):
+			max = -1
+			continue
+		}
+		name := g
+		if i := strings.IndexAny(name, ":="); i >= 0 {
+			name = name[:i]
+		}
+		if !pyIdentifier(strings.TrimSpace(name)) {
+			return 0, 0, false
+		}
+		if max >= 0 {
+			max++
+		}
+		if !strings.Contains(g, "=") {
+			min++
+		}
+	}
+	return min, max, true
+}
+
+// pyArityCompatible keeps candidates that can take argc arguments (and
+// every candidate whose arity is unknown).
+func pyArityCompatible(cands []*core.SymbolRecord, argc int) []*core.SymbolRecord {
+	var out []*core.SymbolRecord
+	for _, c := range cands {
+		min, max, ok := pyArity(c)
+		if !ok || (argc >= min && (max < 0 || argc <= max)) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// pyCallHasSplat reports whether the call at cs unpacks arguments (*a, **kw)
+// -- then its real argument count is unknown -- or cannot be located (also
+// unknown). Only a located call with plain arguments has a known count.
+func pyCallHasSplat(symbol *core.SymbolRecord, cs core.CallSite) bool {
+	if symbol.RawText == "" || cs.Line < symbol.Span.Start {
+		return true
+	}
+	lines := strings.Split(symbol.RawText, "\n")
+	off := cs.Line - symbol.Span.Start
+	if off < 0 || off >= len(lines) {
+		return true
+	}
+	leaf := cs.Callee
+	if i := strings.LastIndexByte(leaf, '.'); i >= 0 {
+		leaf = leaf[i+1:]
+	}
+	end := off + 20
+	if end > len(lines) {
+		end = len(lines)
+	}
+	text := strings.Join(lines[off:end], "\n")
+	i := strings.Index(text, leaf+"(")
+	if i < 0 {
+		return true
+	}
+	depth, start := 0, i+len(leaf)
+	for k := start; k < len(text); k++ {
+		switch text[k] {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			depth--
+			if depth == 0 {
+				for _, arg := range splitTopLevel(text[start+1:k], ',') {
+					if strings.HasPrefix(strings.TrimSpace(arg), "*") {
+						return true
+					}
+				}
+				return false
+			}
+		}
+	}
+	return true
 }
