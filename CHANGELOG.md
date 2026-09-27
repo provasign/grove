@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.60.2 - 2026-09-27
+
+Python call edges: an unannotated pytest test parameter takes the type of the
+fixture that fills it (same module, else nearest conftest.py); unannotated
+parameters no longer read as a type named after the parameter, so overrides
+with unannotated signatures stay in change-impact families; a receiver call
+binds only methods whose parameters can take its argument count (calls that
+unpack, and decorated defs, keep every candidate). click Command.invoke:
+280 -> 6 callers. Edge accuracy: flask P 0.8522 R 0.7164; gin, cobra within
+baseline.
+
 ## v0.60.1 - 2026-09-27
 
 Go call edges drop guesses the type checker rules out. A method call on the
