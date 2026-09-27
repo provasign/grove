@@ -840,8 +840,13 @@ func TestSelfNamedWrapperDoesNotShadowQualifiedTarget(t *testing.T) {
 		CallSites: []core.CallSite{{Callee: "engine().Use", Line: 1}},
 	}
 	target := core.SymbolRecord{ID: "engine/use.go::Engine.Use", FilePath: "engine/use.go", Language: "go", Kind: core.KindMethod, Name: "Use", QualifiedName: "Engine.Use", ParentSymbol: "Engine"}
+	// gin's ginS: `func engine() *gin.Engine` is the wrapper package's own
+	// producer. A call-result receiver whose producer is not indexed is
+	// external and binds nothing (TestGoCallResultReceiverFromExternal...).
+	producer := core.SymbolRecord{ID: "wrapper.go::engine", FilePath: "wrapper.go", Language: "go", Kind: core.KindFunction,
+		Name: "engine", QualifiedName: "engine", Signature: "func engine() *engine.Engine"}
 	g := New()
-	g.Replace([]core.SymbolRecord{caller, target}, 2)
+	g.Replace([]core.SymbolRecord{caller, target, producer}, 2)
 	if !hasEdge(g, core.EdgeCalls, caller.ID, target.ID) {
 		_, edges := g.Snapshot()
 		t.Fatalf("qualified wrapper target missing: %+v", edges)
@@ -892,5 +897,119 @@ func TestBuildCalls_PropertyReadEdges(t *testing.T) {
 	}
 	if gotPlain {
 		t.Error("attribute access must not edge to non-property methods")
+	}
+}
+
+// runtime.FuncForPC(pc).Name() reaches grove as FuncForPC().Name: the package
+// is gone, and before 2026-09-27 the call bound the one Name method in scope
+// (gin: nameOfFunction -> xmlBinding.Name at 0.95). A producer the index does
+// not hold is external, so no local method is the target; a local type name
+// is a conversion with an exact type; a local function keeps its candidates.
+func TestGoCallResultReceiverFromExternalFunctionBindsNothing(t *testing.T) {
+	g := New()
+	g.Replace([]core.SymbolRecord{
+		{ID: "b.go::xmlBinding@sha", FilePath: "b.go", Language: "go", Kind: core.KindStruct, Name: "xmlBinding", QualifiedName: "xmlBinding"},
+		{ID: "b.go::xmlBinding.Name@sha", FilePath: "b.go", Language: "go", Kind: core.KindMethod, Name: "Name", ParentSymbol: "xmlBinding", Signature: "func (xmlBinding) Name() string"},
+		{ID: "b.go::jsonBinding@sha", FilePath: "b.go", Language: "go", Kind: core.KindStruct, Name: "jsonBinding", QualifiedName: "jsonBinding"},
+		{ID: "b.go::jsonBinding.Name@sha", FilePath: "b.go", Language: "go", Kind: core.KindMethod, Name: "Name", ParentSymbol: "jsonBinding", Signature: "func (jsonBinding) Name() string"},
+		{ID: "b.go::pick@sha", FilePath: "b.go", Language: "go", Kind: core.KindFunction, Name: "pick", Signature: "func pick() xmlBinding"},
+		{ID: "u.go::external@sha", FilePath: "u.go", Language: "go", Kind: core.KindFunction, Name: "external",
+			RawText: "func external(f any) string { return runtime.FuncForPC(0).Name() }", Span: core.LineRange{Start: 1, End: 1},
+			CallSites: []core.CallSite{{Callee: "FuncForPC().Name", Line: 1}}},
+		{ID: "u.go::conversion@sha", FilePath: "u.go", Language: "go", Kind: core.KindFunction, Name: "conversion",
+			RawText: "func conversion(v any) string { return jsonBinding(v).Name() }", Span: core.LineRange{Start: 2, End: 2},
+			CallSites: []core.CallSite{{Callee: "jsonBinding().Name", Line: 2}}},
+		{ID: "u.go::local@sha", FilePath: "u.go", Language: "go", Kind: core.KindFunction, Name: "local",
+			RawText: "func local() string { return pick().Name() }", Span: core.LineRange{Start: 3, End: 3},
+			CallSites: []core.CallSite{{Callee: "pick().Name", Line: 3}}},
+	}, 1)
+	for _, m := range []string{"b.go::xmlBinding.Name@sha", "b.go::jsonBinding.Name@sha"} {
+		if hasEdge(g, core.EdgeCalls, "u.go::external@sha", m) {
+			t.Fatalf("external call-result receiver bound local method %s", m)
+		}
+	}
+	if !hasEdge(g, core.EdgeCalls, "u.go::conversion@sha", "b.go::jsonBinding.Name@sha") ||
+		hasEdge(g, core.EdgeCalls, "u.go::conversion@sha", "b.go::xmlBinding.Name@sha") {
+		t.Fatal("conversion receiver jsonBinding(v).Name() must bind jsonBinding.Name only")
+	}
+	if !hasEdge(g, core.EdgeCalls, "u.go::local@sha", "b.go::xmlBinding.Name@sha") &&
+		!hasEdge(g, core.EdgeCalls, "u.go::local@sha", "b.go::jsonBinding.Name@sha") {
+		t.Fatal("a local producer's call-result receiver lost all candidates")
+	}
+}
+
+// gin wide bed 2026-09-27: TestUriBinding's `b := Uri; b.Name()` resolved
+// natively to uriBinding.Name while astkit also bound all Binding
+// implementers by name. A caller's natively resolved callee name overrides
+// name-narrowed edges for that name; other names and non-native callers stay.
+func TestMergeEdgesNativeCallSupersedesNameNarrowedGuesses(t *testing.T) {
+	base := []core.Edge{
+		{From: "t_test.go::TestUri@1", To: "json.go::jsonBinding.Name@1", Type: core.EdgeCalls, Confidence: 0.95, Source: core.EvidenceSourceASTKit},
+		{From: "t_test.go::TestUri@1", To: "xml.go::xmlBinding.Name@1", Type: core.EdgeCalls, Confidence: 0.95, Source: core.EvidenceSourceASTKit},
+		{From: "t_test.go::TestUri@1", To: "helper.go::assertEqual@1", Type: core.EdgeCalls, Confidence: 0.95, Source: core.EvidenceSourceASTKit},
+		{From: "t_test.go::Other@1", To: "json.go::jsonBinding.Name@1", Type: core.EdgeCalls, Confidence: 0.95, Source: core.EvidenceSourceASTKit},
+	}
+	native := []core.Edge{
+		{From: "t_test.go::TestUri@1", To: "uri.go::uriBinding.Name@1", Type: core.EdgeCalls, Confidence: 0.99, Source: core.EvidenceSourceNative},
+		{From: "t_test.go::TestUri@1", To: "binding.go::BindingUri@1#Name", Type: core.EdgeCalls, Confidence: 0.99, Source: core.EvidenceSourceNative},
+	}
+	got := map[string]bool{}
+	for _, e := range mergeEdges(base, native) {
+		got[e.From+"->"+e.To] = true
+	}
+	for _, gone := range []string{"t_test.go::TestUri@1->json.go::jsonBinding.Name@1", "t_test.go::TestUri@1->xml.go::xmlBinding.Name@1"} {
+		if got[gone] {
+			t.Fatalf("name-narrowed guess survived a native resolution of the same name: %s", gone)
+		}
+	}
+	for _, kept := range []string{"t_test.go::TestUri@1->uri.go::uriBinding.Name@1", "t_test.go::TestUri@1->helper.go::assertEqual@1",
+		"t_test.go::Other@1->json.go::jsonBinding.Name@1"} {
+		if !got[kept] {
+			t.Fatalf("edge wrongly dropped: %s", kept)
+		}
+	}
+}
+
+// Build-tag twins: go/types resolves validate() to one file's copy while the
+// default build calls the other (gin binding.go / binding_nomsgpack.go). The
+// same qualified name in a twin file is not a wrong guess.
+func TestMergeEdgesNativeCallKeepsBuildTagTwin(t *testing.T) {
+	base := []core.Edge{{From: "form.go::formBinding.Bind@1", To: "binding.go::validate@1", Type: core.EdgeCalls, Confidence: 0.95, Source: core.EvidenceSourceASTKit}}
+	native := []core.Edge{{From: "form.go::formBinding.Bind@1", To: "binding_nomsgpack.go::validate@1", Type: core.EdgeCalls, Confidence: 0.99, Source: core.EvidenceSourceNative}}
+	for _, e := range mergeEdges(base, native) {
+		if e.To == "binding.go::validate@1" {
+			return
+		}
+	}
+	t.Fatal("same-qualified-name twin edge was dropped")
+}
+
+// gin setWithProperType: json.API.Unmarshal(...) through `var API Core`
+// resolves natively to Core.Unmarshal, the Core#Unmarshal anchor and one
+// implementer the checker could name (a test type); jsonApi, the production
+// implementation in the default build, implements Core too, so its
+// name-narrowed edge stays. A same-name method of a type that does not
+// implement Core is still dropped.
+func TestMergeEdgesInterfaceDispatchKeepsImplementersOfThatInterface(t *testing.T) {
+	from := "binding/form_mapping.go::setWithProperType@1"
+	base := []core.Edge{
+		{From: from, To: "codec/json/json.go::jsonApi.Unmarshal@1", Type: core.EdgeCalls, Confidence: 0.95, Source: core.EvidenceSourceASTKit},
+		{From: from, To: "other.go::xmlDecoder.Unmarshal@1", Type: core.EdgeCalls, Confidence: 0.95, Source: core.EvidenceSourceASTKit},
+	}
+	native := []core.Edge{
+		{From: from, To: "codec/json/api.go::Core.Unmarshal@1", Type: core.EdgeCalls, Confidence: 0.99, Source: core.EvidenceSourceNative},
+		{From: from, To: "codec/json/api.go::Core@1#Unmarshal", Type: core.EdgeCalls, Confidence: 0.99, Source: core.EvidenceSourceNative, Reason: core.ReasonMethodSet},
+		{From: from, To: "binding/json_test.go::customJsonApi.Unmarshal@1", Type: core.EdgeCalls, Confidence: 0.99, Source: core.EvidenceSourceNative, Reason: core.ReasonMethodSet},
+		{From: "codec/json/json.go::jsonApi@1", To: "codec/json/api.go::Core@1", Type: core.EdgeImplements, Confidence: 0.99, Source: core.EvidenceSourceNative},
+	}
+	got := map[string]bool{}
+	for _, e := range mergeEdges(base, native) {
+		got[e.To] = true
+	}
+	if !got["codec/json/json.go::jsonApi.Unmarshal@1"] {
+		t.Fatal("an implementer of the dispatched interface lost its edge")
+	}
+	if got["other.go::xmlDecoder.Unmarshal@1"] {
+		t.Fatal("a same-name method of a non-implementer survived interface dispatch")
 	}
 }

@@ -192,11 +192,133 @@ func mergeEdges(base, enriched []core.Edge) []core.Edge {
 	for _, edge := range enriched {
 		add(edge)
 	}
+	// A Go call the type checker resolved outranks name-narrowed guesses for
+	// the same callee name from the same caller (gin wide bed 2026-09-27:
+	// TestUriBinding's `b := Uri; b.Name()` resolved natively to
+	// BindingUri/uriBinding.Name while astkit also bound all 13 Binding
+	// implementers). A guess survives when it could still be right:
+	//   - its qualified name is one the checker resolved (Go build-tag
+	//     twins: binding.go / binding_nomsgpack.go both declare validate);
+	//   - the call dispatched through an interface the guess's type
+	//     implements (the checker's implementer list can be partial: gin
+	//     json.API.Unmarshal named only a test type, not jsonApi);
+	//   - the checker named no concrete target at all.
+	type calleeSet struct {
+		quals, ifaceOwners map[string]bool
+		static             bool // a direct, non-dispatch concrete resolution
+	}
+	resolved := map[string]map[string]*calleeSet{} // caller -> callee name -> native targets
+	implements := map[string]map[string]bool{}     // type qual -> interface quals
+	for _, k := range ordered {
+		e := byKey[k]
+		if e.Type == core.EdgeImplements {
+			from, _ := symbolQual(e.From)
+			to, _ := symbolQual(e.To)
+			if implements[from] == nil {
+				implements[from] = map[string]bool{}
+			}
+			implements[from][to] = true
+		}
+		if e.Type != core.EdgeCalls || e.Source != core.EvidenceSourceNative || !isGoNode(e.From) {
+			continue
+		}
+		byName := resolved[e.From]
+		if byName == nil {
+			byName = map[string]*calleeSet{}
+			resolved[e.From] = byName
+		}
+		name := calleeNameOf(e.To)
+		set := byName[name]
+		if set == nil {
+			set = &calleeSet{quals: map[string]bool{}, ifaceOwners: map[string]bool{}}
+			byName[name] = set
+		}
+		qual, anchor := symbolQual(e.To)
+		set.quals[qual] = true
+		if anchor {
+			set.ifaceOwners[qualOwner(qual)] = true
+		} else if e.Reason != core.ReasonMethodSet {
+			set.static = true
+		}
+	}
+	superseded := func(e core.Edge) bool {
+		set := resolved[e.From][calleeNameOf(e.To)]
+		if set == nil {
+			return false
+		}
+		qual := calleeQualOf(e.To)
+		if set.quals[qual] {
+			return false
+		}
+		if len(set.ifaceOwners) > 0 {
+			for iface := range set.ifaceOwners {
+				if implements[qualOwner(qual)][iface] {
+					return false
+				}
+			}
+			return true
+		}
+		// No dispatch: a static resolution names the target; the interface
+		// member itself (owner an interface we saw no anchor for) does not.
+		return set.static
+	}
 	out := make([]core.Edge, 0, len(ordered))
 	for _, k := range ordered {
-		out = append(out, byKey[k])
+		e := byKey[k]
+		if e.Type == core.EdgeCalls && e.Source != core.EvidenceSourceNative && superseded(e) {
+			continue
+		}
+		out = append(out, e)
 	}
 	return out
+}
+
+// qualOwner is the type part of a qualified member name ("" for a function).
+func qualOwner(qual string) string {
+	if i := strings.LastIndexByte(qual, '.'); i >= 0 {
+		return qual[:i]
+	}
+	return ""
+}
+
+// calleeQualOf is the qualified name in a symbol ID: "f.go::T@sha#Name" and
+// "g.go::T.Name@sha" both give "T.Name".
+func calleeQualOf(id string) string {
+	qual, _ := symbolQual(id)
+	return qual
+}
+
+func isGoNode(id string) bool {
+	file, _, _ := strings.Cut(id, "::")
+	return strings.HasSuffix(file, ".go")
+}
+
+// symbolQual splits a symbol ID into its qualified name and whether it is a
+// method-set anchor. Symbols are "f.go::T.Name@sha"; anchors append the
+// member after the owner's ID: "f.go::T@sha#Name" (or "f.go::T#Name").
+func symbolQual(id string) (qual string, anchor bool) {
+	_, rest, ok := strings.Cut(id, "::")
+	if !ok {
+		return "", false
+	}
+	owner, member, anchor := strings.Cut(rest, "#")
+	if at := strings.LastIndexByte(owner, '@'); at >= 0 {
+		owner = owner[:at]
+	}
+	if anchor {
+		return owner + "." + member, true
+	}
+	return owner, false
+}
+
+// calleeNameOf is the member name in a symbol ID: "f.go::T.Name@sha" and the
+// anchor "f.go::T@sha#Name" both give "Name".
+func calleeNameOf(id string) string {
+	qual, _ := symbolQual(id)
+	if i := strings.LastIndexByte(qual, '.'); i >= 0 {
+		return qual[i+1:]
+	}
+	return qual
 }
 
 // BuildEdges constructs all 8 edge types from the symbol set.

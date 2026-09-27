@@ -158,7 +158,7 @@ func (d *goInterfaceDispatch) contractEdges() []core.Edge {
 				}
 			}
 			candidateType, methods, ok := candidateForInterface(candidate, iface.named, iface.typ)
-			if !ok || !types.Implements(candidateType, contract) {
+			if !ok || !implementsEveryMethod(candidateType, methods, contract) {
 				continue
 			}
 			add(candidate.symbol.ID, iface.symbol.ID, core.EdgeImplements)
@@ -207,7 +207,7 @@ func (d *goInterfaceDispatch) implementations(recv types.Type, iface *types.Inte
 	seen := map[string]bool{}
 	for _, candidate := range d.candidates {
 		candidateType, methods, ok := candidateForInterface(candidate, recv, iface)
-		if !ok || !types.Implements(candidateType, iface) {
+		if !ok || !implementsEveryMethod(candidateType, methods, iface) {
 			continue
 		}
 		for i := 0; i < iface.NumMethods(); i++ {
@@ -337,4 +337,23 @@ func goDispatchTypeValid(typ types.Type, seen map[types.Type]bool) bool {
 	default:
 		return false
 	}
+}
+
+// implementsEveryMethod is types.Implements plus proof: every interface
+// method must be found in the candidate's method set. A type embedding a
+// field whose package did not load has an invalid embedded type, and go/types
+// then answers Implements true for methods it cannot see (gin json_test.go:
+// TimeEx{jsoniter.DummyExtension} "implemented" BindingUri with no Name or
+// BindUri, which made BindingUri a sibling contract of Binding.Name).
+func implementsEveryMethod(candidate types.Type, methods *types.MethodSet, iface *types.Interface) bool {
+	if !types.Implements(candidate, iface) {
+		return false
+	}
+	for i := 0; i < iface.NumMethods(); i++ {
+		m := iface.Method(i)
+		if methods.Lookup(m.Pkg(), m.Name()) == nil {
+			return false
+		}
+	}
+	return true
 }

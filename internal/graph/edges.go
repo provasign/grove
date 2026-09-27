@@ -2902,6 +2902,21 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					}
 				}
 			}
+			if symbol.Language == "go" && strings.HasSuffix(qualifier, "()") && len(cands) > 0 {
+				// Call-result receiver. astkit drops the package of a chained
+				// receiver (runtime.FuncForPC(pc).Name() arrives as
+				// FuncForPC().Name), so a function the index does not hold
+				// is another package's: its result is an external type and
+				// none of our same-named methods is the target (gin wide bed
+				// 2026-09-27: nameOfFunction -> xmlBinding.Name). A local type
+				// name is a conversion, T(v).M(), whose type is exact.
+				producer := strings.TrimSuffix(qualifier, "()")
+				if typeSymbolExists(idx, producer) {
+					cands = filterByParent(cands, producer)
+				} else if !goProducerSymbolExists(idx, producer) {
+					cands = nil
+				}
+			}
 			if symbol.Language == "php" && strings.HasSuffix(qualifier, "()") && len(cands) > 0 {
 				// Fluent-chain receiver ($builder->make()->addStmt()): resolve
 				// the call result's class and keep only its methods. An

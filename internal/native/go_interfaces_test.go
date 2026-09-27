@@ -188,3 +188,55 @@ func goDispatchFixture(t *testing.T, src string, wantTypeError bool, extra ...co
 	}
 	return got
 }
+
+// gin json_test.go: TimeEx embeds jsoniter.DummyExtension. When that package
+// does not load, the embedded type is invalid and types.Implements answers
+// true for any interface, so TimeEx "implemented" BindingUri with neither of
+// its methods. An implements edge needs every method found.
+func TestGoContractEdgesSkipTypesEmbeddingUnloadedPackages(t *testing.T) {
+	const src = `package coverage
+import "missing.invalid/jsoniter"
+type BindingUri interface { Name() string; BindUri(v any) error }
+type uriBinding struct{}
+func (uriBinding) Name() string { return "uri" }
+func (uriBinding) BindUri(v any) error { return nil }
+type TimeEx struct { jsoniter.DummyExtension }
+func (te *TimeEx) CreateDecoder() {}
+`
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "fixture.go", src, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := types.Config{Importer: importer.Default(), Error: func(error) {}}
+	pkg, _ := config.Check("coverage", fset, []*ast.File{file}, &types.Info{})
+	var symbols []core.SymbolRecord
+	for _, decl := range file.Decls {
+		switch d := decl.(type) {
+		case *ast.GenDecl:
+			for _, spec := range d.Specs {
+				if typ, ok := spec.(*ast.TypeSpec); ok {
+					symbols = append(symbols, core.SymbolRecord{ID: typ.Name.Name, Name: typ.Name.Name,
+						FilePath: "fixture.go", Kind: core.KindType, Language: "go"})
+				}
+			}
+		case *ast.FuncDecl:
+			recv := goReceiverName(d)
+			symbols = append(symbols, core.SymbolRecord{ID: recv + "." + d.Name.Name, Name: d.Name.Name,
+				ParentSymbol: recv, FilePath: "fixture.go", Kind: core.KindMethod, Language: "go"})
+		}
+	}
+	dispatch := newGoInterfaceDispatch(pkg, ".", ".", fset, newGoSymbolIndex(symbols), nil)
+	implements := map[string]bool{}
+	for _, e := range dispatch.contractEdges() {
+		if e.Type == core.EdgeImplements {
+			implements[e.From] = true
+		}
+	}
+	if implements["TimeEx"] {
+		t.Fatal("TimeEx embeds an unloaded type and has no Name/BindUri, yet got an implements edge")
+	}
+	if !implements["uriBinding"] {
+		t.Fatalf("the real implementer lost its implements edge: %v", implements)
+	}
+}

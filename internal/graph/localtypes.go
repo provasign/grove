@@ -572,3 +572,17 @@ func csharpExtensionTargets(cands []*core.SymbolRecord, receiverType string) []*
 // receiver; beyond it the hierarchy is a framework root (every visitor,
 // every node) and the edges say nothing about this call.
 const maxDispatchFanout = 64
+
+// goProducerSymbolExists reports whether the index holds any Go symbol of
+// this name that a call could produce a value from: a function, a method, or
+// a function-valued variable or field (gin's ginS: `var engine =
+// sync.OnceValue(func() *gin.Engine {...})`, called as engine().Use). Only a
+// name the project does not declare at all is another package's.
+func goProducerSymbolExists(idx *edgeIndex, name string) bool {
+	for _, cand := range namedSymbols(idx, name) {
+		if cand.Language == "go" {
+			return true
+		}
+	}
+	return false
+}
