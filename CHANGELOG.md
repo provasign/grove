@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.60.1 - 2026-09-27
+
+Go call edges drop guesses the type checker rules out. A method call on the
+result of a function the index does not hold (runtime.FuncForPC(pc).Name())
+no longer binds a same-name local method; a conversion T(v).M() binds T's
+method. A Go implements edge needs every interface method present in the
+type's method set, so a type embedding a field from an unloaded package no
+longer "implements" arbitrary interfaces. When the type checker resolves a
+call, name-narrowed guesses for the same callee name from the same caller
+are dropped unless they share its qualified name (build-tag twins) or
+implement the interface the call dispatched through. Edge accuracy: gin
+precision 0.9522 -> 0.9573 at unchanged recall; cobra unchanged.
+
 ## v0.60.0 - 2026-09-26
 
 Change-impact gets new outputs, found by reviewing benchmark tasks both agents
