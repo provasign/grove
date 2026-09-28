@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.61.2 - 2026-09-28
+
+Faster re-indexing after an edit; no change to results (every change below
+was checked incremental-index == full-index, edge for edge, on real repos).
+
+- **Store**: the per-file native-edge deletes of an incremental write used
+  idx_edge_source and scanned every native edge once per file. They now use
+  the node range index (plan pinned by a test). guava edit refresh via MCP:
+  31-33s -> 7.6s.
+- **TypeScript**: an incremental run walks only the changed files'
+  directories and their importers', and skips programs holding none of
+  them; parsed sources are shared across a run's programs (keyed by
+  parse-relevant settings). hono edit: 7.3s -> 1.8s.
+- **Python**: an incremental run parses only the changed directories (the
+  pass is per file); runs that add or remove files run in full (new
+  FileSetChanged signal); module lookups memoized. django edit: Python pass
+  3.8s -> 0.14s, refresh 9.7s -> 6.1s.
+- **Carry-forward fix**: file-level native edges of files with no symbols
+  (an __init__.py that only imports) were dropped from every partial run.
+- Native analyzers report their own duration and mode; the TS pass reports
+  program-build and reference-walk time; GROVE_TIMING covers the splice
+  write and graph install.
+
 ## v0.61.1 - 2026-09-28
 
 - **TypeScript**: files no tsconfig includes get an inferred project (the
