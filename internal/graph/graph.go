@@ -67,7 +67,10 @@ func (g *CodeGraph) ReplaceWithEdgesProgress(symbols []core.SymbolRecord, extraE
 // the incremental counterpart of ReplaceWithEdges, which computes the base
 // itself.
 func (g *CodeGraph) ReplaceWithBaseEdges(symbols []core.SymbolRecord, base, extraEdges []core.Edge, filesIndexed int) {
-	g.install(symbols, mergeEdges(base, extraEdges), filesIndexed)
+	tick := edgeTimer()
+	merged := mergeEdges(base, extraEdges)
+	tick("merge-native")
+	g.install(symbols, merged, filesIndexed)
 }
 
 // ReplaceWithStoredEdges installs a previously-computed edge set verbatim —
@@ -84,6 +87,8 @@ func (g *CodeGraph) ReplaceWithStoredEdges(symbols []core.SymbolRecord, edges []
 }
 
 func (g *CodeGraph) install(symbols []core.SymbolRecord, edges []core.Edge, filesIndexed int) {
+	tick := edgeTimer()
+	defer tick("install-maps")
 	// Canonical edge order: the edge slice determines adjacency-iteration
 	// order and thus every order-sensitive query surface. Sorting makes the
 	// installed state a pure function of the edge SET — identical whether the
@@ -105,6 +110,7 @@ func (g *CodeGraph) install(symbols []core.SymbolRecord, edges []core.Edge, file
 		}
 		return a.Source < b.Source
 	})
+	tick("install-sort")
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
