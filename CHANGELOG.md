@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.61.1 - 2026-09-28
+
+- **TypeScript**: files no tsconfig includes get an inferred project (the
+  nearest config's options, as tsserver does) instead of no compiler pass;
+  analysis forces noEmit (which also makes allowImportingTsExtensions
+  legal); a script-runner config (allowImportingTsExtensions under
+  Node16/NodeNext, run by tsx or bun) resolves like the runner. hono
+  benchmarks: router.match now resolves; wide audit Router.match recall
+  0.95 -> 1.0.
+- **Python**: an override whose annotations narrow the base's stays in the
+  rename family (no overloading in Python; werkzeug UUIDConverter.to_url).
+  Calls on container elements (astkit v0.15.2 keeps the receiver) bind
+  through the container's annotation, dict[str, BaseConverter] dispatching
+  to BaseConverter and its overrides. werkzeug to_url recall 0.64 -> 0.91;
+  Python wide audit 0.951 -> 0.980; flask edge recall 0.716 -> 0.729.
+- **ExtractorVersion** bumped: v0.61.0 changed TypeScript extraction
+  without a bump, so upgraded indexes kept stale symbols until files
+  changed. The next index re-extracts every file once.
+- Go analyzer prints each partial-type-check diagnostic once.
+
 ## v0.61.0 - 2026-09-28
 
 Compiler-backed analysis runs for real on a developer machine, and runs to
