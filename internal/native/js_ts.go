@@ -5,6 +5,7 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -218,9 +219,33 @@ function projectForFile(abs) {
   const cfg = nearestConfig(abs);
   return cfg && configByPath.get(path.resolve(cfg));
 }
+// Parsed SourceFiles are shared across the programs of one run, keyed by
+// file plus every option that changes parsing or binding: hono's 14
+// tsconfigs re-parsed the same sources once per program. The language
+// service's DocumentRegistry shares the same way (by compilation settings).
+const sharedSourceFiles = new Map();
+function parseSettingsKey(o) {
+  return JSON.stringify([o.target, o.module, o.moduleResolution, o.moduleDetection, o.jsx, o.jsxFactory,
+    o.jsxImportSource, o.allowJs, o.checkJs, o.experimentalDecorators, o.useDefineForClassFields,
+    o.verbatimModuleSyntax, o.allowArbitraryExtensions, o.resolveJsonModule]);
+}
 function projectHost(project) {
-  if (!project.host) project.host = ts.createCompilerHost(project.parsed.options, true);
-  return project.host;
+  if (project.host) return project.host;
+  const host = ts.createCompilerHost(project.parsed.options, true);
+  const settings = parseSettingsKey(project.parsed.options);
+  const read = host.getSourceFile.bind(host);
+  host.getSourceFile = (fileName, languageVersionOrOptions, onError, shouldCreate) => {
+    const lv = typeof languageVersionOrOptions === 'object' ? languageVersionOrOptions : {languageVersion: languageVersionOrOptions};
+    const key = settings + '\0' + lv.languageVersion + '\0' + lv.impliedNodeFormat + '\0' + lv.jsDocParsingMode + '\0' + fileName;
+    let sf = sharedSourceFiles.get(key);
+    if (sf === undefined) {
+      sf = read(fileName, languageVersionOrOptions, onError, shouldCreate);
+      sharedSourceFiles.set(key, sf);
+    }
+    return sf;
+  };
+  project.host = host;
+  return host;
 }
 function addModuleEdge(spec, abs, from, options, host) {
   if (!spec) return;
@@ -407,7 +432,23 @@ for (const relPath of inputFiles) {
 	if (spec) addModuleEdge(spec, abs, relPath, options, host);
   }
 }
+// Incremental run: walk only the changed files' directories and those of
+// files importing them (the import graph above), and skip programs that hold
+// none of them. Every other directory's stored compiler facts carry forward
+// (the analyzer reports scopedDirs as a partial run).
+function relDir(r) { const i = r.lastIndexOf('/'); return i >= 0 ? r.slice(0, i) : '.'; }
+const changedRel = JSON.parse(process.env.GROVE_CHANGED || 'null');
+let visitDirs = null;
+if (Array.isArray(changedRel) && changedRel.length > 0) {
+  const changedSet = new Set(changedRel);
+  const dirs = new Set(changedRel.map(relDir));
+  for (const e of edges) if (changedSet.has(e.to)) dirs.add(relDir(e.from));
+  const inScope = inputFiles.filter(f => dirs.has(relDir(f))).length;
+  if (2 * inScope <= inputFiles.length) visitDirs = dirs;
+}
+function inVisitScope(abs) { return visitDirs === null || visitDirs.has(relDir(rel(abs))); }
 const loadedFiles = new Set();
+const timing = {programMs: 0, visitMs: 0};
 let solutionConfigs = 0;
 for (const project of configs) {
   const parsed = project.parsed;
@@ -415,22 +456,27 @@ for (const project of configs) {
     if ((parsed.projectReferences || []).length > 0) solutionConfigs++;
     continue;
   }
+  if (visitDirs !== null && !parsed.fileNames.some(f => inVisitScope(f))) continue;
   const host = projectHost(project);
+  let began = Date.now();
   const program = ts.createProgram({rootNames: parsed.fileNames, options: parsed.options,
     projectReferences: parsed.projectReferences, host});
   const checker = program.getTypeChecker();
+  timing.programMs += Date.now() - began;
+  began = Date.now();
   for (const sf of program.getSourceFiles()) {
-    if (sf.isDeclarationFile || !input.has(path.resolve(sf.fileName))) continue;
+    if (sf.isDeclarationFile || !input.has(path.resolve(sf.fileName)) || !inVisitScope(sf.fileName)) continue;
     loadedFiles.add(path.resolve(sf.fileName));
     visit(checker, parsed.options, host, sf, sf, []);
   }
+  timing.visitMs += Date.now() - began;
 }
 // Files no config includes (hono's benchmarks/*.mts outside tsconfig's
 // include) get an inferred project, as tsserver does for an open file: the
 // nearest config's compiler options, the uncovered files as roots. Imports
 // into the main project still resolve, so their calls land on its
 // declarations. Before this, such files were never visited.
-const uncovered = [...input].filter(abs => !loadedFiles.has(abs) &&
+const uncovered = [...input].filter(abs => !loadedFiles.has(abs) && inVisitScope(abs) &&
   /\.[cm]?[jt]sx?$/.test(abs) && !/\.d\.[cm]?ts$/.test(abs) &&
   !abs.split(path.sep).includes('node_modules'));
 let inferredFiles = 0;
@@ -465,7 +511,8 @@ if (uncovered.length > 0) {
   }
 }
 process.stdout.write("\n@@GROVE_TS_PAYLOAD@@");
-console.log(JSON.stringify({files: loadedFiles.size, configs: configs.length, solutionConfigs, inferredFiles,
+console.log(JSON.stringify({files: loadedFiles.size, configs: configs.length, solutionConfigs, inferredFiles, timing,
+  scopedDirs: visitDirs === null ? null : [...visitDirs],
   configErrors, edges, calls, types, members}));
 `)
 	// Trusted (default): run node in the repo so its own typescript loads,
@@ -477,7 +524,13 @@ console.log(JSON.stringify({files: loadedFiles.size, configs: configs.length, so
 	if untrustedMode() {
 		cmd.Dir = neutralNodeCWD()
 	}
-	cmd.Env = appendEnv("GROVE_FILES="+string(filesJSON), "GROVE_ROOT="+req.Root)
+	env := []string{"GROVE_FILES=" + string(filesJSON), "GROVE_ROOT=" + req.Root}
+	if changed := tsChangedFiles(req); changed != nil {
+		if b, err := jsonMarshal(changed); err == nil {
+			env = append(env, "GROVE_CHANGED="+string(b))
+		}
+	}
+	cmd.Env = appendEnv(env...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	err = cmd.Run()
@@ -494,8 +547,13 @@ console.log(JSON.stringify({files: loadedFiles.size, configs: configs.length, so
 		Configs         int      `json:"configs"`
 		SolutionConfigs int      `json:"solutionConfigs"`
 		InferredFiles   int      `json:"inferredFiles"`
-		ConfigErrors    []string `json:"configErrors"`
-		Edges           []struct {
+		ScopedDirs      []string `json:"scopedDirs"`
+		Timing          struct {
+			ProgramMs int `json:"programMs"`
+			VisitMs   int `json:"visitMs"`
+		} `json:"timing"`
+		ConfigErrors []string `json:"configErrors"`
+		Edges        []struct {
 			From string `json:"from"`
 			To   string `json:"to"`
 		} `json:"edges"`
@@ -569,16 +627,45 @@ console.log(JSON.stringify({files: loadedFiles.size, configs: configs.length, so
 		}
 		edges = append(edges, symbolEdge(from, to, edgeType, 0.97))
 	}
-	return Result{
+	res := Result{
 		Edges: edges,
 		Diagnostics: append([]string{
-			"typescript projects loaded " + itoa(payload.Configs) + " config(s), including " + itoa(payload.SolutionConfigs) + " solution config(s), and " + itoa(payload.Files) + " indexed file(s)" + inferredNote(payload.InferredFiles),
+			"typescript projects loaded " + itoa(payload.Configs) + " config(s), including " + itoa(payload.SolutionConfigs) + " solution config(s), and " + itoa(payload.Files) + " indexed file(s)" + inferredNote(payload.InferredFiles) +
+				" (program build " + itoa(payload.Timing.ProgramMs) + "ms, reference walk " + itoa(payload.Timing.VisitMs) + "ms)",
 			"resolved " + itoa(len(payload.Edges)) + " native import candidate(s)",
 			"resolved " + itoa(len(payload.Calls)) + " native call candidate(s)",
 			"resolved " + itoa(len(payload.Types)) + " native type-use candidate(s)",
 			"resolved " + itoa(len(payload.Members)) + " native member-reference candidate(s)",
 		}, payload.ConfigErrors...),
 	}
+	if payload.ScopedDirs != nil {
+		res.Partial = map[string][]string{"javascript": payload.ScopedDirs, "typescript": payload.ScopedDirs, "tsx": payload.ScopedDirs}
+		res.Diagnostics = append(res.Diagnostics, "scoped to "+itoa(len(payload.ScopedDirs))+" affected dir(s); other dirs' compiler edges carried forward")
+	}
+	return res
+}
+
+// tsChangedFiles returns the changed JS/TS files of an incremental run, or nil
+// for a full run: a cold index, a rebaseline, or a deletion (importers of a
+// deleted file are not visible in the import graph any more).
+func tsChangedFiles(req Request) []string {
+	if req.ChangedFiles == nil {
+		return nil
+	}
+	all := fileSet(req.Files)
+	var out []string
+	for _, f := range req.ChangedFiles {
+		switch strings.ToLower(filepath.Ext(f)) {
+		case ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs":
+		default:
+			continue
+		}
+		if !all[f] {
+			return nil
+		}
+		out = append(out, f)
+	}
+	return out
 }
 
 func inferredNote(n int) string {
