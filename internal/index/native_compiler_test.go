@@ -200,6 +200,72 @@ func TestTSScriptConfigsAndFilesOutsideEveryConfig(t *testing.T) {
 	)
 }
 
+// An incremental TypeScript index walks only the changed files' directories
+// and their importers' (hono edit 7.1s -> 2.5s), and ends up identical to a
+// full index of the same tree.
+func TestTSIncrementalScopedMatchesFullIndex(t *testing.T) {
+	ts := os.Getenv("GROVE_TEST_TYPESCRIPT")
+	if ts == "" {
+		t.Skip("GROVE_TEST_TYPESCRIPT not set")
+	}
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node not found")
+	}
+	root := t.TempDir()
+	write := func(rel, body string) {
+		p := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(root, "node_modules"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(ts, filepath.Join(root, "node_modules", "typescript")); err != nil {
+		t.Fatal(err)
+	}
+	write("tsconfig.json", `{"compilerOptions":{"strict":true,"target":"es2022","module":"esnext","moduleResolution":"bundler"},"include":["src"]}`)
+	write("src/a/util.ts", "export function check(x: number): number { return x }\n")
+	write("src/b/client.ts", "import { check } from '../a/util'\nexport function one(): number { return check(1) }\n")
+	write("src/c/other.ts", "export class Other { n(): number { return 3 } }\n")
+	write("src/d/other2.ts", "import { Other } from '../c/other'\nexport function m(): number { return new Other().n() }\n")
+	write("src/e/more.ts", "export const e = 1\n")
+	write("src/f/more.ts", "export const f = 2\n")
+	_, diags, st := compilerIndex(t, root)
+	skipUnless(t, diags, "js-ts")
+	st.Close()
+
+	write("src/a/util.ts", "export function check(x: number): number { return x }\nexport function twice(x: number): number { return check(check(x)) }\n")
+	inc, incDiags, st2 := compilerIndex(t, root)
+	st2.Close()
+	scoped := false
+	for _, d := range incDiags {
+		scoped = scoped || strings.Contains(d, "js-ts: scoped to")
+	}
+	if !scoped {
+		t.Errorf("incremental TS run was not scoped: %v", incDiags)
+	}
+	wantEdges(t, inc, incDiags, "one→check calls", "twice→check calls", "m→n calls")
+	if err := os.RemoveAll(filepath.Join(root, ".grove")); err != nil {
+		t.Fatal(err)
+	}
+	full, _, st3 := compilerIndex(t, root)
+	st3.Close()
+	for k := range full {
+		if !inc[k] {
+			t.Errorf("full index has %q, incremental does not", k)
+		}
+	}
+	for k := range inc {
+		if !full[k] {
+			t.Errorf("incremental index has %q, full does not", k)
+		}
+	}
+}
+
 // A project package with a type error still loads for interface dispatch:
 // its interface reaches the implementers, and the diagnostic says the load
 // was partial (it used to drop the package and every dispatch edge with it).
