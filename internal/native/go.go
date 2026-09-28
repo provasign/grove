@@ -424,7 +424,15 @@ func goSemanticEdges(ctx context.Context, root string, files []string, symbols [
 			}
 		}
 	}
-	diagnostics = append(diagnostics, projectImporter.preloadInterfaceImports(analyzedImports, interfacePackages)...)
+	// One line per distinct problem: the same partially-checked import is
+	// reached from every package that imports it (grafana: 14 copies).
+	seenDiag := map[string]bool{}
+	for _, d := range projectImporter.preloadInterfaceImports(analyzedImports, interfacePackages) {
+		if !seenDiag[d] {
+			seenDiag[d] = true
+			diagnostics = append(diagnostics, d)
+		}
+	}
 	// Per-package type-checks are independent and symbolIdx/pkgDirsByImport
 	// are read-only here; results land by index so output order (and thus
 	// the built graph) is identical to the sequential loop.

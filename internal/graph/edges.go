@@ -2896,6 +2896,23 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// in-repo Drop impl by name.
 				continue
 			}
+			if symbol.Language == "python" && strings.HasSuffix(qualifier, "[]") && len(cands) > 0 {
+				// Element receiver (self._converters[name].to_url()): a
+				// container annotated dict[str, BaseConverter] dispatches to
+				// BaseConverter's method and its overrides. Unannotated keeps
+				// the unnarrowed member set.
+				if elem := pyContainerElementType(idx, &symbol, strings.TrimSuffix(fullChain, "[]"), localTypes, selfVars); elem != "" {
+					owners := pyDispatchOwners(idx, elem, calleeName, dirOf(symbol.FilePath))
+					var byType []*core.SymbolRecord
+					for _, c := range cands {
+						if owners[c.ParentSymbol] {
+							byType = append(byType, c)
+						}
+					}
+					cands = byType
+					capped = false
+				}
+			}
 			if symbol.Language == "python" && strings.HasSuffix(qualifier, "()") && len(cands) > 0 {
 				// Call-result receiver (self.app_context().push()): the
 				// called def's return annotation names the class. An

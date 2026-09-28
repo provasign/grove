@@ -1500,3 +1500,134 @@ func pyCallHasSplat(symbol *core.SymbolRecord, cs core.CallSite) bool {
 	}
 	return true
 }
+
+// pyElementType returns the element class of a container annotation:
+// dict[str, BaseConverter] / Mapping[K, V] / defaultdict[K, V] -> V,
+// list[X] / Sequence[X] / tuple[X, ...] / Iterable[X] -> X. "" when the
+// annotation is not a container of a class.
+func pyElementType(ann string) string {
+	ann = strings.TrimSpace(strings.Trim(strings.TrimSpace(ann), `"'`))
+	for _, prefix := range []string{"Optional[", "t.Optional[", "typing.Optional["} {
+		if strings.HasPrefix(ann, prefix) && strings.HasSuffix(ann, "]") {
+			return pyElementType(ann[len(prefix) : len(ann)-1])
+		}
+	}
+	if parts := splitTopLevel(ann, '|'); len(parts) == 2 {
+		a, b := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+		if a == "None" {
+			return pyElementType(b)
+		} else if b == "None" {
+			return pyElementType(a)
+		}
+	}
+	i := strings.IndexByte(ann, '[')
+	if i < 0 || !strings.HasSuffix(ann, "]") {
+		return ""
+	}
+	outer := strings.TrimSpace(ann[:i])
+	leaf := outer[strings.LastIndexByte(outer, '.')+1:]
+	args := splitTopLevel(ann[i+1:len(ann)-1], ',')
+	var elem string
+	switch leaf {
+	case "dict", "Dict", "Mapping", "MutableMapping", "defaultdict", "DefaultDict", "OrderedDict", "ChainMap":
+		if len(args) != 2 {
+			return ""
+		}
+		elem = args[1]
+	case "list", "List", "Sequence", "MutableSequence", "Iterable", "Iterator", "Collection", "deque", "Deque", "frozenset", "set", "Set", "AbstractSet":
+		if len(args) != 1 {
+			return ""
+		}
+		elem = args[0]
+	case "tuple", "Tuple":
+		if len(args) != 2 || strings.TrimSpace(args[1]) != "..." {
+			return ""
+		}
+		elem = args[0]
+	default:
+		return ""
+	}
+	t := pyBareType(elem)
+	if strings.HasPrefix(t, "class:") {
+		return ""
+	}
+	return t
+}
+
+// pyAttrAnnotation returns the raw annotation of attribute attr on class
+// className: a class-body "attr: T" or an __init__ "self.attr: T = ...".
+func pyAttrAnnotation(idx *edgeIndex, className, attr, preferDir string) string {
+	cls := pyResolveClass(idx, className, preferDir)
+	if cls == nil {
+		return ""
+	}
+	for _, m := range pyClassAnnRe.FindAllStringSubmatch(cls.RawText, -1) {
+		if m[1] == attr {
+			return m[2]
+		}
+	}
+	for _, cand := range idx.byFile[cls.FilePath] {
+		if cand.ParentSymbol != className || cand.Name != "__init__" {
+			continue
+		}
+		for _, m := range pySelfAnnRe.FindAllStringSubmatch(stripCommentsAndStrings(cand.RawText), -1) {
+			if m[1] == attr {
+				return m[2]
+			}
+		}
+	}
+	return ""
+}
+
+// pyContainerElementType types the element of a subscripted receiver
+// ("self._converters" in self._converters[name].to_url()): the container's
+// annotation on the enclosing class, on a typed local's class, or on a
+// parameter of the caller.
+func pyContainerElementType(idx *edgeIndex, symbol *core.SymbolRecord, base string, localTypes map[string]string, selfVars map[string]struct{}) string {
+	preferDir := dirOf(symbol.FilePath)
+	if head, attr, ok := strings.Cut(base, "."); ok && !strings.Contains(attr, ".") {
+		owner := ""
+		if _, isSelf := selfVars[head]; isSelf {
+			owner = symbol.ParentSymbol
+		} else if t := localTypes[head]; t != "" && !strings.HasPrefix(t, "class:") {
+			owner = t
+		}
+		if owner == "" {
+			return ""
+		}
+		for _, cls := range pyMRO(idx, owner, preferDir) {
+			if ann := pyAttrAnnotation(idx, cls, attr, preferDir); ann != "" {
+				return pyElementType(ann)
+			}
+		}
+		return ""
+	}
+	if !pyIdentifier(base) {
+		return ""
+	}
+	for _, p := range pySplitParams(pyDefParams(symbol.RawText)) {
+		name, ann, ok := strings.Cut(p, ":")
+		if !ok || strings.TrimSpace(strings.TrimLeft(name, "*")) != base {
+			continue
+		}
+		if eq := strings.IndexByte(ann, '='); eq >= 0 {
+			ann = ann[:eq]
+		}
+		return pyElementType(ann)
+	}
+	return ""
+}
+
+// pyDispatchOwners returns the classes whose `method` a call on a value of
+// static type className can run: className's MRO and every subclass that
+// overrides it.
+func pyDispatchOwners(idx *edgeIndex, className, method, preferDir string) map[string]bool {
+	owners := map[string]bool{}
+	for _, c := range pyMRO(idx, className, preferDir) {
+		owners[c] = true
+	}
+	for _, o := range subclassOverrides(idx, "python", className, method, preferDir) {
+		owners[o.ParentSymbol] = true
+	}
+	return owners
+}

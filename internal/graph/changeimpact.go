@@ -1346,6 +1346,13 @@ func paramTypesOf(s *core.SymbolRecord) []string {
 	if s.Language == "java" {
 		return javaParamTypes(s)
 	}
+	if s.Language == "python" {
+		// Python has no overloading: a same-named method in a subclass
+		// overrides whatever its annotations say, and narrowing them is
+		// routine (werkzeug UUIDConverter.to_url(value: uuid.UUID) overrides
+		// BaseConverter.to_url(value: t.Any) and was dropped from the family).
+		return nil
+	}
 	src := s.Signature
 	if !strings.Contains(src, ")") {
 		src = s.RawText
