@@ -50,7 +50,7 @@ traces candidate narrowing per call site to stderr).
 | Corpus (pin) | Language | Oracle (`--lang`) | Universe | P | R | F1 |
 |---|---|---|---|---|---|---|
 | gin (`d75fcd4`) | Go | SSA + VTA (default) | 99.7% | 0.9522 | 0.9505 | 0.9513 |
-| commons-lang (`44298fe`) | Java | javac + javap (`java`) | 97.0% | 0.9381 | 0.9517 | 0.9449 |
+| commons-lang (`44298fe`) | Java | javac + javap (`java`) | 97.0% | 0.9620 | 0.9807 | 0.9713 |
 | newtonsoft (`0a2e291`) | C# | Roslyn (`csharp`) | 99.7% | 0.9346 | 0.9470 | 0.9408 |
 | socket.io (`3ad4e1f2`) | TypeScript | tsc checker (`tstruth/gen_truth.mjs`) | 98.3% | 0.9029 | 0.9917 | 0.9452 |
 | express (`dae209ae`) | JavaScript | tsc `checkJs` (`tstruth/gen_truth.mjs`) | 90.3% | 0.8400 | 1.0000 | 0.9130 |
@@ -75,13 +75,24 @@ sit beside the first corpus's under `testdata/`.
 | Corpus (pin) | Language | Oracle | Universe | P | R | First corpus P / R |
 |---|---|---|---|---|---|---|
 | cobra (`adbc881`) | Go | SSA + VTA | 100% | 0.9828 | 0.9518 | 0.9522 / 0.9505 |
-| commons-io (`8ad9867d`) | Java | javac + javap | 94.5% | 0.8933 | 0.9121 | 0.9386 / 0.9517 |
+| commons-io (`8ad9867d`) | Java | javac + javap | 94.6% | 0.9303 | 0.9776 | 0.9620 / 0.9807 |
 | cJSON (`6d9f244`) | C | clang AST | 100% | 0.9982 | 0.9991 | 0.9991 / 0.9837 |
 | fd (`5bbfa3e`) | Rust | rust-analyzer SCIP | 100% | 0.9516 | 0.9130 | 0.9364 / 0.9045 |
 | p-queue (`180ab9e`) | TypeScript | tsc checker | 100% | 0.9592 | 1.0000 | 0.9029 / 0.9917 |
 | Files (`e85f2b4`) | Swift | SourceKit index | 97.0% | 0.9881 | 0.9222 | 0.9355 / 1.0000 |
 | CocoaLumberjack (`f54de25f`) | Objective-C | clang AST | 79.2% | 0.9557 | 0.7989 | 1.0000 / 0.9914 |
 | csv (`89ac08c`) | PHP | Xdebug trace (dynamic) | 100% | 0.8892 | 0.7016 | 0.9176 / 0.6471 |
+
+Java rows as of 2026-09-27: grove's javac resolver (a JDK on the machine
+is required; CI pins Temurin 17) plus an oracle correction. **The oracle
+dropped every call to an inherited method**: an invoke names the receiver's
+static type (`Builder.setMaxCount` for a method declared on
+`AbstractBuilder`), and the oracle looked the target up only there. It now
+walks the superclass chain, then superinterfaces, as JVM resolution does.
+Both snapshots were regenerated at the same pins, only adding edges
+(commons-lang +139, commons-io +284, none removed). Without a JDK grove
+falls back to name resolution and scores lower (commons-io R 0.88 against
+the new truth); `prism index` reports that as degraded.
 
 What the second corpora found, all fixed the same day and re-gated on both
 corpora of each language:

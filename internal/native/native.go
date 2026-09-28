@@ -29,7 +29,17 @@ type Config struct {
 	// TimeoutPinned marks an explicit user-set timeout (GROVE_NATIVE_TIMEOUT*)
 	// — size-scaling is skipped so the pin is honored exactly.
 	TimeoutPinned bool
+	// RunToCompletion names analyzers that have never completed a full pass
+	// on this index. They analyze every file and get completionCap, not an
+	// incremental budget: the compiler pass is a one-time cost, like a
+	// developer's first build, and a pass killed at a budget left TypeScript
+	// with no compiler facts at all on every re-index.
+	RunToCompletion map[string]bool
 }
+
+// completionCap bounds a run-to-completion pass (a safety net for a hung
+// toolchain, not a performance knob).
+const completionCap = 30 * time.Minute
 
 func DefaultConfig() Config {
 	return Config{Enabled: true, Timeout: defaultTimeout}
@@ -70,6 +80,12 @@ type Analyzer interface {
 	Analyze(context.Context, Request) Result
 }
 
+// budgeted analyzers size their own time budget from the number of files
+// they must analyze (unless the operator pinned GROVE_NATIVE_TIMEOUT).
+type budgeted interface {
+	Budget(files int) time.Duration
+}
+
 type Availability struct {
 	Available bool
 	Reason    string
@@ -98,6 +114,8 @@ type Result struct {
 	// re-analyzed this run. The indexer carries stored native edges of that
 	// language whose source file lives OUTSIDE those dirs.
 	Partial map[string][]string
+	// Completed names analyzers that finished a full pass this run.
+	Completed []string
 }
 
 func PriorityAnalyzers() []Analyzer {
@@ -149,7 +167,8 @@ func AnalyzeChangedFiles(ctx context.Context, root string, symbols []core.Symbol
 			combined.Diagnostics = append(combined.Diagnostics, analyzer.Name()+": skipped: disabled by config")
 			continue
 		}
-		if changedLanguages != nil && !touchesLanguages(analyzer, changedLanguages) {
+		full := changedLanguages == nil || cfg.RunToCompletion[analyzer.Name()]
+		if !full && !touchesLanguages(analyzer, changedLanguages) {
 			combined.Diagnostics = append(combined.Diagnostics, analyzer.Name()+": skipped: no changed files in its languages (previous edges carried forward)")
 			combined.SkippedLanguages = append(combined.SkippedLanguages, analyzer.Languages()...)
 			continue
@@ -172,16 +191,32 @@ func AnalyzeChangedFiles(ctx context.Context, root string, symbols []core.Symbol
 		// 19k files) and a starved analyzer used to land PARTIAL results —
 		// half a million edges flapping run to run.
 		timeout := cfg.Timeout
-		if !cfg.TimeoutPinned {
-			if scaled := time.Duration(len(reqFiles)) * 4 * time.Millisecond; scaled > timeout {
-				timeout = scaled
-			}
-			if timeout > maxScaledTimeout {
-				timeout = maxScaledTimeout
+		if !cfg.TimeoutPinned && full {
+			timeout = completionCap
+		} else if !cfg.TimeoutPinned {
+			if b, ok := analyzer.(budgeted); ok {
+				// Compiler-backed analyzers declare their own budget: the
+				// default's 4ms/file was calibrated on `go list` and starved
+				// the TypeScript checker on every repo in the wide bed (hono,
+				// 434 files: needs ~6s, got 5s, killed every index).
+				if own := b.Budget(len(reqFiles)); own > timeout {
+					timeout = own
+				}
+			} else {
+				if scaled := time.Duration(len(reqFiles)) * 4 * time.Millisecond; scaled > timeout {
+					timeout = scaled
+				}
+				if timeout > maxScaledTimeout {
+					timeout = maxScaledTimeout
+				}
 			}
 		}
 		runCtx, cancel := context.WithTimeout(ctx, timeout)
-		result := analyzer.Analyze(runCtx, Request{Root: root, Symbols: symbols, Files: reqFiles, ChangedFiles: changedFiles})
+		reqChanged := changedFiles
+		if full {
+			reqChanged = nil // a full pass analyzes every package
+		}
+		result := analyzer.Analyze(runCtx, Request{Root: root, Symbols: symbols, Files: reqFiles, ChangedFiles: reqChanged})
 		timedOut := errors.Is(runCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
 		cancel()
 		for _, diag := range result.Diagnostics {
@@ -206,6 +241,9 @@ func AnalyzeChangedFiles(ctx context.Context, root string, symbols []core.Symbol
 			continue
 		}
 		combined.Edges = append(combined.Edges, result.Edges...)
+		if full && !timedOut && len(result.Partial) == 0 {
+			combined.Completed = append(combined.Completed, analyzer.Name())
+		}
 		for lang, dirs := range result.Partial {
 			if combined.Partial == nil {
 				combined.Partial = map[string][]string{}
@@ -443,6 +481,16 @@ func (loc symbolLocator) at(file, name string, line int) (core.SymbolRecord, boo
 	}
 	s, ok := loc.byName[file+"\x00"+name]
 	return s, ok
+}
+
+// atOrTopLevel is at, falling back to the file's <top-level> symbol when the
+// named enclosing declaration is not a grove symbol (a module-level const
+// the extractor does not index).
+func (loc symbolLocator) atOrTopLevel(file, name string, line int) (core.SymbolRecord, bool) {
+	if s, ok := loc.at(file, name, line); ok {
+		return s, true
+	}
+	return loc.at(file, "<top-level>", 1)
 }
 
 func symbolEdge(from, to core.SymbolRecord, edgeType core.EdgeType, confidence float64) core.Edge {

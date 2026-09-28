@@ -15,29 +15,55 @@ func (javaAnalyzer) Name() string { return "java" }
 
 func (javaAnalyzer) Languages() []string { return []string{"java"} }
 
+// Available: javac needs only a JDK, not a build system (a plain-javac
+// project has no pom.xml); jdtls/Maven/Gradle alone still run the
+// tool-free inheritance and type-use pass. Neither means no compiler facts,
+// and the reason says so in terms readiness can alert on.
 func (javaAnalyzer) Available(_ context.Context, root string) Availability {
-	if !anyFile(root, "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts") {
-		return Availability{Reason: "no Maven or Gradle project config"}
+	if findJDK() != nil {
+		return Availability{Available: true}
 	}
-	if firstExistingExecutable("jdtls", "mvn", "gradle", "javac") == "" {
-		return Availability{Reason: "jdtls, mvn, gradle, or javac executable not found"}
+	if !anyFile(root, "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts") {
+		return Availability{Reason: "no JDK 11+ found and no Maven or Gradle project config"}
+	}
+	if firstExistingExecutable("jdtls", "mvn", "gradle") == "" {
+		return Availability{Reason: "no JDK 11+ found (JAVA_HOME, PATH, java_home, Homebrew openjdk) and no jdtls, mvn, or gradle"}
 	}
 	return Availability{Available: true}
 }
 
 func (javaAnalyzer) Analyze(ctx context.Context, req Request) Result {
-	_ = ctx
-	edges := javaSemanticEdges(req.Symbols)
-	return Result{
-		Edges: edges,
-		Diagnostics: []string{
-			"project tooling detected",
-			"resolved " + itoa(countNativeEdges(edges, core.EdgeCalls)) + " native call edge(s)",
-			"resolved " + itoa(countNativeEdges(edges, core.EdgeUsesType)) + " native type-use edge(s)",
-			"resolved " + itoa(countNativeEdges(edges, core.EdgeExtends)) + " native extends edge(s)",
-			"resolved " + itoa(countNativeEdges(edges, core.EdgeImplements)) + " native implements edge(s)",
-		},
+	diags := []string{"project tooling detected"}
+	// Compiler-resolved calls and field references: javac attributes the
+	// project's sources (with its Maven classpath when resolvable) and names
+	// the exact declaration of every call, constructor call, method
+	// reference and field access -- overloads included. An incremental run
+	// attributes only the affected packages; the text pass below follows the
+	// same scope so every other package's stored edges carry forward whole.
+	javacEdges, javacDiags, scopedDirs := javacResolveScoped(ctx, req)
+	var inScope func(file string) bool
+	if scopedDirs != nil {
+		dirs := map[string]bool{}
+		for _, d := range scopedDirs {
+			dirs[d] = true
+		}
+		inScope = func(file string) bool { return dirs[packageDir(file)] }
 	}
+	edges := javaSemanticEdgesIn(req.Symbols, inScope)
+	edges = append(edges, javacEdges...)
+	diags = append(diags, javacDiags...)
+	diags = append(diags,
+		"resolved "+itoa(countNativeEdges(edges, core.EdgeCalls))+" native call edge(s)",
+		"resolved "+itoa(countNativeEdges(edges, core.EdgeReads)+countNativeEdges(edges, core.EdgeWrites))+" native field-reference edge(s)",
+		"resolved "+itoa(countNativeEdges(edges, core.EdgeUsesType))+" native type-use edge(s)",
+		"resolved "+itoa(countNativeEdges(edges, core.EdgeExtends))+" native extends edge(s)",
+		"resolved "+itoa(countNativeEdges(edges, core.EdgeImplements))+" native implements edge(s)",
+	)
+	res := Result{Edges: edges, Diagnostics: diags}
+	if scopedDirs != nil {
+		res.Partial = map[string][]string{"java": scopedDirs}
+	}
+	return res
 }
 
 type javaIndex struct {
@@ -74,6 +100,12 @@ func newJavaIndex(symbols []core.SymbolRecord) javaIndex {
 }
 
 func javaSemanticEdges(symbols []core.SymbolRecord) []core.Edge {
+	return javaSemanticEdgesIn(symbols, nil)
+}
+
+// javaSemanticEdgesIn emits edges only from symbols whose file inScope
+// accepts (nil: every file); targets still resolve against every symbol.
+func javaSemanticEdgesIn(symbols []core.SymbolRecord, inScope func(string) bool) []core.Edge {
 	idx := newJavaIndex(symbols)
 	slowNames := slowTypeNames(idx.typesByName)
 	var edges []core.Edge
@@ -88,7 +120,7 @@ func javaSemanticEdges(symbols []core.SymbolRecord) []core.Edge {
 	}
 
 	for _, symbol := range symbols {
-		if symbol.Language != "java" {
+		if symbol.Language != "java" || (inScope != nil && !inScope(symbol.FilePath)) {
 			continue
 		}
 		if typeKind(symbol.Kind) {
@@ -119,8 +151,12 @@ func javaSemanticEdges(symbols []core.SymbolRecord) []core.Edge {
 			}
 		}
 		sort.Strings(names)
+		stripped := ""
+		if len(slowNames) > 0 {
+			stripped = stripQuotedText(symbol.RawText)
+		}
 		for _, name := range slowNames {
-			if containsTypeToken(symbol.RawText, name) {
+			if containsTypeTokenStripped(stripped, name) {
 				names = append(names, name)
 			}
 		}

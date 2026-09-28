@@ -222,7 +222,7 @@ func detectRefLang(path string) (astkit.LanguageKey, bool) {
 		return astkit.LangGo, true
 	case ".java":
 		return astkit.LangJava, true
-	case ".ts":
+	case ".ts", ".mts", ".cts":
 		return astkit.LangTypeScript, true
 	case ".tsx":
 		return astkit.LangTSX, true

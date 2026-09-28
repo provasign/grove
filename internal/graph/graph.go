@@ -219,7 +219,7 @@ func mergeEdges(base, enriched []core.Edge) []core.Edge {
 			}
 			implements[from][to] = true
 		}
-		if e.Type != core.EdgeCalls || e.Source != core.EvidenceSourceNative || !isGoNode(e.From) {
+		if e.Type != core.EdgeCalls || e.Source != core.EvidenceSourceNative || !compilerResolvedNode(e.From) {
 			continue
 		}
 		byName := resolved[e.From]
@@ -288,9 +288,11 @@ func calleeQualOf(id string) string {
 	return qual
 }
 
-func isGoNode(id string) bool {
+// compilerResolvedNode: callers whose native call edges come from a real
+// compiler (go/types, javac), so a native resolution is authoritative.
+func compilerResolvedNode(id string) bool {
 	file, _, _ := strings.Cut(id, "::")
-	return strings.HasSuffix(file, ".go")
+	return strings.HasSuffix(file, ".go") || strings.HasSuffix(file, ".java")
 }
 
 // symbolQual splits a symbol ID into its qualified name and whether it is a

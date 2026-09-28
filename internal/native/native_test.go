@@ -490,12 +490,18 @@ func TestCSharpAnalyzeWithCsproj(t *testing.T) {
 	}
 }
 
-func TestJavaAvailableNeedsProjectFiles(t *testing.T) {
+func TestJavaAvailableNeedsJDKOrProjectFiles(t *testing.T) {
 	root := t.TempDir()
 	a := javaAnalyzer{}
 	av := a.Available(context.Background(), root)
-	if av.Available {
-		t.Fatalf("expected not available without Maven/Gradle files, got: %q", av.Reason)
+	if findJDK() != nil {
+		if !av.Available {
+			t.Fatalf("a JDK is enough for javac, got: %q", av.Reason)
+		}
+		return
+	}
+	if av.Available || !strings.Contains(av.Reason, "no JDK") {
+		t.Fatalf("expected unavailable with a no-JDK reason, got: %+v", av)
 	}
 }
 
@@ -1156,7 +1162,7 @@ func Caller() {
 		{ID: "main.go::Map@1", FilePath: "main.go", Language: "go", Kind: core.KindFunction, Name: "Map", QualifiedName: "Map"},
 		{ID: "main.go::Caller@1", FilePath: "main.go", Language: "go", Kind: core.KindFunction, Name: "Caller", QualifiedName: "Caller"},
 	}
-	edges, diagnostics := goSemanticEdges(context.Background(), root, []string{"main.go"}, symbols, nil)
+	edges, diagnostics := goSemanticEdges(context.Background(), root, []string{"main.go"}, symbols, nil, nil)
 	if len(diagnostics) == 0 {
 		t.Fatal("expected diagnostics")
 	}
@@ -1812,4 +1818,17 @@ func assertNativeEdge(t *testing.T, edges []core.Edge, from, to string, edgeType
 		}
 	}
 	t.Fatalf("missing %s edge %s -> %s in %#v", edgeType, from, to, edges)
+}
+
+func TestTSPayloadSkipsStrayStdout(t *testing.T) {
+	out := []byte("=== warning printed by a tsconfig plugin ===\n" + tsPayloadSentinel + `{"files":2}` + "\n")
+	var payload struct {
+		Files int `json:"files"`
+	}
+	if err := unmarshalJSON(tsPayload(out), &payload); err != nil || payload.Files != 2 {
+		t.Fatalf("payload after stray stdout: files=%d err=%v", payload.Files, err)
+	}
+	if got := string(tsPayload([]byte(`{"files":1}`))); got != `{"files":1}` {
+		t.Fatalf("output without sentinel must pass through, got %q", got)
+	}
 }

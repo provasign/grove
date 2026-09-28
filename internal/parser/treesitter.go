@@ -180,6 +180,9 @@ func extractSymbolsFromAST(language, filePath, blobSHA string, src []byte, fileI
 		}
 		syms = append(syms, projected)
 	}
+	if key == astkit.LangTypeScript || key == astkit.LangTSX {
+		tsExtendOverloadSpans(syms, src)
+	}
 	if tree != nil && (key == astkit.LangJavaScript || key == astkit.LangTypeScript || key == astkit.LangTSX) {
 		if topLevel := jsTopLevelSymbol(tree.RootNode(), src, filePath, blobSHA, language, fileImports); topLevel != nil {
 			syms = append(syms, *topLevel)
@@ -218,21 +221,79 @@ var jsCallableContainers = map[string]bool{
 
 var jsTopLevelCalleeRe = regexp.MustCompile(`^[A-Za-z_$][A-Za-z0-9_$]*(?:\??\.[A-Za-z_$][A-Za-z0-9_$]*)*$`)
 
+// jsAnonymousCallable reports whether a function-like node is an anonymous
+// callback passed as an argument -- describe('x', () => {...}),
+// arr.map(function (v) {...}). No symbol is extracted for it, so its calls
+// belong to the enclosing <top-level>.
+func jsAnonymousCallable(node *sitter.Node) bool {
+	switch node.Type() {
+	case "arrow_function", "function_expression", "function", "generator_function":
+	default:
+		return false
+	}
+	parent := node.Parent()
+	return parent != nil && parent.Type() == "arguments"
+}
+
 func jsTopLevelSymbol(root *sitter.Node, src []byte, filePath, blobSHA, language string, imports []string) *core.SymbolRecord {
 	if root == nil {
 		return nil
 	}
 	var calls []core.CallSite
-	var walk func(*sitter.Node)
-	walk = func(node *sitter.Node) {
-		if node == nil || jsCallableContainers[node.Type()] {
+	// Source with every separately extracted container blanked: what remains
+	// is the file's own top-level code, including anonymous callbacks, so
+	// local type inference sees `const app = new Hono()` before
+	// app.basePath(...) (hono wide bed 2026-09-27: calls inside
+	// describe/it callbacks were dropped entirely -- hono.test.ts kept 44 of
+	// its call sites, none of 6 basePath uses).
+	masked := append([]byte(nil), src...)
+	blank := func(n *sitter.Node) {
+		start, end := int(n.StartByte()), int(n.EndByte())
+		if start < 0 {
+			start = 0
+		}
+		if end > len(masked) {
+			end = len(masked)
+		}
+		for i := start; i < end; i++ {
+			if masked[i] != '\n' && masked[i] != '\r' {
+				masked[i] = ' '
+			}
+		}
+	}
+	var walk func(node *sitter.Node, inCallback bool)
+	walk = func(node *sitter.Node, inCallback bool) {
+		if node == nil {
 			return
+		}
+		if jsCallableContainers[node.Type()] {
+			switch {
+			case jsAnonymousCallable(node):
+				inCallback = true
+			case inCallback && (node.Type() == "arrow_function" || node.Type() == "function_expression"):
+				// a helper defined inside a callback is not extracted either
+			default:
+				blank(node)
+				return
+			}
 		}
 		if node.Type() == "call_expression" {
 			calleeNode := node.ChildByFieldName("function")
 			if calleeNode != nil {
 				callee := strings.ReplaceAll(strings.TrimSpace(calleeNode.Content(src)), "?.", ".")
-				if jsTopLevelCalleeRe.MatchString(callee) {
+				if calleeNode.Type() == "member_expression" {
+					// `new Hono<Env>().basePath('/api')`: the receiver is a
+					// construction. astkit writes that receiver as `Hono()`
+					// inside function bodies; use the same form so the
+					// constructed-receiver rule resolves it by type.
+					obj, prop := calleeNode.ChildByFieldName("object"), calleeNode.ChildByFieldName("property")
+					if obj != nil && prop != nil && obj.Type() == "new_expression" {
+						if ctor := obj.ChildByFieldName("constructor"); ctor != nil {
+							callee = strings.TrimSpace(ctor.Content(src)) + "()." + strings.TrimSpace(prop.Content(src))
+						}
+					}
+				}
+				if jsTopLevelCalleeRe.MatchString(strings.Replace(callee, "().", ".", 1)) {
 					argc := 0
 					if args := node.ChildByFieldName("arguments"); args != nil {
 						argc = int(args.NamedChildCount())
@@ -242,20 +303,14 @@ func jsTopLevelSymbol(root *sitter.Node, src []byte, filePath, blobSHA, language
 			}
 		}
 		for child := 0; child < int(node.NamedChildCount()); child++ {
-			walk(node.NamedChild(child))
+			walk(node.NamedChild(child), inCallback)
 		}
 	}
-	walk(root)
+	walk(root, false)
 	if len(calls) == 0 {
 		return nil
 	}
 	lineCount := bytes.Count(src, []byte{'\n'}) + 1
-	lines := make([]string, lineCount)
-	for _, call := range calls {
-		if call.Line > 0 && call.Line <= len(lines) {
-			lines[call.Line-1] += call.Callee + "();"
-		}
-	}
 	const name = "<top-level>"
 	return &core.SymbolRecord{
 		ID:            symID(filePath, name, blobSHA),
@@ -266,7 +321,7 @@ func jsTopLevelSymbol(root *sitter.Node, src []byte, filePath, blobSHA, language
 		Name:          name,
 		QualifiedName: name,
 		Span:          core.LineRange{Start: 1, End: lineCount},
-		RawText:       strings.Join(lines, "\n"),
+		RawText:       string(masked),
 		Imports:       append([]string(nil), imports...),
 		CallSites:     calls,
 		TokenEstimate: len(calls) * 3,
@@ -728,4 +783,38 @@ func countErrorNodes(n *sitter.Node) int {
 		c += countErrorNodes(n.Child(i))
 	}
 	return c
+}
+
+// tsOverloadLineRe matches one TS overload signature line: an optional
+// modifier run, the member name, a parameter list, and a terminating `;`
+// (no body).
+func tsOverloadLineRe(name string) *regexp.Regexp {
+	return regexp.MustCompile(`^\s*(?:(?:export|declare|public|private|protected|static|async|abstract|override|readonly)\s+)*(?:function\s+)?` +
+		regexp.QuoteMeta(name) + `\s*[<(].*;\s*$`)
+}
+
+// tsExtendOverloadSpans widens a TS function or method to cover the
+// overload signatures stacked directly above its implementation. They are
+// part of its declaration -- renaming the member renames them too (h3
+// EventStream.push has four) -- but carry no body, so Astkit does not
+// extract them.
+func tsExtendOverloadSpans(syms []core.SymbolRecord, src []byte) {
+	lines := strings.Split(string(src), "\n")
+	for i := range syms {
+		s := &syms[i]
+		if (s.Kind != core.KindMethod && s.Kind != core.KindFunction) || s.Name == "" || s.Span.Start < 2 {
+			continue
+		}
+		re := tsOverloadLineRe(s.Name)
+		start := s.Span.Start
+		for start > 1 && start-2 < len(lines) && re.MatchString(lines[start-2]) {
+			start--
+		}
+		if start < s.Span.Start {
+			// Keep RawText aligned with Span: line offsets into the body are
+			// computed as line - Span.Start everywhere.
+			s.RawText = strings.Join(lines[start-1:s.Span.Start-1], "\n") + "\n" + s.RawText
+			s.Span.Start = start
+		}
+	}
 }

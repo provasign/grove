@@ -2,6 +2,7 @@ package index
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -422,6 +423,8 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 	// Phase 3 (serial): persist. SQLite has one writer; ordered writes keep
 	// the run reproducible.
 	changedLanguages := map[string]bool{}
+	var replacedSymbols []core.SymbolRecord // pre-edit symbols of changed files
+	var incomingNative []core.Edge          // stored compiler edges into them, deleted on replace
 	for idx, task := range tasks {
 		if err := ctx.Err(); err != nil {
 			return nil, result, err
@@ -439,6 +442,14 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 			continue
 		}
 		language := parser.DetectLanguageFile(task.absPath)
+		if _, stored := fileMeta[task.relPath]; stored {
+			if keys, err := i.store.SymbolKeysForFile(ctx, task.relPath); err == nil {
+				replacedSymbols = append(replacedSymbols, keys...)
+			}
+			if in, err := i.store.NativeEdgesInto(ctx, task.relPath); err == nil {
+				incomingNative = append(incomingNative, in...)
+			}
+		}
 		if err := i.store.UpsertFile(ctx, task.relPath, task.blobSHA, language, task.size, task.mtime, outcomes[idx].symbols); err != nil {
 			return nil, result, err
 		}
@@ -546,7 +557,36 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 	}
 	sort.Strings(allFiles)
 	prog.phase("native", "")
-	nativeResult := native.AnalyzeChangedFiles(ctx, root, symbols, i.nativeConfig, scope, changedRel, allFiles)
+	nativeCfg := i.nativeConfig
+	completed := map[string]bool{}
+	if raw, ok, err := i.store.GetMeta(ctx, core.MetaNativeComplete); err == nil && ok && raw != "" {
+		var names []string
+		if json.Unmarshal([]byte(raw), &names) == nil {
+			for _, n := range names {
+				completed[n] = true
+			}
+		}
+	}
+	nativeCfg.RunToCompletion = map[string]bool{}
+	for _, a := range native.PriorityAnalyzers() {
+		if !completed[a.Name()] {
+			nativeCfg.RunToCompletion[a.Name()] = true
+		}
+	}
+	nativeResult := native.AnalyzeChangedFiles(ctx, root, symbols, nativeCfg, scope, changedRel, allFiles)
+	if len(nativeResult.Completed) > 0 {
+		for _, n := range nativeResult.Completed {
+			completed[n] = true
+		}
+		names := make([]string, 0, len(completed))
+		for n := range completed {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		if raw, err := json.Marshal(names); err == nil {
+			_ = i.store.SetMeta(ctx, core.MetaNativeComplete, string(raw))
+		}
+	}
 	result.Native = append(result.Native, nativeResult.Diagnostics...)
 	// The analyzers ran: their verdict is what this database's native
 	// edges reflect from now on (a no-change re-index returns above and
@@ -567,6 +607,12 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 		if err != nil {
 			return nil, result, err
 		}
+		// An edit changes every symbol ID in the edited file (IDs embed the
+		// blob SHA), and replacing the file deleted the stored compiler edges
+		// pointing into it from unchanged files. Restore those and follow
+		// each declaration that still exists to its new ID.
+		stored = append(stored, incomingNative...)
+		remapEdgeEndpoints(stored, symbolRemap(replacedSymbols, symbols))
 		if len(nativeResult.SkippedLanguages) > 0 {
 			nativeResult.Edges = append(nativeResult.Edges,
 				carriedNativeEdges(stored, symbols, nativeResult.SkippedLanguages)...)
@@ -775,4 +821,76 @@ func carriedPartialEdges(stored []core.Edge, symbols []core.SymbolRecord, partia
 		out = append(out, e)
 	}
 	return out
+}
+
+// symbolRemap maps pre-edit symbol IDs of changed files to the current IDs of
+// the same declarations: same file, kind and qualified name, disambiguated by
+// signature when overloads share a name. A declaration that was removed,
+// renamed, or cannot be matched unambiguously is left out, so edges to it
+// drop as before.
+func symbolRemap(old, current []core.SymbolRecord) map[string]string {
+	if len(old) == 0 {
+		return nil
+	}
+	type key struct{ file, kind, qn string }
+	files := map[string]bool{}
+	for _, o := range old {
+		files[o.FilePath] = true
+	}
+	now := map[key][]core.SymbolRecord{}
+	for _, c := range current {
+		if files[c.FilePath] {
+			k := key{c.FilePath, string(c.Kind), c.QualifiedName}
+			now[k] = append(now[k], c)
+		}
+	}
+	before := map[key][]core.SymbolRecord{}
+	for _, o := range old {
+		k := key{o.FilePath, string(o.Kind), o.QualifiedName}
+		before[k] = append(before[k], o)
+	}
+	remap := map[string]string{}
+	for k, olds := range before {
+		cands := now[k]
+		if len(cands) == 0 {
+			continue
+		}
+		if len(olds) == 1 && len(cands) == 1 {
+			if olds[0].ID != cands[0].ID {
+				remap[olds[0].ID] = cands[0].ID
+			}
+			continue
+		}
+		bySig := map[string][]string{}
+		for _, c := range cands {
+			bySig[c.Signature] = append(bySig[c.Signature], c.ID)
+		}
+		oldSig := map[string]int{}
+		for _, o := range olds {
+			oldSig[o.Signature]++
+		}
+		for _, o := range olds {
+			if ids := bySig[o.Signature]; len(ids) == 1 && oldSig[o.Signature] == 1 && ids[0] != o.ID {
+				remap[o.ID] = ids[0]
+			}
+		}
+	}
+	return remap
+}
+
+// remapEdgeEndpoints rewrites edge endpoints through remap in place.
+func remapEdgeEndpoints(edges []core.Edge, remap map[string]string) {
+	if len(remap) == 0 {
+		return
+	}
+	fix := func(node string) string {
+		if n, ok := remap[node]; ok {
+			return n
+		}
+		return node
+	}
+	for i := range edges {
+		edges[i].From = fix(edges[i].From)
+		edges[i].To = fix(edges[i].To)
+	}
 }

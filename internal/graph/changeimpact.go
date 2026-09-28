@@ -483,7 +483,12 @@ func (g *CodeGraph) changeImpactScoped(query, file string) (*ChangeImpactResult,
 	for id := range memberIDs {
 		for _, ei := range g.inbound[id] {
 			edge := g.edges[ei]
-			if edge.Type != core.EdgeCalls {
+			// Compiler-resolved non-call references also break under a
+			// rename/signature change: this.match = match, Router<T>['match'],
+			// an object literal's match: (m, p) => ... typed as Router.
+			nativeRef := edge.Source == core.EvidenceSourceNative &&
+				(edge.Type == core.EdgeReads || edge.Type == core.EdgeWrites)
+			if edge.Type != core.EdgeCalls && !nativeRef {
 				continue
 			}
 			if edge.Source == core.EvidenceSourceHeuristic || edge.Source == core.EvidenceSourceRegex {
@@ -943,6 +948,11 @@ func (g *CodeGraph) containedMethods(typeIDs []string, methodName string) []core
 			// method new" while listing new among its members was the
 			// symptom of leaving them out.
 			if s.Kind == core.KindMethod || s.Kind == core.KindFunction || s.Kind == core.KindConstructor {
+				out = append(out, s)
+			} else if s.Kind == core.KindField && (s.Language == "typescript" || s.Language == "tsx" || s.Language == "javascript") {
+				// TS/JS: a function-valued property implements a method
+				// (hono RegExpRouter: match: typeof match<Router<T>, T> = match
+				// implements Router.match); it is part of the family.
 				out = append(out, s)
 			}
 		}

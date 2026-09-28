@@ -43,6 +43,11 @@ type memberClassifier struct {
 	// import names the declaring module.
 	imports map[string]bool
 	goPkg   string
+	// nativeOurs / nativeOthers: enclosing-symbol IDs with compiler-resolved
+	// (native) reads/writes/calls edges to this member's declarations, or to
+	// a same-named member of another declarer. Compiler facts outrank the
+	// receiver heuristics below.
+	nativeOurs, nativeOthers map[string]bool
 
 	confirmed, ambiguous []MemberAccess
 	excluded             int
@@ -52,13 +57,46 @@ func newMemberClassifier(g *CodeGraph, a *memberAnchor) *memberClassifier {
 	c := &memberClassifier{g: g, a: a, lang: a.decls[0].Language,
 		ltCache: map[string]map[string]string{}, fileSyms: map[string][]*core.SymbolRecord{},
 		otherDeclarers: map[string]bool{}, shadowFrom: map[string]int{}, imports: map[string]bool{}}
+	decl := map[string]bool{}
+	for _, d := range a.decls {
+		decl[d.ID] = true
+	}
+	c.nativeOurs, c.nativeOthers = map[string]bool{}, map[string]bool{}
 	for _, id := range g.idsNamed(a.name) {
 		s := g.symbols[id]
 		if s.ParentSymbol != "" && !a.owners[s.ParentSymbol] {
 			c.otherDeclarers[s.ParentSymbol] = true
 		}
+		for _, ei := range g.inbound[id] {
+			e := g.edges[ei]
+			if e.Source != core.EvidenceSourceNative ||
+				(e.Type != core.EdgeReads && e.Type != core.EdgeWrites && e.Type != core.EdgeCalls) {
+				continue
+			}
+			if decl[id] {
+				c.nativeOurs[e.From] = true
+			} else if s.ParentSymbol != "" {
+				c.nativeOthers[e.From] = true
+			}
+		}
 	}
 	return c
+}
+
+// compilerVerdict applies compiler-resolved member facts to a heuristic
+// verdict for an occurrence inside enclosing symbol e.
+func (c *memberClassifier) compilerVerdict(e *core.SymbolRecord, v verdict, evidence string) (verdict, string) {
+	if e == nil {
+		return v, evidence
+	}
+	ours, others := c.nativeOurs[e.ID], c.nativeOthers[e.ID]
+	switch {
+	case ours && !others:
+		return vConfirm, "compiler-resolved"
+	case others && !ours && v == vAmbiguous:
+		return vExclude, "compiler-resolved to another declarer"
+	}
+	return v, evidence
 }
 
 func (c *memberClassifier) edgeIdx() *edgeIndex {
@@ -154,6 +192,11 @@ func (c *memberClassifier) classify(occs []core.MemberOccurrence) {
 		} else {
 			e = c.enclosing(o.File, o.Line)
 			v, evidence = c.classifyOne(o, e)
+			if o.Form == "access" || o.Form == "key" {
+				// member-shaped occurrences only: a same-named local in the
+				// same function is not the property
+				v, evidence = c.compilerVerdict(e, v, evidence)
+			}
 		}
 		if v == vSkip {
 			continue

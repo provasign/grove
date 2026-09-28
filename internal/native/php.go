@@ -221,8 +221,12 @@ func phpSemanticEdges(symbols []core.SymbolRecord, psr4 map[string][]string, fil
 			}
 		}
 		sort.Strings(names)
+		stripped := ""
+		if len(slowNames) > 0 {
+			stripped = stripQuotedText(symbol.RawText)
+		}
 		for _, name := range slowNames {
-			if containsTypeToken(symbol.RawText, name) {
+			if containsTypeTokenStripped(stripped, name) {
 				names = append(names, name)
 			}
 		}
