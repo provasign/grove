@@ -36,6 +36,10 @@ type Config struct {
 	// developer's first build, and a pass killed at a budget left TypeScript
 	// with no compiler facts at all on every re-index.
 	RunToCompletion map[string]bool
+	// FileSetChanged: this run added or removed files. Analyzers whose
+	// per-file results depend on which files exist (Python module
+	// resolution) run in full instead of scoping to the changed files.
+	FileSetChanged bool
 }
 
 // completionCap bounds a run-to-completion pass (a safety net for a hung
@@ -102,6 +106,8 @@ type Request struct {
 	// package dirs in Result.Partial so the indexer carries the stored
 	// native edges of every other package forward.
 	ChangedFiles []string
+	// FileSetChanged: see Config.FileSetChanged.
+	FileSetChanged bool
 }
 
 type Result struct {
@@ -218,7 +224,7 @@ func AnalyzeChangedFiles(ctx context.Context, root string, symbols []core.Symbol
 			reqChanged = nil // a full pass analyzes every package
 		}
 		began := time.Now()
-		result := analyzer.Analyze(runCtx, Request{Root: root, Symbols: symbols, Files: reqFiles, ChangedFiles: reqChanged})
+		result := analyzer.Analyze(runCtx, Request{Root: root, Symbols: symbols, Files: reqFiles, ChangedFiles: reqChanged, FileSetChanged: cfg.FileSetChanged})
 		timedOut := errors.Is(runCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
 		cancel()
 		mode := "incremental"
