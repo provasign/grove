@@ -132,14 +132,18 @@ func (i *Indexer) spliceEdgeWrite(ctx context.Context, symbols []core.SymbolReco
 		}
 	}
 
+	tick := phaseTimer()
 	if err := i.store.SpliceEdges(ctx, owners, nativeFiles, inserts); err != nil {
 		return err
 	}
+	tick(fmt.Sprintf("  splice/write (%d owners, %d native files, %d inserts)", len(owners), len(nativeFiles), len(inserts)))
 	stored, err := i.store.EdgeFingerprint(ctx)
 	if err != nil {
 		return err
 	}
+	tick("  splice/fingerprint-stored")
 	memory := store.FingerprintEdges(edges)
+	tick("  splice/fingerprint-memory")
 	if stored != memory {
 		// Write-set miss: self-heal with the full diff and record it —
 		// a persistent mismatch is a bug in the splice enumeration.
