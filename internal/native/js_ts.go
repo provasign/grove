@@ -174,6 +174,19 @@ function addConfig(cfg) {
     return undefined;
   }
   const parsed = ts.parseJsonConfigFileContent(read.config, ts.sys, path.dirname(cfg), undefined, cfg);
+  // Analysis never emits. noEmit also makes allowImportingTsExtensions legal:
+  // without it that option is rejected and every "./x.ts" import resolves to
+  // any (hono's benchmarks: router.match on an untyped receiver).
+  parsed.options.noEmit = true;
+  // allowImportingTsExtensions under Node16/NodeNext marks scripts run by
+  // tsx or bun, not Node ESM output: they import project sources that use
+  // extensionless relative imports, which strict ESM resolution rejects, so
+  // every imported class typed as any. Resolve the way the runner does.
+  const nodeEsm = [ts.ModuleKind.Node16, ts.ModuleKind.NodeNext].includes(parsed.options.module);
+  if (parsed.options.allowImportingTsExtensions && nodeEsm && ts.ModuleResolutionKind.Bundler) {
+    parsed.options.module = ts.ModuleKind.ESNext;
+    parsed.options.moduleResolution = ts.ModuleResolutionKind.Bundler;
+  }
   const project = {cfg, parsed};
   configByPath.set(cfg, project);
   configs.push(project);
@@ -412,8 +425,47 @@ for (const project of configs) {
     visit(checker, parsed.options, host, sf, sf, []);
   }
 }
+// Files no config includes (hono's benchmarks/*.mts outside tsconfig's
+// include) get an inferred project, as tsserver does for an open file: the
+// nearest config's compiler options, the uncovered files as roots. Imports
+// into the main project still resolve, so their calls land on its
+// declarations. Before this, such files were never visited.
+const uncovered = [...input].filter(abs => !loadedFiles.has(abs) &&
+  /\.[cm]?[jt]sx?$/.test(abs) && !/\.d\.[cm]?ts$/.test(abs) &&
+  !abs.split(path.sep).includes('node_modules'));
+let inferredFiles = 0;
+if (uncovered.length > 0) {
+  const groups = new Map();
+  for (const abs of uncovered) {
+    const cfg = nearestConfig(abs);
+    const key = cfg ? path.resolve(cfg) : '';
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(abs);
+  }
+  for (const [key, files] of groups) {
+    const base = key ? configByPath.get(key) : undefined;
+    const options = Object.assign({}, base ? base.parsed.options : {
+      target: ts.ScriptTarget.ESNext, module: ts.ModuleKind.ESNext,
+      moduleResolution: ts.ModuleResolutionKind.Bundler || ts.ModuleResolutionKind.NodeJs,
+      esModuleInterop: true, jsx: ts.JsxEmit.Preserve,
+    }, {allowJs: true, noEmit: true, skipLibCheck: true});
+    const project = {cfg: key || path.join(rootAbs, 'tsconfig.json'),
+      parsed: {options, fileNames: files, projectReferences: base ? base.parsed.projectReferences : undefined}};
+    const host = projectHost(project);
+    const program = ts.createProgram({rootNames: files, options, projectReferences: project.parsed.projectReferences, host});
+    const checker = program.getTypeChecker();
+    const roots = new Set(files);
+    for (const sf of program.getSourceFiles()) {
+      const abs = path.resolve(sf.fileName);
+      if (sf.isDeclarationFile || !roots.has(abs) || loadedFiles.has(abs)) continue;
+      loadedFiles.add(abs);
+      inferredFiles++;
+      visit(checker, options, host, sf, sf, []);
+    }
+  }
+}
 process.stdout.write("\n@@GROVE_TS_PAYLOAD@@");
-console.log(JSON.stringify({files: loadedFiles.size, configs: configs.length, solutionConfigs,
+console.log(JSON.stringify({files: loadedFiles.size, configs: configs.length, solutionConfigs, inferredFiles,
   configErrors, edges, calls, types, members}));
 `)
 	// Trusted (default): run node in the repo so its own typescript loads,
@@ -441,6 +493,7 @@ console.log(JSON.stringify({files: loadedFiles.size, configs: configs.length, so
 		Files           int      `json:"files"`
 		Configs         int      `json:"configs"`
 		SolutionConfigs int      `json:"solutionConfigs"`
+		InferredFiles   int      `json:"inferredFiles"`
 		ConfigErrors    []string `json:"configErrors"`
 		Edges           []struct {
 			From string `json:"from"`
@@ -519,11 +572,18 @@ console.log(JSON.stringify({files: loadedFiles.size, configs: configs.length, so
 	return Result{
 		Edges: edges,
 		Diagnostics: append([]string{
-			"typescript projects loaded " + itoa(payload.Configs) + " config(s), including " + itoa(payload.SolutionConfigs) + " solution config(s), and " + itoa(payload.Files) + " indexed file(s)",
+			"typescript projects loaded " + itoa(payload.Configs) + " config(s), including " + itoa(payload.SolutionConfigs) + " solution config(s), and " + itoa(payload.Files) + " indexed file(s)" + inferredNote(payload.InferredFiles),
 			"resolved " + itoa(len(payload.Edges)) + " native import candidate(s)",
 			"resolved " + itoa(len(payload.Calls)) + " native call candidate(s)",
 			"resolved " + itoa(len(payload.Types)) + " native type-use candidate(s)",
 			"resolved " + itoa(len(payload.Members)) + " native member-reference candidate(s)",
 		}, payload.ConfigErrors...),
 	}
+}
+
+func inferredNote(n int) string {
+	if n == 0 {
+		return ""
+	}
+	return " (" + itoa(n) + " outside every config, checked in an inferred project)"
 }

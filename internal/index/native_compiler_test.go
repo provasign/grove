@@ -155,6 +155,51 @@ export function setInfo(c: Conn) { c.info = { remote: "x" } }
 	)
 }
 
+// Two ways a TypeScript file used to get no compiler facts: a script config
+// run by tsx/bun (allowImportingTsExtensions under NodeNext) whose imports
+// of extensionless project sources resolved to any, and a file no config
+// includes at all (now checked in an inferred project).
+func TestTSScriptConfigsAndFilesOutsideEveryConfig(t *testing.T) {
+	ts := os.Getenv("GROVE_TEST_TYPESCRIPT")
+	if ts == "" {
+		t.Skip("GROVE_TEST_TYPESCRIPT not set")
+	}
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node not found")
+	}
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "node_modules"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(ts, filepath.Join(root, "node_modules", "typescript")); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{
+		"package.json":        `{"name":"p","type":"module"}`,
+		"tsconfig.json":       `{"compilerOptions":{"strict":true,"target":"es2022","module":"esnext","moduleResolution":"bundler"},"include":["src"]}`,
+		"src/router.ts":       "export class Router {\n  match(path: string): number { return path.length }\n}\n",
+		"src/index.ts":        "export { Router } from './router'\n",
+		"bench/tsconfig.json": `{"compilerOptions":{"allowImportingTsExtensions":true,"module":"NodeNext"},"include":["./src"]}`,
+		"bench/src/run.mts":   "import { Router } from '../../src/index.ts'\nconst r = new Router()\nr.match('/a')\n",
+		"tools/use.ts":        "import { Router } from '../src/router'\nexport function useRouter(): number { return new Router().match('/b') }\n",
+	}
+	for rel, body := range files {
+		p := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, diags, _ := compilerIndex(t, root)
+	skipUnless(t, diags, "js-ts")
+	wantEdges(t, got, diags,
+		"<top-level>→match calls", // bench/src/run.mts under the tsx-style config
+		"useRouter→match calls",   // tools/use.ts, outside every config
+	)
+}
+
 // A project package with a type error still loads for interface dispatch:
 // its interface reaches the implementers, and the diagnostic says the load
 // was partial (it used to drop the package and every dispatch edge with it).
