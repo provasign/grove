@@ -919,3 +919,24 @@ func constructorBaseClasses(idx *edgeIndex, language, className, preferDir strin
 	}
 	return baseClassesFor(idx, language, className, preferDir)
 }
+
+// tsBaseClassesInFile reads the inheritance clauses of the class-like
+// declaration named className in file (ok=false when file declares none).
+func tsBaseClassesInFile(idx *edgeIndex, className, file string) ([]string, bool) {
+	for _, cand := range namedSymbols(idx, className) {
+		if cand.FilePath != file {
+			continue
+		}
+		switch cand.Kind {
+		case core.KindClass, core.KindStruct, core.KindInterface, core.KindTrait:
+		default:
+			continue
+		}
+		sig := stripLeadingGenericParams(cand.Signature)
+		var out []string
+		out = append(out, inheritanceClauseTypes(sig, "extends", "implements")...)
+		out = append(out, inheritanceClauseTypes(sig, "implements")...)
+		return uniqueStrings(out), true
+	}
+	return nil, false
+}

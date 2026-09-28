@@ -1,5 +1,78 @@
 # Changelog
 
+## Unreleased
+
+Compiler-backed analysis runs for real on a developer machine, and runs to
+completion once per index.
+
+- **Go**: release binaries had the CI runner's GOROOT baked in, so go/types
+  could not find the standard library and skipped every package importing
+  it (gin: 11 packages). GOROOT now comes from the local `go env`. A project
+  package with a type error (typically one missing third-party module) is
+  kept, partially checked, instead of dropped with everything above it; the
+  diagnostic says so. gin: native calls 2366 -> 3966.
+- **TypeScript**: the compiler pass is no longer killed at a 5s budget. The
+  first index (and any index after a pass that never finished) runs every
+  analyzer to completion, capped at 30 minutes; the `native-complete` meta
+  records which ones have a full baseline. The checker now also reports
+  property reads/writes, object-literal keys typed by their contextual type,
+  and indexed-access types, attributed to the declaring member, and calls
+  from module top level. Test callbacks (`describe(() => { ... })`) are
+  walked, overload signatures join their implementation, `.mts`/`.cts` are
+  TypeScript, and inherited methods resolve through aliased imported base
+  classes.
+- **Java**: a javac resolver (single-file Java program, JDK 11+) attributes
+  every call, constructor call, method reference, and field read/write to
+  its exact declaration, with the Maven test classpath when resolvable.
+  Compile errors are tolerated. The JDK is found via JAVA_HOME, PATH,
+  macOS java_home, then Homebrew's keg-only openjdk; the macOS /usr/bin
+  stubs are never probed (they can block on an install prompt). A JDK alone
+  enables the pass; a pom.xml is no longer required. jackson-databind:
+  32,268 call and 22,393 field-reference edges in 60s.
+- Compiler-resolved calls now supersede name-narrowed guesses in Java as in
+  Go. Change-impact counts compiler-resolved reads/writes of a method (a
+  TS function-valued property implementing an interface method) as sites.
+- **Go dependencies load from compiler export data** (`go list -e -deps
+  -export`). The default importer looked packages up GOPATH-style and never
+  found a module dependency, so every package importing one was
+  type-checked partially even with the module cache full. A syntax error
+  mid-edit no longer drops the whole package: go/types checks the
+  declarations the parser could read.
+- **TypeScript resolver output**: stderr was merged into the JSON payload
+  and anything printed to stdout broke decoding (zod: the compiler pass
+  failed silently). stderr is now separate and the payload follows a
+  sentinel.
+- **Incremental compiler runs**: an index after an edit re-attributes only
+  the edited Java packages (Go already scoped to affected packages).
+  Stored compiler edges from unchanged files into an edited file used to be
+  deleted with the file's old rows (symbol IDs embed the blob SHA); they
+  are now restored and remapped to the new IDs by file, kind, qualified
+  name and, for overloads, signature. guava: an edit re-checks 52 files in
+  ~1s and the result equals a full index edge for edge.
+- **Java full runs**: source roots that redefine the same classes (guava's
+  guava/ and android/guava/) are attributed in separate batches;
+  `module-info.java` is left out so javac stays in classpath mode (it made
+  every classpath package "not visible"); Maven runs fail-at-end with
+  appended output so one unresolvable module no longer strips every
+  module's classpath; Gradle projects get their classpath from an init
+  script (wrapper or gradle, trying each installed JDK); build tools are
+  not run in untrusted mode. The classpath is cached per build-file hash.
+  guava: compile errors 29,660 -> 433, resolved calls 58k -> 91k;
+  jackson-databind: 21,821 -> 11 errors.
+- **Java text pass**: anonymous classes (`<anonymous@L:C>`) no longer
+  trigger a regex scan of every method body; guava's native phase went
+  from 513s to 12s with identical output.
+- **Oracle fix (eval)**: the javac+javap oracle dropped every call to an
+  inherited method, because bytecode names the receiver's static type and
+  the oracle looked only there. It now resolves up the superclass chain,
+  then superinterfaces, as the JVM does. Truth regenerated at the same pins:
+  commons-lang +139 edges, commons-io +284, none removed.
+
+Edge accuracy (all gates pass): commons-lang P 0.9620 R 0.9807, commons-io
+P 0.9303 R 0.9776 (new truth; baselines raised), gin P 0.9599 R 0.9735,
+cobra P 0.9834 R 0.9870, flask P 0.8522 R 0.7164, socket.io P 0.9156
+R 0.9917, express P 0.8400 R 1.0, p-queue P 0.9592 R 1.0.
+
 ## v0.60.2 - 2026-09-27
 
 Python call edges: an unannotated pytest test parameter takes the type of the

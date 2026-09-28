@@ -222,9 +222,15 @@ var identTokenRe = regexp.MustCompile(`[A-Za-z_$][A-Za-z0-9_$]*`)
 var asciiIdentRe = regexp.MustCompile(`^[A-Za-z_$][A-Za-z0-9_$]*$`)
 
 // slowTypeNames returns the type names typeTokensIn cannot surface.
+// Synthetic names ("<anonymous@38:13>") never occur in source text: guava's
+// 4,935 anonymous classes made every method body take 4,935 regex scans
+// (513s of a 530s cold index).
 func slowTypeNames(typesByName map[string][]core.SymbolRecord) []string {
 	var out []string
 	for name := range typesByName {
+		if strings.HasPrefix(name, "<") {
+			continue
+		}
 		if !asciiIdentRe.MatchString(name) {
 			out = append(out, name)
 		}
@@ -239,6 +245,15 @@ func typeTokensIn(text string) map[string]bool {
 		tokens[t] = true
 	}
 	return tokens
+}
+
+// containsTypeTokenStripped is containsTypeToken on text already passed
+// through stripQuotedText, for loops probing one body with many names.
+func containsTypeTokenStripped(stripped, name string) bool {
+	if name == "" {
+		return false
+	}
+	return cachedPattern(tokenPatternCache, name, `\b`, `\b`).MatchString(stripped)
 }
 
 func containsTypeToken(text, name string) bool {

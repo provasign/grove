@@ -132,8 +132,12 @@ func (g *CodeGraph) memberAnchorLocked(query, file string) (*memberAnchor, error
 			}
 			return g.ownerlessAnchorLocked(q, member, decls)
 		}
-		if len(g.containedMethods(typeIDs, member)) > 0 {
-			return nil, nil // a method of this name: the ordinary path answers
+		for _, m := range g.containedMethods(typeIDs, member) {
+			// A method of this name: the ordinary path answers. (TS/JS
+			// fields also come back as family members; they stay here.)
+			if m.Kind != core.KindField {
+				return nil, nil
+			}
 		}
 		decls := g.containedDataMembers(typeIDs, member, fileOK)
 		if len(decls) == 0 {

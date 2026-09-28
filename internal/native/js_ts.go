@@ -1,10 +1,13 @@
 package native
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/provasign/grove/internal/core"
 )
@@ -22,7 +25,39 @@ type jsTSAnalyzer struct{}
 // GROVE_ROOT for file access, never as the module-resolution cwd.
 func neutralNodeCWD() string { return os.TempDir() }
 
+// tsPayloadSentinel precedes the resolver's JSON on stdout (see Analyze).
+const tsPayloadSentinel = "@@GROVE_TS_PAYLOAD@@"
+
+// tsPayload returns the resolver's JSON: the project's typescript, tsconfig
+// plugins or node itself may print to stdout before it, so only what follows
+// the last sentinel is decoded.
+func tsPayload(out []byte) []byte {
+	if i := bytes.LastIndex(out, []byte(tsPayloadSentinel)); i >= 0 {
+		return out[i+len(tsPayloadSentinel):]
+	}
+	return out
+}
+
+func clip(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if len(s) > n {
+		return s[:n] + "…"
+	}
+	return s
+}
+
 func (jsTSAnalyzer) Name() string { return "js-ts" }
+
+// Budget: building a TypeScript program and walking it with the checker
+// costs far more per file than `go list`. Measured on hono (345 program
+// files): ~6s. Floor 30s, +25ms per file, capped at 5 minutes.
+func (jsTSAnalyzer) Budget(files int) time.Duration {
+	d := 30*time.Second + time.Duration(files)*25*time.Millisecond
+	if d > 5*time.Minute {
+		d = 5 * time.Minute
+	}
+	return d
+}
 
 func (jsTSAnalyzer) Languages() []string {
 	return []string{"javascript", "typescript", "tsx"}
@@ -85,6 +120,8 @@ const input = new Set(inputFiles.map(f => path.resolve(root, f)));
 const edges = [];
 const calls = [];
 const types = [];
+const members = [];
+const memberKeys = new Set();
 const edgeKeys = new Set();
 const callKeys = new Set();
 const typeKeys = new Set();
@@ -147,7 +184,7 @@ addConfig(exactConfig(rootAbs));
 for (const relPath of inputFiles) addConfig(nearestConfig(path.resolve(rootAbs, relPath)));
 if (configs.length === 0) {
   console.log(JSON.stringify({files: 0, configs: 0, solutionConfigs: 0, configErrors,
-    edges: [], calls: [], types: []}));
+    edges: [], calls: [], types: [], members: []}));
   process.exit(0);
 }
 const projectByInput = new Map();
@@ -215,9 +252,9 @@ function currentName(sf, stack) {
     const n = stack[i];
     let name = undefined;
     if ((ts.isFunctionDeclaration(n) || ts.isClassDeclaration(n) || ts.isInterfaceDeclaration(n) || ts.isTypeAliasDeclaration(n)) && n.name) name = n.name.text;
-    else if (ts.isMethodDeclaration(n) && n.name && ts.isIdentifier(n.name)) name = n.name.text;
+    else if (ts.isMethodDeclaration(n) && n.name && (ts.isIdentifier(n.name) || ts.isPrivateIdentifier(n.name))) name = n.name.text;
 	else if (ts.isConstructorDeclaration(n)) name = 'constructor';
-	else if ((ts.isGetAccessor(n) || ts.isSetAccessor(n)) && n.name && ts.isIdentifier(n.name)) name = n.name.text;
+	else if ((ts.isGetAccessor(n) || ts.isSetAccessor(n)) && n.name && (ts.isIdentifier(n.name) || ts.isPrivateIdentifier(n.name))) name = n.name.text;
     else if (ts.isPropertyDeclaration(n) && n.name && ts.isIdentifier(n.name) && n.initializer &&
              (ts.isArrowFunction(n.initializer) || ts.isFunctionExpression(n.initializer))) name = n.name.text;
     else if (ts.isVariableDeclaration(n) && n.name && ts.isIdentifier(n.name) && n.initializer &&
@@ -236,9 +273,20 @@ function currentName(sf, stack) {
 	  }
 	  if (!nested) name = n.name.text;
 	}
+    else if (ts.isVariableDeclaration(n) && n.name && ts.isIdentifier(n.name) && n.initializer) {
+	  // zod: export const ZodType = core.$constructor("ZodType", (inst) => {...})
+	  // is the ZodType symbol; code in its initializer belongs to it (Go side
+	  // falls back to <top-level> when no symbol carries the name).
+	  let nested = false;
+	  for (let j = i - 1; j >= 0; j--) { if (isCallableNode(stack[j])) { nested = true; break; } }
+	  if (!nested) name = n.name.text;
+	}
     if (name) return {name, line: sf.getLineAndCharacterOfPosition(n.getStart(sf)).line + 1};
   }
-  return undefined;
+  // No named declaration encloses this node: module code, or an anonymous
+  // callback at module level (describe/it bodies in tests). Grove indexes
+  // that as the file's <top-level> symbol, spanning the whole file.
+  return {name: '<top-level>', line: 1};
 }
 function visit(checker, options, host, sf, node, stack) {
 	if (ts.isCallExpression(node) && node.arguments.length > 0 && ts.isStringLiteralLike(node.arguments[0])) {
@@ -269,8 +317,59 @@ function visit(checker, options, host, sf, node, stack) {
       if (!typeKeys.has(key)) { typeKeys.add(key); types.push(typeUse); }
     }
   }
+  if (fromName) {
+    let target, write = false;
+    if (ts.isPropertyAccessExpression(node) &&
+        !(ts.isCallExpression(node.parent) && node.parent.expression === node)) {
+      target = memberDeclInfo(checker, checker.getSymbolAtLocation(node.name));
+      write = isWriteTarget(node);
+    } else if ((ts.isPropertyAssignment(node) || ts.isShorthandPropertyAssignment(node) || ts.isMethodDeclaration(node)) &&
+               node.parent && ts.isObjectLiteralExpression(node.parent) && node.name &&
+               (ts.isIdentifier(node.name) || ts.isStringLiteral(node.name))) {
+      // An object literal's property counts as the member of the type it
+      // is checked against: { append: true } passed to a SetHeadersOptions
+      // parameter, { remote: {...} } returned as ConnInfo.
+      const ct = checker.getContextualType(node.parent);
+      if (ct) {
+        for (const t of (ct.isUnion && ct.isUnion() ? ct.types : [ct])) {
+          const p = checker.getPropertyOfType(checker.getApparentType(t), node.name.text);
+          if (p) { target = memberDeclInfo(checker, p); if (target) break; }
+        }
+      }
+      write = true;
+    }
+    else if (ts.isIndexedAccessTypeNode(node) && ts.isLiteralTypeNode(node.indexType) &&
+             ts.isStringLiteral(node.indexType.literal)) {
+      // Router<T>['match'] names the member as a type.
+      const objType = checker.getTypeFromTypeNode(node.objectType);
+      const p = objType && checker.getPropertyOfType(checker.getApparentType(objType), node.indexType.literal.text);
+      if (p) target = memberDeclInfo(checker, p);
+    }
+    if (target) {
+      const m = {from: rel(sf.fileName), fromName, fromLine, to: target.file, toName: target.name, toLine: target.line, write};
+      const key = JSON.stringify(m);
+      if (!memberKeys.has(key)) { memberKeys.add(key); members.push(m); }
+    }
+  }
   const next = stack.concat(node);
   ts.forEachChild(node, child => visit(checker, options, host, sf, child, next));
+}
+// memberDeclInfo is declInfo restricted to members: a property, accessor or
+// method declared on a class, interface, or object type -- never a local.
+function memberDeclInfo(checker, sym) {
+  if (!sym || !sym.declarations || !sym.declarations.length) return undefined;
+  const d = sym.valueDeclaration || sym.declarations[0];
+  const owner = d && d.parent;
+  if (!owner || !(ts.isClassLike(owner) || ts.isInterfaceDeclaration(owner) || ts.isTypeLiteralNode(owner))) return undefined;
+  return declInfo(checker, sym);
+}
+function isWriteTarget(node) {
+  const p = node.parent;
+  if (!p) return false;
+  if (ts.isBinaryExpression(p) && p.left === node &&
+      p.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && p.operatorToken.kind <= ts.SyntaxKind.LastAssignment) return true;
+  return (ts.isPrefixUnaryExpression(p) || ts.isPostfixUnaryExpression(p)) &&
+         (p.operator === ts.SyntaxKind.PlusPlusToken || p.operator === ts.SyntaxKind.MinusMinusToken);
 }
 // Import resolution does not require a Program. Resolve it for every indexed
 // input using that file's nearest project options, even if a broken config
@@ -313,8 +412,9 @@ for (const project of configs) {
     visit(checker, parsed.options, host, sf, sf, []);
   }
 }
+process.stdout.write("\n@@GROVE_TS_PAYLOAD@@");
 console.log(JSON.stringify({files: loadedFiles.size, configs: configs.length, solutionConfigs,
-  configErrors, edges, calls, types}));
+  configErrors, edges, calls, types, members}));
 `)
 	// Trusted (default): run node in the repo so its own typescript loads,
 	// like any dev tool. Untrusted: run from a neutral cwd so the repo's
@@ -326,9 +426,12 @@ console.log(JSON.stringify({files: loadedFiles.size, configs: configs.length, so
 		cmd.Dir = neutralNodeCWD()
 	}
 	cmd.Env = appendEnv("GROVE_FILES="+string(filesJSON), "GROVE_ROOT="+req.Root)
-	out, err := cmd.CombinedOutput()
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	err = cmd.Run()
+	out := stdout.Bytes()
 	if err != nil {
-		detail := strings.TrimSpace(string(out))
+		detail := strings.TrimSpace(stderr.String() + "\n" + stdout.String())
 		if detail != "" {
 			return Result{Diagnostics: []string{"typescript language service bootstrap failed: " + err.Error() + ": " + detail}}
 		}
@@ -339,7 +442,7 @@ console.log(JSON.stringify({files: loadedFiles.size, configs: configs.length, so
 		Configs         int      `json:"configs"`
 		SolutionConfigs int      `json:"solutionConfigs"`
 		ConfigErrors    []string `json:"configErrors"`
-		Edges []struct {
+		Edges           []struct {
 			From string `json:"from"`
 			To   string `json:"to"`
 		} `json:"edges"`
@@ -359,9 +462,19 @@ console.log(JSON.stringify({files: loadedFiles.size, configs: configs.length, so
 			ToName   string `json:"toName"`
 			ToLine   int    `json:"toLine"`
 		} `json:"types"`
+		Members []struct {
+			From     string `json:"from"`
+			FromName string `json:"fromName"`
+			FromLine int    `json:"fromLine"`
+			To       string `json:"to"`
+			ToName   string `json:"toName"`
+			ToLine   int    `json:"toLine"`
+			Write    bool   `json:"write"`
+		} `json:"members"`
 	}
-	if err := unmarshalJSON(out, &payload); err != nil {
-		return Result{Diagnostics: []string{"typescript resolver JSON decode failed: " + err.Error()}}
+	if err := unmarshalJSON(tsPayload(out), &payload); err != nil {
+		return Result{Diagnostics: []string{"typescript resolver JSON decode failed: " + err.Error() +
+			": stdout starts " + strconv.Quote(clip(stdout.String(), 160)) + "; stderr " + strconv.Quote(clip(stderr.String(), 160))}}
 	}
 	fileScope := fileSet(req.Files)
 	symbols := newSymbolLocator(req.Symbols, map[string]bool{"javascript": true, "typescript": true, "tsx": true})
@@ -375,18 +488,33 @@ console.log(JSON.stringify({files: loadedFiles.size, configs: configs.length, so
 		edges = append(edges, nativeImportEdge(from, to, 0.97))
 	}
 	for _, edge := range payload.Calls {
-		from, okFrom := symbols.at(edge.From, edge.FromName, edge.FromLine)
+		from, okFrom := symbols.atOrTopLevel(edge.From, edge.FromName, edge.FromLine)
 		to, okTo := symbols.at(edge.To, edge.ToName, edge.ToLine)
 		if okFrom && okTo && from.ID != to.ID {
 			edges = append(edges, symbolEdge(from, to, core.EdgeCalls, 0.98))
 		}
 	}
 	for _, edge := range payload.Types {
-		from, okFrom := symbols.at(edge.From, edge.FromName, edge.FromLine)
+		from, okFrom := symbols.atOrTopLevel(edge.From, edge.FromName, edge.FromLine)
 		to, okTo := symbols.at(edge.To, edge.ToName, edge.ToLine)
 		if okFrom && okTo && from.ID != to.ID {
 			edges = append(edges, symbolEdge(from, to, core.EdgeUsesType, 0.96))
 		}
+	}
+	// Member references: property reads/writes and object-literal properties
+	// resolved by the checker (the literal's contextual type names the
+	// member). Field-rename impact confirms occurrences through these.
+	for _, m := range payload.Members {
+		from, okFrom := symbols.atOrTopLevel(m.From, m.FromName, m.FromLine)
+		to, okTo := symbols.at(m.To, m.ToName, m.ToLine)
+		if !okFrom || !okTo || from.ID == to.ID {
+			continue
+		}
+		edgeType := core.EdgeReads
+		if m.Write {
+			edgeType = core.EdgeWrites
+		}
+		edges = append(edges, symbolEdge(from, to, edgeType, 0.97))
 	}
 	return Result{
 		Edges: edges,
@@ -395,6 +523,7 @@ console.log(JSON.stringify({files: loadedFiles.size, configs: configs.length, so
 			"resolved " + itoa(len(payload.Edges)) + " native import candidate(s)",
 			"resolved " + itoa(len(payload.Calls)) + " native call candidate(s)",
 			"resolved " + itoa(len(payload.Types)) + " native type-use candidate(s)",
+			"resolved " + itoa(len(payload.Members)) + " native member-reference candidate(s)",
 		}, payload.ConfigErrors...),
 	}
 }

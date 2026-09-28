@@ -1,0 +1,191 @@
+// GroveJavacResolver: resolves Java calls and field references with javac.
+//
+// Run as a single-file program with the project's own JDK:
+//   java GroveJavacResolver.java <root> <files-list> <classpath-file> [<sourcepath-file>]
+// files-list: one repo-relative .java path per line. classpath-file: a
+// File.pathSeparator-joined classpath (may be empty). Prints one JSON object:
+//   {"files":N,"errors":N,"calls":[...],"members":[...]}
+// Each entry: from/fromName/fromLine (enclosing method or class, its start
+// line), to/toName/toLine (the declaration), and for members "write".
+// Only declarations inside <root> are reported.
+import com.sun.source.tree.*;
+import com.sun.source.util.*;
+import javax.lang.model.element.*;
+import javax.tools.*;
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.util.*;
+
+public class GroveJavacResolver {
+    static final StringBuilder calls = new StringBuilder();
+    static final StringBuilder members = new StringBuilder();
+    static final Set<String> seen = new HashSet<>();
+    static int nCalls = 0, nMembers = 0;
+
+    public static void main(String[] args) throws Exception {
+        Path root = Paths.get(args[0]).toAbsolutePath().normalize();
+        List<String> rel = Files.readAllLines(Paths.get(args[1]), StandardCharsets.UTF_8);
+        String cp = args.length > 2 ? new String(Files.readAllBytes(Paths.get(args[2])), StandardCharsets.UTF_8).trim() : "";
+        // Optional: source roots for a scoped run. javac attributes only the
+        // listed files and reads other project classes from these roots as
+        // their declarations are needed.
+        String sp = args.length > 3 ? new String(Files.readAllBytes(Paths.get(args[3])), StandardCharsets.UTF_8).trim() : "";
+        JavaCompiler javac = ToolProvider.getSystemJavaCompiler();
+        DiagnosticCollector<JavaFileObject> diags = new DiagnosticCollector<>();
+        StandardJavaFileManager fm = javac.getStandardFileManager(diags, null, StandardCharsets.UTF_8);
+        List<File> files = new ArrayList<>();
+        for (String r : rel) { if (!r.isBlank()) files.add(root.resolve(r.trim()).toFile()); }
+        // -Xprefer:source: a published jar of the project's own modules on the
+        // classpath must not shadow the sources being analyzed.
+        List<String> opts = new ArrayList<>(Arrays.asList("-proc:none", "-implicit:none", "-nowarn", "-Xprefer:source",
+            "-XDshould-stop.ifError=FLOW", "-XDshould-stop.ifNoError=FLOW", "-Xmaxerrs", "100000"));
+        if (!cp.isEmpty()) { opts.add("-classpath"); opts.add(cp); }
+        if (!sp.isEmpty()) { opts.add("-sourcepath"); opts.add(sp); }
+        JavacTask task = (JavacTask) javac.getTask(null, fm, diags, opts, null, fm.getJavaFileObjectsFromFiles(files));
+        Iterable<? extends CompilationUnitTree> units = task.parse();
+        task.analyze();
+        Trees trees = Trees.instance(task);
+        int unitCount = 0;
+        for (CompilationUnitTree cu : units) {
+            unitCount++;
+            new Scanner(root, trees, cu).scan(cu, null);
+        }
+        int errors = 0;
+        for (Diagnostic<?> d : diags.getDiagnostics()) if (d.getKind() == Diagnostic.Kind.ERROR) errors++;
+        System.out.print("{\"files\":" + unitCount + ",\"errors\":" + errors +
+            ",\"calls\":[" + calls + "],\"members\":[" + members + "]}");
+    }
+
+    static String q(String s) {
+        StringBuilder b = new StringBuilder("\"");
+        for (char c : s.toCharArray()) {
+            if (c == '"' || c == '\\') b.append('\\').append(c);
+            else if (c < 0x20) b.append(String.format("\\u%04x", (int) c));
+            else b.append(c);
+        }
+        return b.append('"').toString();
+    }
+
+    static class Scanner extends TreePathScanner<Void, Void> {
+        final Path root; final Trees trees; final CompilationUnitTree cu; final String file;
+        Scanner(Path root, Trees trees, CompilationUnitTree cu) {
+            this.root = root; this.trees = trees; this.cu = cu;
+            this.file = root.relativize(Paths.get(cu.getSourceFile().toUri()).toAbsolutePath().normalize()).toString().replace('\\', '/');
+        }
+        long line(Tree t, CompilationUnitTree unit) {
+            long pos = trees.getSourcePositions().getStartPosition(unit, t);
+            return pos < 0 ? -1 : unit.getLineMap().getLineNumber(pos);
+        }
+        // A line inside the method's own span whatever the extractor counts as
+        // its start (annotations, modifiers): the body's first line, else the
+        // declaration's start.
+        long declLine(MethodTree m, CompilationUnitTree unit) {
+            return m.getBody() != null ? line(m.getBody(), unit) : line(m, unit);
+        }
+        // Enclosing method (or constructor, or class for initializers) of the current path.
+        String[] enclosing() {
+            for (TreePath p = getCurrentPath(); p != null; p = p.getParentPath()) {
+                Tree t = p.getLeaf();
+                if (t instanceof MethodTree) {
+                    MethodTree m = (MethodTree) t;
+                    String name = m.getName().contentEquals("<init>") ? enclosingClassName(p) : m.getName().toString();
+                    return new String[]{name, Long.toString(declLine(m, cu))};
+                }
+                if (t instanceof ClassTree) {
+                    return new String[]{((ClassTree) t).getSimpleName().toString(), Long.toString(line(t, cu))};
+                }
+            }
+            return null;
+        }
+        String enclosingClassName(TreePath p) {
+            for (TreePath q = p; q != null; q = q.getParentPath())
+                if (q.getLeaf() instanceof ClassTree) return ((ClassTree) q.getLeaf()).getSimpleName().toString();
+            return "<init>";
+        }
+        // Declaration site of an element, if it is in this project.
+        String[] declared(Element e) {
+            if (e == null) return null;
+            TreePath dp = trees.getPath(e);
+            if (dp == null) return null;
+            CompilationUnitTree du = dp.getCompilationUnit();
+            Path abs = Paths.get(du.getSourceFile().toUri()).toAbsolutePath().normalize();
+            if (!abs.startsWith(root)) return null;
+            String name = e.getKind() == ElementKind.CONSTRUCTOR ? e.getEnclosingElement().getSimpleName().toString() : e.getSimpleName().toString();
+            long ln = dp.getLeaf() instanceof MethodTree ? declLine((MethodTree) dp.getLeaf(), du) : line(dp.getLeaf(), du);
+            return new String[]{root.relativize(abs).toString().replace('\\', '/'), name, Long.toString(ln)};
+        }
+        // Whether the current node sits in a lambda body inside its enclosing method.
+        boolean inLambda() {
+            for (TreePath p = getCurrentPath(); p != null; p = p.getParentPath()) {
+                Tree t = p.getLeaf();
+                if (t instanceof LambdaExpressionTree) return true;
+                if (t instanceof MethodTree || t instanceof ClassTree) return false;
+            }
+            return false;
+        }
+        void emit(StringBuilder out, Element target, Boolean write) {
+            String[] from = enclosing(), to = declared(target);
+            if (from == null || to == null) return;
+            String json = "{\"from\":" + q(file) + ",\"fromName\":" + q(from[0]) + ",\"fromLine\":" + from[1] +
+                ",\"to\":" + q(to[0]) + ",\"toName\":" + q(to[1]) + ",\"toLine\":" + to[2] +
+                (write == null ? "" : ",\"write\":" + write) + (inLambda() ? ",\"lambda\":true" : "") +
+                (inMethodRef ? ",\"ref\":true" : "") + "}";
+            if (!seen.add(json)) return;
+            if (out.length() > 0) out.append(',');
+            out.append(json);
+            if (write == null) nCalls++; else nMembers++;
+        }
+        Element element() { return trees.getElement(getCurrentPath()); }
+        @Override public Void visitMethodInvocation(MethodInvocationTree t, Void v) {
+            Element e = trees.getElement(new TreePath(getCurrentPath(), t.getMethodSelect()));
+            if (e != null && (e.getKind() == ElementKind.METHOD || e.getKind() == ElementKind.CONSTRUCTOR)) emit(calls, e, null);
+            return super.visitMethodInvocation(t, v);
+        }
+        @Override public Void visitNewClass(NewClassTree t, Void v) {
+            Element e = element();
+            if (e != null && e.getKind() == ElementKind.CONSTRUCTOR) emit(calls, e, null);
+            return super.visitNewClass(t, v);
+        }
+        boolean inMethodRef = false;
+        @Override public Void visitMemberReference(MemberReferenceTree t, Void v) {
+            Element e = element();
+            if (e != null && (e.getKind() == ElementKind.METHOD || e.getKind() == ElementKind.CONSTRUCTOR)) {
+                inMethodRef = true;
+                emit(calls, e, null);
+                inMethodRef = false;
+            }
+            return super.visitMemberReference(t, v);
+        }
+        boolean isWrite() {
+            TreePath p = getCurrentPath(), parent = p.getParentPath();
+            if (parent == null) return false;
+            Tree pt = parent.getLeaf();
+            if (pt instanceof AssignmentTree) return ((AssignmentTree) pt).getVariable() == p.getLeaf();
+            if (pt instanceof CompoundAssignmentTree) return ((CompoundAssignmentTree) pt).getVariable() == p.getLeaf();
+            if (pt instanceof UnaryTree) {
+                Tree.Kind k = pt.getKind();
+                return k == Tree.Kind.PREFIX_INCREMENT || k == Tree.Kind.PREFIX_DECREMENT || k == Tree.Kind.POSTFIX_INCREMENT || k == Tree.Kind.POSTFIX_DECREMENT;
+            }
+            return false;
+        }
+        void field(Void v) {
+            Element e = element();
+            if (e != null && e.getKind() == ElementKind.FIELD || e != null && e.getKind() == ElementKind.ENUM_CONSTANT) emit(members, e, isWrite());
+        }
+        @Override public Void visitMemberSelect(MemberSelectTree t, Void v) {
+            TreePath parent = getCurrentPath().getParentPath();
+            boolean callee = parent != null && parent.getLeaf() instanceof MethodInvocationTree
+                && ((MethodInvocationTree) parent.getLeaf()).getMethodSelect() == t;
+            if (!callee) field(v);
+            return super.visitMemberSelect(t, v);
+        }
+        @Override public Void visitIdentifier(IdentifierTree t, Void v) {
+            TreePath parent = getCurrentPath().getParentPath();
+            boolean callee = parent != null && parent.getLeaf() instanceof MethodInvocationTree
+                && ((MethodInvocationTree) parent.getLeaf()).getMethodSelect() == t;
+            if (!callee) field(v);
+            return super.visitIdentifier(t, v);
+        }
+    }
+}

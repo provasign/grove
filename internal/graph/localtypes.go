@@ -458,6 +458,14 @@ func narrowByLocalType(idx *edgeIndex, sat *interfaceSatisfaction, caller *core.
 	if len(targets) > maxDispatchFanout {
 		targets = nil
 	}
+	if len(byType) == 0 && caller != nil && tsFamilyLang(caller.Language) {
+		// TS: resolve the hierarchy from the declaration in the resolved
+		// file, through export aliases (hono: Hono in hono.ts extends
+		// HonoBase, which is hono-base.ts's own Hono re-exported under an
+		// alias; walking by name alone picked hono-base.ts's Hono, found no
+		// base, and dropped app.basePath(...) as decided-to-nothing).
+		byType = typeOrInheritedMethodTargets(idx, caller, typ, calleeName, pool)
+	}
 	if len(byType) == 0 {
 		// The method may be inherited: a receiver typed FlaskProxy (a stub
 		// subclass of Flask) calling make_response runs Flask's. Walk the
@@ -527,6 +535,14 @@ func typeOrInheritedMethodTargets(idx *edgeIndex, caller *core.SymbolRecord, typ
 		return own
 	}
 	bases := baseClassesFor(idx, caller.Language, typ, dirOf(typeFile))
+	if tsFamilyLang(caller.Language) && typeFile != "" {
+		// Two classes may share the name in one directory (hono: the public
+		// Hono in hono.ts extends HonoBase; the base class in hono-base.ts
+		// is also named Hono). The declaration in the resolved file decides.
+		if inFile, ok := tsBaseClassesInFile(idx, typ, typeFile); ok {
+			bases = inFile
+		}
+	}
 	seen := map[string]bool{}
 	for len(bases) > 0 {
 		var next []string
@@ -538,9 +554,49 @@ func typeOrInheritedMethodTargets(idx *edgeIndex, caller *core.SymbolRecord, typ
 			baseFile := ""
 			if tsFamilyLang(caller.Language) {
 				baseFile = tsResolveClassFile(idx, base, typeFile)
+				if baseFile == "" {
+					// No class carries this name: it may be an import of an
+					// export alias (hono.ts: `import { HonoBase } from
+					// './hono-base'`, where hono-base.ts ends with
+					// `export { Hono as HonoBase }`). The import still names
+					// the file.
+					if module, _, ok := idx.jsImportAlias(typeFile, base); ok {
+						if files := idx.resolveRelativeImport(typeFile, module); len(files) > 0 {
+							baseFile = files[0]
+						}
+					}
+				}
 			}
 			if inherited := filterCandidatesByFile(filterByParent(pool, base), baseFile); len(inherited) > 0 {
 				return inherited
+			}
+			if tsFamilyLang(caller.Language) {
+				// Aliased base: the class is re-exported under the base's name
+				// (`export { Hono as HonoBase }`), so no class carries it.
+				// Take the method from the base's file, or -- when the import
+				// does not name it -- from the files the subclass's file
+				// imports, when exactly one class there declares it.
+				files := map[string]bool{}
+				if baseFile != "" {
+					files[baseFile] = true
+				} else {
+					for module := range idx.fileImports[typeFile] {
+						for _, f := range idx.resolveRelativeImport(typeFile, module) {
+							files[f] = true
+						}
+					}
+				}
+				var inFile []*core.SymbolRecord
+				owners := map[string]bool{}
+				for _, cand := range pool {
+					if files[cand.FilePath] && cand.ParentSymbol != "" {
+						inFile = append(inFile, cand)
+						owners[cand.FilePath+"\x00"+cand.ParentSymbol] = true
+					}
+				}
+				if len(owners) == 1 {
+					return inFile
+				}
 			}
 			next = append(next, baseClassesFor(idx, caller.Language, base, dirOf(baseFile))...)
 			if baseFile != "" {

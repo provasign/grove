@@ -148,6 +148,9 @@ const (
 	MetaIndexStarted  = "index-started"
 	MetaIndexFinished = "index-finished"
 	MetaIndexNative   = "index-native"
+	// MetaNativeComplete: JSON list of native analyzers that have completed
+	// a full pass on this index (later passes may be incremental).
+	MetaNativeComplete = "native-complete"
 )
 
 type IndexResult struct {
@@ -245,8 +248,16 @@ const (
 type EdgeReason string
 
 const (
-	ReasonASTNarrowed    EdgeReason = "ast-narrowed"    // AST call site resolved by receiver/type/import narrowing
-	ReasonDispatch       EdgeReason = "dispatch"        // interface/dynamic dispatch rescue (reduced confidence)
+	ReasonASTNarrowed EdgeReason = "ast-narrowed" // AST call site resolved by receiver/type/import narrowing
+	ReasonDispatch    EdgeReason = "dispatch"     // interface/dynamic dispatch rescue (reduced confidence)
+	// ReasonLambdaBody: a compiler-resolved call written inside a lambda,
+	// attributed to the enclosing method (where a rename edits it). Bytecode
+	// oracles attribute lambda bodies to synthetic methods instead.
+	ReasonLambdaBody EdgeReason = "lambda-body"
+	// ReasonMethodRef: a compiler-resolved method reference (Type::method).
+	// Bytecode compiles it to invokedynamic, which javap oracles do not
+	// record as a call; a rename must still edit it.
+	ReasonMethodRef      EdgeReason = "method-ref"
 	ReasonConstructor    EdgeReason = "constructor"     // class-instantiation / super()/this() constructor edge
 	ReasonInheritance    EdgeReason = "inheritance"     // super.method()/inherited method on a base class
 	ReasonProperty       EdgeReason = "property"        // attribute/property read (AttrSite)

@@ -26,6 +26,11 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
+      # The TypeScript compiler-pass test needs a real typescript package.
+      - if: runner.os == 'Linux'
+        run: |
+          npm install --silent --prefix "$RUNNER_TEMP/ts" typescript@5
+          echo "GROVE_TEST_TYPESCRIPT=$RUNNER_TEMP/ts/node_modules/typescript" >> "$GITHUB_ENV"
       - run: go vet ./...
       - run: go test ./... -count=1 -short -timeout 120s
       - run: go build ./...

@@ -91,6 +91,14 @@ func ScoreCalls(ctx context.Context, repoRoot string, header TruthFile, truth []
 			// unscorable, not false.
 			continue
 		}
+		if header.Generator == "javac-javap" && (e.Reason == core.ReasonLambdaBody || e.Reason == core.ReasonMethodRef) {
+			// javap attributes a lambda body's calls to its synthetic
+			// lambda$... method; Grove attributes them to the enclosing
+			// method, where the call is written and edited. Neither is
+			// wrong; the edge is unscorable against this oracle.
+			ignoredDispatch++
+			continue
+		}
 		if staticOracle && e.Reason == core.ReasonDispatch {
 			// A declaration-binding oracle records the declared target,
 			// never the overrides a call may reach; class-hierarchy

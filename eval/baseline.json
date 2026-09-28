@@ -29,8 +29,8 @@
  },
  "commons-lang": {
   "commit": "44298fe",
-  "precision": 0.9386,
-  "recall": 0.9517,
+  "precision": 0.962,
+  "recall": 0.9807,
   "minUniverse": 0.96,
   "tolerance": 0.005
  },
@@ -92,8 +92,8 @@
  },
  "commons-io": {
   "commit": "8ad9867d",
-  "precision": 0.8936,
-  "recall": 0.9121,
+  "precision": 0.9303,
+  "recall": 0.9776,
   "tolerance": 0.005,
   "minUniverse": 0.93
  },

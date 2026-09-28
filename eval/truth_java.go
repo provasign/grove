@@ -32,6 +32,8 @@ var (
 	javapInvokeRe = regexp.MustCompile(`// (?:Interface)?Method (?:([\w/$]+)\.)?"?([\w$<>]+)"?:(\(.*?\)\S+)`)
 	javapLineRe   = regexp.MustCompile(`^\s+line (\d+): \d+`)
 	javapDescRe   = regexp.MustCompile(`^    descriptor: (\(.*)$`)
+	// "public abstract class p.A<T> extends p.Base implements p.I"
+	javapClassHeaderRe = regexp.MustCompile(`^[\w ]*\b(?:class|interface) [\w.$]+`)
 )
 
 type javaMethod struct {
@@ -99,6 +101,7 @@ func JavaCallTruth(repoRoot string) (TruthFile, []TruthEdge, error) {
 	})
 
 	methods := map[string]*javaMethod{} // FQN.name:descriptor → method
+	supers := map[string][]string{}     // class FQN → direct supertypes, superclass first
 	var ordered []*javaMethod
 	for _, cf := range classFiles {
 		fqn := strings.TrimSuffix(filepath.ToSlash(strings.TrimPrefix(cf, classesDir+string(filepath.Separator))), ".class")
@@ -110,6 +113,7 @@ func JavaCallTruth(repoRoot string) (TruthFile, []TruthEdge, error) {
 			continue
 		}
 		parsed := parseJavap(string(out), strings.ReplaceAll(fqn, "/", "."))
+		supers[strings.ReplaceAll(fqn, "/", ".")] = parseJavapSupers(string(out))
 		pkgDir := filepath.Dir(strings.ReplaceAll(fqn, "/", string(filepath.Separator)))
 		for _, m := range parsed {
 			if m.file == "" || m.line == 0 || isSyntheticJavaName(m.name) {
@@ -148,7 +152,7 @@ func JavaCallTruth(repoRoot string) (TruthFile, []TruthEdge, error) {
 			if isSyntheticJavaName(inv.name) {
 				continue
 			}
-			target := methods[strings.ReplaceAll(inv.classFQN, "/", ".")+"."+inv.name+":"+inv.descriptor]
+			target := resolveJavaMethod(methods, supers, strings.ReplaceAll(inv.classFQN, "/", "."), inv.name+":"+inv.descriptor)
 			if target == nil {
 				continue // outside the repo (JDK, deps)
 			}
@@ -180,6 +184,79 @@ func JavaCallTruth(repoRoot string) (TruthFile, []TruthEdge, error) {
 		Edges:     len(edges),
 	}
 	return header, edges, nil
+}
+
+// resolveJavaMethod finds the declaration an invoke instruction links to.
+// The instruction names the receiver's static type, which for an inherited
+// method is the subclass (Builder.setMaxCount compiled against a Builder
+// receiver declared in AbstractBuilder); the JVM resolves it by searching
+// the superclass chain, then superinterfaces (JVMS 5.4.3.3/5.4.3.4). An
+// exact-owner lookup alone dropped every call to an inherited method.
+func resolveJavaMethod(methods map[string]*javaMethod, supers map[string][]string, cls, sig string) *javaMethod {
+	seen := map[string]bool{}
+	var walk func(string) *javaMethod
+	walk = func(c string) *javaMethod {
+		if seen[c] {
+			return nil
+		}
+		seen[c] = true
+		if m := methods[c+"."+sig]; m != nil {
+			return m
+		}
+		if strings.HasPrefix(sig, "<init>:") {
+			return nil // constructors are not inherited
+		}
+		for _, s := range supers[c] {
+			if m := walk(s); m != nil {
+				return m
+			}
+		}
+		return nil
+	}
+	return walk(cls)
+}
+
+// parseJavapSupers reads a class's direct supertypes from javap's header
+// line ("public class p.B extends p.A<T> implements p.I, p.J<X>"), type
+// arguments stripped: the superclass first, then interfaces (for an
+// interface, its "extends" list).
+func parseJavapSupers(out string) []string {
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, " ") || !javapClassHeaderRe.MatchString(line) {
+			continue
+		}
+		var b strings.Builder
+		depth := 0
+		for _, r := range line {
+			switch {
+			case r == '<':
+				depth++
+			case r == '>':
+				depth--
+			case depth == 0:
+				b.WriteRune(r)
+			}
+		}
+		flat := b.String()
+		var out []string
+		for _, kw := range []string{" extends ", " implements "} {
+			i := strings.Index(flat, kw)
+			if i < 0 {
+				continue
+			}
+			rest := flat[i+len(kw):]
+			if j := strings.Index(rest, " implements "); j >= 0 {
+				rest = rest[:j]
+			}
+			for _, n := range strings.Split(rest, ",") {
+				if n = strings.TrimSpace(n); n != "" && n != "java.lang.Object" {
+					out = append(out, n)
+				}
+			}
+		}
+		return out
+	}
+	return nil
 }
 
 // parseJavap extracts methods, their first source line, and their invoke

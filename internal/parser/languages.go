@@ -61,7 +61,7 @@ func DetectLanguage(path string) string {
 	// ── Code languages (AST-parsed via Tree-sitter or regex fallback) ──
 	case ".go":
 		return "go"
-	case ".ts":
+	case ".ts", ".mts", ".cts":
 		return "typescript"
 	case ".tsx":
 		return "tsx"

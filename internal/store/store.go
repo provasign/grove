@@ -625,6 +625,59 @@ func (s *Store) DeleteFilesNotIn(ctx context.Context, current map[string]bool) (
 	return len(stale), nil
 }
 
+// SymbolKeysForFile returns the stored identity of one file's symbols (ID,
+// qualified name, signature, kind). The indexer reads it before a changed
+// file is overwritten, to remap stored edges from the old symbol IDs (which
+// embed the old blob SHA) to the new ones.
+func (s *Store) SymbolKeysForFile(ctx context.Context, filePath string) ([]core.SymbolRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, file_path, kind, qualified_name, signature
+		FROM symbols WHERE file_path = ? ORDER BY span_start, id`, filePath)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []core.SymbolRecord
+	for rows.Next() {
+		var sym core.SymbolRecord
+		var kind string
+		if err := rows.Scan(&sym.ID, &sym.FilePath, &kind, &sym.QualifiedName, &sym.Signature); err != nil {
+			return nil, err
+		}
+		sym.Kind = core.SymbolKind(kind)
+		out = append(out, sym)
+	}
+	return out, rows.Err()
+}
+
+// NativeEdgesInto returns the stored compiler (native) edges pointing into
+// one file from other files. Replacing the file deletes them; the indexer
+// reads them first so an incremental run can carry them to the file's new
+// symbol IDs.
+func (s *Store) NativeEdgesInto(ctx context.Context, filePath string) ([]core.Edge, error) {
+	lo, hi := filePath+"::", filePath+":;"
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT from_node, to_node, edge_type, confidence, source, COALESCE(reason, '')
+		FROM edges
+		WHERE to_node >= ? AND to_node < ? AND source = 'native'
+		  AND NOT (from_node >= ? AND from_node < ?)`, lo, hi, lo, hi)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []core.Edge
+	for rows.Next() {
+		var e core.Edge
+		var typ, source, reason string
+		if err := rows.Scan(&e.From, &e.To, &typ, &e.Confidence, &source, &reason); err != nil {
+			return nil, err
+		}
+		e.Type, e.Source, e.Reason = core.EdgeType(typ), core.EvidenceSource(source), core.EdgeReason(reason)
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) AllSymbols(ctx context.Context) ([]core.SymbolRecord, error) {
 	// Count BEFORE opening the row cursor: the pool is capped at one
 	// connection (SetMaxOpenConns(1)), so a query issued while rows are open

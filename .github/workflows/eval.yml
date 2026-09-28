@@ -286,6 +286,12 @@ jobs:
           cache-dependency-path: |
             go.sum
             eval/go.sum
+      # grove's javac resolver runs with this JDK (JAVA_HOME); without one
+      # the index falls back to name-resolved calls and scores far lower.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
       - name: Clone commons-lang at corpus pin
         run: |
           git clone --quiet https://github.com/apache/commons-lang.git /tmp/commons-lang
