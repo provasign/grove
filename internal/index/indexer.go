@@ -428,6 +428,7 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 	// the run reproducible.
 	changedLanguages := map[string]bool{}
 	var replacedSymbols []core.SymbolRecord // pre-edit symbols of changed files
+	fileSetChanged := false                 // this run adds or removes files
 	var incomingNative []core.Edge          // stored compiler edges into them, deleted on replace
 	for idx, task := range tasks {
 		if err := ctx.Err(); err != nil {
@@ -446,6 +447,9 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 			continue
 		}
 		language := parser.DetectLanguageFile(task.absPath)
+		if _, stored := fileMeta[task.relPath]; !stored {
+			fileSetChanged = true // a new file
+		}
 		if _, stored := fileMeta[task.relPath]; stored {
 			if keys, err := i.store.SymbolKeysForFile(ctx, task.relPath); err == nil {
 				replacedSymbols = append(replacedSymbols, keys...)
@@ -562,6 +566,7 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 	sort.Strings(allFiles)
 	prog.phase("native", "")
 	nativeCfg := i.nativeConfig
+	nativeCfg.FileSetChanged = fileSetChanged || len(prunedFiles) > 0
 	completed := map[string]bool{}
 	if raw, ok, err := i.store.GetMeta(ctx, core.MetaNativeComplete); err == nil && ok && raw != "" {
 		var names []string
@@ -619,14 +624,14 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 		remapEdgeEndpoints(stored, symbolRemap(replacedSymbols, symbols))
 		if len(nativeResult.SkippedLanguages) > 0 {
 			nativeResult.Edges = append(nativeResult.Edges,
-				carriedNativeEdges(stored, symbols, nativeResult.SkippedLanguages)...)
+				carriedNativeEdges(stored, symbols, currentFiles, nativeResult.SkippedLanguages)...)
 		}
 		// Partially-analyzed languages: carry the stored native edges whose
 		// source file lives outside the analyzed package dirs — those
 		// packages' facts did not change and were not recomputed.
 		if len(nativeResult.Partial) > 0 {
 			nativeResult.Edges = append(nativeResult.Edges,
-				carriedPartialEdges(stored, symbols, nativeResult.Partial)...)
+				carriedPartialEdges(stored, symbols, currentFiles, nativeResult.Partial)...)
 		}
 	}
 
@@ -715,7 +720,7 @@ func (i *Indexer) minConfidence(ctx context.Context, opts Options) (float64, err
 // endpoint belongs to one of the skipped languages and whose endpoints still
 // resolve against the current symbol set. Skipping an analyzer must not
 // erase the facts it produced last run.
-func carriedNativeEdges(stored []core.Edge, symbols []core.SymbolRecord, skippedLanguages []string) []core.Edge {
+func carriedNativeEdges(stored []core.Edge, symbols []core.SymbolRecord, files map[string]bool, skippedLanguages []string) []core.Edge {
 	skipped := make(map[string]bool, len(skippedLanguages))
 	for _, l := range skippedLanguages {
 		skipped[l] = true
@@ -742,6 +747,11 @@ func carriedNativeEdges(stored []core.Edge, symbols []core.SymbolRecord, skipped
 			if l, ok2 := fileLang[rest]; ok2 {
 				return l, true
 			}
+			// A file with no symbols (an __init__.py that only imports)
+			// still exists: its file-level edges carry forward too.
+			if files[rest] {
+				return parser.DetectLanguage(rest), true
+			}
 		}
 		return "", false
 	}
@@ -766,7 +776,7 @@ func carriedNativeEdges(stored []core.Edge, symbols []core.SymbolRecord, skipped
 // languages whose SOURCE file is outside the analyzed package dirs (fresh
 // facts exist for files inside them). Endpoints must still resolve — edge
 // IDs embed blob SHAs, so edges into changed files drop out naturally.
-func carriedPartialEdges(stored []core.Edge, symbols []core.SymbolRecord, partial map[string][]string) []core.Edge {
+func carriedPartialEdges(stored []core.Edge, symbols []core.SymbolRecord, files map[string]bool, partial map[string][]string) []core.Edge {
 	analyzed := map[string]map[string]bool{} // lang -> dir set
 	for lang, dirs := range partial {
 		set := map[string]bool{}
@@ -796,6 +806,9 @@ func carriedPartialEdges(stored []core.Edge, symbols []core.SymbolRecord, partia
 		if rest, found := strings.CutPrefix(node, "file:"); found {
 			if l, ok2 := fileLang[rest]; ok2 {
 				return l, rest, true
+			}
+			if files[rest] { // symbol-less file (see carriedNativeEdges)
+				return parser.DetectLanguage(rest), rest, true
 			}
 		}
 		return "", "", false

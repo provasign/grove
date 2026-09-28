@@ -4,6 +4,7 @@ import (
 	"context"
 	"os/exec"
 	"slices"
+	"sort"
 	"strings"
 
 	"github.com/provasign/grove/internal/core"
@@ -36,6 +37,9 @@ import ast, json, os, sys
 from importlib.machinery import PathFinder
 root = os.getcwd()
 files = json.loads(os.environ.get("GROVE_FILES", "[]"))
+# Incremental run: parse only these files (the changed files' directories);
+# the full list above still drives module resolution.
+only = json.loads(os.environ.get("GROVE_ONLY", "null"))
 sys.path.insert(0, root)
 edges = []
 calls = []
@@ -135,6 +139,8 @@ def add_types(rel, from_name, from_line, node, seen, imported_names, imported_mo
             types.append({"from": rel, "fromName": from_name, "fromLine": from_line,
                           "to": target_file, "toName": target_name,
                           "localImport": imported is not None})
+import functools
+@functools.lru_cache(maxsize=None)
 def find_spec_no_import(mod):
     # importlib.util.find_spec imports parent packages for dotted names,
     # which executes the repository's __init__.py at index time. Walk the
@@ -151,7 +157,7 @@ def find_spec_no_import(mod):
             return None
         path = spec.submodule_search_locations
     return spec
-for rel in files:
+for rel in (only if only is not None else files):
     path = os.path.join(root, rel)
     try:
         source = open(path, "r", encoding="utf-8").read()
@@ -246,7 +252,16 @@ print(json.dumps({"edges": edges, "calls": calls, "types": types}))
 	// sys.path.insert(root) for PathFinder resolution is unaffected — and
 	// PathFinder only resolves paths, it never imports/executes repo modules.
 	// appendEnv also scrubs grove's secrets from the subprocess environment.
-	cmd.Env = appendEnv("GROVE_FILES="+string(filesJSON), "PYTHONSAFEPATH=1")
+	env := []string{"GROVE_FILES=" + string(filesJSON), "PYTHONSAFEPATH=1"}
+	only, scopedDirs := pythonScope(req)
+	if only != nil {
+		b, err := jsonMarshal(only)
+		if err != nil {
+			return Result{Diagnostics: []string{"failed to encode scoped file list: " + err.Error()}}
+		}
+		env = append(env, "GROVE_ONLY="+string(b))
+	}
+	cmd.Env = appendEnv(env...)
 	out, err := cmd.Output()
 	if err != nil {
 		return Result{Diagnostics: []string{name + " failed: " + err.Error()}}
@@ -327,7 +342,7 @@ print(json.dumps({"edges": edges, "calls": calls, "types": types}))
 			edges = append(edges, symbolEdge(from, to, core.EdgeUsesType, 0.96))
 		}
 	}
-	return Result{
+	res := Result{
 		Edges: edges,
 		Diagnostics: []string{
 			name + " resolved " + itoa(len(payload.Edges)) + " native import candidate(s)",
@@ -335,4 +350,43 @@ print(json.dumps({"edges": edges, "calls": calls, "types": types}))
 			name + " resolved " + itoa(len(payload.Types)) + " native type-use candidate(s)",
 		},
 	}
+	if scopedDirs != nil {
+		res.Partial = map[string][]string{"python": scopedDirs}
+		res.Diagnostics = append(res.Diagnostics, "scoped to "+itoa(len(scopedDirs))+" affected dir(s); other dirs' native edges carried forward")
+	}
+	return res
+}
+
+// pythonScope picks the files an incremental run parses: every .py file in
+// the changed files' directories. The pass is per-file (each file's facts
+// come from its own syntax plus which files exist), so unchanged files'
+// facts carry forward. nil = parse everything: a cold index, a rebaseline,
+// a run that adds or removes files (module resolution of other files can
+// change), or a change touching most of the project.
+func pythonScope(req Request) (only []string, dirs []string) {
+	if req.ChangedFiles == nil || req.FileSetChanged {
+		return nil, nil
+	}
+	dirSet := map[string]bool{}
+	for _, f := range req.ChangedFiles {
+		if strings.HasSuffix(f, ".py") || strings.HasSuffix(f, ".pyi") {
+			dirSet[packageDir(f)] = true
+		}
+	}
+	if len(dirSet) == 0 {
+		return nil, nil
+	}
+	for _, f := range req.Files {
+		if dirSet[packageDir(f)] {
+			only = append(only, f)
+		}
+	}
+	if 2*len(only) > len(req.Files) {
+		return nil, nil
+	}
+	for d := range dirSet {
+		dirs = append(dirs, d)
+	}
+	sort.Strings(dirs)
+	return only, dirs
 }
