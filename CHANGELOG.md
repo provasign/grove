@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.61.0 - 2026-09-28
 
 Compiler-backed analysis runs for real on a developer machine, and runs to
 completion once per index.
