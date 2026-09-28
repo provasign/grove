@@ -650,17 +650,26 @@ func (s *Store) SymbolKeysForFile(ctx context.Context, filePath string) ([]core.
 	return out, rows.Err()
 }
 
+// Native-edge range queries. "+source" keeps SQLite on the from_node /
+// to_node range index: with a plain source = 'native' it chose
+// idx_edge_source and scanned every native edge once per file (guava: 172k
+// rows x 216 files x 2 per edit, 25s). spliceplan_test pins the plans.
+const (
+	sqlDeleteNativeFromFile   = `DELETE FROM edges WHERE from_node >= ? AND from_node < ? AND +source = 'native'`
+	sqlDeleteNativeFromFileID = `DELETE FROM edges WHERE from_node = ? AND +source = 'native'`
+	sqlNativeEdgesInto        = `SELECT from_node, to_node, edge_type, confidence, source, COALESCE(reason, '')
+		FROM edges
+		WHERE to_node >= ? AND to_node < ? AND +source = 'native'
+		  AND NOT (from_node >= ? AND from_node < ?)`
+)
+
 // NativeEdgesInto returns the stored compiler (native) edges pointing into
 // one file from other files. Replacing the file deletes them; the indexer
 // reads them first so an incremental run can carry them to the file's new
 // symbol IDs.
 func (s *Store) NativeEdgesInto(ctx context.Context, filePath string) ([]core.Edge, error) {
 	lo, hi := filePath+"::", filePath+":;"
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT from_node, to_node, edge_type, confidence, source, COALESCE(reason, '')
-		FROM edges
-		WHERE to_node >= ? AND to_node < ? AND source = 'native'
-		  AND NOT (from_node >= ? AND from_node < ?)`, lo, hi, lo, hi)
+	rows, err := s.db.QueryContext(ctx, sqlNativeEdgesInto, lo, hi, lo, hi)
 	if err != nil {
 		return nil, err
 	}
@@ -801,11 +810,11 @@ func (s *Store) SpliceEdges(ctx context.Context, deleteOwners []string, nativeFi
 	for _, f := range nativeFiles {
 		lo, hi := f+"::", f+":;"
 		if _, err := tx.ExecContext(ctx,
-			`DELETE FROM edges WHERE from_node >= ? AND from_node < ? AND source = 'native'`, lo, hi); err != nil {
+			sqlDeleteNativeFromFile, lo, hi); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx,
-			`DELETE FROM edges WHERE from_node = ? AND source = 'native'`, "file:"+f); err != nil {
+			sqlDeleteNativeFromFileID, "file:"+f); err != nil {
 			return err
 		}
 	}

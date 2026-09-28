@@ -3,6 +3,7 @@ package native
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -216,9 +217,16 @@ func AnalyzeChangedFiles(ctx context.Context, root string, symbols []core.Symbol
 		if full {
 			reqChanged = nil // a full pass analyzes every package
 		}
+		began := time.Now()
 		result := analyzer.Analyze(runCtx, Request{Root: root, Symbols: symbols, Files: reqFiles, ChangedFiles: reqChanged})
 		timedOut := errors.Is(runCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
 		cancel()
+		mode := "incremental"
+		if full {
+			mode = "full"
+		}
+		combined.Diagnostics = append(combined.Diagnostics, fmt.Sprintf("%s: %s pass over %d file(s) took %s",
+			analyzer.Name(), mode, len(reqFiles), time.Since(began).Round(10*time.Millisecond)))
 		for _, diag := range result.Diagnostics {
 			combined.Diagnostics = append(combined.Diagnostics, analyzer.Name()+": "+diag)
 		}
