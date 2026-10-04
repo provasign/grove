@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.61.3 - 2026-10-04
+
+Incremental re-indexing now produces exactly what a full index produces, and
+an edit in a resident session (MCP) refreshes faster. Every change was
+checked on real repos: edits applied through a session leave the store
+byte-identical to a cold index of the same tree (guava, django,
+jackson-databind, gin, typeorm).
+
+**Fixes (results)** — all present since incremental re-indexing:
+- **Template and implicit super() edges**: the framework builder
+  (template -> model edges) and the Java/C# implicit super-constructor
+  builder never re-ran on an edit. An edit dropped the implicit super() edge
+  of every re-resolved constructor, and every template edge. They are now
+  regenerated over the whole repo on each edit (~0.01s). guava lost 2-4
+  edges per edit; django lost 521 over three edits.
+- **Dependency imports**: carrying compiler edges forward dropped any
+  endpoint that was not an indexed file, including imports the compiler
+  resolved into node_modules, which a full index keeps. typeorm lost 17
+  per edit.
+- **TypeScript**: a reference to a symbol declared in several files (a
+  property of a union type) resolved to whichever declaration the
+  compiler created first, which depends on the files it checked. A scoped
+  incremental check and a full one could pick different targets. Such
+  declarations are now chosen by file and position.
+
+**Speed** (one-line edit in a resident session, 3s between edits):
+guava 5.5s -> 3.3s, django 7.6s -> 5.8s.
+- The post-write store fingerprint check (a full read of the edges table)
+  runs in the background after the refresh returns, always before the next
+  index or close. A mismatch still heals through the full diff, is reported
+  on the next result, and is logged under GROVE_TIMING.
+- Symbols of unchanged files and stored compiler edges are taken from the
+  resident graph instead of being read back from SQLite (guarded by blob
+  SHAs and row counts; any mismatch reads the store).
+
 ## v0.61.2 - 2026-09-28
 
 Faster re-indexing after an edit; no change to results (every change below
