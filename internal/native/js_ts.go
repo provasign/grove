@@ -270,10 +270,29 @@ function hasCallableAncestor(node) {
   }
   return false;
 }
+// primaryDecl picks the declaration a reference resolves to. When the
+// declarations span several files (a property of a union type, interfaces
+// merged across files), TypeScript orders them -- and sets valueDeclaration
+// -- by type creation order, which depends on which files the program
+// checked first: a scoped incremental program and a full one picked
+// different targets for the same read (typeorm: MysqlConnectionOptions vs
+// MongoConnectionOptions). Order those by file and position instead.
+function primaryDecl(sym) {
+  const decls = sym.declarations;
+  const files = new Set(decls.map(d => d.getSourceFile().fileName));
+  if (files.size <= 1) {
+    return decls.find(d => d.body) || sym.valueDeclaration || decls[0];
+  }
+  const ordered = decls.slice().sort((a, b) => {
+    const fa = a.getSourceFile().fileName, fb = b.getSourceFile().fileName;
+    return fa < fb ? -1 : fa > fb ? 1 : a.pos - b.pos;
+  });
+  return ordered.find(d => d.body) || ordered[0];
+}
 function declInfo(checker, sym) {
   if (sym && sym.flags & ts.SymbolFlags.Alias) sym = checker.getAliasedSymbol(sym);
   if (!sym || !sym.declarations || !sym.declarations.length) return undefined;
-	const decl = sym.declarations.find(d => d.body) || sym.valueDeclaration || sym.declarations[0];
+	const decl = primaryDecl(sym);
   if (ts.isVariableDeclaration(decl) && decl.initializer &&
       (ts.isArrowFunction(decl.initializer) || ts.isFunctionExpression(decl.initializer)) &&
       hasCallableAncestor(decl)) return undefined;
@@ -396,7 +415,7 @@ function visit(checker, options, host, sf, node, stack) {
 // method declared on a class, interface, or object type -- never a local.
 function memberDeclInfo(checker, sym) {
   if (!sym || !sym.declarations || !sym.declarations.length) return undefined;
-  const d = sym.valueDeclaration || sym.declarations[0];
+  const d = primaryDecl(sym);
   const owner = d && d.parent;
   if (!owner || !(ts.isClassLike(owner) || ts.isInterfaceDeclaration(owner) || ts.isTypeLiteralNode(owner))) return undefined;
   return declInfo(checker, sym);

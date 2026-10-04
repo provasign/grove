@@ -163,6 +163,39 @@ func BuildEdgesDeltaMeta(prevEdges []core.Edge, prevSymbols, symbols []core.Symb
 		}
 		return "", false
 	}
+	// Post-call builders (framework, implicit super calls) are global
+	// functions of the symbol set, exactly like decorators: an owner's
+	// output can change when a DIFFERENT file changes (a template's target,
+	// a base class's constructors), so their previous edges are never
+	// carried; they are regenerated over the full set below. Carrying them
+	// for unaffected owners while dropping them for affected ones silently
+	// lost edges: one body edit in guava's Strings.java dropped 2 implicit
+	// super() edges, three django edits dropped 521 template edges.
+	//
+	// Framework edges are identifiable by reason. Implicit-super edges share
+	// every field with call-pass constructor edges, so the previous set is
+	// recomputed from the previous symbols and dropped by key.
+	oldImplicit := previousImplicitSuperKeys(prevSymbols)
+	postOwners := map[string]bool{}
+	for _, e := range prevEdges {
+		if e.Type != core.EdgeCalls || !(e.Reason == core.ReasonCrossArtifact || oldImplicit[e.From+"\x00"+e.To]) {
+			continue
+		}
+		owner, ok := normalize(e.From)
+		if !ok {
+			continue
+		}
+		postOwners[owner] = true
+		if e.Reason == core.ReasonConstructor && !affected[owner] {
+			// A `new Base()` in the same constructor can produce the
+			// identical key from the call pass; dropping the key would
+			// lose that edge, so re-resolve the owner.
+			if s, ok := idx.byID[owner]; ok && callsClassOf(s, e.To) {
+				affected[owner] = true
+			}
+		}
+	}
+
 	var prevCalls []core.Edge
 	for _, e := range prevEdges {
 		if e.Type != core.EdgeCalls {
@@ -174,6 +207,9 @@ func BuildEdgesDeltaMeta(prevEdges []core.Edge, prevSymbols, symbols []core.Symb
 		// full rebuild.
 		if e.Reason == core.ReasonDecorator {
 			continue
+		}
+		if e.Reason == core.ReasonCrossArtifact || oldImplicit[e.From+"\x00"+e.To] {
+			continue // regenerated globally with the post-call builders
 		}
 		if e.Source == core.EvidenceSourceNative && nativeAnalyzedDirs[fileDirOfNode(e.From)] {
 			continue
@@ -200,6 +236,7 @@ func BuildEdgesDeltaMeta(prevEdges []core.Edge, prevSymbols, symbols []core.Symb
 		}
 	}
 	callsNew := scopedCalls(idx, affectedSyms, sat)
+
 	keptCalls := make([]core.Edge, 0, len(prevCalls))
 	for _, e := range prevCalls {
 		if !affected[e.From] { // endpoints already normalized to current IDs
@@ -222,7 +259,80 @@ func BuildEdgesDeltaMeta(prevEdges []core.Edge, prevSymbols, symbols []core.Symb
 	allCalls = append(allCalls, decoAll...)
 	edges = append(edges, allCalls...)
 	tick("delta-calls")
-	return edges, buildDeltaMeta(symbols, affected, changedFiles, nativeAnalyzedDirs)
+	post := append(buildFrameworkEdges(idx, symbols), buildImplicitSuperCalls(idx, symbols)...)
+	edges = append(edges, post...)
+	for _, e := range post {
+		postOwners[e.From] = true
+	}
+	tick("delta-post-call")
+	// Owners whose post-call edges were dropped or regenerated get their
+	// stored rows rewritten from memory, like recomputed owners.
+	metaOwners := make(map[string]bool, len(affected)+len(postOwners))
+	for id := range affected {
+		metaOwners[id] = true
+	}
+	for id := range postOwners {
+		metaOwners[id] = true
+	}
+	return edges, buildDeltaMeta(symbols, metaOwners, changedFiles, nativeAnalyzedDirs)
+}
+
+// previousImplicitSuperKeys returns the "from\x00to" keys the implicit super
+// call builder produced for the previous symbol set, recomputed over an
+// index of those symbols in store order (the order the build that produced
+// them saw). Only Java and C# have implicit super calls.
+func previousImplicitSuperKeys(prevSymbols []core.SymbolRecord) map[string]bool {
+	keys := map[string]bool{}
+	jvm := false
+	for i := range prevSymbols {
+		if l := prevSymbols[i].Language; l == "java" || l == "csharp" {
+			jvm = true
+			break
+		}
+	}
+	if !jvm {
+		return keys
+	}
+	ordered := append([]core.SymbolRecord(nil), prevSymbols...)
+	sort.Slice(ordered, func(a, b int) bool {
+		x, y := &ordered[a], &ordered[b]
+		if x.FilePath != y.FilePath {
+			return x.FilePath < y.FilePath
+		}
+		if x.Span.Start != y.Span.Start {
+			return x.Span.Start < y.Span.Start
+		}
+		return x.ID < y.ID
+	})
+	for _, e := range buildImplicitSuperCalls(newEdgeIndex(ordered), ordered) {
+		keys[e.From+"\x00"+e.To] = true
+	}
+	return keys
+}
+
+// callsClassOf reports whether caller has a call site naming the class whose
+// constructor target is (a `new Target()`), the one way the call pass can
+// emit the same edge key as an implicit super call.
+func callsClassOf(caller *core.SymbolRecord, target string) bool {
+	class := target
+	if i := strings.Index(class, "::"); i >= 0 {
+		class = class[i+2:]
+	}
+	if i := strings.LastIndexByte(class, '@'); i >= 0 {
+		class = class[:i]
+	}
+	if i := strings.LastIndexByte(class, '.'); i >= 0 {
+		class = class[:i] // Outer.Base.Base -> Outer.Base
+	}
+	if i := strings.LastIndexByte(class, '.'); i >= 0 {
+		class = class[i+1:]
+	}
+	for _, cs := range caller.CallSites {
+		if _, n := splitCallSiteName(cs.Callee); n == class {
+			return true
+		}
+	}
+	return false
 }
 
 // buildDeltaMeta assembles the store-splice write-set metadata: owners in

@@ -203,6 +203,9 @@ func (e *Engine) runPendingCheck(ctx context.Context) {
 	}
 	if note != "" {
 		e.spliceNote = note
+		if os.Getenv("GROVE_TIMING") != "" {
+			fmt.Fprintf(os.Stderr, "[timing] splice-check: %s\n", note)
+		}
 	}
 }
 

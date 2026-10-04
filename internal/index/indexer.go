@@ -773,14 +773,14 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 		remapEdgeEndpoints(stored, symbolRemap(replacedSymbols, symbols))
 		if len(nativeResult.SkippedLanguages) > 0 {
 			nativeResult.Edges = append(nativeResult.Edges,
-				carriedNativeEdges(stored, symbols, currentFiles, nativeResult.SkippedLanguages)...)
+				carriedNativeEdges(stored, symbols, currentFiles, fileMeta, nativeResult.SkippedLanguages)...)
 		}
 		// Partially-analyzed languages: carry the stored native edges whose
 		// source file lives outside the analyzed package dirs — those
 		// packages' facts did not change and were not recomputed.
 		if len(nativeResult.Partial) > 0 {
 			nativeResult.Edges = append(nativeResult.Edges,
-				carriedPartialEdges(stored, symbols, currentFiles, nativeResult.Partial)...)
+				carriedPartialEdges(stored, symbols, currentFiles, fileMeta, nativeResult.Partial)...)
 		}
 	}
 
@@ -869,7 +869,7 @@ func (i *Indexer) minConfidence(ctx context.Context, opts Options) (float64, err
 // endpoint belongs to one of the skipped languages and whose endpoints still
 // resolve against the current symbol set. Skipping an analyzer must not
 // erase the facts it produced last run.
-func carriedNativeEdges(stored []core.Edge, symbols []core.SymbolRecord, files map[string]bool, skippedLanguages []string) []core.Edge {
+func carriedNativeEdges(stored []core.Edge, symbols []core.SymbolRecord, files map[string]bool, indexedBefore map[string]store.FileMeta, skippedLanguages []string) []core.Edge {
 	skipped := make(map[string]bool, len(skippedLanguages))
 	for _, l := range skippedLanguages {
 		skipped[l] = true
@@ -913,7 +913,7 @@ func carriedNativeEdges(stored []core.Edge, symbols []core.SymbolRecord, files m
 		if !ok || !skipped[fromLang] {
 			continue
 		}
-		if _, ok := nodeLang(e.To); !ok {
+		if _, ok := nodeLang(e.To); !ok && !externalNode(e.To, files, indexedBefore) {
 			continue // endpoint no longer exists; drop the stale edge
 		}
 		out = append(out, e)
@@ -925,7 +925,7 @@ func carriedNativeEdges(stored []core.Edge, symbols []core.SymbolRecord, files m
 // languages whose SOURCE file is outside the analyzed package dirs (fresh
 // facts exist for files inside them). Endpoints must still resolve — edge
 // IDs embed blob SHAs, so edges into changed files drop out naturally.
-func carriedPartialEdges(stored []core.Edge, symbols []core.SymbolRecord, files map[string]bool, partial map[string][]string) []core.Edge {
+func carriedPartialEdges(stored []core.Edge, symbols []core.SymbolRecord, files map[string]bool, indexedBefore map[string]store.FileMeta, partial map[string][]string) []core.Edge {
 	analyzed := map[string]map[string]bool{} // lang -> dir set
 	for lang, dirs := range partial {
 		set := map[string]bool{}
@@ -981,12 +981,37 @@ func carriedPartialEdges(stored []core.Edge, symbols []core.SymbolRecord, files 
 		if !isPartial || dirs[dirOf(file)] {
 			continue // fully analyzed language, or a freshly analyzed dir
 		}
-		if _, _, ok := nodeInfo(e.To); !ok {
+		if _, _, ok := nodeInfo(e.To); !ok && !externalNode(e.To, files, indexedBefore) {
 			continue // endpoint no longer exists; drop the stale edge
 		}
 		out = append(out, e)
 	}
 	return out
+}
+
+// externalNode reports whether a native edge endpoint lives in a file this
+// index never contained — a dependency the compiler resolved into, such as
+// file:node_modules/redis/dist/index.d.ts. Such endpoints are kept on carry,
+// as a full build keeps them; only endpoints in files that were indexed and
+// are gone now are stale. Without this every carried import into a
+// dependency was dropped (typeorm: 17 per edit).
+func externalNode(node string, files map[string]bool, indexedBefore map[string]store.FileMeta) bool {
+	if indexedBefore == nil {
+		return false
+	}
+	path, ok := strings.CutPrefix(node, "file:")
+	if !ok {
+		i := strings.Index(node, "::")
+		if i < 0 {
+			return false
+		}
+		path = node[:i]
+	}
+	if files[path] {
+		return false // indexed now: existence is decided by its symbols
+	}
+	_, wasIndexed := indexedBefore[path]
+	return !wasIndexed
 }
 
 // symbolRemap maps pre-edit symbol IDs of changed files to the current IDs of
