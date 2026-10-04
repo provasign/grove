@@ -3,8 +3,10 @@ package graph
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -89,6 +91,7 @@ func BuildEdgesDeltaMeta(prevEdges []core.Edge, prevSymbols, symbols []core.Symb
 	tick("edge-index")
 
 	remap, semanticOld, semanticNew := identityRemap(prevSymbols, symbols, changedFiles)
+	bodyOnly := bodyOnlyRemap(prevSymbols, symbols, semanticOld, semanticNew, remap)
 
 	// Names whose resolution meaning may have changed: names and parent-type
 	// names of SEMANTICALLY changed symbols only, on both sides. Lowercased:
@@ -114,6 +117,9 @@ func BuildEdgesDeltaMeta(prevEdges []core.Edge, prevSymbols, symbols []core.Symb
 	affected, ok := affectedCallers(idx, symbols, changedSemFiles, nameDelta)
 	for id := range semanticNew {
 		affected[id] = true
+	}
+	for id := range bodyOnly {
+		affected[id] = true // its own call sites changed
 	}
 	if !ok || len(affected) > int(maxAffectedFraction*float64(len(symbols))) {
 		deltaStats.fallback++
@@ -382,7 +388,7 @@ func contentIdentityKey(s *core.SymbolRecord) string {
 		b.WriteByte(1)
 	}
 	for _, imp := range s.Imports {
-		b.WriteString(imp)
+		b.WriteString(importKey(imp))
 		b.WriteByte(1)
 	}
 	b.WriteByte(0)
@@ -452,6 +458,155 @@ func identityRemap(prevSymbols, symbols []core.SymbolRecord, changedFiles map[st
 		}
 	}
 	return remap, semanticOld, semanticNew
+}
+
+// bodyOnlyRemap pairs changed functions whose edit is invisible to every
+// OTHER symbol's resolution: same declaration (name, kind, qualified name,
+// parent, signature, exports, imports, modifiers, type parameters,
+// decorators, header text) and the same self./this./cls. member writes,
+// differing only in the body. Other files read a function's header
+// (parameters, return annotation, arity) but its body only for member
+// types (self.x = ..., this.x = new ...), fixtures, and constructors, so
+// such an edit changes only the function's OWN outgoing edges. Each pair is
+// added to remap (incoming edges follow the new ID) and removed from the
+// semantic sets, so neither the import-scope nor the name rule fires for it;
+// the returned new IDs must still be re-resolved. Constructors, __init__ and
+// fixtures are never paired. The synthetic <top-level> symbol pairs when its
+// imports are unchanged: its masked text shifts whenever any body gains a
+// line, and no other symbol reads it.
+func bodyOnlyRemap(prevSymbols, symbols []core.SymbolRecord, semanticOld, semanticNew map[string]bool, remap map[string]string) map[string]bool {
+	group := func(list []core.SymbolRecord, semantic map[string]bool) map[string][]*core.SymbolRecord {
+		out := map[string][]*core.SymbolRecord{}
+		for i := range list {
+			s := &list[i]
+			if semantic[s.ID] && bodyOnlyCandidate(s) {
+				k := bodyOnlyKey(s)
+				out[k] = append(out[k], s)
+			}
+		}
+		for _, g := range out {
+			sort.Slice(g, func(a, b int) bool { return g[a].Span.Start < g[b].Span.Start })
+		}
+		return out
+	}
+	oldG, newG := group(prevSymbols, semanticOld), group(symbols, semanticNew)
+	paired := map[string]bool{}
+	for k, olds := range oldG {
+		news := newG[k]
+		if len(news) != len(olds) {
+			continue
+		}
+		for i := range olds {
+			remap[olds[i].ID] = news[i].ID
+			delete(semanticOld, olds[i].ID)
+			delete(semanticNew, news[i].ID)
+			paired[news[i].ID] = true
+		}
+	}
+	return paired
+}
+
+// importKey drops the source line from a Python binding entry
+// ("@python-binding:112:X=mod#X" -> "@python-binding:X=mod#X"). The line
+// only places the binding in a scope by span containment, which a uniform
+// shift preserves, but it made every symbol below an inserted line look
+// changed (django text.py: 47 symbols, 11,883 callers re-resolved).
+// Entries keep their order, and a binding that moves between scopes
+// changes the owning function's text or the module's import lines.
+func importKey(imp string) string {
+	rest, ok := strings.CutPrefix(imp, "@python-binding:")
+	if !ok {
+		return imp
+	}
+	if i := strings.IndexByte(rest, ':'); i > 0 {
+		if _, err := strconv.Atoi(rest[:i]); err == nil {
+			return "@python-binding:" + rest[i+1:]
+		}
+	}
+	return imp
+}
+
+func bodyOnlyCandidate(s *core.SymbolRecord) bool {
+	if s.Name == "<top-level>" {
+		return true
+	}
+	if s.Kind != core.KindFunction && s.Kind != core.KindMethod {
+		return false
+	}
+	if s.Name == "__init__" || s.Name == "constructor" || strings.HasPrefix(s.Name, "<") {
+		return false
+	}
+	for _, a := range s.Annotations {
+		if strings.Contains(a, "fixture") {
+			return false
+		}
+	}
+	return true
+}
+
+var memberWriteRe = regexp.MustCompile(`\b(?:self|this|cls)\.[A-Za-z_]\w*\s*(?::[^=\n]*)?=[^=]`)
+
+// bodyOnlyKey is everything another symbol's resolution can read from a
+// function: its declaration and header, and its member writes.
+func bodyOnlyKey(s *core.SymbolRecord) string {
+	var b strings.Builder
+	for _, v := range []string{s.FilePath, s.Language, string(s.Kind), s.Name, s.QualifiedName, s.ParentSymbol, s.Signature} {
+		b.WriteString(v)
+		b.WriteByte(0)
+	}
+	if s.Exports {
+		b.WriteByte(1)
+	}
+	for _, imp := range s.Imports {
+		b.WriteString(importKey(imp))
+		b.WriteByte(1)
+	}
+	b.WriteByte(0)
+	for _, list := range [][]string{s.Modifiers, s.TypeParameters, s.Annotations} {
+		for _, v := range list {
+			b.WriteString(v)
+			b.WriteByte(1)
+		}
+		b.WriteByte(0)
+	}
+	if s.Name == "<top-level>" {
+		// Its masked text keeps module-level statements only; the import
+		// lines among them decide which bindings are module-scoped.
+		for _, line := range strings.Split(s.RawText, "\n") {
+			if t := strings.TrimSpace(line); strings.HasPrefix(t, "import ") || strings.HasPrefix(t, "from ") {
+				b.WriteString(t)
+				b.WriteByte(1)
+			}
+		}
+		return b.String()
+	}
+	b.WriteString(functionHeader(s))
+	b.WriteByte(0)
+	for _, m := range memberWriteRe.FindAllString(s.RawText, -1) {
+		b.WriteString(strings.Join(strings.Fields(m), " "))
+		b.WriteByte(1)
+	}
+	return b.String()
+}
+
+// functionHeader is a function's source up to where its body starts: the
+// first line ending in ':' for Python, the first '{' otherwise (or all of it
+// when neither is found, which keeps such functions out of body-only pairs
+// unless their whole text is unchanged).
+func functionHeader(s *core.SymbolRecord) string {
+	raw := s.RawText
+	if s.Language == "python" {
+		for i, line := range strings.Split(raw, "\n") {
+			if strings.HasSuffix(strings.TrimRight(line, " \t\r"), ":") {
+				return strings.Join(strings.Split(raw, "\n")[:i+1], "\n")
+			}
+		}
+		return raw
+	}
+	if i := strings.IndexByte(raw, '{'); i >= 0 {
+		return raw[:i]
+	}
+	return raw
 }
 
 // fileDirOfNode returns the package dir of the file a node ID is anchored to
