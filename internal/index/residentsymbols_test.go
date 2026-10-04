@@ -47,7 +47,9 @@ func TestResidentSymbolsMatchFullLoad(t *testing.T) {
 		t.Fatal(err)
 	}
 	steps := []func(){
-		func() { write("p3/p.go", "package p3\n\nfunc A() int { return B() + 1 }\n\nfunc B() int { return 3 }\n\nfunc C() {}\n") },
+		func() {
+			write("p3/p.go", "package p3\n\nfunc A() int { return B() + 1 }\n\nfunc B() int { return 3 }\n\nfunc C() {}\n")
+		},
 		func() { write("p20/new.go", "package p20\n\nfunc N() {}\n") },
 		func() { _ = os.RemoveAll(filepath.Join(root, "p5")) },
 	}
