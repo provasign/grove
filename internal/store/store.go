@@ -693,6 +693,62 @@ func (s *Store) AllSymbols(ctx context.Context) ([]core.SymbolRecord, error) {
 	// waits for a connection the cursor will not release until it is drained
 	// — a self-deadlock, not a slow query.
 	nSymbols := s.countRows(ctx, `SELECT COUNT(*) FROM symbols`)
+	return s.querySymbols(ctx, nSymbols, `ORDER BY file_path, span_start, id`)
+}
+
+// EdgeCountBySource returns the number of stored edges with the given
+// evidence source.
+func (s *Store) EdgeCountBySource(ctx context.Context, source string) int {
+	return s.countRows(ctx, `SELECT COUNT(*) FROM edges WHERE source = ?`, source)
+}
+
+// SymbolCount returns COUNT(*) of the symbols table.
+func (s *Store) SymbolCount(ctx context.Context) int {
+	return s.countRows(ctx, `SELECT COUNT(*) FROM symbols`)
+}
+
+// SymbolsForFiles returns the stored symbols of the given files in
+// AllSymbols order (file_path, span_start, id).
+func (s *Store) SymbolsForFiles(ctx context.Context, files []string) ([]core.SymbolRecord, error) {
+	if len(files) == 0 {
+		return nil, nil
+	}
+	var out []core.SymbolRecord
+	const chunk = 500
+	for start := 0; start < len(files); start += chunk {
+		end := min(start+chunk, len(files))
+		part := files[start:end]
+		args := make([]any, len(part))
+		for i, f := range part {
+			args[i] = f
+		}
+		ph := strings.TrimSuffix(strings.Repeat("?,", len(part)), ",")
+		syms, err := s.querySymbols(ctx, 0, `WHERE file_path IN (`+ph+`) ORDER BY file_path, span_start, id`, args...)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, syms...)
+	}
+	sort.SliceStable(out, func(i, j int) bool { return symbolStoreLess(&out[i], &out[j]) })
+	return out, nil
+}
+
+// symbolStoreLess is the AllSymbols ORDER BY (file_path, span_start, id).
+func symbolStoreLess(a, b *core.SymbolRecord) bool {
+	if a.FilePath != b.FilePath {
+		return a.FilePath < b.FilePath
+	}
+	if a.Span.Start != b.Span.Start {
+		return a.Span.Start < b.Span.Start
+	}
+	return a.ID < b.ID
+}
+
+// SymbolStoreLess exposes the stored symbol order for callers that merge
+// symbol slices and must match AllSymbols exactly.
+func SymbolStoreLess(a, b *core.SymbolRecord) bool { return symbolStoreLess(a, b) }
+
+func (s *Store) querySymbols(ctx context.Context, capHint int, tail string, args ...any) ([]core.SymbolRecord, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, file_path, blob_sha, language, kind, name, qualified_name,
 		       signature, docstring, span_start, span_end, imports, exports,
@@ -700,14 +756,13 @@ func (s *Store) AllSymbols(ctx context.Context) ([]core.SymbolRecord, error) {
 		       modifiers, type_parameters, annotations, call_sites,
 		       COALESCE(attr_sites, '[]')
 		FROM symbols
-		ORDER BY file_path, span_start, id
-	`)
+		`+tail, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	symbols := make([]core.SymbolRecord, 0, nSymbols)
+	symbols := make([]core.SymbolRecord, 0, capHint)
 	for rows.Next() {
 		var symbol core.SymbolRecord
 		var kind, importsJSON, modifiersJSON, typeParamsJSON, annotationsJSON, callSitesJSON, attrSitesJSON string

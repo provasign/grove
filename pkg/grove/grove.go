@@ -111,6 +111,12 @@ type Engine struct {
 	// indexMu serializes Index calls: two concurrent walks would interleave
 	// per-file store writes and race on the final edge rewrite.
 	indexMu sync.Mutex
+	// pendingCheck is the deferred store check of the last splice write,
+	// guarded by indexMu. It runs in the background after Index returns and
+	// always before the next Index or Close touches the store.
+	pendingCheck index.SpliceCheck
+	// spliceNote reports a healed deferred check on the next Index result.
+	spliceNote string
 
 	mu    sync.RWMutex
 	graph *graph.CodeGraph
@@ -176,7 +182,28 @@ func (e *Engine) Close() error {
 	if e.store == nil {
 		return nil
 	}
+	e.indexMu.Lock()
+	e.runPendingCheck(context.Background())
+	e.indexMu.Unlock()
 	return e.store.Close()
+}
+
+// runPendingCheck runs the deferred splice check, if any. Callers hold
+// indexMu. A failed check leaves the note for the next Index result; the
+// in-memory graph is unaffected either way.
+func (e *Engine) runPendingCheck(ctx context.Context) {
+	check := e.pendingCheck
+	if check == nil {
+		return
+	}
+	e.pendingCheck = nil
+	note, err := check(ctx)
+	if err != nil {
+		note = "deferred edge splice check failed: " + err.Error()
+	}
+	if note != "" {
+		e.spliceNote = note
+	}
 }
 
 // Root returns the repository root the engine is attached to.
@@ -245,11 +272,12 @@ func (e *Engine) Index(ctx context.Context, dir string) (IndexResult, error) {
 	}
 	e.indexMu.Lock()
 	defer e.indexMu.Unlock()
+	e.runPendingCheck(ctx)
 	// SkipNoopGraph: a no-change index returns a nil graph instead of
 	// reloading all stored symbols+edges. If a resident graph exists it is
 	// kept (set-equal to the store by the stored-edge invariant); if none
 	// exists yet, the first query rehydrates lazily via currentGraph.
-	opts := index.Options{SkipNoopGraph: true, Force: e.force, Vacuum: e.cfg.VacuumAfterIndex}
+	opts := index.Options{SkipNoopGraph: true, Force: e.force, Vacuum: e.cfg.VacuumAfterIndex, DeferSpliceCheck: true}
 	if e.cfg.MinEdgeConfidence != nil {
 		opts.MinConfidence, opts.MinConfidenceSet = *e.cfg.MinEdgeConfidence, true
 	}
@@ -266,6 +294,18 @@ func (e *Engine) Index(ctx context.Context, dir string) (IndexResult, error) {
 		e.mu.RUnlock()
 	}
 	cg, result, err := e.idx.IndexWithOptions(ctx, dir, opts)
+	if e.spliceNote != "" {
+		result.Native = append(result.Native, "previous run: "+e.spliceNote)
+		e.spliceNote = ""
+	}
+	if check := e.idx.TakeSpliceCheck(); check != nil {
+		e.pendingCheck = check
+		go func() {
+			e.indexMu.Lock()
+			defer e.indexMu.Unlock()
+			e.runPendingCheck(context.Background())
+		}()
+	}
 	if err != nil {
 		return result, err
 	}

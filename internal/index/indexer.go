@@ -25,6 +25,24 @@ type Indexer struct {
 	parser       *parser.Engine
 	store        *store.Store
 	nativeConfig native.Config
+
+	// pendingSpliceCheck is the store fingerprint check of the last splice
+	// write when Options.DeferSpliceCheck was set; see TakeSpliceCheck.
+	pendingSpliceCheck SpliceCheck
+}
+
+// SpliceCheck verifies a splice write against the in-memory edge set and
+// heals the store through the full diff on a mismatch. It returns a note
+// when it healed, "" otherwise.
+type SpliceCheck func(ctx context.Context) (string, error)
+
+// TakeSpliceCheck returns and clears the check deferred by the last index
+// run, or nil. The caller must run it before the next index run touches the
+// store: it compares the store with that run's edge set.
+func (i *Indexer) TakeSpliceCheck() SpliceCheck {
+	c := i.pendingSpliceCheck
+	i.pendingSpliceCheck = nil
+	return c
 }
 
 func New(parser *parser.Engine, store *store.Store) *Indexer {
@@ -52,6 +70,14 @@ type Options struct {
 	// from the store. The stored-edge invariant (stored == what a rebuild
 	// would produce) is untouched.
 	SkipNoopGraph bool
+
+	// DeferSpliceCheck hands the post-splice store fingerprint check (a full
+	// read of the edges table, ~1s on a 776k-edge index) to the caller via
+	// TakeSpliceCheck instead of running it before Index returns. The
+	// in-memory graph is final either way; the check only guards the store
+	// against a write-set enumeration bug. Resident engines run it after
+	// answering and before their next index run.
+	DeferSpliceCheck bool
 
 	// PrevEdges/PrevSymbols enable incremental edge construction on delta
 	// runs (gated additionally by GROVE_INCREMENTAL=1): the caller's
@@ -88,7 +114,7 @@ const MetaMinConfidence = "edge-min-confidence"
 // altered is upserted with merge semantics. A COUNT(*) invariant guards the
 // splice — any content or cardinality divergence from the in-memory edge set
 // self-heals through the full ReplaceEdges diff in the same run.
-func (i *Indexer) spliceEdgeWrite(ctx context.Context, symbols []core.SymbolRecord, edges []core.Edge, meta *graph.DeltaMeta, result *core.IndexResult) error {
+func (i *Indexer) spliceEdgeWrite(ctx context.Context, symbols []core.SymbolRecord, edges []core.Edge, meta *graph.DeltaMeta, result *core.IndexResult, deferCheck bool) error {
 	owners := make([]string, 0, len(meta.AffectedOwners))
 	for id := range meta.AffectedOwners {
 		owners = append(owners, id)
@@ -137,24 +163,123 @@ func (i *Indexer) spliceEdgeWrite(ctx context.Context, symbols []core.SymbolReco
 		return err
 	}
 	tick(fmt.Sprintf("  splice/write (%d owners, %d native files, %d inserts)", len(owners), len(nativeFiles), len(inserts)))
-	stored, err := i.store.EdgeFingerprint(ctx)
+	check := func(ctx context.Context) (string, error) {
+		tick := phaseTimer()
+		stored, err := i.store.EdgeFingerprint(ctx)
+		if err != nil {
+			return "", err
+		}
+		tick("  splice/fingerprint-stored")
+		memory := store.FingerprintEdges(edges)
+		tick("  splice/fingerprint-memory")
+		if stored != memory {
+			// Write-set miss: self-heal with the full diff and record it —
+			// a persistent mismatch is a bug in the splice enumeration.
+			note := fmt.Sprintf("edge splice mismatch (stored %d/%x != memory %d/%x): healed via full diff",
+				stored.Count, stored.Digest[:6], memory.Count, memory.Digest[:6])
+			return note, i.store.ReplaceEdges(ctx, edges)
+		}
+		return "", nil
+	}
+	summary := fmt.Sprintf("edge splice: %d owners, %d native files, %d upserts", len(owners), len(nativeFiles), len(inserts))
+	if deferCheck {
+		i.pendingSpliceCheck = check
+		result.Native = append(result.Native, summary+" (store check deferred)")
+		return nil
+	}
+	note, err := check(ctx)
 	if err != nil {
 		return err
 	}
-	tick("  splice/fingerprint-stored")
-	memory := store.FingerprintEdges(edges)
-	tick("  splice/fingerprint-memory")
-	if stored != memory {
-		// Write-set miss: self-heal with the full diff and record it —
-		// a persistent mismatch is a bug in the splice enumeration.
-		result.Native = append(result.Native,
-			fmt.Sprintf("edge splice mismatch (stored %d/%x != memory %d/%x): healed via full diff",
-				stored.Count, stored.Digest[:6], memory.Count, memory.Digest[:6]))
-		return i.store.ReplaceEdges(ctx, edges)
+	if note != "" {
+		result.Native = append(result.Native, note)
+		return nil
 	}
-	result.Native = append(result.Native,
-		fmt.Sprintf("edge splice: %d owners, %d native files, %d upserts", len(owners), len(nativeFiles), len(inserts)))
+	result.Native = append(result.Native, summary)
 	return nil
+}
+
+// residentSymbols rebuilds the post-persist symbol set from the caller's
+// resident baseline instead of reading every row: symbols of unchanged files
+// come from prev, those of reloaded (changed, failed or pruned) files from
+// the store. It returns nil — the caller then loads everything — unless the
+// baseline provably matches the store: every reused symbol's blob SHA equals
+// its file's stored SHA, and the merged count equals the table's. The result
+// is in AllSymbols order.
+func (i *Indexer) residentSymbols(ctx context.Context, prev []core.SymbolRecord, fileMeta map[string]store.FileMeta, reload []string) ([]core.SymbolRecord, error) {
+	if len(prev) == 0 || !incrementalEnabled() {
+		return nil, nil
+	}
+	reloaded := make(map[string]bool, len(reload))
+	for _, f := range reload {
+		reloaded[f] = true
+	}
+	fresh, err := i.store.SymbolsForFiles(ctx, reload)
+	if err != nil {
+		return nil, err
+	}
+	symbols := make([]core.SymbolRecord, 0, len(prev)+len(fresh))
+	for idx := range prev {
+		s := &prev[idx]
+		if reloaded[s.FilePath] {
+			continue
+		}
+		if meta, ok := fileMeta[s.FilePath]; !ok || meta.BlobSHA != s.BlobSHA {
+			return nil, nil // baseline is not this store's state
+		}
+		symbols = append(symbols, *s)
+	}
+	symbols = append(symbols, fresh...)
+	if len(symbols) != i.store.SymbolCount(ctx) {
+		return nil, nil
+	}
+	sort.Slice(symbols, func(a, b int) bool { return store.SymbolStoreLess(&symbols[a], &symbols[b]) })
+	return symbols, nil
+}
+
+// residentNativeEdges returns the stored compiler (Source==native) edges as
+// they are after this run's persist phase, derived from the caller's
+// resident baseline instead of reading them back: the previous native edges
+// minus the rows deleteFileEdges removed for each replaced or pruned file
+// (from its file node, from its symbols, into its symbols). It returns nil —
+// the caller then reads the store — when there is no baseline or the derived
+// count differs from the stored one. The result is in EdgesBySource order.
+func (i *Indexer) residentNativeEdges(ctx context.Context, prev []core.Edge, reloaded map[string]bool) []core.Edge {
+	if prev == nil || reloaded == nil || !incrementalEnabled() {
+		return nil
+	}
+	symbolFile := func(node string) string {
+		if idx := strings.Index(node, "::"); idx >= 0 {
+			return node[:idx]
+		}
+		return ""
+	}
+	out := make([]core.Edge, 0, len(prev)/4)
+	for _, e := range prev {
+		if e.Source != core.EvidenceSourceNative {
+			continue
+		}
+		if f, ok := strings.CutPrefix(e.From, "file:"); ok && reloaded[f] {
+			continue
+		}
+		if reloaded[symbolFile(e.From)] || reloaded[symbolFile(e.To)] {
+			continue
+		}
+		out = append(out, e)
+	}
+	if len(out) != i.store.EdgeCountBySource(ctx, string(core.EvidenceSourceNative)) {
+		return nil
+	}
+	sort.Slice(out, func(a, b int) bool {
+		if out[a].From != out[b].From {
+			return out[a].From < out[b].From
+		}
+		if out[a].Type != out[b].Type {
+			return out[a].Type < out[b].Type
+		}
+		return out[a].To < out[b].To
+	})
+	return out
 }
 
 // incrementalEnabled gates incremental edge construction — ON by default,
@@ -540,9 +665,29 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 		result.Native = append(result.Native, "recovery: persisted symbols have no edges; rebuilding all analyzers")
 	}
 
-	symbols, err := i.store.AllSymbols(ctx)
-	if err != nil {
-		return nil, result, err
+	var symbols []core.SymbolRecord
+	// Files whose stored symbols and edges this run replaced or removed.
+	var reloadedFiles map[string]bool
+	if !forceExtract && !recoverMissingEdges && result.FilesUpdated < result.FilesSeen {
+		reload := make([]string, 0, len(tasks)+len(prunedFiles))
+		for _, task := range tasks {
+			reload = append(reload, task.relPath)
+		}
+		reload = append(reload, prunedFiles...)
+		reloadedFiles = make(map[string]bool, len(reload))
+		for _, f := range reload {
+			reloadedFiles[f] = true
+		}
+		symbols, err = i.residentSymbols(ctx, opts.PrevSymbols, fileMeta, reload)
+		if err != nil {
+			return nil, result, err
+		}
+	}
+	if symbols == nil {
+		symbols, err = i.store.AllSymbols(ctx)
+		if err != nil {
+			return nil, result, err
+		}
 	}
 	tick("load-all-symbols")
 
@@ -612,10 +757,14 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 		// discarded rows live through the allocation-heavy edge build below,
 		// and the GC pressure alone made delta edge construction ~5x slower
 		// than cold on monorepos.
-		stored, err := i.store.EdgesBySource(ctx, string(core.EvidenceSourceNative))
-		if err != nil {
-			return nil, result, err
+		stored := i.residentNativeEdges(ctx, opts.PrevEdges, reloadedFiles)
+		if stored == nil {
+			stored, err = i.store.EdgesBySource(ctx, string(core.EvidenceSourceNative))
+			if err != nil {
+				return nil, result, err
+			}
 		}
+		tick("  carry/load-native")
 		// An edit changes every symbol ID in the edited file (IDs embed the
 		// blob SHA), and replacing the file deleted the stored compiler edges
 		// pointing into it from unchanged files. Restore those and follow
@@ -680,7 +829,7 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 		// Splice write: apply the known write-set instead of diffing the
 		// whole table, then verify with a COUNT(*) invariant. Any mismatch
 		// self-heals through the full diff path in the same run.
-		if err := i.spliceEdgeWrite(ctx, symbols, edges, deltaMeta, &result); err != nil {
+		if err := i.spliceEdgeWrite(ctx, symbols, edges, deltaMeta, &result, opts.DeferSpliceCheck); err != nil {
 			return nil, result, err
 		}
 	} else if err := i.store.ReplaceEdges(ctx, edges); err != nil {
