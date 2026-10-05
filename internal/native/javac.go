@@ -357,6 +357,14 @@ func javaScope(req Request, files []string) (units []string, dirs []string) {
 	if len(dirSet) == 0 {
 		return nil, nil
 	}
+	// A declaration change (signature, added/removed/renamed member or type)
+	// can change how OTHER packages bind: re-attribute the packages that
+	// depend on the changed classes too. Body-only edits keep the scope.
+	if javaDeclarationsChanged(req) {
+		for d := range javaDependentDirs(req, files) {
+			dirSet[d] = true
+		}
+	}
 	for _, f := range files {
 		if dirSet[packageDir(f)] {
 			units = append(units, f)
@@ -370,6 +378,97 @@ func javaScope(req Request, files []string) (units []string, dirs []string) {
 	}
 	sort.Strings(dirs)
 	return units, dirs
+}
+
+// javaDeclarationsChanged reports whether any changed Java file's
+// declarations (kind, qualified name, signature) differ from before the
+// edit. A file with no previous symbols (new, or no baseline) counts as
+// changed.
+func javaDeclarationsChanged(req Request) bool {
+	key := func(s core.SymbolRecord) string { return string(s.Kind) + "\x00" + s.QualifiedName + "\x00" + s.Signature }
+	for _, f := range req.ChangedFiles {
+		if !strings.HasSuffix(f, ".java") {
+			continue
+		}
+		var before, after []string
+		for _, s := range req.PrevChanged {
+			if s.FilePath == f {
+				before = append(before, key(s))
+			}
+		}
+		for _, s := range req.Symbols {
+			if s.FilePath == f {
+				after = append(after, key(s))
+			}
+		}
+		if len(before) == 0 {
+			return true
+		}
+		sort.Strings(before)
+		sort.Strings(after)
+		if strings.Join(before, "\x01") != strings.Join(after, "\x01") {
+			return true
+		}
+	}
+	return false
+}
+
+// javaDependentDirs returns the package dirs of files that may bind to a
+// changed file's classes: they import the class (single-type, nested or
+// static import) or its package, or name it fully qualified in their text.
+func javaDependentDirs(req Request, files []string) map[string]bool {
+	type ref struct{ pkg, class string }
+	var refs []ref
+	for _, f := range req.ChangedFiles {
+		if !strings.HasSuffix(f, ".java") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(req.Root, f))
+		pkg := ""
+		if err == nil {
+			if m := javaPackageDecl.FindSubmatch(data); m != nil {
+				pkg = string(m[1])
+			}
+		}
+		classes := map[string]bool{strings.TrimSuffix(filepath.Base(f), ".java"): true}
+		for _, list := range [][]core.SymbolRecord{req.PrevChanged, req.Symbols} {
+			for _, s := range list {
+				if s.FilePath == f && !strings.Contains(s.QualifiedName, ".") && s.QualifiedName != "" {
+					classes[s.QualifiedName] = true
+				}
+			}
+		}
+		for c := range classes {
+			refs = append(refs, ref{pkg, c})
+		}
+	}
+	javaFile := fileSet(files)
+	out := map[string]bool{}
+	for i := range req.Symbols {
+		s := &req.Symbols[i]
+		if !javaFile[s.FilePath] || out[packageDir(s.FilePath)] {
+			continue
+		}
+		for _, r := range refs {
+			fq := r.class
+			if r.pkg != "" {
+				fq = r.pkg + "." + r.class
+			}
+			hit := false
+			for _, imp := range s.Imports {
+				imp = strings.TrimPrefix(imp, "static ")
+				if imp == fq || strings.HasPrefix(imp, fq+".") || (r.pkg != "" && imp == r.pkg+".*") {
+					hit = true
+					break
+				}
+			}
+			if hit || (r.pkg != "" && s.ParentSymbol == "" && strings.Contains(s.RawText, fq)) {
+				out[packageDir(s.FilePath)] = true
+				break
+			}
+		}
+	}
+	return out
 }
 
 var javaPackageDecl = regexp.MustCompile(`(?m)^\s*package\s+([A-Za-z_$][\w$.]*)\s*;`)

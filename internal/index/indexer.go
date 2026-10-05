@@ -717,6 +717,7 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 	nativeCfg := i.nativeConfig
 	nativeCfg.FileSetChanged = fileSetChanged || len(prunedFiles) > 0
 	nativeCfg.Resident = opts.Resident
+	nativeCfg.PrevChanged = replacedSymbols
 	completed := map[string]bool{}
 	if raw, ok, err := i.store.GetMeta(ctx, core.MetaNativeComplete); err == nil && ok && raw != "" {
 		var names []string

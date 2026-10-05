@@ -431,14 +431,17 @@ public class Util {
 `)
 	inc, incDiags, st2 := compilerIndex(t, root)
 	st2.Close()
+	// Adding an overload is a declaration change: callers in other packages
+	// may now bind to it, so the run re-attributes the edited package and
+	// its dependent b, but still not the unrelated package c.
 	scoped := false
 	for _, d := range incDiags {
-		if strings.Contains(d, "scoped to 1 affected package dir") {
+		if strings.Contains(d, "scoped to 2 affected package dir") {
 			scoped = true
 		}
 	}
 	if !scoped {
-		t.Errorf("incremental run was not scoped to the edited package: %v", incDiags)
+		t.Errorf("incremental run was not scoped to the edited package and its dependent: %v", incDiags)
 	}
 	wantEdges(t, inc, incDiags, "one→check calls", "two→check calls", "m→n calls")
 
@@ -544,5 +547,91 @@ public class Other2 { public int m() { return new Other().n(); } }
 		if !inc[k] {
 			t.Errorf("full index has %q, incremental does not", k)
 		}
+	}
+}
+
+// A declaration change in one package can change how OTHER packages'
+// calls resolve. The scoped run re-attributed only the edited package and
+// carried every other package's compiler edges, so removing the overload a
+// caller bound to left that caller with no compiler edge at all, while a
+// full index binds it to the remaining overload.
+func TestJavacIncrementalReattributesDependentsOnDeclarationChange(t *testing.T) {
+	files := map[string]string{
+		"src/main/java/a/Util.java": `package a;
+public class Util {
+  public static int check(int x) { return x; }
+  public static long check(long x) { return x; }
+}
+`,
+		"src/main/java/b/Client.java": `package b;
+import a.Util;
+public class Client {
+  public long one() { return Util.check(1); }
+}
+`,
+		"src/main/java/c/Other.java": `package c;
+public class Other { public int n() { return 3; } }
+`,
+		"src/main/java/c/Other2.java": `package c;
+public class Other2 { public int m() { return new Other().n(); } }
+`,
+		"src/main/java/d/More.java": `package d;
+public class More { public int k() { return 4; } }
+`,
+	}
+	root := t.TempDir()
+	write := func(rel, body string) {
+		p := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for rel, body := range files {
+		write(rel, body)
+	}
+	_, diags, st := compilerIndex(t, root)
+	skipUnless(t, diags, "javac attributed")
+	st.Close()
+	write("src/main/java/a/Util.java", `package a;
+public class Util {
+  public static long check(long x) { return x; }
+}
+`)
+	inc, incDiags, st2 := compilerIndex(t, root)
+	st2.Close()
+	if err := os.RemoveAll(filepath.Join(root, ".grove")); err != nil {
+		t.Fatal(err)
+	}
+	full, fullDiags, st3 := compilerIndex(t, root)
+	st3.Close()
+	for k := range full {
+		if !inc[k] {
+			t.Errorf("full index has %q, incremental does not\nfull: %v\ninc: %v", k, fullDiags, incDiags)
+		}
+	}
+	for k := range inc {
+		if !full[k] {
+			t.Errorf("incremental index has %q, full does not", k)
+		}
+	}
+	// A body-only edit must keep the scope to the edited package.
+	write("src/main/java/a/Util.java", `package a;
+public class Util {
+  public static long check(long x) { return x + 0; }
+}
+`)
+	_, bodyDiags, st4 := compilerIndex(t, root)
+	st4.Close()
+	narrow := false
+	for _, d := range bodyDiags {
+		if strings.Contains(d, "scoped to 1 affected package dir") {
+			narrow = true
+		}
+	}
+	if !narrow {
+		t.Errorf("body-only edit was not scoped to its own package: %v", bodyDiags)
 	}
 }
