@@ -693,7 +693,14 @@ func (s *Store) AllSymbols(ctx context.Context) ([]core.SymbolRecord, error) {
 	// waits for a connection the cursor will not release until it is drained
 	// — a self-deadlock, not a slow query.
 	nSymbols := s.countRows(ctx, `SELECT COUNT(*) FROM symbols`)
-	return s.querySymbols(ctx, nSymbols, `ORDER BY file_path, span_start, id`)
+	// Unordered scan sorted in Go: same order as ORDER BY file_path,
+	// span_start, id (see AllEdges), without SQLite's temp B-tree sort.
+	symbols, err := s.querySymbols(ctx, nSymbols, ``)
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(symbols, func(i, j int) bool { return symbolStoreLess(&symbols[i], &symbols[j]) })
+	return symbols, nil
 }
 
 // EdgeCountBySource returns the number of stored edges with the given
@@ -793,10 +800,13 @@ func (s *Store) querySymbols(ctx context.Context, capHint int, tail string, args
 
 func (s *Store) AllEdges(ctx context.Context) ([]core.Edge, error) {
 	nEdges := s.countRows(ctx, `SELECT COUNT(*) FROM edges`) // before the cursor: see AllSymbols
+	// No ORDER BY: SQLite answered it with an index scan plus a temp B-tree
+	// sort, the bulk of a session's first-query hydration. A table scan
+	// sorted in Go yields the same order (the key is unique and BINARY
+	// collation compares bytes like Go strings).
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT from_node, to_node, edge_type, confidence, COALESCE(source, 'unknown'), COALESCE(reason, '')
 		FROM edges
-		ORDER BY from_node, edge_type, to_node
 	`)
 	if err != nil {
 		return nil, err
@@ -814,7 +824,20 @@ func (s *Store) AllEdges(ctx context.Context) ([]core.Edge, error) {
 		edge.Reason = core.EdgeReason(reason)
 		edges = append(edges, edge)
 	}
-	return edges, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.Slice(edges, func(i, j int) bool {
+		a, b := &edges[i], &edges[j]
+		if a.From != b.From {
+			return a.From < b.From
+		}
+		if a.Type != b.Type {
+			return a.Type < b.Type
+		}
+		return a.To < b.To
+	})
+	return edges, nil
 }
 
 // storeTimer mirrors graph.edgeTimer: sub-phase attribution for the edge
