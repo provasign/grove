@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.62.1 - 2026-10-05
+
+**Fix (results)**
+- **Python decorators are calls** (astkit v0.15.4): a decorator runs when its
+  definition is evaluated, in the enclosing scope. `@click.argument("x")` at
+  module level is a call from the module's `<top-level>`; `@setupmethod` on a
+  method is a call from the class body; a decorator inside a function is a
+  call from that function. Decorators were kept only as annotation names, so
+  decorator-driven APIs had no call edges. Class symbols now also carry the
+  calls in their body (they had none).
+  - flask edge accuracy (dynamic oracle): precision 0.8293 -> 0.8544, recall
+    0.7039 -> 0.7288; baseline raised to match.
+  - click: `argument` callers now span 20 files (was 1); `version_option` 0 -> 7.
+- **ExtractorVersion** bumped (2026-10-05.1): stored indexes re-extract so
+  the new Python call sites appear without `--force`.
+
+**Known gap:** decorators on instances held in un-annotated module variables
+(`@app.route`, `@bp.route`) are recorded but stay unresolved: the module
+variable's type is not inferred.
+
 ## v0.62.0 - 2026-10-05
 
 Correctness fixes for incremental Java indexing, faster edits for Python
