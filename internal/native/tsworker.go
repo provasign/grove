@@ -117,9 +117,12 @@ func (w *tsWorker) call(ctx context.Context, request []byte) ([]byte, error) {
 		err  error
 	}
 	done := make(chan reply, 1)
-	out := w.out
+	// The goroutine uses only these locals: stopLocked clears the fields
+	// when the caller is cancelled, and reading them here raced with that
+	// (a nil stdin made the goroutine panic and take the process down).
+	in, out := w.stdin, w.out
 	go func() {
-		if _, err := w.stdin.Write(append(request, '\n')); err != nil {
+		if _, err := in.Write(append(request, '\n')); err != nil {
 			done <- reply{err: err}
 			return
 		}

@@ -84,3 +84,23 @@ func TestJsTSResidentWorker(t *testing.T) {
 		t.Fatalf("worker was not used: %v", changed.Diagnostics)
 	}
 }
+
+// A caller cancelled while its request is in flight (Close during the
+// background warm-up) stops the worker; the in-flight goroutine must not
+// touch the cleared fields. Run under -race.
+func TestTSWorkerCancelDuringCall(t *testing.T) {
+	root := t.TempDir()
+	linkTypeScriptForTest(t, root)
+	t.Cleanup(func() { StopTSWorkers(root) })
+	if err := os.WriteFile(filepath.Join(root, "tsconfig.json"), []byte(`{"include":["*.ts"]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "a.ts"), []byte("export const a = 1;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 20; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		go cancel()
+		WarmTSWorker(ctx, root, []string{"a.ts"})
+	}
+}
