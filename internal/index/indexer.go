@@ -79,6 +79,10 @@ type Options struct {
 	// answering and before their next index run.
 	DeferSpliceCheck bool
 
+	// Resident marks a long-lived caller: native analyzers may keep worker
+	// processes and caches between runs (see native.Config.Resident).
+	Resident bool
+
 	// PrevEdges/PrevSymbols enable incremental edge construction on delta
 	// runs (gated additionally by GROVE_INCREMENTAL=1): the caller's
 	// resident graph state from the previous index. PrevEdges may be the
@@ -712,6 +716,7 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 	prog.phase("native", "")
 	nativeCfg := i.nativeConfig
 	nativeCfg.FileSetChanged = fileSetChanged || len(prunedFiles) > 0
+	nativeCfg.Resident = opts.Resident
 	completed := map[string]bool{}
 	if raw, ok, err := i.store.GetMeta(ctx, core.MetaNativeComplete); err == nil && ok && raw != "" {
 		var names []string

@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.61.5 - 2026-10-05
+
+Faster TypeScript/JavaScript edit refresh in a resident session; no change
+to results (randomized real-corpus shadows byte-identical to a full index).
+
+- **Resident TypeScript worker**: resident engines (MCP, watch) keep one
+  node process per repository that holds parsed files and each project's
+  previous program between runs, instead of starting node and rebuilding
+  every program per edit. It is warmed in the background after the first
+  index, stopped on Close, and any failure falls back to the one-shot
+  process. One-shot CLI runs are unchanged. `GROVE_TS_WORKER=0` turns it
+  off. Memory: the worker stays resident (typeorm: ~450 MB).
+- **Declaration-shape narrowing**: when an edited .ts/.tsx file's
+  declaration shape (types including inferred ones, members, signatures,
+  imports/exports) is unchanged, only its directory is re-walked instead
+  of every importer. typeorm one-line edit: 5.8s -> 1.7-2.1s (TS pass
+  4.2s -> ~0.05s).
+- Two TS tests that only run with a TypeScript install
+  (GROVE_TEST_TYPESCRIPT_ROOT) asserted a diagnostic that has since gained
+  a timing suffix; fixed.
+
 ## v0.61.4 - 2026-10-05
 
 Faster edit refresh for Python in a resident session; no change to
