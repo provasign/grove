@@ -127,6 +127,11 @@ type Engine struct {
 	tsWarm     sync.Once
 	warmCtx    context.Context
 	warmCancel context.CancelFunc
+	// bg tracks the engine's background goroutines (deferred splice check,
+	// TS worker warm-up); Close waits for them before closing the store, or
+	// a query still in flight keeps the database locked (Windows:
+	// SQLITE_BUSY for the next opener).
+	bg sync.WaitGroup
 
 	mu    sync.RWMutex
 	graph *graph.CodeGraph
@@ -198,6 +203,7 @@ func (e *Engine) Close() error {
 		e.warmCancel()
 	}
 	e.indexMu.Unlock()
+	e.bg.Wait()
 	native.StopTSWorkers(e.root)
 	return e.store.Close()
 }
@@ -318,7 +324,9 @@ func (e *Engine) Index(ctx context.Context, dir string) (IndexResult, error) {
 	e.tsWarm.Do(func() {
 		e.warmCtx, e.warmCancel = context.WithCancel(context.Background())
 		ctx := e.warmCtx
+		e.bg.Add(1)
 		go func() {
+			defer e.bg.Done()
 			meta, err := e.store.AllFileMeta(ctx)
 			if err != nil {
 				return
@@ -334,7 +342,9 @@ func (e *Engine) Index(ctx context.Context, dir string) (IndexResult, error) {
 	if check := e.idx.TakeSpliceCheck(); check != nil {
 		e.pendingCheck = check
 		if !e.holdPendingCheck {
+			e.bg.Add(1)
 			go func() {
+				defer e.bg.Done()
 				e.indexMu.Lock()
 				defer e.indexMu.Unlock()
 				e.runPendingCheck(context.Background())

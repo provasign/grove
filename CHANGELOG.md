@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.61.6 - 2026-10-05
+
+- **Fix**: Engine.Close now waits for its background goroutines (the
+  v0.61.5 TypeScript worker warm-up and the deferred store check) before
+  closing the store. A query still in flight kept the database locked, so
+  the next process or connection to write it could fail with SQLITE_BUSY
+  (seen on Windows CI right after a Close).
+
 ## v0.61.5 - 2026-10-05
 
 Faster TypeScript/JavaScript edit refresh in a resident session; no change
