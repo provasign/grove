@@ -11,7 +11,7 @@ env:
   # EVERY PRISM RELEASE: a stale pin means the gate reporting on grove PRs is
   # an old gate — v0.30.0 sat here through four releases, so grove's dogfood
   # ran a verify missing every false-complete fix those releases carried.
-  PRISM_VERSION: "v0.34.0"
+  PRISM_VERSION: "v0.85.11"
 jobs:
   test:
     name: Test (${{ matrix.os }})
@@ -26,11 +26,17 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
-      # The TypeScript compiler-pass test needs a real typescript package.
-      - if: runner.os == 'Linux'
+      # The TypeScript compiler-pass and resident-worker tests need a real
+      # typescript package; GROVE_TEST_REQUIRE_TS makes them fail instead of
+      # silently skipping when it is missing (they skipped in CI until
+      # 2026-10: the native tests read a variable CI never set).
+      - name: install typescript for tests
+        shell: bash
         run: |
           npm install --silent --prefix "$RUNNER_TEMP/ts" typescript@5
           echo "GROVE_TEST_TYPESCRIPT=$RUNNER_TEMP/ts/node_modules/typescript" >> "$GITHUB_ENV"
+          echo "GROVE_TEST_TYPESCRIPT_ROOT=$RUNNER_TEMP/ts" >> "$GITHUB_ENV"
+          echo "GROVE_TEST_REQUIRE_TS=1" >> "$GITHUB_ENV"
       - run: go vet ./...
       - run: go test ./... -count=1 -short -timeout 120s
       - run: go build ./...

@@ -118,6 +118,9 @@ public class Svc extends Base {
 func TestTSNativeMemberReferences(t *testing.T) {
 	ts := os.Getenv("GROVE_TEST_TYPESCRIPT") // a node_modules/typescript package dir
 	if ts == "" {
+		if os.Getenv("GROVE_TEST_REQUIRE_TS") == "1" {
+			t.Fatal("GROVE_TEST_REQUIRE_TS=1 but GROVE_TEST_TYPESCRIPT is not set")
+		}
 		t.Skip("GROVE_TEST_TYPESCRIPT not set")
 	}
 	if _, err := exec.LookPath("node"); err != nil {
@@ -162,6 +165,9 @@ export function setInfo(c: Conn) { c.info = { remote: "x" } }
 func TestTSScriptConfigsAndFilesOutsideEveryConfig(t *testing.T) {
 	ts := os.Getenv("GROVE_TEST_TYPESCRIPT")
 	if ts == "" {
+		if os.Getenv("GROVE_TEST_REQUIRE_TS") == "1" {
+			t.Fatal("GROVE_TEST_REQUIRE_TS=1 but GROVE_TEST_TYPESCRIPT is not set")
+		}
 		t.Skip("GROVE_TEST_TYPESCRIPT not set")
 	}
 	if _, err := exec.LookPath("node"); err != nil {
@@ -206,6 +212,9 @@ func TestTSScriptConfigsAndFilesOutsideEveryConfig(t *testing.T) {
 func TestTSIncrementalScopedMatchesFullIndex(t *testing.T) {
 	ts := os.Getenv("GROVE_TEST_TYPESCRIPT")
 	if ts == "" {
+		if os.Getenv("GROVE_TEST_REQUIRE_TS") == "1" {
+			t.Fatal("GROVE_TEST_REQUIRE_TS=1 but GROVE_TEST_TYPESCRIPT is not set")
+		}
 		t.Skip("GROVE_TEST_TYPESCRIPT not set")
 	}
 	if _, err := exec.LookPath("node"); err != nil {

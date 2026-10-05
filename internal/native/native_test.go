@@ -587,8 +587,16 @@ for (const candidate of roots) {
 process.exit(1);`
 	probe := exec.Command("node", "-e", probeScript)
 	probe.Env = os.Environ()
+	if pkg := os.Getenv("GROVE_TEST_TYPESCRIPT"); pkg != "" && os.Getenv("GROVE_TEST_TYPESCRIPT_ROOT") == "" {
+		// CI exports the package dir (…/node_modules/typescript); resolve
+		// from the project that holds it.
+		probe.Env = append(probe.Env, "GROVE_TEST_TYPESCRIPT_ROOT="+filepath.Dir(filepath.Dir(pkg)))
+	}
 	resolved, err := probe.Output()
 	if err != nil {
+		if os.Getenv("GROVE_TEST_REQUIRE_TS") == "1" {
+			t.Fatal("GROVE_TEST_REQUIRE_TS=1 but typescript is not available to node")
+		}
 		t.Skip("typescript module is not available to node; set GROVE_TEST_TYPESCRIPT_ROOT to a project that installs it")
 	}
 	typescriptDir := filepath.Dir(filepath.Dir(strings.TrimSpace(string(resolved))))
