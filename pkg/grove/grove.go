@@ -337,6 +337,7 @@ func (e *Engine) Index(ctx context.Context, dir string) (IndexResult, error) {
 			}
 			sort.Strings(files)
 			native.WarmTSWorker(ctx, e.root, files)
+			native.WarmJavaWorker(ctx, e.root, files)
 		}()
 	})
 	if check := e.idx.TakeSpliceCheck(); check != nil {

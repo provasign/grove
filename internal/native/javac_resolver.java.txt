@@ -24,6 +24,30 @@ public class GroveJavacResolver {
     static int nCalls = 0, nMembers = 0;
 
     public static void main(String[] args) throws Exception {
+        if (args.length > 0 && args[0].equals("--serve")) {
+            // Resident worker: one request per stdin line (root, files-list,
+            // classpath-file, sourcepath-file, tab-separated), one marked
+            // JSON payload per stdout line. Keeps the JVM and javac warm.
+            BufferedReader in = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
+            PrintStream out = new PrintStream(new FileOutputStream(FileDescriptor.out), true, "UTF-8");
+            String line;
+            while ((line = in.readLine()) != null) {
+                String result;
+                try {
+                    calls.setLength(0); members.setLength(0); seen.clear(); nCalls = 0; nMembers = 0;
+                    result = run(line.split("\t", -1));
+                } catch (Throwable e) {
+                    result = "{\"error\":" + q(String.valueOf(e)) + "}";
+                }
+                out.print("@@GROVE_JAVA_PAYLOAD@@" + result + "\n");
+                out.flush();
+            }
+            return;
+        }
+        System.out.print(run(args));
+    }
+
+    static String run(String[] args) throws Exception {
         Path root = Paths.get(args[0]).toAbsolutePath().normalize();
         List<String> rel = Files.readAllLines(Paths.get(args[1]), StandardCharsets.UTF_8);
         String cp = args.length > 2 ? new String(Files.readAllBytes(Paths.get(args[2])), StandardCharsets.UTF_8).trim() : "";
@@ -72,8 +96,8 @@ public class GroveJavacResolver {
         }
         int errors = 0;
         for (Diagnostic<?> d : diags.getDiagnostics()) if (d.getKind() == Diagnostic.Kind.ERROR) errors++;
-        System.out.print("{\"files\":" + unitCount + ",\"errors\":" + errors +
-            ",\"calls\":[" + calls + "],\"members\":[" + members + "]}");
+        return "{\"files\":" + unitCount + ",\"errors\":" + errors +
+            ",\"calls\":[" + calls + "],\"members\":[" + members + "]}";
     }
 
     static String q(String s) {
