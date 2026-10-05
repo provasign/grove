@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -121,6 +122,11 @@ type Engine struct {
 	// instead of starting it in the background, so a test can act before
 	// it runs.
 	holdPendingCheck bool
+	// tsWarm starts the resident TypeScript worker after the first index;
+	// Close cancels it (warmCancel) before stopping the worker.
+	tsWarm     sync.Once
+	warmCtx    context.Context
+	warmCancel context.CancelFunc
 
 	mu    sync.RWMutex
 	graph *graph.CodeGraph
@@ -188,7 +194,11 @@ func (e *Engine) Close() error {
 	}
 	e.indexMu.Lock()
 	e.runPendingCheck(context.Background())
+	if e.warmCancel != nil {
+		e.warmCancel()
+	}
 	e.indexMu.Unlock()
+	native.StopTSWorkers(e.root)
 	return e.store.Close()
 }
 
@@ -284,7 +294,7 @@ func (e *Engine) Index(ctx context.Context, dir string) (IndexResult, error) {
 	// reloading all stored symbols+edges. If a resident graph exists it is
 	// kept (set-equal to the store by the stored-edge invariant); if none
 	// exists yet, the first query rehydrates lazily via currentGraph.
-	opts := index.Options{SkipNoopGraph: true, Force: e.force, Vacuum: e.cfg.VacuumAfterIndex, DeferSpliceCheck: true}
+	opts := index.Options{SkipNoopGraph: true, Force: e.force, Vacuum: e.cfg.VacuumAfterIndex, DeferSpliceCheck: true, Resident: true}
 	if e.cfg.MinEdgeConfidence != nil {
 		opts.MinConfidence, opts.MinConfidenceSet = *e.cfg.MinEdgeConfidence, true
 	}
@@ -305,6 +315,22 @@ func (e *Engine) Index(ctx context.Context, dir string) (IndexResult, error) {
 		result.Native = append(result.Native, "previous run: "+e.spliceNote)
 		e.spliceNote = ""
 	}
+	e.tsWarm.Do(func() {
+		e.warmCtx, e.warmCancel = context.WithCancel(context.Background())
+		ctx := e.warmCtx
+		go func() {
+			meta, err := e.store.AllFileMeta(ctx)
+			if err != nil {
+				return
+			}
+			files := make([]string, 0, len(meta))
+			for f := range meta {
+				files = append(files, f)
+			}
+			sort.Strings(files)
+			native.WarmTSWorker(ctx, e.root, files)
+		}()
+	})
 	if check := e.idx.TakeSpliceCheck(); check != nil {
 		e.pendingCheck = check
 		if !e.holdPendingCheck {

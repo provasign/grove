@@ -40,6 +40,10 @@ type Config struct {
 	// per-file results depend on which files exist (Python module
 	// resolution) run in full instead of scoping to the changed files.
 	FileSetChanged bool
+	// Resident: the caller is a long-lived engine (MCP, watch) that will
+	// index again, so analyzers may keep a worker process and its caches
+	// between runs. One-shot CLI runs leave it false.
+	Resident bool
 }
 
 // completionCap bounds a run-to-completion pass (a safety net for a hung
@@ -108,6 +112,8 @@ type Request struct {
 	ChangedFiles []string
 	// FileSetChanged: see Config.FileSetChanged.
 	FileSetChanged bool
+	// Resident: see Config.Resident.
+	Resident bool
 }
 
 type Result struct {
@@ -224,7 +230,7 @@ func AnalyzeChangedFiles(ctx context.Context, root string, symbols []core.Symbol
 			reqChanged = nil // a full pass analyzes every package
 		}
 		began := time.Now()
-		result := analyzer.Analyze(runCtx, Request{Root: root, Symbols: symbols, Files: reqFiles, ChangedFiles: reqChanged, FileSetChanged: cfg.FileSetChanged})
+		result := analyzer.Analyze(runCtx, Request{Root: root, Symbols: symbols, Files: reqFiles, ChangedFiles: reqChanged, FileSetChanged: cfg.FileSetChanged, Resident: cfg.Resident})
 		timedOut := errors.Is(runCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
 		cancel()
 		mode := "incremental"

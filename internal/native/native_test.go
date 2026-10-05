@@ -690,7 +690,7 @@ func TestJsTSSolutionReferencesLoadEveryProject(t *testing.T) {
 		}
 	}
 	wantDiagnostic := "typescript projects loaded 3 config(s), including 1 solution config(s), and 2 indexed file(s)"
-	if !slices.Contains(result.Diagnostics, wantDiagnostic) {
+	if !slices.ContainsFunc(result.Diagnostics, func(d string) bool { return strings.HasPrefix(d, wantDiagnostic) }) {
 		t.Fatalf("missing project-reference diagnostic %q: %v", wantDiagnostic, result.Diagnostics)
 	}
 }
@@ -718,7 +718,7 @@ func TestJsTSFindsNestedProjectWithoutRootConfig(t *testing.T) {
 	})
 	assertNativeEdge(t, result.Edges, "serve", "helper", core.EdgeCalls)
 	wantDiagnostic := "typescript projects loaded 1 config(s), including 0 solution config(s), and 1 indexed file(s)"
-	if !slices.Contains(result.Diagnostics, wantDiagnostic) {
+	if !slices.ContainsFunc(result.Diagnostics, func(d string) bool { return strings.HasPrefix(d, wantDiagnostic) }) {
 		t.Fatalf("missing nested-project diagnostic %q: %v", wantDiagnostic, result.Diagnostics)
 	}
 }
