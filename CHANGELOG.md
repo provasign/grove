@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.61.4 - 2026-10-05
+
+Faster edit refresh for Python in a resident session; no change to
+results (randomized real-corpus shadows byte-identical to a full index).
+
+- **Body-only edits** no longer re-resolve every importer. A changed
+  function whose declaration, header and self./this. member writes are
+  unchanged only re-resolves its own calls. Constructors, __init__ and
+  fixtures keep the full path. django one-line edit: 6.4s -> 3.0s
+  (re-resolved symbols 11,033 -> 1,203).
+- **Python import bindings** no longer make every symbol below an
+  inserted line look changed (their line is dropped from identity keys).
+- **TypeScript**: an object literal checked against a union type now
+  resolves its properties to the same member in scoped and full runs
+  (first declaring member by file and line).
+- Fixed a flaky test of the deferred store check.
+
 ## v0.61.3 - 2026-10-04
 
 Incremental re-indexing now produces exactly what a full index produces, and
