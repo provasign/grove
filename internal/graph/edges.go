@@ -92,7 +92,13 @@ type edgeIndex struct {
 	// names are kept (a name declared with conflicting types across modules is
 	// dropped). Empty when the indexer predates module-var extraction, so the
 	// resolution paths that consult it are no-ops on older indexes.
-	pyModuleGlobals  map[string]string
+	pyModuleGlobals map[string]string
+	// pyFileGlobals maps a Python file to its module-level variables' class
+	// types: annotated (`g: _AppCtxGlobalsProxy`) or constructed
+	// (`app = Flask(__name__)`, `bp = Blueprint(...)`). Keyed per file, unlike
+	// pyModuleGlobals, because a name like `app` exists in many modules;
+	// importers resolve through their import binding to the defining file.
+	pyFileGlobals    map[string]map[string]string
 	pyImportBindings map[string]map[string][]pyImportBinding
 	jsImportAliases  map[string]map[string]string
 	jsReExports      map[string]map[string]struct{}
@@ -635,7 +641,45 @@ func (idx *edgeIndex) buildPyModuleGlobals(symbols []core.SymbolRecord) {
 		delete(globals, name)
 	}
 	idx.pyModuleGlobals = globals
+
+	// Per-file module variables, including plain constructed ones. A name
+	// assigned two different types in one file is dropped.
+	files := map[string]map[string]string{}
+	fileAmbiguous := map[string]bool{}
+	for i := range symbols {
+		s := &symbols[i]
+		if s.Language != "python" || s.Kind != core.KindVariable || s.ParentSymbol != "" {
+			continue
+		}
+		ct := ""
+		if slices.Contains(s.Modifiers, "module-value") {
+			if m := pyModuleVarCtorRe.FindStringSubmatch(s.Signature); m != nil && m[1] == s.Name && typeSymbolExists(idx, m[2]) {
+				ct = m[2]
+			}
+		} else {
+			ct = pyModuleGlobalType(s.Signature)
+		}
+		if ct == "" {
+			continue
+		}
+		if files[s.FilePath] == nil {
+			files[s.FilePath] = map[string]string{}
+		}
+		if prev, ok := files[s.FilePath][s.Name]; ok && prev != ct {
+			fileAmbiguous[s.FilePath+"\x00"+s.Name] = true
+		}
+		files[s.FilePath][s.Name] = ct
+	}
+	for key := range fileAmbiguous {
+		file, name, _ := strings.Cut(key, "\x00")
+		delete(files[file], name)
+	}
+	idx.pyFileGlobals = files
 }
+
+// pyModuleVarCtorRe matches a plain module assignment from a constructor call:
+// "app = Flask(__name__)", "bp = flask.Blueprint(...)".
+var pyModuleVarCtorRe = regexp.MustCompile(`^\s*([A-Za-z_]\w*)\s*=\s*(?:\w+\.)*(_*[A-Z]\w*)\(`)
 
 // creationSite reports whether the call site's source line instantiates
 // the callee (`new Name(` / `new Name<`), for the languages whose
