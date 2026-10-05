@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.62.2 - 2026-10-05
+
+Python receivers that hold objects built elsewhere now resolve. Flask's
+`route` goes from 27 callers to 170 (25 files) with this release.
+
+**Fixes (results)**
+- **Inherited methods through an aliased base**: flask's public `Blueprint`
+  subclasses `Blueprint as SansioBlueprint` (flask/sansio), and `route` lives
+  on `Scaffold` above it. The base-class walk matched by name, re-picked the
+  public class for its own base, and decided `bp.route` to nothing. Bases now
+  resolve in the module they were imported from.
+- **pytest fixtures returning a built local**: `app = Flask(...)`, configure,
+  `return app` now types the tests' `app` parameter (flask: ~200
+  `@app.route` uses).
+- **Module variables**: `bp = Blueprint(...)` / `app = Flask(...)` at module
+  level type that name in its own module's functions and in modules that
+  import it (including `from . import app`).
+- **Lazy proxies**: a typed lookup on a class that forwards members through
+  `__getattr__` (django's `default_storage`, `admin.site`) no longer drops the
+  name-resolved target. django: +1,678 call edges (mostly real proxy
+  `__getattr__`/`__getitem__` calls); the 61 it removes are all redirects to a
+  better target, none lost.
+- **ResolverVersion** bumped (2026-10-05-language-graph-v23): stored indexes
+  re-resolve.
+
 ## v0.62.1 - 2026-10-05
 
 **Fix (results)**

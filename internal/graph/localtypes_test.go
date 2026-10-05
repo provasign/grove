@@ -1022,3 +1022,94 @@ func TestDeclParamCountSkipsGoReceiver(t *testing.T) {
 		t.Fatalf("one-arg Go method = n:%d variadic:%v ok:%v", n, variadic, ok)
 	}
 }
+
+// flask: the public Blueprint subclasses `Blueprint as SansioBlueprint` from
+// flask/sansio, and route() lives on Scaffold, the sansio Blueprint's base.
+// A name-only base walk re-picked the public Blueprint for its own base and
+// stopped, so `bp.route` on a module-level `bp = Blueprint(...)` drew no edge.
+func TestPythonInheritedMethodThroughSameNamedAliasedBase(t *testing.T) {
+	scaffold := core.SymbolRecord{ID: "flask/sansio/scaffold.py::Scaffold", FilePath: "flask/sansio/scaffold.py", Language: "python", Kind: core.KindClass, Name: "Scaffold", QualifiedName: "Scaffold", Signature: "class Scaffold:"}
+	route := core.SymbolRecord{ID: "flask/sansio/scaffold.py::Scaffold.route", FilePath: "flask/sansio/scaffold.py", Language: "python", Kind: core.KindMethod, Name: "route", QualifiedName: "Scaffold.route", ParentSymbol: "Scaffold", Signature: "def route(self, rule, **options):"}
+	sansioBP := core.SymbolRecord{ID: "flask/sansio/blueprints.py::Blueprint", FilePath: "flask/sansio/blueprints.py", Language: "python", Kind: core.KindClass, Name: "Blueprint", QualifiedName: "Blueprint", Signature: "class Blueprint(Scaffold):",
+		Imports: []string{".scaffold", "@python-binding:1:Scaffold=.scaffold#Scaffold"}}
+	publicBP := core.SymbolRecord{ID: "flask/blueprints.py::Blueprint", FilePath: "flask/blueprints.py", Language: "python", Kind: core.KindClass, Name: "Blueprint", QualifiedName: "Blueprint", Signature: "class Blueprint(SansioBlueprint):",
+		Imports: []string{".sansio.blueprints", "@python-binding:1:SansioBlueprint=.sansio.blueprints#Blueprint"}}
+	top := core.SymbolRecord{
+		ID: "app/auth.py::<top-level>", FilePath: "app/auth.py", Language: "python", Kind: core.KindFunction,
+		Name: "<top-level>", QualifiedName: "<top-level>", Signature: "<top-level>",
+		RawText: "bp = Blueprint(\"auth\", __name__)\n\n\n\n", Imports: []string{"flask", "@python-binding:1:Blueprint=flask.blueprints#Blueprint"},
+		CallSites: []core.CallSite{{Callee: "Blueprint", Line: 1, Argc: 2}, {Callee: "bp.route", Line: 3, Argc: 1}},
+	}
+	edges := BuildEdges([]core.SymbolRecord{scaffold, route, sansioBP, publicBP, top})
+	if !javaHasCall(edges, top.ID, route.ID) {
+		t.Fatalf("bp.route on a public Blueprint did not reach Scaffold.route through the aliased sansio base; edges=%+v", edges)
+	}
+}
+
+// flask's conftest builds the app in a local and returns it; tests receive it
+// as an unannotated `app` parameter and register routes with @app.route.
+func TestPythonFixtureReturningConstructedLocalTypesTheParameter(t *testing.T) {
+	flask := core.SymbolRecord{ID: "flask/app.py::Flask", FilePath: "flask/app.py", Language: "python", Kind: core.KindClass, Name: "Flask", QualifiedName: "Flask", Signature: "class Flask:"}
+	route := core.SymbolRecord{ID: "flask/app.py::Flask.route", FilePath: "flask/app.py", Language: "python", Kind: core.KindMethod, Name: "route", QualifiedName: "Flask.route", ParentSymbol: "Flask", Signature: "def route(self, rule):"}
+	fixture := core.SymbolRecord{ID: "tests/conftest.py::app", FilePath: "tests/conftest.py", Language: "python", Kind: core.KindFunction, Name: "app", QualifiedName: "app",
+		Annotations: []string{"pytest.fixture"}, Signature: "def app():",
+		RawText: "def app():\n    app = Flask(\"t\")\n    app.config.update(TESTING=True)\n    return app\n", Imports: []string{"flask"}}
+	test := core.SymbolRecord{ID: "tests/test_basic.py::test_index", FilePath: "tests/test_basic.py", Language: "python", Kind: core.KindFunction, Name: "test_index", QualifiedName: "test_index",
+		Signature: "def test_index(app):", RawText: "def test_index(app):\n    @app.route(\"/\")\n    def index():\n        return \"\"\n",
+		CallSites: []core.CallSite{{Callee: "app.route", Line: 2, Argc: 1}}}
+	edges := BuildEdges([]core.SymbolRecord{flask, route, fixture, test})
+	if !javaHasCall(edges, test.ID, route.ID) {
+		t.Fatalf("fixture-typed app.route did not resolve; edges=%+v", edges)
+	}
+}
+
+// A module variable built from a constructor types its uses: in the importing
+// module (`from js_example import app` where js_example/__init__.py has
+// `app = Flask(__name__)`) and inside its own module's functions.
+func TestPythonConstructedModuleVariableTypesImportersAndOwnModule(t *testing.T) {
+	flask := core.SymbolRecord{ID: "flask/app.py::Flask", FilePath: "flask/app.py", Language: "python", Kind: core.KindClass, Name: "Flask", QualifiedName: "Flask", Signature: "class Flask:"}
+	route := core.SymbolRecord{ID: "flask/app.py::Flask.route", FilePath: "flask/app.py", Language: "python", Kind: core.KindMethod, Name: "route", QualifiedName: "Flask.route", ParentSymbol: "Flask", Signature: "def route(self, rule):"}
+	logger := core.SymbolRecord{ID: "flask/app.py::Flask.log_exception", FilePath: "flask/app.py", Language: "python", Kind: core.KindMethod, Name: "log_exception", QualifiedName: "Flask.log_exception", ParentSymbol: "Flask", Signature: "def log_exception(self, exc):"}
+	appVar := core.SymbolRecord{ID: "js_example/__init__.py::app", FilePath: "js_example/__init__.py", Language: "python", Kind: core.KindVariable, Name: "app", QualifiedName: "app",
+		Signature: "app = Flask(__name__)", Modifiers: []string{"public", "module-value"}}
+	own := core.SymbolRecord{ID: "js_example/__init__.py::report", FilePath: "js_example/__init__.py", Language: "python", Kind: core.KindFunction, Name: "report", QualifiedName: "report",
+		Signature: "def report(exc):", RawText: "def report(exc):\n    app.log_exception(exc)\n", CallSites: []core.CallSite{{Callee: "app.log_exception", Line: 2, Argc: 1}}}
+	views := core.SymbolRecord{ID: "js_example/views.py::<top-level>", FilePath: "js_example/views.py", Language: "python", Kind: core.KindFunction, Name: "<top-level>", QualifiedName: "<top-level>",
+		Signature: "<top-level>", RawText: "\n\n\n", Imports: []string{"js_example", "@python-binding:1:app=js_example#app"},
+		CallSites: []core.CallSite{{Callee: "app.route", Line: 3, Argc: 1}}}
+	// flask's own example imports it relatively: `from . import app`.
+	relative := core.SymbolRecord{ID: "js_example/rel.py::<top-level>", FilePath: "js_example/rel.py", Language: "python", Kind: core.KindFunction, Name: "<top-level>", QualifiedName: "<top-level>",
+		Signature: "<top-level>", RawText: "\n\n\n", Imports: []string{".", "@python-binding:1:app=.#app"},
+		CallSites: []core.CallSite{{Callee: "app.route", Line: 3, Argc: 1}}}
+	edges := BuildEdges([]core.SymbolRecord{flask, route, logger, appVar, own, views, relative})
+	if !javaHasCall(edges, views.ID, route.ID) {
+		t.Fatalf("imported module variable did not type app.route; edges=%+v", edges)
+	}
+	if !javaHasCall(edges, relative.ID, route.ID) {
+		t.Fatalf("`from . import app` did not type app.route; edges=%+v", edges)
+	}
+	if !javaHasCall(edges, own.ID, logger.ID) {
+		t.Fatalf("own-module variable did not type app.log_exception; edges=%+v", edges)
+	}
+}
+
+// django: `default_storage = DefaultStorage()`, a LazyObject proxy that
+// forwards `url` through __getattr__. Typing the module variable must not
+// decide default_storage.url to nothing; name resolution still applies.
+func TestPythonProxyTypedVariableDoesNotDropForwardedMember(t *testing.T) {
+	lazy := core.SymbolRecord{ID: "functional.py::LazyObject", FilePath: "utils/functional.py", Language: "python", Kind: core.KindClass, Name: "LazyObject", QualifiedName: "LazyObject", Signature: "class LazyObject:"}
+	getattr := core.SymbolRecord{ID: "functional.py::LazyObject.__getattr__", FilePath: "utils/functional.py", Language: "python", Kind: core.KindMethod, Name: "__getattr__", QualifiedName: "LazyObject.__getattr__", ParentSymbol: "LazyObject", Signature: "def __getattr__(self, name):"}
+	def := core.SymbolRecord{ID: "storage.py::DefaultStorage", FilePath: "files/storage.py", Language: "python", Kind: core.KindClass, Name: "DefaultStorage", QualifiedName: "DefaultStorage", Signature: "class DefaultStorage(LazyObject):",
+		Imports: []string{"utils.functional", "@python-binding:1:LazyObject=utils.functional#LazyObject"}}
+	fs := core.SymbolRecord{ID: "storage.py::FileSystemStorage", FilePath: "files/storage.py", Language: "python", Kind: core.KindClass, Name: "FileSystemStorage", QualifiedName: "FileSystemStorage", Signature: "class FileSystemStorage:"}
+	url := core.SymbolRecord{ID: "storage.py::FileSystemStorage.url", FilePath: "files/storage.py", Language: "python", Kind: core.KindMethod, Name: "url", QualifiedName: "FileSystemStorage.url", ParentSymbol: "FileSystemStorage", Signature: "def url(self, name):"}
+	variable := core.SymbolRecord{ID: "storage.py::default_storage", FilePath: "files/storage.py", Language: "python", Kind: core.KindVariable, Name: "default_storage", QualifiedName: "default_storage",
+		Signature: "default_storage = DefaultStorage()", Modifiers: []string{"public", "module-value"}}
+	caller := core.SymbolRecord{ID: "widgets.py::render", FilePath: "files/widgets.py", Language: "python", Kind: core.KindFunction, Name: "render", QualifiedName: "render",
+		Signature: "def render(name):", RawText: "def render(name):\n    return default_storage.url(name)\n", Imports: []string{"files.storage", "@python-binding:1:default_storage=files.storage#default_storage"},
+		CallSites: []core.CallSite{{Callee: "default_storage.url", Line: 2, Argc: 1}}}
+	edges := BuildEdges([]core.SymbolRecord{lazy, getattr, def, fs, url, variable, caller})
+	if !javaHasCall(edges, caller.ID, url.ID) {
+		t.Fatalf("proxy-typed default_storage.url lost its name-resolved target; edges=%+v", edges)
+	}
+}

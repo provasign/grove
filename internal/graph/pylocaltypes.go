@@ -689,13 +689,16 @@ func pyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 	// `current_app: FlaskProxy`, imported as `from .globals import
 	// current_app`), unless a parameter or local rebinding shadows the
 	// name. Lowest precedence: nothing above is overwritten.
-	if idx != nil && len(idx.pyModuleGlobals) > 0 {
-		shadowed := pyParamNames(symbol.RawText)
+	var shadowed map[string]bool
+	if idx != nil && (len(idx.pyModuleGlobals) > 0 || len(idx.pyFileGlobals) > 0) {
+		shadowed = pyParamNames(symbol.RawText)
 		if symbol.RawText != "" {
 			for _, m := range pyLocalRebindRe.FindAllStringSubmatch(stripCommentsAndStrings(symbol.RawText), -1) {
 				shadowed[m[1]] = true
 			}
 		}
+	}
+	if idx != nil && len(idx.pyModuleGlobals) > 0 {
 		for _, imp := range symbol.Imports {
 			_, name, ok := strings.Cut(imp, "#")
 			if !ok || shadowed[name] {
@@ -706,6 +709,30 @@ func pyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 			}
 			if t, ok := idx.pyModuleGlobals[name]; ok {
 				out[name] = t
+			}
+		}
+	}
+	// Module variables typed by their declaration or constructor: this
+	// module's own (`bp = Blueprint(...)` used inside its functions), and
+	// imported ones resolved to the file the import names
+	// (`from js_example import app`, where js_example/__init__.py has
+	// `app = Flask(__name__)`).
+	if idx != nil && len(idx.pyFileGlobals) > 0 {
+		for name, t := range idx.pyFileGlobals[symbol.FilePath] {
+			if _, done := out[name]; !done && !shadowed[name] {
+				out[name] = t
+			}
+		}
+		for local := range idx.pyImportBindings[symbol.FilePath] {
+			if _, done := out[local]; done || shadowed[local] {
+				continue
+			}
+			module, member, ok, _ := idx.pyImportBinding(symbol, local)
+			if !ok || member == "" {
+				continue
+			}
+			if t := idx.pyImportedGlobalType(symbol.FilePath, module, member); t != "" {
+				out[local] = t
 			}
 		}
 	}
@@ -778,6 +805,25 @@ func pyClassAttrTypes(idx *edgeIndex, symbol *core.SymbolRecord, className strin
 // signature: "class Blueprint(Scaffold):" → [Scaffold]. Keyword arguments
 // (metaclass=...) and subscripted bases (Generic[T]) are skipped.
 func pyBaseClasses(idx *edgeIndex, className, preferDir string) []string {
+	refs := pyBaseRefs(idx, className, preferDir)
+	if refs == nil {
+		return nil
+	}
+	names := make([]string, len(refs))
+	for i, r := range refs {
+		names[i] = r.name
+	}
+	return names
+}
+
+// pyBaseRef is one base class of a Python class: its name and the directory
+// of the module that defines it ("" when unknown). Two classes may share a
+// name -- flask's public Blueprint subclasses `Blueprint as SansioBlueprint`
+// imported from flask/sansio -- and a name-only walk re-picks the subclass
+// for its own base and stops, never reaching Scaffold.route.
+type pyBaseRef struct{ name, dir string }
+
+func pyBaseRefs(idx *edgeIndex, className, preferDir string) []pyBaseRef {
 	var chosen *core.SymbolRecord
 	for _, cand := range idx.byName[strings.ToLower(className)] {
 		if cand.Name != className || (cand.Kind != core.KindClass && cand.Kind != core.KindInterface) {
@@ -798,7 +844,7 @@ func pyBaseClasses(idx *edgeIndex, className, preferDir string) []string {
 		if open < 0 || closeIdx <= open {
 			return nil
 		}
-		var bases []string
+		var bases []pyBaseRef
 		for _, b := range splitTopLevel(sig[open+1:closeIdx], ',') {
 			b = strings.TrimSpace(b)
 			if b == "" || strings.Contains(b, "=") {
@@ -810,16 +856,89 @@ func pyBaseClasses(idx *edgeIndex, className, preferDir string) []string {
 			if i := strings.LastIndexByte(b, '.'); i >= 0 {
 				b = b[i+1:]
 			}
-			if _, member, ok, _ := idx.pyImportBinding(chosen, b); ok && member != "" {
+			dir := dirOf(chosen.FilePath) // unimported: declared alongside
+			if module, member, ok, _ := idx.pyImportBinding(chosen, b); ok && member != "" {
 				b = member
+				dir = ""
+				if files := idx.pyModuleFiles(chosen.FilePath, module); len(files) > 0 {
+					dir = dirOf(files[0])
+				}
 			}
 			if b != "" && b != "object" {
-				bases = append(bases, b)
+				bases = append(bases, pyBaseRef{name: b, dir: dir})
 			}
 		}
 		return bases
 	}
 	return nil
+}
+
+// pyInheritedTargets walks a Python type's ancestors, nearest first, and
+// returns the pool members declared by the first ancestor level that has any.
+// Each base resolves in the module it was imported from (pyBaseRef), so a base
+// sharing its subclass's name is the other class, not a cycle; seen keys on
+// name and directory.
+func pyInheritedTargets(idx *edgeIndex, typ string, pool []*core.SymbolRecord) []*core.SymbolRecord {
+	level := pyBaseRefs(idx, typ, "")
+	seen := map[pyBaseRef]bool{}
+	for depth := 0; depth < 8 && len(level) > 0; depth++ {
+		var found []*core.SymbolRecord
+		var next []pyBaseRef
+		for _, b := range level {
+			if seen[b] {
+				continue
+			}
+			seen[b] = true
+			matches := filterByParent(pool, b.name)
+			if b.dir != "" {
+				if c := pyResolveClass(idx, b.name, b.dir); c != nil && dirOf(c.FilePath) == b.dir {
+					matches = filterCandidatesByFile(matches, c.FilePath)
+				}
+			}
+			found = append(found, matches...)
+			next = append(next, pyBaseRefs(idx, b.name, b.dir)...)
+		}
+		if len(found) > 0 {
+			return found
+		}
+		level = next
+	}
+	return nil
+}
+
+// pyTypeHasDynamicAttrs reports whether a Python class or any ancestor
+// defines __getattr__: a proxy (django's LazyObject-based default_storage,
+// DefaultAdminSite) whose members are forwarded, not declared. A typed lookup
+// that finds nothing on such a type has not shown the call goes nowhere.
+func pyTypeHasDynamicAttrs(idx *edgeIndex, typ string) bool {
+	declares := func(class, dir string) bool {
+		for _, m := range idx.byName["__getattr__"] {
+			if m.ParentSymbol == class && (dir == "" || dirOf(m.FilePath) == dir) {
+				return true
+			}
+		}
+		return false
+	}
+	if declares(typ, "") {
+		return true
+	}
+	level := pyBaseRefs(idx, typ, "")
+	seen := map[pyBaseRef]bool{}
+	for depth := 0; depth < 8 && len(level) > 0; depth++ {
+		var next []pyBaseRef
+		for _, b := range level {
+			if seen[b] {
+				continue
+			}
+			seen[b] = true
+			if declares(b.name, b.dir) {
+				return true
+			}
+			next = append(next, pyBaseRefs(idx, b.name, b.dir)...)
+		}
+		level = next
+	}
+	return false
 }
 
 // inheritedTargets resolves self.method() / self.property to members of the
@@ -1375,11 +1494,25 @@ func pyFixtureType(idx *edgeIndex, symbol *core.SymbolRecord, param string) stri
 			}
 		}
 	}
-	if m := pyFixtureValueRe.FindStringSubmatch(stripCommentsAndStrings(best.RawText)); m != nil && typeSymbolExists(idx, m[1]) {
+	body := stripCommentsAndStrings(best.RawText)
+	if m := pyFixtureValueRe.FindStringSubmatch(body); m != nil && typeSymbolExists(idx, m[1]) {
 		return m[1]
+	}
+	// `app = Flask(...)`, configure it, `return app`: the returned local's
+	// constructor assignment types the fixture (flask's conftest `app`, which
+	// ~200 test-module `@app.route` uses receive).
+	if m := pyFixtureNameRe.FindStringSubmatch(body); m != nil {
+		for _, a := range pyCtorAssignRe.FindAllStringSubmatch(body, -1) {
+			if a[1] == m[1] && typeSymbolExists(idx, a[2]) {
+				return a[2]
+			}
+		}
 	}
 	return ""
 }
+
+// pyFixtureNameRe matches a fixture returning or yielding a bare local name.
+var pyFixtureNameRe = regexp.MustCompile(`(?m)^\s*(?:return|yield)\s+([A-Za-z_][A-Za-z0-9_]*)\s*$`)
 
 // pyTransparentDecorators do not change how a method is called.
 var pyTransparentDecorators = map[string]bool{
@@ -1630,4 +1763,34 @@ func pyDispatchOwners(idx *edgeIndex, className, method, preferDir string) map[s
 		owners[o.ParentSymbol] = true
 	}
 	return owners
+}
+
+// pyImportedGlobalType is the class type of module variable member in the
+// module an import names: the module's own file, or a package's __init__.py.
+func (idx *edgeIndex) pyImportedGlobalType(fromFile, module, member string) string {
+	if strings.Trim(module, ".") == "" {
+		// `from . import app`: the package's own __init__.py, one directory
+		// up per extra dot (pyModuleFiles resolves only dotted names).
+		dir := dirOf(fromFile)
+		for i := 1; i < len(module); i++ {
+			dir = dirOf(dir)
+		}
+		init := "__init__.py"
+		if dir != "" {
+			init = dir + "/__init__.py"
+		}
+		return idx.pyFileGlobals[init][member]
+	}
+	files := idx.pyModuleFiles(fromFile, module)
+	for _, f := range files {
+		if strings.HasSuffix(f, "/__init__.py") || f == "__init__.py" {
+			if t := idx.pyFileGlobals[f][member]; t != "" {
+				return t
+			}
+		}
+	}
+	if len(files) == 1 {
+		return idx.pyFileGlobals[files[0]][member]
+	}
+	return ""
 }

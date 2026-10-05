@@ -466,6 +466,18 @@ func narrowByLocalType(idx *edgeIndex, sat *interfaceSatisfaction, caller *core.
 		// base, and dropped app.basePath(...) as decided-to-nothing).
 		byType = typeOrInheritedMethodTargets(idx, caller, typ, calleeName, pool)
 	}
+	if len(byType) == 0 && lang == "python" {
+		// Python bases resolve through the module each was imported from:
+		// flask's public Blueprint subclasses the sansio Blueprint under an
+		// alias, and the name-only walk below loops on "Blueprint" and
+		// decides bp.route (Scaffold.route) to nothing.
+		byType = pyInheritedTargets(idx, typ, pool)
+		if len(byType) == 0 && len(targets) == 0 && pyTypeHasDynamicAttrs(idx, typ) {
+			// A proxy type forwards members through __getattr__: leave the
+			// call to name-based resolution instead of deciding it to nothing.
+			return nil, nil, false
+		}
+	}
 	if len(byType) == 0 {
 		// The method may be inherited: a receiver typed FlaskProxy (a stub
 		// subclass of Flask) calling make_response runs Flask's. Walk the
