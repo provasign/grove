@@ -36,6 +36,7 @@ func TestDeferredSpliceCheckHealsBeforeNextIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer eng.Close()
+	eng.holdPendingCheck = true
 	if _, err := eng.Index(ctx, ""); err != nil {
 		t.Fatal(err)
 	}

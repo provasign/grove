@@ -117,6 +117,10 @@ type Engine struct {
 	pendingCheck index.SpliceCheck
 	// spliceNote reports a healed deferred check on the next Index result.
 	spliceNote string
+	// holdPendingCheck (tests only) leaves the deferred check pending
+	// instead of starting it in the background, so a test can act before
+	// it runs.
+	holdPendingCheck bool
 
 	mu    sync.RWMutex
 	graph *graph.CodeGraph
@@ -303,11 +307,13 @@ func (e *Engine) Index(ctx context.Context, dir string) (IndexResult, error) {
 	}
 	if check := e.idx.TakeSpliceCheck(); check != nil {
 		e.pendingCheck = check
-		go func() {
-			e.indexMu.Lock()
-			defer e.indexMu.Unlock()
-			e.runPendingCheck(context.Background())
-		}()
+		if !e.holdPendingCheck {
+			go func() {
+				e.indexMu.Lock()
+				defer e.indexMu.Unlock()
+				e.runPendingCheck(context.Background())
+			}()
+		}
 	}
 	if err != nil {
 		return result, err

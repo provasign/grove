@@ -386,11 +386,16 @@ function visit(checker, options, host, sf, node, stack) {
       // An object literal's property counts as the member of the type it
       // is checked against: { append: true } passed to a SetHeadersOptions
       // parameter, { remote: {...} } returned as ConnInfo.
+      // A union contextual type lists its members in type creation order,
+      // which depends on the files the program checked first: take the
+      // member declaring the property that comes first by file and line,
+      // so scoped and full runs agree.
       const ct = checker.getContextualType(node.parent);
       if (ct) {
         for (const t of (ct.isUnion && ct.isUnion() ? ct.types : [ct])) {
           const p = checker.getPropertyOfType(checker.getApparentType(t), node.name.text);
-          if (p) { target = memberDeclInfo(checker, p); if (target) break; }
+          const info = p && memberDeclInfo(checker, p);
+          if (info && (!target || info.file < target.file || (info.file === target.file && info.line < target.line))) target = info;
         }
       }
       write = true;
