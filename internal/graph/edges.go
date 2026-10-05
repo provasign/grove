@@ -45,6 +45,12 @@ type edgeIndex struct {
 	// importPathToFiles maps a slash-separated import path without extension to
 	// files whose path matches that import exactly or by package directory.
 	importPathToFiles map[string][]string
+	// pathSuffix / dirSuffix map every segment-boundary suffix ("c", "b/c",
+	// "a/b/c") of an importPathToFiles / dirFilesLower key to the keys that
+	// end with it, sorted. Import lookups by suffix used to scan every key
+	// once per import (django: 62% of index construction).
+	pathSuffix map[string][]string
+	dirSuffix  map[string][]string
 
 	// baseToFiles maps lowercase basename without extension to files.
 	baseToFiles map[string][]string
@@ -208,6 +214,8 @@ func newEdgeIndex(symbols []core.SymbolRecord) *edgeIndex {
 		idx.importPathToFiles[strings.ToLower(trimExt(f))] = append(idx.importPathToFiles[strings.ToLower(trimExt(f))], f)
 		idx.baseToFiles[strings.ToLower(baseNameNoExt(f))] = append(idx.baseToFiles[strings.ToLower(baseNameNoExt(f))], f)
 	}
+	idx.pathSuffix = segmentSuffixIndex(idx.importPathToFiles)
+	idx.dirSuffix = segmentSuffixIndex(idx.dirFilesLower)
 	idx.buildRustCrates()
 	if traceCalls && len(idx.rustCrateByName) > 0 {
 		fmt.Fprintf(os.Stderr, "grove-trace rust-crates %v\n", idx.rustCrateByName)
@@ -303,14 +311,30 @@ func (idx *edgeIndex) pyModuleFiles(fromFile, modPath string) []string {
 	}
 	joined := strings.ToLower(strings.Join(segs, "/"))
 	var out []string
-	for pathKey, files := range idx.importPathToFiles {
-		if pathKey == joined || strings.HasSuffix(pathKey, "/"+joined) {
-			out = append(out, files...)
-		}
+	for _, pathKey := range idx.pathSuffix[joined] {
+		out = append(out, idx.importPathToFiles[pathKey]...)
 	}
-	for dir, files := range idx.dirFilesLower {
-		if dir == joined || strings.HasSuffix(dir, "/"+joined) {
-			out = append(out, files...)
+	for _, dir := range idx.dirSuffix[joined] {
+		out = append(out, idx.dirFilesLower[dir]...)
+	}
+	return out
+}
+
+// segmentSuffixIndex maps each segment-boundary suffix of every key to the
+// keys ending with it (a key is its own longest suffix), each list sorted.
+func segmentSuffixIndex(m map[string][]string) map[string][]string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make(map[string][]string, len(keys)*2)
+	for _, k := range keys {
+		out[k] = append(out[k], k)
+		for i := 0; i < len(k); i++ {
+			if k[i] == '/' && i+1 < len(k) {
+				out[k[i+1:]] = append(out[k[i+1:]], k)
+			}
 		}
 	}
 	return out
@@ -4206,22 +4230,20 @@ func (idx *edgeIndex) computeImportFilesForQualifierForSymbol(symbol *core.Symbo
 		// Maven/Gradle layouts prefix source dirs ("src/main/java/org/..."),
 		// so the import path is a SUFFIX of the dir or file, not equal to it.
 		if len(out) == 0 {
-			slashImp := "/" + impNorm // hoisted: the loops below are over every dir / import path
-			for dir, files := range idx.dirFilesLower {
-				if strings.HasSuffix(dir, slashImp) || dir == impNorm {
-					for _, f := range files {
-						if f != fromFile {
-							out[f] = struct{}{}
-						}
+			for _, dir := range idx.dirSuffix[impNorm] {
+				for _, f := range idx.dirFilesLower[dir] {
+					if f != fromFile {
+						out[f] = struct{}{}
 					}
 				}
 			}
-			for pathKey, files := range idx.importPathToFiles {
-				if strings.HasSuffix(pathKey, slashImp) {
-					for _, f := range files {
-						if f != fromFile {
-							out[f] = struct{}{}
-						}
+			for _, pathKey := range idx.pathSuffix[impNorm] {
+				if pathKey == impNorm {
+					continue // a proper suffix only, as before
+				}
+				for _, f := range idx.importPathToFiles[pathKey] {
+					if f != fromFile {
+						out[f] = struct{}{}
 					}
 				}
 			}
