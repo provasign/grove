@@ -97,6 +97,13 @@ type Config struct {
 	// edge-confidence floor: edges below it are dropped from the graph and
 	// the store. See index.Options.MinConfidence.
 	MinEdgeConfidence *float64
+	// OneShot marks an engine that indexes once and exits (a CLI command).
+	// It keeps no resident analyzer workers, starts no background warm-up,
+	// and verifies its store write before returning. With no resident graph
+	// to diff against, an index run with changes loads the stored baseline
+	// instead, so an edit still takes the incremental edge path. Long-lived
+	// callers (MCP servers, watch) leave it false.
+	OneShot bool
 }
 
 // Engine is the embedded Grove API consumed by Prism, Fuse, and Relay.
@@ -300,7 +307,8 @@ func (e *Engine) Index(ctx context.Context, dir string) (IndexResult, error) {
 	// reloading all stored symbols+edges. If a resident graph exists it is
 	// kept (set-equal to the store by the stored-edge invariant); if none
 	// exists yet, the first query rehydrates lazily via currentGraph.
-	opts := index.Options{SkipNoopGraph: true, Force: e.force, Vacuum: e.cfg.VacuumAfterIndex, DeferSpliceCheck: true, Resident: true}
+	resident := !e.cfg.OneShot
+	opts := index.Options{SkipNoopGraph: true, Force: e.force, Vacuum: e.cfg.VacuumAfterIndex, DeferSpliceCheck: resident, Resident: resident}
 	if e.cfg.MinEdgeConfidence != nil {
 		opts.MinConfidence, opts.MinConfidenceSet = *e.cfg.MinEdgeConfidence, true
 	}
@@ -315,6 +323,22 @@ func (e *Engine) Index(ctx context.Context, dir string) (IndexResult, error) {
 			opts.PrevSymbols, opts.PrevEdges = e.graph.BaselineRef()
 		}
 		e.mu.RUnlock()
+		if opts.PrevEdges == nil && e.cfg.OneShot {
+			// No resident graph: the indexer loads the stored baseline only
+			// if this run has changes, before it overwrites them.
+			opts.PrevBaseline = func(ctx context.Context) ([]core.SymbolRecord, []core.Edge, error) {
+				symbols, err := e.store.AllSymbols(ctx)
+				if err != nil {
+					return nil, nil, err
+				}
+				edges, err := e.store.AllEdges(ctx)
+				if err != nil {
+					return nil, nil, err
+				}
+				graph.SortBaselineSymbols(symbols)
+				return symbols, edges, nil
+			}
+		}
 	}
 	cg, result, err := e.idx.IndexWithOptions(ctx, dir, opts)
 	if e.spliceNote != "" {
@@ -322,6 +346,9 @@ func (e *Engine) Index(ctx context.Context, dir string) (IndexResult, error) {
 		e.spliceNote = ""
 	}
 	e.tsWarm.Do(func() {
+		if e.cfg.OneShot {
+			return
+		}
 		e.warmCtx, e.warmCancel = context.WithCancel(context.Background())
 		ctx := e.warmCtx
 		e.bg.Add(1)
