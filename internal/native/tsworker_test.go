@@ -164,3 +164,35 @@ func TestJavacResidentWorkerMatchesOneShot(t *testing.T) {
 		t.Fatalf("expected one running javac worker for the root, found %d", n)
 	}
 }
+
+// A worker over the memory cap is stopped and its root falls back to
+// one-shot runs, with a diagnostic; a stopped worker arms no idle timer.
+func TestTSWorkerMemoryCapAndIdle(t *testing.T) {
+	root := t.TempDir()
+	linkTypeScriptForTest(t, root)
+	t.Cleanup(func() { StopTSWorkers(root); tsOverCap.Delete(root) })
+	if err := os.WriteFile(filepath.Join(root, "tsconfig.json"), []byte(`{"include":["*.ts"]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "a.ts"), []byte("export const a = 1;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GROVE_TS_WORKER_MAX_MB", "1")
+	req := Request{Root: root, Files: []string{"a.ts"}, Resident: true}
+	first := (jsTSAnalyzer{}).Analyze(context.Background(), req)
+	if !strings.Contains(strings.Join(first.Diagnostics, "\n"), "typescript worker stopped at") {
+		t.Fatalf("worker over the cap was not stopped: %v", first.Diagnostics)
+	}
+	second := (jsTSAnalyzer{}).Analyze(context.Background(), req)
+	if slices.Contains(second.Diagnostics, "resident worker") {
+		t.Fatalf("root over the cap still used the worker: %v", second.Diagnostics)
+	}
+	w := tsWorkerFor(root, root)
+	w.mu.Lock()
+	w.armIdleLocked() // no process: must not arm
+	armed := w.idle != nil
+	w.mu.Unlock()
+	if armed {
+		t.Fatal("idle timer armed for a stopped worker")
+	}
+}

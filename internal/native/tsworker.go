@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"strconv"
+	"time"
 
 	"fmt"
 	"io"
@@ -35,6 +37,18 @@ type residentWorker struct {
 	stdin  io.WriteCloser
 	out    *bufio.Reader
 	errs   *bytes.Buffer
+	// idle stops the process after workerIdle without a request, releasing
+	// its memory; the next request starts it again.
+	idle *time.Timer
+}
+
+// workerIdle is how long a resident worker may sit unused before it exits
+// (GROVE_WORKER_IDLE_MIN minutes, default 20).
+func workerIdle() time.Duration {
+	if v, err := strconv.Atoi(os.Getenv("GROVE_WORKER_IDLE_MIN")); err == nil && v > 0 {
+		return time.Duration(v) * time.Minute
+	}
+	return 20 * time.Minute
 }
 
 var residentWorkers = struct {
@@ -104,6 +118,10 @@ func (w *residentWorker) startLocked() error {
 }
 
 func (w *residentWorker) stopLocked() {
+	if w.idle != nil {
+		w.idle.Stop()
+		w.idle = nil
+	}
 	if w.cmd == nil {
 		return
 	}
@@ -153,6 +171,7 @@ func (w *residentWorker) call(ctx context.Context, request []byte) ([]byte, erro
 			// Anything else is output from the project's own tooling.
 		}
 	}()
+	defer w.armIdleLocked()
 	select {
 	case r := <-done:
 		if r.err != nil {
@@ -168,6 +187,44 @@ func (w *residentWorker) call(ctx context.Context, request []byte) ([]byte, erro
 		w.stopLocked() // unblocks the reader; the next run starts fresh
 		return nil, ctx.Err()
 	}
+}
+
+// stop stops the worker process (it restarts on the next call).
+func (w *residentWorker) stop() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.stopLocked()
+}
+
+// A TypeScript worker whose process grows past tsWorkerMaxBytes is stopped
+// and its root uses one-shot processes for the rest of this process: on a
+// very large monorepo a resident program set can hold several GB.
+var tsOverCap sync.Map // root -> true
+
+func tsWorkerMaxBytes() int64 {
+	if v, err := strconv.ParseInt(os.Getenv("GROVE_TS_WORKER_MAX_MB"), 10, 64); err == nil && v > 0 {
+		return v << 20
+	}
+	return 3072 << 20
+}
+
+func tsWorkerOverCap(root string) bool { _, over := tsOverCap.Load(root); return over }
+func markTSWorkerOverCap(root string)  { tsOverCap.Store(root, true) }
+
+// armIdleLocked (re)starts the idle timer of a running worker.
+func (w *residentWorker) armIdleLocked() {
+	if w.cmd == nil {
+		return
+	}
+	if w.idle != nil {
+		w.idle.Reset(workerIdle())
+		return
+	}
+	w.idle = time.AfterFunc(workerIdle(), func() {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		w.stopLocked()
+	})
 }
 
 // limitedWriter keeps the first max bytes of a stream (worker stderr).

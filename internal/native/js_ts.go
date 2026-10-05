@@ -3,6 +3,7 @@ package native
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -123,7 +124,7 @@ func (jsTSAnalyzer) Analyze(ctx context.Context, req Request) Result {
 	}
 	var out []byte
 	var workerNote, stdoutText, stderrText string
-	if req.Resident && tsWorkerEnabled() {
+	if req.Resident && tsWorkerEnabled() && !tsWorkerOverCap(req.Root) {
 		request, _ := jsonMarshal(map[string]any{"root": req.Root, "files": req.Files, "changed": tsChangedFiles(req), "fileSetChanged": req.FileSetChanged})
 		w := tsWorkerFor(req.Root, dir)
 		line, werr := w.call(ctx, request)
@@ -138,6 +139,15 @@ func (jsTSAnalyzer) Analyze(ctx context.Context, req Request) Result {
 		default:
 			out = line
 			stdoutText = string(line)
+			var mem struct {
+				RSS int64 `json:"rss"`
+			}
+			if unmarshalJSON(tsPayload(line), &mem) == nil && mem.RSS > tsWorkerMaxBytes() {
+				markTSWorkerOverCap(req.Root)
+				w.stop()
+				workerNote = fmt.Sprintf("typescript worker stopped at %d MB (cap %d MB, GROVE_TS_WORKER_MAX_MB); later runs use one-shot processes",
+					mem.RSS>>20, tsWorkerMaxBytes()>>20)
+			}
 		}
 	}
 	if out == nil {
@@ -262,7 +272,7 @@ func (jsTSAnalyzer) Analyze(ctx context.Context, req Request) Result {
 	}
 	if workerNote != "" {
 		res.Diagnostics = append(res.Diagnostics, workerNote)
-	} else if req.Resident && tsWorkerEnabled() {
+	} else if req.Resident && tsWorkerEnabled() && !tsWorkerOverCap(req.Root) {
 		res.Diagnostics = append(res.Diagnostics, "resident worker")
 	}
 	if payload.ScopedDirs != nil {
@@ -898,6 +908,7 @@ if (process.env.GROVE_TS_WORKER === '1') {
       const req = JSON.parse(line);
       if (req.reset) { STATE.sourceFiles.clear(); STATE.programs.clear(); }
       out = analyze(req);
+      out.rss = process.memoryUsage().rss;
     } catch (e) {
       out = {error: String(e && e.stack || e)};
     }
