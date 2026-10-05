@@ -454,6 +454,13 @@ func (g *CodeGraph) DropBelowConfidence(min float64) int {
 // itself). The caller must treat both slices as immutable and drop them as
 // soon as the delta completes. Symbols are materialized from the map (order
 // is irrelevant to the delta path, which indexes by ID and file).
+// SortBaselineSymbols orders symbols the way BaselineRef returns them, for
+// callers that build an incremental baseline from the store instead of a
+// resident graph.
+func SortBaselineSymbols(symbols []core.SymbolRecord) {
+	sort.Slice(symbols, func(i, j int) bool { return lessSymbols(&symbols[i], &symbols[j]) })
+}
+
 func (g *CodeGraph) BaselineRef() ([]core.SymbolRecord, []core.Edge) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()

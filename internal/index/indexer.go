@@ -83,6 +83,12 @@ type Options struct {
 	// processes and caches between runs (see native.Config.Resident).
 	Resident bool
 
+	// PrevBaseline, when PrevEdges is nil, loads the previous state from the
+	// store. It is called only when the walk found changed files and before
+	// they are persisted (afterwards the store no longer holds the previous
+	// state), so a no-change run never pays the load.
+	PrevBaseline func(context.Context) ([]core.SymbolRecord, []core.Edge, error)
+
 	// PrevEdges/PrevSymbols enable incremental edge construction on delta
 	// runs (gated additionally by GROVE_INCREMENTAL=1): the caller's
 	// resident graph state from the previous index. PrevEdges may be the
@@ -550,6 +556,12 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 		wg.Wait()
 	}
 	tick("parse-changed")
+	if opts.PrevEdges == nil && opts.PrevBaseline != nil && len(tasks) > 0 && !forceExtract && incrementalEnabled() {
+		if ps, pe, err := opts.PrevBaseline(ctx); err == nil && len(pe) > 0 {
+			opts.PrevSymbols, opts.PrevEdges = ps, pe
+		}
+		tick("load-baseline")
+	}
 	prog.flush(ctx)
 	prog.phase("persisting", fmt.Sprintf("0/%d changed files written", len(tasks)))
 
@@ -717,6 +729,7 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 	nativeCfg := i.nativeConfig
 	nativeCfg.FileSetChanged = fileSetChanged || len(prunedFiles) > 0
 	nativeCfg.Resident = opts.Resident
+	nativeCfg.PrevChanged = replacedSymbols
 	completed := map[string]bool{}
 	if raw, ok, err := i.store.GetMeta(ctx, core.MetaNativeComplete); err == nil && ok && raw != "" {
 		var names []string

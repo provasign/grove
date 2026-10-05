@@ -84,3 +84,115 @@ func TestJsTSResidentWorker(t *testing.T) {
 		t.Fatalf("worker was not used: %v", changed.Diagnostics)
 	}
 }
+
+// A caller cancelled while its request is in flight (Close during the
+// background warm-up) stops the worker; the in-flight goroutine must not
+// touch the cleared fields. Run under -race.
+func TestTSWorkerCancelDuringCall(t *testing.T) {
+	root := t.TempDir()
+	linkTypeScriptForTest(t, root)
+	t.Cleanup(func() { StopTSWorkers(root) })
+	if err := os.WriteFile(filepath.Join(root, "tsconfig.json"), []byte(`{"include":["*.ts"]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "a.ts"), []byte("export const a = 1;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 20; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		go cancel()
+		WarmTSWorker(ctx, root, []string{"a.ts"})
+	}
+}
+
+// The resident javac worker (a JVM running the resolver in --serve mode)
+// must produce what the one-shot launch produces, across repeated calls.
+func TestJavacResidentWorkerMatchesOneShot(t *testing.T) {
+	if findJDK() == nil {
+		t.Skip("no JDK")
+	}
+	root := t.TempDir()
+	t.Cleanup(func() { StopTSWorkers(root) })
+	files := map[string]string{
+		"src/main/java/a/Util.java":   "package a;\npublic class Util {\n  public static int check(int x) { return x; }\n}\n",
+		"src/main/java/b/Client.java": "package b;\nimport a.Util;\npublic class Client {\n  public int one() { return Util.check(1); }\n}\n",
+	}
+	var rel []string
+	for f, body := range files {
+		p := filepath.Join(root, filepath.FromSlash(f))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		rel = append(rel, f)
+	}
+	sort.Strings(rel)
+	symbols := []core.SymbolRecord{
+		{ID: "check", FilePath: "src/main/java/a/Util.java", Language: "java", Kind: core.KindMethod, Name: "check", QualifiedName: "Util.check", ParentSymbol: "Util", Span: core.LineRange{Start: 3, End: 3}},
+		{ID: "one", FilePath: "src/main/java/b/Client.java", Language: "java", Kind: core.KindMethod, Name: "one", QualifiedName: "Client.one", ParentSymbol: "Client", Span: core.LineRange{Start: 4, End: 4}},
+	}
+	edgeSet := func(edges []core.Edge) []string {
+		var out []string
+		for _, e := range edges {
+			out = append(out, e.From+"|"+string(e.Type)+"|"+e.To)
+		}
+		sort.Strings(out)
+		return out
+	}
+	ctx := context.Background()
+	oneShot, diags, _ := javacResolveScoped(ctx, Request{Root: root, Files: rel, Symbols: symbols})
+	if len(oneShot) == 0 {
+		t.Skipf("javac resolver produced no edges: %v", diags)
+	}
+	for i := 0; i < 2; i++ {
+		resident, rdiags, _ := javacResolveScoped(ctx, Request{Root: root, Files: rel, Symbols: symbols, Resident: true})
+		if a, b := edgeSet(oneShot), edgeSet(resident); !slices.Equal(a, b) {
+			t.Fatalf("call %d: resident javac differs from one-shot:\n one-shot %v\n resident %v\n diags %v", i, a, b, rdiags)
+		}
+	}
+	residentWorkers.Lock()
+	n := 0
+	for _, w := range residentWorkers.m {
+		if w.root == root && w.marker == javaPayloadSentinel && w.cmd != nil {
+			n++
+		}
+	}
+	residentWorkers.Unlock()
+	if n != 1 {
+		t.Fatalf("expected one running javac worker for the root, found %d", n)
+	}
+}
+
+// A worker over the memory cap is stopped and its root falls back to
+// one-shot runs, with a diagnostic; a stopped worker arms no idle timer.
+func TestTSWorkerMemoryCapAndIdle(t *testing.T) {
+	root := t.TempDir()
+	linkTypeScriptForTest(t, root)
+	t.Cleanup(func() { StopTSWorkers(root); tsOverCap.Delete(root) })
+	if err := os.WriteFile(filepath.Join(root, "tsconfig.json"), []byte(`{"include":["*.ts"]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "a.ts"), []byte("export const a = 1;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GROVE_TS_WORKER_MAX_MB", "1")
+	req := Request{Root: root, Files: []string{"a.ts"}, Resident: true}
+	first := (jsTSAnalyzer{}).Analyze(context.Background(), req)
+	if !strings.Contains(strings.Join(first.Diagnostics, "\n"), "typescript worker stopped at") {
+		t.Fatalf("worker over the cap was not stopped: %v", first.Diagnostics)
+	}
+	second := (jsTSAnalyzer{}).Analyze(context.Background(), req)
+	if slices.Contains(second.Diagnostics, "resident worker") {
+		t.Fatalf("root over the cap still used the worker: %v", second.Diagnostics)
+	}
+	w := tsWorkerFor(root, root)
+	w.mu.Lock()
+	w.armIdleLocked() // no process: must not arm
+	armed := w.idle != nil
+	w.mu.Unlock()
+	if armed {
+		t.Fatal("idle timer armed for a stopped worker")
+	}
+}

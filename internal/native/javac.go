@@ -1,6 +1,7 @@
 package native
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	_ "embed"
@@ -357,6 +358,14 @@ func javaScope(req Request, files []string) (units []string, dirs []string) {
 	if len(dirSet) == 0 {
 		return nil, nil
 	}
+	// A declaration change (signature, added/removed/renamed member or type)
+	// can change how OTHER packages bind: re-attribute the packages that
+	// depend on the changed classes too. Body-only edits keep the scope.
+	if javaDeclarationsChanged(req) {
+		for d := range javaDependentDirs(req, files) {
+			dirSet[d] = true
+		}
+	}
 	for _, f := range files {
 		if dirSet[packageDir(f)] {
 			units = append(units, f)
@@ -370,6 +379,99 @@ func javaScope(req Request, files []string) (units []string, dirs []string) {
 	}
 	sort.Strings(dirs)
 	return units, dirs
+}
+
+// javaDeclarationsChanged reports whether any changed Java file's
+// declarations (kind, qualified name, signature) differ from before the
+// edit. A file with no previous symbols (new, or no baseline) counts as
+// changed.
+func javaDeclarationsChanged(req Request) bool {
+	key := func(s core.SymbolRecord) string {
+		return string(s.Kind) + "\x00" + s.QualifiedName + "\x00" + s.Signature
+	}
+	for _, f := range req.ChangedFiles {
+		if !strings.HasSuffix(f, ".java") {
+			continue
+		}
+		var before, after []string
+		for _, s := range req.PrevChanged {
+			if s.FilePath == f {
+				before = append(before, key(s))
+			}
+		}
+		for _, s := range req.Symbols {
+			if s.FilePath == f {
+				after = append(after, key(s))
+			}
+		}
+		if len(before) == 0 {
+			return true
+		}
+		sort.Strings(before)
+		sort.Strings(after)
+		if strings.Join(before, "\x01") != strings.Join(after, "\x01") {
+			return true
+		}
+	}
+	return false
+}
+
+// javaDependentDirs returns the package dirs of files that may bind to a
+// changed file's classes: they import the class (single-type, nested or
+// static import) or its package, or name it fully qualified in their text.
+func javaDependentDirs(req Request, files []string) map[string]bool {
+	type ref struct{ pkg, class string }
+	var refs []ref
+	for _, f := range req.ChangedFiles {
+		if !strings.HasSuffix(f, ".java") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(req.Root, f))
+		pkg := ""
+		if err == nil {
+			if m := javaPackageDecl.FindSubmatch(data); m != nil {
+				pkg = string(m[1])
+			}
+		}
+		classes := map[string]bool{strings.TrimSuffix(filepath.Base(f), ".java"): true}
+		for _, list := range [][]core.SymbolRecord{req.PrevChanged, req.Symbols} {
+			for _, s := range list {
+				if s.FilePath == f && !strings.Contains(s.QualifiedName, ".") && s.QualifiedName != "" {
+					classes[s.QualifiedName] = true
+				}
+			}
+		}
+		for c := range classes {
+			refs = append(refs, ref{pkg, c})
+		}
+	}
+	javaFile := fileSet(files)
+	out := map[string]bool{}
+	for i := range req.Symbols {
+		s := &req.Symbols[i]
+		if !javaFile[s.FilePath] || out[packageDir(s.FilePath)] {
+			continue
+		}
+		for _, r := range refs {
+			fq := r.class
+			if r.pkg != "" {
+				fq = r.pkg + "." + r.class
+			}
+			hit := false
+			for _, imp := range s.Imports {
+				imp = strings.TrimPrefix(imp, "static ")
+				if imp == fq || strings.HasPrefix(imp, fq+".") || (r.pkg != "" && imp == r.pkg+".*") {
+					hit = true
+					break
+				}
+			}
+			if hit || (r.pkg != "" && s.ParentSymbol == "" && strings.Contains(s.RawText, fq)) {
+				out[packageDir(s.FilePath)] = true
+				break
+			}
+		}
+	}
+	return out
 }
 
 var javaPackageDecl = regexp.MustCompile(`(?m)^\s*package\s+([A-Za-z_$][\w$.]*)\s*;`)
@@ -436,7 +538,7 @@ func javacResolveScoped(ctx context.Context, req Request) ([]core.Edge, []string
 		if len(batchUnits) < len(b.files) {
 			sourcepath = strings.Join(b.roots, string(os.PathListSeparator))
 		}
-		part, err := runJavacResolver(ctx, j, req.Root, tmp, src, cpFile, batchUnits, sourcepath, bi)
+		part, err := runJavacResolver(ctx, j, req.Root, tmp, src, cpFile, batchUnits, sourcepath, bi, req.Resident)
 		if err != nil {
 			return nil, []string{err.Error()}, nil
 		}
@@ -522,7 +624,7 @@ type javacPayload struct {
 	Members []javacRef `json:"members"`
 }
 
-func runJavacResolver(ctx context.Context, j *jdk, root, tmp, src, cpFile string, units []string, sourcepath string, batch int) (javacPayload, error) {
+func runJavacResolver(ctx context.Context, j *jdk, root, tmp, src, cpFile string, units []string, sourcepath string, batch int, resident bool) (javacPayload, error) {
 	var payload javacPayload
 	list := filepath.Join(tmp, "files-"+itoa(batch)+".txt")
 	spFile := filepath.Join(tmp, "sourcepath-"+itoa(batch)+".txt")
@@ -531,6 +633,21 @@ func runJavacResolver(ctx context.Context, j *jdk, root, tmp, src, cpFile string
 	}
 	if err := os.WriteFile(spFile, []byte(sourcepath), 0o600); err != nil {
 		return payload, fmt.Errorf("javac resolver skipped: %v", err)
+	}
+	if resident && javaWorkerEnabled() {
+		line, err := javaWorkerFor(root, j).call(ctx, []byte(strings.Join([]string{root, list, cpFile, spFile}, "\t")))
+		if err == nil {
+			body := line[bytes.LastIndex(line, []byte(javaPayloadSentinel))+len(javaPayloadSentinel):]
+			if !bytes.HasPrefix(bytes.TrimSpace(body), []byte(`{"error"`)) {
+				if err := unmarshalJSON(body, &payload); err == nil {
+					return payload, nil
+				}
+			}
+			StopTSWorkers(root) // a bad payload: restart the worker next time
+		} else if ctx.Err() != nil {
+			return payload, fmt.Errorf("javac worker: %v", err)
+		}
+		// Any other worker failure: fall back to the one-shot process.
 	}
 	cmd := exec.CommandContext(ctx, j.java, "-Xss8m", src, root, list, cpFile, spFile)
 	cmd.Dir = tmp
@@ -663,4 +780,73 @@ func firstLines(s string, n int) string {
 		lines = lines[:n]
 	}
 	return strings.Join(lines, " | ")
+}
+
+// javaPayloadSentinel precedes each resident javac worker payload.
+const javaPayloadSentinel = "@@GROVE_JAVA_PAYLOAD@@"
+
+// javaWorkerEnabled: resident engines keep one JVM running the resolver in
+// --serve mode per repository and JDK, so an edit pays neither JVM startup
+// nor compiling the resolver, and javac runs warm. GROVE_JAVA_WORKER=0
+// turns it off; one-shot CLI runs never use it.
+func javaWorkerEnabled() bool { return os.Getenv("GROVE_JAVA_WORKER") != "0" }
+
+func javaWorkerFor(root string, j *jdk) *residentWorker {
+	return residentWorkerFor("java\x00"+root+"\x00"+j.java, root, javaPayloadSentinel, func() *exec.Cmd {
+		// The single-file launcher compiles the resolver once at startup,
+		// so the source can live in a stable temp path for the worker.
+		src := filepath.Join(os.TempDir(), "grove-javac-resolver-"+shortHash(javacResolverSource)+".java")
+		if _, err := os.Stat(src); err != nil {
+			_ = os.WriteFile(src, []byte(javacResolverSource), 0o600)
+		}
+		cmd := exec.Command(j.java, "-Xss8m", src, "--serve")
+		cmd.Dir = os.TempDir()
+		cmd.Env = j.env()
+		return cmd
+	})
+}
+
+func shortHash(s string) string {
+	h := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(h[:6])
+}
+
+// WarmJavaWorker starts a resident engine's javac worker in the background
+// (JVM startup and compiling the resolver, ~0.3-1s), so the session's first
+// Java edit does not pay it. No-op when workers are off, no JDK is found, or
+// the repo has no Java files.
+func WarmJavaWorker(ctx context.Context, root string, files []string) {
+	if !javaWorkerEnabled() {
+		return
+	}
+	hasJava := false
+	for _, f := range files {
+		if strings.HasSuffix(f, ".java") {
+			hasJava = true
+			break
+		}
+	}
+	if !hasJava {
+		return
+	}
+	j := findJDK()
+	if j == nil {
+		return
+	}
+	tmp, err := os.MkdirTemp("", "grove-javac-warm-")
+	if err != nil {
+		return
+	}
+	defer os.RemoveAll(tmp)
+	var paths []string
+	for _, name := range []string{"files.txt", "classpath.txt", "sourcepath.txt"} {
+		p := filepath.Join(tmp, name)
+		if os.WriteFile(p, nil, 0o600) != nil {
+			return
+		}
+		paths = append(paths, p)
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	_, _ = javaWorkerFor(root, j).call(ctx, []byte(strings.Join(append([]string{root}, paths...), "\t")))
 }

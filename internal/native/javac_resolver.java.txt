@@ -24,6 +24,30 @@ public class GroveJavacResolver {
     static int nCalls = 0, nMembers = 0;
 
     public static void main(String[] args) throws Exception {
+        if (args.length > 0 && args[0].equals("--serve")) {
+            // Resident worker: one request per stdin line (root, files-list,
+            // classpath-file, sourcepath-file, tab-separated), one marked
+            // JSON payload per stdout line. Keeps the JVM and javac warm.
+            BufferedReader in = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
+            PrintStream out = new PrintStream(new FileOutputStream(FileDescriptor.out), true, "UTF-8");
+            String line;
+            while ((line = in.readLine()) != null) {
+                String result;
+                try {
+                    calls.setLength(0); members.setLength(0); seen.clear(); nCalls = 0; nMembers = 0;
+                    result = run(line.split("\t", -1));
+                } catch (Throwable e) {
+                    result = "{\"error\":" + q(String.valueOf(e)) + "}";
+                }
+                out.print("@@GROVE_JAVA_PAYLOAD@@" + result + "\n");
+                out.flush();
+            }
+            return;
+        }
+        System.out.print(run(args));
+    }
+
+    static String run(String[] args) throws Exception {
         Path root = Paths.get(args[0]).toAbsolutePath().normalize();
         List<String> rel = Files.readAllLines(Paths.get(args[1]), StandardCharsets.UTF_8);
         String cp = args.length > 2 ? new String(Files.readAllBytes(Paths.get(args[2])), StandardCharsets.UTF_8).trim() : "";
@@ -42,7 +66,26 @@ public class GroveJavacResolver {
             "-XDshould-stop.ifError=FLOW", "-XDshould-stop.ifNoError=FLOW", "-Xmaxerrs", "100000"));
         if (!cp.isEmpty()) { opts.add("-classpath"); opts.add(cp); }
         if (!sp.isEmpty()) { opts.add("-sourcepath"); opts.add(sp); }
-        JavacTask task = (JavacTask) javac.getTask(null, fm, diags, opts, null, fm.getJavaFileObjectsFromFiles(files));
+        // A scoped run reads other classes from -sourcepath. A module-info.java
+        // on that path (guava's source roots have one) switches javac into
+        // module mode, where classpath packages are not visible: thousands of
+        // types failed to resolve and calls were lost that a full run (which
+        // never compiles module-info.java) resolves. Hide it from lookups so
+        // both runs compile in the unnamed module.
+        JavaFileManager noModules = new ForwardingJavaFileManager<StandardJavaFileManager>(fm) {
+            @Override public JavaFileObject getJavaFileForInput(Location loc, String className, JavaFileObject.Kind kind) throws IOException {
+                if (className.equals("module-info") || className.endsWith(".module-info")) return null;
+                return super.getJavaFileForInput(loc, className, kind);
+            }
+            @Override public Iterable<JavaFileObject> list(Location loc, String pkg, Set<JavaFileObject.Kind> kinds, boolean recurse) throws IOException {
+                List<JavaFileObject> out = new ArrayList<>();
+                for (JavaFileObject f : super.list(loc, pkg, kinds, recurse)) {
+                    if (!f.getName().endsWith("module-info.java") && !f.getName().endsWith("module-info.class")) out.add(f);
+                }
+                return out;
+            }
+        };
+        JavacTask task = (JavacTask) javac.getTask(null, noModules, diags, opts, null, fm.getJavaFileObjectsFromFiles(files));
         Iterable<? extends CompilationUnitTree> units = task.parse();
         task.analyze();
         Trees trees = Trees.instance(task);
@@ -53,8 +96,8 @@ public class GroveJavacResolver {
         }
         int errors = 0;
         for (Diagnostic<?> d : diags.getDiagnostics()) if (d.getKind() == Diagnostic.Kind.ERROR) errors++;
-        System.out.print("{\"files\":" + unitCount + ",\"errors\":" + errors +
-            ",\"calls\":[" + calls + "],\"members\":[" + members + "]}");
+        return "{\"files\":" + unitCount + ",\"errors\":" + errors +
+            ",\"calls\":[" + calls + "],\"members\":[" + members + "]}";
     }
 
     static String q(String s) {

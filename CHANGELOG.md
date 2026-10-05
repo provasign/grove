@@ -1,5 +1,51 @@
 # Changelog
 
+## v0.62.0 - 2026-10-05
+
+Correctness fixes for incremental Java indexing, faster edits for Python
+and Java, a fast one-shot re-index, a worker data-race fix, and bounded
+worker memory. Every change was checked against a full index on real
+repositories (randomized edits through a session: guava, django,
+jackson-databind, typeorm, gin byte-identical).
+
+**Fixes (results)**
+- **Java scoped runs**: a source root holding module-info.java put the
+  scoped javac run into module mode, where classpath packages are not
+  visible (guava: 8,194 compile errors vs 430 in a full run) and calls the
+  full run resolves were lost. Module descriptors are now hidden from the
+  resolver, so both modes compile in the unnamed module.
+- **Java dependents**: a declaration change (signature, added, removed or
+  renamed member or type) now also re-attributes the packages that import
+  or name the changed classes. Before, only the edited package was
+  re-attributed and, for example, a caller of a removed overload lost its
+  compiler edge. Body-only edits keep the single-package scope.
+- **TypeScript worker data race** (v0.61.5+): a request cancelled in flight
+  (Close during the background warm-up) could make the worker's reader
+  goroutine write to a cleared pipe and panic. Found by a Windows -race
+  stress run.
+
+**Speed** (one-line edit in a resident session)
+- **Resident javac worker**: one JVM per repository runs the resolver,
+  warmed after the first index. guava 3.3s -> 2.7s (javac 1.0s -> 0.4s).
+  `GROVE_JAVA_WORKER=0` turns it off.
+- **Import suffix index**: Python absolute imports (and the Maven/Gradle
+  import fallback) were resolved by scanning every path key per import.
+  django 3.0s -> 1.2s.
+- **Session start**: bulk symbol/edge loads sort in Go instead of SQLite
+  ORDER BY (guava first-query hydration ~1.8s -> ~1.5s).
+
+**One-shot engines** (`Config.OneShot`, for CLI commands that index once):
+no resident workers or warm-up, an inline store check, and an index run
+with changes diffs against the stored baseline instead of rebuilding every
+edge. One-shot edit index: guava 11.8s -> 7.9s, django 17.6s -> 4.5s.
+
+**Worker memory**: resident workers exit after 20 idle minutes
+(`GROVE_WORKER_IDLE_MIN`); the TypeScript worker is stopped past 3 GB RSS
+(`GROVE_TS_WORKER_MAX_MB`) and that repository falls back to one-shot runs.
+
+**CI**: the TypeScript analyzer tests now run on every OS and fail instead
+of skipping when the toolchain is missing.
+
 ## v0.61.6 - 2026-10-05
 
 - **Fix**: Engine.Close now waits for its background goroutines (the

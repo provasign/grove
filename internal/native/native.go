@@ -44,6 +44,11 @@ type Config struct {
 	// index again, so analyzers may keep a worker process and its caches
 	// between runs. One-shot CLI runs leave it false.
 	Resident bool
+	// PrevChanged: the changed files' symbols before this run (ID, file,
+	// kind, qualified name, signature). Analyzers that scope to the edited
+	// package compare them with the current symbols: when declarations
+	// changed, other packages' bindings may change too.
+	PrevChanged []core.SymbolRecord
 }
 
 // completionCap bounds a run-to-completion pass (a safety net for a hung
@@ -114,6 +119,8 @@ type Request struct {
 	FileSetChanged bool
 	// Resident: see Config.Resident.
 	Resident bool
+	// PrevChanged: see Config.PrevChanged.
+	PrevChanged []core.SymbolRecord
 }
 
 type Result struct {
@@ -230,7 +237,7 @@ func AnalyzeChangedFiles(ctx context.Context, root string, symbols []core.Symbol
 			reqChanged = nil // a full pass analyzes every package
 		}
 		began := time.Now()
-		result := analyzer.Analyze(runCtx, Request{Root: root, Symbols: symbols, Files: reqFiles, ChangedFiles: reqChanged, FileSetChanged: cfg.FileSetChanged, Resident: cfg.Resident})
+		result := analyzer.Analyze(runCtx, Request{Root: root, Symbols: symbols, Files: reqFiles, ChangedFiles: reqChanged, FileSetChanged: cfg.FileSetChanged, Resident: cfg.Resident, PrevChanged: cfg.PrevChanged})
 		timedOut := errors.Is(runCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
 		cancel()
 		mode := "incremental"
