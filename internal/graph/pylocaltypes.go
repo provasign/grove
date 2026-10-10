@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/provasign/astkit/textmask"
 	"github.com/provasign/grove/internal/core"
 )
 
@@ -579,8 +580,11 @@ func pyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 		// show_server_banner()` is the imported cli module, not the
 		// AppGroup in self.cli) — drop the attribute reading for it.
 		if symbol.RawText != "" {
+			// Masked: a comment or docstring mentioning `self.cli` is not
+			// a use of the attribute.
+			code := maskCode(symbol.Language, symbol.RawText)
 			for name := range out {
-				if !strings.Contains(symbol.RawText, "self."+name) && !strings.Contains(symbol.RawText, "cls."+name) {
+				if !strings.Contains(code, "self."+name) && !strings.Contains(code, "cls."+name) {
 					delete(out, name)
 				}
 			}
@@ -764,12 +768,13 @@ func pyClassAttrTypes(idx *edgeIndex, symbol *core.SymbolRecord, className strin
 		}
 	}
 	if class != nil {
-		for _, m := range pyClassAnnRe.FindAllStringSubmatch(class.RawText, -1) {
-			record(m[1], pyAnnotationType(idx, class, m[2]))
+		attrs := pyClassBodyAttrs(idx, class)
+		for _, a := range attrs.anns {
+			record(a[0], pyAnnotationType(idx, class, a[1]))
 		}
-		for _, m := range pyClassRefRe.FindAllStringSubmatch(class.RawText, -1) {
-			if typeSymbolExists(idx, m[2]) {
-				record(m[1], "class:"+m[2])
+		for _, a := range attrs.refs {
+			if typeSymbolExists(idx, a[1]) {
+				record(a[0], "class:"+a[1])
 			}
 		}
 	}
@@ -799,6 +804,48 @@ func pyClassAttrTypes(idx *edgeIndex, symbol *core.SymbolRecord, className strin
 			}
 		}
 	}
+}
+
+// pyClassAttrs holds a class body's own attribute statements: annotations
+// (`name: T`, `name: T = v`) and class references (`name = SomeClass`), as
+// (name, text) pairs in source order.
+type pyClassAttrs struct{ anns, refs [][2]string }
+
+// pyClassBodyAttrs reads the class-body attribute statements of cls, memoized
+// per class. Only statements at the class body's own indentation count
+// (classBody): a method's local `tmp: Bar` or a docstring's numpy
+// "client : Bar" line is not an attribute. The annotation text is read with
+// only comments masked, since a string annotation (`parent: "Node"`) is type
+// syntax; a match counts only where the fully masked body has code, so a
+// docstring is never read.
+func pyClassBodyAttrs(idx *edgeIndex, cls *core.SymbolRecord) pyClassAttrs {
+	key := "py-attrs\x00" + cls.ID
+	if idx != nil && cls.ID != "" {
+		if v, ok := idx.classBodies.Load(key); ok {
+			return v.(pyClassAttrs)
+		}
+	}
+	var attrs pyClassAttrs
+	if top := classBody(idx, cls); top != "" {
+		text := textmask.MaskComments(cls.Language, cls.RawText)
+		inCode := func(loc []int) bool {
+			return loc[2] < len(top) && top[loc[2]] != ' ' && top[loc[2]] != '\t'
+		}
+		for _, loc := range pyClassAnnRe.FindAllStringSubmatchIndex(text, -1) {
+			if inCode(loc) {
+				attrs.anns = append(attrs.anns, [2]string{text[loc[2]:loc[3]], text[loc[4]:loc[5]]})
+			}
+		}
+		for _, loc := range pyClassRefRe.FindAllStringSubmatchIndex(text, -1) {
+			if inCode(loc) {
+				attrs.refs = append(attrs.refs, [2]string{text[loc[2]:loc[3]], text[loc[4]:loc[5]]})
+			}
+		}
+	}
+	if idx != nil && cls.ID != "" {
+		idx.classBodies.Store(key, attrs)
+	}
+	return attrs
 }
 
 // pyBaseClasses parses the base-class names from a class declaration
@@ -1592,11 +1639,12 @@ func pyArityCompatible(cands []*core.SymbolRecord, argc int) []*core.SymbolRecor
 // pyCallHasSplat reports whether the call at cs unpacks arguments (*a, **kw)
 // -- then its real argument count is unknown -- or cannot be located (also
 // unknown). Only a located call with plain arguments has a known count.
-func pyCallHasSplat(symbol *core.SymbolRecord, cs core.CallSite) bool {
+func pyCallHasSplat(idx *edgeIndex, symbol *core.SymbolRecord, cs core.CallSite) bool {
 	if symbol.RawText == "" || cs.Line < symbol.Span.Start {
 		return true
 	}
-	lines := strings.Split(symbol.RawText, "\n")
+	// Masked: a `leaf(` or `*` inside a string or comment is not the call.
+	lines := maskedSymbolLines(idx, symbol)
 	off := cs.Line - symbol.Span.Start
 	if off < 0 || off >= len(lines) {
 		return true
@@ -1694,9 +1742,9 @@ func pyAttrAnnotation(idx *edgeIndex, className, attr, preferDir string) string 
 	if cls == nil {
 		return ""
 	}
-	for _, m := range pyClassAnnRe.FindAllStringSubmatch(cls.RawText, -1) {
-		if m[1] == attr {
-			return m[2]
+	for _, a := range pyClassBodyAttrs(idx, cls).anns {
+		if a[0] == attr {
+			return a[1]
 		}
 	}
 	for _, cand := range idx.byFile[cls.FilePath] {

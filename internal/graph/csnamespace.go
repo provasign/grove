@@ -272,9 +272,9 @@ func csIsExtensionMethod(s *core.SymbolRecord) bool {
 	if s.Language != "csharp" || s.Kind != core.KindMethod {
 		return false
 	}
-	params := tsDeclParams(s.Signature)
+	params := tsDeclParams(s.Language, s.Signature)
 	if params == "" {
-		params = tsDeclParams(s.RawText)
+		params = tsDeclParams(s.Language, s.RawText)
 	}
 	first := strings.TrimSpace(strings.SplitN(params, ",", 2)[0])
 	return strings.HasPrefix(first, "this ")

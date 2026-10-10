@@ -892,7 +892,7 @@ func (c *memberClassifier) cFieldType(typeName, field string) string {
 		if f.ParentSymbol != typeName || f.Kind != core.KindField {
 			continue
 		}
-		if m := cFieldTypeRe.FindStringSubmatch(f.Signature); m != nil {
+		if m := cFieldTypeRe.FindStringSubmatch(codeSignature(&f)); m != nil {
 			t := lastSegment(strings.ReplaceAll(m[1], "::", "."))
 			if c.typeExists(t) {
 				return t
@@ -972,7 +972,7 @@ func (c *memberClassifier) returnTypeOf(f *core.SymbolRecord) string {
 		return goReturnType(c.edgeIdx(), f)
 	case "c", "cpp", "objc":
 		if f.Kind == core.KindMacro {
-			body := f.RawText
+			body := maskCode(f.Language, f.RawText)
 			for _, re := range []*regexp.Regexp{cContainerOfRe, cCastRe} {
 				if m := re.FindStringSubmatch(body); m != nil && c.typeExists(m[1]) {
 					return m[1]
@@ -981,7 +981,7 @@ func (c *memberClassifier) returnTypeOf(f *core.SymbolRecord) string {
 			return ""
 		}
 		re := regexp.MustCompile(`\b(?:struct\s+)?([A-Za-z_]\w*)\s*\*?\s*` + regexp.QuoteMeta(f.Name) + `\s*\(`)
-		if m := re.FindStringSubmatch(f.Signature); m != nil && c.typeExists(m[1]) {
+		if m := re.FindStringSubmatch(codeSignature(f)); m != nil && c.typeExists(m[1]) {
 			return m[1]
 		}
 	case "python":
@@ -1078,7 +1078,7 @@ func (c *memberClassifier) pyModuleVarType(name string) string {
 		if v.Language != "python" || v.ParentSymbol != "" || !dataMemberKinds[v.Kind] {
 			continue
 		}
-		m := pyModuleCtorRe.FindStringSubmatch(v.Signature + "\n" + v.RawText)
+		m := pyModuleCtorRe.FindStringSubmatch(maskCode(v.Language, v.Signature+"\n"+v.RawText))
 		if m == nil || !c.typeExists(m[1]) {
 			continue
 		}

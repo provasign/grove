@@ -50,11 +50,9 @@ func cFamilyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]str
 					default:
 						continue
 					}
-					body := cls.RawText
-					if i := strings.IndexByte(body, '{'); i >= 0 {
-						body = body[i+1:]
-					}
-					for _, m := range cppLocalDeclRe.FindAllStringSubmatch(body, -1) {
+					// Top-level members only (classBody): an inline method's
+					// local or a commented-out declaration is not a field.
+					for _, m := range cppLocalDeclRe.FindAllStringSubmatch(classBody(idx, cls), -1) {
 						if t := cFamilyBareType(m[1]); t != "" {
 							if _, exists := out[m[2]]; !exists {
 								record(m[2], t)

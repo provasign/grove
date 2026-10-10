@@ -27,7 +27,7 @@ var (
 func objcLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 	out := map[string]string{}
 
-	for _, m := range objcParamRe.FindAllStringSubmatch(symbol.Signature, -1) {
+	for _, m := range objcParamRe.FindAllStringSubmatch(codeSignature(symbol), -1) {
 		if typ := objcBareType(m[1]); typ != "" {
 			out[m[2]] = typ
 		}
@@ -78,7 +78,7 @@ func objcIvarTypes(idx *edgeIndex, class, file string) map[string]string {
 			if field.Kind != core.KindField || field.ParentSymbol != class || field.Language != "objc" {
 				continue
 			}
-			m := objcMemberDeclRe.FindStringSubmatch(field.Signature)
+			m := objcMemberDeclRe.FindStringSubmatch(codeSignature(field))
 			if m == nil {
 				continue
 			}
@@ -122,7 +122,7 @@ func objcCallResultClasses(idx *edgeIndex, name string, caller *core.SymbolRecor
 		if cand.Language != "objc" || cand.Kind != core.KindMethod {
 			continue
 		}
-		m := objcReturnTypeRe.FindStringSubmatch(cand.Signature)
+		m := objcReturnTypeRe.FindStringSubmatch(codeSignature(cand))
 		if m == nil {
 			continue
 		}
@@ -159,9 +159,9 @@ func objcBaseClasses(idx *edgeIndex, className string) []string {
 		if decl.Language != "objc" || decl.Kind != core.KindClass {
 			continue
 		}
-		text := decl.Signature
+		text := codeSignature(decl)
 		if text == "" {
-			text = firstLine(decl.RawText)
+			text = maskCode(decl.Language, firstLine(decl.RawText))
 		}
 		if m := objcSuperclassRe.FindStringSubmatch(text); len(m) == 2 {
 			return []string{m[1]}
