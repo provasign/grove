@@ -142,5 +142,43 @@ class U {
 `),
 			want: []string{"E U.m calls Store.size"},
 		},
+		{
+			// newtonsoft: astkit cut C# attribute sections out of signatures
+			// (strings in them read as types), so typeof(T) and Enum.Member
+			// arguments lost their uses-type edges with them. They are read
+			// from the masked attribute text now; a string or a named
+			// argument's name is not a type.
+			id: "J4-csharp-attribute-type-references",
+			clean: one("A.cs", `namespace P {
+    public class AConverter { }
+    public enum Mode { Fast, Slow }
+    public class Name { }
+    public class ConverterAttribute : System.Attribute { }
+    public class Holder {
+        [Converter(typeof(AConverter), Mode.Fast)]
+        public int Value { get; set; }
+        [Converter(Name = "x")]
+        public int Other { get; set; }
+    }
+}
+`),
+			decoy: one("A.cs", `namespace P {
+    public class AConverter { }
+    public enum Mode { Fast, Slow }
+    public class Name { }
+    public class ConverterAttribute : System.Attribute { }
+    public class Holder {
+        [Converter(typeof(AConverter), /* typeof(Name) */ Mode.Fast)] // Name.Thing
+        public int Value { get; set; }
+        [Converter(Name = "x Name.Thing typeof(Mode)")]
+        public int Other { get; set; }
+    }
+}
+`),
+			rawAnnotations: true,
+			want: []string{"E Holder.Value uses-type AConverter", "E Holder.Value uses-type Mode",
+				"E Holder.Value uses-type ConverterAttribute", "E Holder.Other uses-type ConverterAttribute"},
+			wantNot: []string{"E Holder.Value uses-type Name", "E Holder.Other uses-type Name", "E Holder.Other uses-type Mode"},
+		},
 	}
 }

@@ -1922,6 +1922,11 @@ func buildUsesType(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
 		scope := idx.importedFiles(symbol.FilePath)
 		sig := codeSignature(&symbol)
 		matches := usesTypeIdent.FindAllStringSubmatch(sig, -1)
+		if symbol.Language == "csharp" && len(symbol.Annotations) > 0 {
+			for _, name := range csharpAttributeTypeNames(idx, &symbol) {
+				matches = append(matches, []string{name, name})
+			}
+		}
 		for _, m := range matches {
 			candidateName := m[1]
 			if candidateName == symbol.Name {
