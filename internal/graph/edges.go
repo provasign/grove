@@ -3934,7 +3934,7 @@ func declParamCount(s *core.SymbolRecord) (int, bool, bool) {
 		}
 		return 0, false, false
 	}
-	groups := splitTopLevel(params, ',')
+	groups := splitParams(s.Language, params)
 	if s.Language == "java" {
 		groups = splitJavaParamGroups(params)
 	}

@@ -1358,7 +1358,7 @@ func paramTypesOf(s *core.SymbolRecord) []string {
 		return pyParamTypeTokens(inner)
 	}
 	var out []string
-	for _, gr := range splitTopLevel(inner, ',') {
+	for _, gr := range splitParams(s.Language, inner) {
 		token := bareTypeToken(gr)
 		switch s.Language {
 		case "typescript", "tsx", "javascript":
@@ -1380,7 +1380,7 @@ func paramTypesOf(s *core.SymbolRecord) []string {
 // so one unannotated parameter makes the whole list neutral (nil).
 func pyParamTypeTokens(inner string) []string {
 	var out []string
-	for i, gr := range splitTopLevel(inner, ',') {
+	for i, gr := range splitParams("python", inner) {
 		gr = strings.TrimSpace(gr)
 		name, ann, annotated := strings.Cut(gr, ":")
 		name = strings.TrimSpace(name)
@@ -1418,7 +1418,7 @@ func pyParamTypeTokens(inner string) []string {
 // Returns nil (neutral evidence, like paramTypesOf) when a token cannot be
 // recovered.
 func goParamTokens(inner string) []string {
-	groups := splitTopLevel(inner, ',')
+	groups := splitParams("go", inner)
 	n := len(groups)
 	types := make([]string, n)
 	named := false
