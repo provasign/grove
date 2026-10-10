@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/provasign/astkit/textmask"
 )
 
 // Content-based detection for mainframe artifacts. Estate exports are routinely
@@ -30,6 +32,9 @@ var (
 	sniffLevelLine = regexp.MustCompile(`(?m)^.{7}\s*\d{2}\s+[A-Z0-9][A-Z0-9-]*`)
 	sniffPIC       = regexp.MustCompile(`(?i)\bPIC(?:TURE)?\s+`)
 	sniffCPPHeader = regexp.MustCompile(`(?m)^\s*(?:template\s*<|namespace\b|class\s+[A-Za-z_]|extern\s+"C")`)
+	// sniffCPlusPlusGuard matches a conditional on __cplusplus; group 1 is
+	// set when it tests for its absence (`#ifndef`, `#if !defined`).
+	sniffCPlusPlusGuard = regexp.MustCompile(`^#\s*(?:ifdef\s+__cplusplus\b|if\s+(?:defined\s*\(?\s*__cplusplus\b|__cplusplus\b)|(ifndef\s+__cplusplus\b|if\s+!\s*defined\s*\(?\s*__cplusplus\b))`)
 	// Objective-C headers use a small set of `@`-prefixed keywords with no
 	// C or C++ equivalent — unambiguous even in a header carrying ordinary
 	// C declarations alongside them (the common case: Foundation-style
@@ -39,14 +44,73 @@ var (
 
 // sniffHeader classifies a .h file's content as "objc", "cpp", or "" (plain
 // C, the default DetectLanguage/DetectLanguageFile already assume).
+//
+// The markers are matched on sniffHeaderCode, so a comment line starting
+// with "namespace" or "class", an `#if 0` branch, or the C-library idiom
+// `#ifdef __cplusplus / extern "C" { / #endif` does not make a C header C++.
 func sniffHeader(content []byte) string {
-	if sniffObjCHeader.Match(content) {
+	code := sniffHeaderCode(string(content))
+	if sniffObjCHeader.MatchString(code) {
 		return "objc"
 	}
-	if sniffCPPHeader.Match(content) {
+	if sniffCPPHeader.MatchString(code) {
 		return "cpp"
 	}
 	return ""
+}
+
+// sniffHeaderCode returns content with comments and `#if 0` branches
+// blanked (astkit textmask) and the C++-only branches of __cplusplus
+// conditionals blanked: what those branches hold is only ever seen by a C++
+// compiler including a header written to be C as well.
+func sniffHeaderCode(content string) string {
+	code := textmask.MaskComments("cpp", textmask.MaskInactivePreprocessor("cpp", content))
+	if !strings.Contains(code, "__cplusplus") {
+		return code
+	}
+	lines := strings.Split(code, "\n")
+	// One frame per open conditional: cppOnly marks the branch being read
+	// as visible to C++ only; guard is 1 for `#ifdef __cplusplus`, -1 for
+	// `#ifndef __cplusplus`, 0 for any other conditional.
+	type frame struct {
+		guard   int
+		cppOnly bool
+	}
+	var stack []frame
+	for i, line := range lines {
+		t := strings.TrimSpace(line)
+		directive := strings.HasPrefix(t, "#")
+		if directive {
+			d := strings.TrimSpace(strings.TrimPrefix(t, "#"))
+			switch {
+			case strings.HasPrefix(d, "if"):
+				f := frame{}
+				if m := sniffCPlusPlusGuard.FindStringSubmatch(t); m != nil {
+					f.guard = 1
+					if m[1] != "" {
+						f.guard = -1
+					}
+					f.cppOnly = f.guard == 1
+				}
+				stack = append(stack, f)
+			case strings.HasPrefix(d, "el"):
+				if n := len(stack); n > 0 && stack[n-1].guard != 0 {
+					stack[n-1].cppOnly = stack[n-1].guard == -1
+				}
+			case strings.HasPrefix(d, "endif"):
+				if n := len(stack); n > 0 {
+					stack = stack[:n-1]
+				}
+			}
+		}
+		for _, f := range stack {
+			if f.cppOnly && !directive {
+				lines[i] = ""
+				break
+			}
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 // sniffMainframe classifies head bytes as "cobol", "jcl", or "".

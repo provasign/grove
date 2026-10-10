@@ -111,3 +111,35 @@ func languageForPath(path string) string {
 	}
 	return "typescript"
 }
+
+// Comment/string-as-code audit (2026-10-10): import alias patterns read the
+// statement with comments masked; `/* b as c */` binds nothing.
+func TestImportAliasesIgnoreComments(t *testing.T) {
+	js := extractImports("typescript", "import { a as x, /* b as c */ } from './m';\n")
+	py := extractImports("python", "from m import (\n    a as x,  # b as c\n    b,\n)\n")
+	for _, imp := range js {
+		if strings.Contains(imp, "c=") {
+			t.Errorf("typescript: alias from a comment: %q in %v", imp, js)
+		}
+	}
+	if !contains(js, core.JSImportAlias("x", "./m#a")) {
+		t.Errorf("typescript: real alias missing: %v", js)
+	}
+	for _, imp := range py {
+		if strings.Contains(imp, ":c=") {
+			t.Errorf("python: alias from a comment: %q in %v", imp, py)
+		}
+	}
+	if !contains(py, core.PythonImportBinding(1, "b", "m#b")) {
+		t.Errorf("python: real binding b missing: %v", py)
+	}
+}
+
+func contains(list []string, want string) bool {
+	for _, s := range list {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}

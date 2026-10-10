@@ -79,6 +79,13 @@ func TestDetectLanguageFile_HeaderSniff(t *testing.T) {
 	}{
 		{"plain-c.h", "int add(int a, int b);\n", "c"},
 		{"cpp.h", "namespace geo {\nclass Shape {};\n}\n", "cpp"},
+		// The C-library guard is C: only a C++ compiler sees its branch.
+		{"c-guard.h", "#ifdef __cplusplus\nextern \"C\" {\n#endif\nint add(int a, int b);\n#ifdef __cplusplus\n}\n#endif\n", "c"},
+		{"c-guard-defined.h", "#if defined(__cplusplus)\nextern \"C\" {\n#endif\nint add(int a, int b);\n", "c"},
+		{"c-guard-ifndef.h", "#ifndef __cplusplus\ntypedef int bool;\n#else\nclass Wrapper;\n#endif\n", "c"},
+		{"cpp-extern-c.h", "extern \"C\" {\nint add(int a, int b);\n}\n", "cpp"},
+		{"cpp-after-guard.h", "#ifdef __cplusplus\nextern \"C\" {\n#endif\nint add(int a, int b);\n#ifdef __cplusplus\n}\n#endif\nnamespace geo { int f(); }\n", "cpp"},
+		{"if0-namespace.h", "#if 0\nnamespace old {\n#endif\nint add(int a, int b);\n", "c"},
 		{"objc-interface.h", "@interface Person : NSObject\n@end\n", "objc"},
 		{"objc-protocol.h", "@protocol Greeter\n- (void)greet;\n@end\n", "objc"},
 		{"objc-forward-decl.h", "@class Person;\nint helper(void);\n", "objc"},

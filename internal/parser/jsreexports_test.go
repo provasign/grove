@@ -63,3 +63,16 @@ func TestJSExportIndexMatchesPerNameScan(t *testing.T) {
 		t.Fatalf("index = %+v, scan = %+v", idx, one)
 	}
 }
+
+// Comment/string-as-code audit (2026-10-10): a template literal holding an
+// export clause is text, and a regex literal holding `/*` or a backtick
+// does not hide a real clause after it.
+func TestJSExportSpecifiersIgnoreLiterals(t *testing.T) {
+	src := "const doc = `\nexport { a as fromTemplate }\n`;\n" +
+		"const re = /[/*]/;\nconst tick = /`/;\n" +
+		"export { a as real } from './m';\n"
+	got := jsExportSpecifiersIn("x.ts", []byte(src), "a")
+	if len(got) != 1 || got[0].Exported != "real" || got[0].Source != "./m" || got[0].Line != 6 {
+		t.Fatalf("specifiers = %+v, want only a as real from ./m on line 6", got)
+	}
+}
