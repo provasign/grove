@@ -1173,17 +1173,31 @@ func extractSymbolsRegex(language, filePath, blobSHA, content string, fileImport
 	}
 
 	lines := strings.Split(content, "\n")
+	// Patterns match on a copy with comments and string literals blanked
+	// (line numbers kept). Syntax recovery merges every regex name the AST
+	// missed, and the Java patterns are unanchored: Javadoc prose such as
+	// " * Deserializer class that can ..." became a class named "that"
+	// spanning hundreds of lines, and Guava's Preconditions/Verify docs
+	// produced classes named "for", "to", "should". Signatures and bodies
+	// still come from the source.
+	clean := lines
+	switch language {
+	case "java", "csharp", "typescript", "tsx", "javascript", "rust", "php":
+		clean = strings.Split(blankCFamilyComments(content), "\n")
+	case "python":
+		clean = strings.Split(blankPythonCommentsAndStrings(content), "\n")
+	}
 	var symbols []core.SymbolRecord
 
 	for i := 0; i < len(lines); i++ {
 		line := lines[i]
-		trimmed := strings.TrimSpace(line)
+		trimmed := strings.TrimSpace(clean[i])
 		if trimmed == "" || strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "#") {
 			continue
 		}
 
 		for _, pattern := range patterns {
-			matches := pattern.regex.FindStringSubmatch(line)
+			matches := pattern.regex.FindStringSubmatch(clean[i])
 			if len(matches) < 2 {
 				continue
 			}
@@ -1368,6 +1382,61 @@ var cFamilyReservedName = map[string]bool{
 // line lengths are unchanged. Unlike stripCppCommentsAndStrings a literal
 // never runs past the end of its line, so an apostrophe in prose
 // (`#error don't`) or a digit separator cannot swallow the rest of the file.
+// blankPythonCommentsAndStrings blanks "#" comments and string literals,
+// including triple-quoted docstrings across lines, keeping newlines so line
+// numbers are unchanged. A docstring line such as "    class attribute ..."
+// otherwise matches the anchored class pattern.
+func blankPythonCommentsAndStrings(content string) string {
+	out := []byte(content)
+	for i := 0; i < len(out); {
+		switch c := out[i]; {
+		case c == '#':
+			for i < len(out) && out[i] != '\n' {
+				out[i] = ' '
+				i++
+			}
+		case c == '"' || c == '\'':
+			if i+2 < len(out) && out[i+1] == c && out[i+2] == c {
+				out[i], out[i+1], out[i+2] = ' ', ' ', ' '
+				i += 3
+				for i < len(out) && !(out[i] == c && i+2 < len(out) && out[i+1] == c && out[i+2] == c) {
+					if out[i] == '\\' && i+1 < len(out) && out[i+1] != '\n' {
+						out[i], out[i+1] = ' ', ' '
+						i += 2
+						continue
+					}
+					if out[i] != '\n' {
+						out[i] = ' '
+					}
+					i++
+				}
+				for k := 0; k < 3 && i < len(out); k++ {
+					out[i] = ' '
+					i++
+				}
+				continue
+			}
+			i++
+			for i < len(out) && out[i] != '\n' {
+				if out[i] == '\\' && i+1 < len(out) && out[i+1] != '\n' {
+					out[i], out[i+1] = ' ', ' '
+					i += 2
+					continue
+				}
+				if out[i] == c {
+					i++
+					break
+				}
+				out[i] = ' '
+				i++
+			}
+		default:
+			i++
+		}
+	}
+	return string(out)
+}
+
 func blankCFamilyComments(content string) string {
 	out := []byte(content)
 	for i := 0; i < len(out); {
