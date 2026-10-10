@@ -40,6 +40,77 @@ class Impl extends Builder {
 			rawAnnotations: true,
 		},
 		{
+			// guava: anonymous classes are named by position, so two files of
+			// one package each had a `<anonymous@4:12>`. The hierarchy and
+			// method-set maps looked them up by name, gave one file's class
+			// the other's base, and a comment line above either one moved
+			// the collision (10k dispatch edges changed under the decoy).
+			// The decoy keeps every line in place (names carry line numbers)
+			// and only adds comments.
+			id: "J2-java-anonymous-classes-same-position",
+			clean: map[string]string{
+				"src/p/Task.java": "package p;\ninterface Task { void run(); }\n",
+				"src/p/A.java": `package p;
+class A {
+  Task make() {
+    return new Task() {
+      public void run() {}
+    };
+  }
+}
+`,
+				"src/p/B.java": `package p;
+class B {
+  Thread make() {
+    return new Thread() {
+      public void run() {}
+    };
+  }
+}
+`,
+				"src/p/C.java": `package p;
+class C {
+  void go(Task task) {
+    task.run();
+  }
+}
+`,
+			},
+			decoy: map[string]string{
+				"src/p/Task.java": "package p;\ninterface Task { void run(); } // class Fake implements Task\n",
+				"src/p/A.java": `package p;
+class A { // new Thread() {
+  Task make() { // new Task() {
+    return new Task() { // public void run() {}
+      public void run() {}
+    };
+  }
+}
+`,
+				"src/p/B.java": `package p;
+class B { /* extends Task */
+  Thread make() {
+    return new Thread() { // implements Task
+      public void run() {}
+    };
+  }
+}
+`,
+				"src/p/C.java": `package p;
+class C {
+  void go(Task task) { // Thread task;
+    task.run();
+  }
+}
+`,
+			},
+			// Dispatch edges are astkit-mode only (javac binds Task.run), so
+			// the facts are the hierarchy; graph/java_anonymous_test.go
+			// covers the by-name lookups.
+			want:    []string{"E run@src/p/A.java overrides Task", "E C.go calls Task.run"},
+			wantNot: []string{"E run@src/p/B.java overrides Task"},
+		},
+		{
 			// A local declared without an initializer and assigned later
 			// (`Map<K, V> map;` before a try). Its type used to arrive by
 			// accident, from a class "field" regex run over every method

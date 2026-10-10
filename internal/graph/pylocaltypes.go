@@ -1009,7 +1009,7 @@ func inheritedTargets(idx *edgeIndex, symbol *core.SymbolRecord, calleeName stri
 	if len(all) == 0 {
 		return nil
 	}
-	bases := baseClassesFor(idx, symbol.Language, symbol.ParentSymbol, dirOf(symbol.FilePath))
+	bases := baseClassesInFileFor(idx, symbol.Language, symbol.ParentSymbol, symbol.FilePath)
 	// TS/JS: a base class name is resolved through the subclass file's
 	// imports. A monorepo declares `class Transport` in both engine.io and
 	// engine.io-client; `this.onError()` in the client's Fetch transport
@@ -1070,7 +1070,7 @@ func narrowBySuper(idx *edgeIndex, symbol *core.SymbolRecord, cands []*core.Symb
 		}
 		return nil
 	}
-	bases := baseClassesFor(idx, symbol.Language, symbol.ParentSymbol, dirOf(symbol.FilePath))
+	bases := baseClassesInFileFor(idx, symbol.Language, symbol.ParentSymbol, symbol.FilePath)
 	for level := 0; level < 3 && len(bases) > 0; level++ {
 		var matched []*core.SymbolRecord
 		for _, base := range bases {
@@ -1428,8 +1428,14 @@ func subclassOverrides(idx *edgeIndex, language, className, calleeName, preferDi
 				if c.Language == "cpp" && strings.Contains(c.QualifiedName, "::") {
 					className = c.QualifiedName
 				}
-				for _, base := range baseClassesFor(idx, c.Language, className, dirOf(c.FilePath)) {
-					byLang[base] = append(byLang[base], className)
+				sub := className
+				if fileLocalTypeName(className) {
+					// Kept apart from same-named anonymous classes of
+					// other files; see subclassMembers.
+					sub = className + "\x00" + c.FilePath
+				}
+				for _, base := range baseClassesInFileFor(idx, c.Language, className, c.FilePath) {
+					byLang[base] = append(byLang[base], sub)
 				}
 			}
 		}
@@ -1464,10 +1470,27 @@ func subclassOverrides(idx *edgeIndex, language, className, calleeName, preferDi
 				}
 				visited[sub] = true
 				next = append(next, sub)
-				out = append(out, filterByParent(methods, sub)...)
+				out = append(out, subclassMembers(methods, sub)...)
 			}
 		}
 		frontier = next
+	}
+	return out
+}
+
+// subclassMembers filters methods to those of the subclass key sub: a class
+// name, or for a file-local (anonymous) class its name and file joined by
+// NUL.
+func subclassMembers(methods []*core.SymbolRecord, sub string) []*core.SymbolRecord {
+	name, file, local := strings.Cut(sub, "\x00")
+	if !local {
+		return filterByParent(methods, sub)
+	}
+	var out []*core.SymbolRecord
+	for _, m := range filterByParent(methods, name) {
+		if m.FilePath == file {
+			out = append(out, m)
+		}
 	}
 	return out
 }

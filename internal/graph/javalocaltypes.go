@@ -171,7 +171,7 @@ func javaArgTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 						}
 					}
 				}
-				next = append(next, tsBaseClasses(idx, className, dirOf(symbol.FilePath))...)
+				next = append(next, baseClassesInFileFor(idx, "java", className, symbol.FilePath)...)
 			}
 			classes = next
 		}
@@ -679,7 +679,7 @@ func javaCallResultOwners(idx *edgeIndex, candidates []*core.SymbolRecord, name 
 	for depth := 0; depth < 4 && len(level) > 0; depth++ {
 		next := map[string]bool{}
 		for owner := range level {
-			for _, base := range baseClassesFor(idx, "java", owner, dirOf(symbol.FilePath)) {
+			for _, base := range baseClassesInFileFor(idx, "java", owner, symbol.FilePath) {
 				if !owners[base] {
 					owners[base] = true
 					next[base] = true
@@ -896,7 +896,7 @@ func javaLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string
 				if cls := javaOwnerType(idx, className, symbol.FilePath); cls != nil {
 					javaClassFields(idx, cls, className, out)
 				}
-				next = append(next, tsBaseClasses(idx, className, dirOf(symbol.FilePath))...)
+				next = append(next, baseClassesInFileFor(idx, "java", className, symbol.FilePath)...)
 			}
 			classes = next
 		}

@@ -3210,7 +3210,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			if qualifier == "super()" || qualifier == "super" || (symbol.Language == "csharp" && qualifier == "base") ||
 				(symbol.Language == "php" && qualifier == "parent") {
 				if traceCalls {
-					fmt.Fprintf(os.Stderr, "grove-trace %s: super bases=%v matched=%d\n", symbol.QualifiedName, baseClassesFor(idx, symbol.Language, symbol.ParentSymbol, dirOf(symbol.FilePath)), len(narrowBySuper(idx, &symbol, cands)))
+					fmt.Fprintf(os.Stderr, "grove-trace %s: super bases=%v matched=%d\n", symbol.QualifiedName, baseClassesInFileFor(idx, symbol.Language, symbol.ParentSymbol, symbol.FilePath), len(narrowBySuper(idx, &symbol, cands)))
 				}
 				viaSuper := narrowBySuper(idx, &symbol, cands)
 				// `base.WriteValue(x)` binds ONE overload on the base type,

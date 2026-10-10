@@ -928,6 +928,27 @@ func constructorBaseClasses(idx *edgeIndex, language, className, preferDir strin
 	return baseClassesFor(idx, language, className, preferDir)
 }
 
+// fileLocalTypeName reports whether className is a name the parser made up
+// for an anonymous class (`<anonymous@193:9>`). Its line and column are
+// unique only inside its own file and move with every line above it, so
+// looked up by name it binds whichever other file has a class at the same
+// position (guava: AbstractIteratorTest's and ImmutableSortedMapTest's
+// `<anonymous@193:9>` share a directory).
+func fileLocalTypeName(className string) bool {
+	return strings.HasPrefix(className, "<")
+}
+
+// baseClassesInFileFor is baseClassesFor for a class declared in file: a
+// file-local (anonymous) class is read from its declaration in that file,
+// any other name resolves as baseClassesFor does from file's directory.
+func baseClassesInFileFor(idx *edgeIndex, language, className, file string) []string {
+	if fileLocalTypeName(className) {
+		bases, _ := tsBaseClassesInFile(idx, className, file)
+		return bases
+	}
+	return baseClassesFor(idx, language, className, dirOf(file))
+}
+
 // tsBaseClassesInFile reads the inheritance clauses of the class-like
 // declaration named className in file (ok=false when file declares none).
 func tsBaseClassesInFile(idx *edgeIndex, className, file string) ([]string, bool) {
