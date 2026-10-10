@@ -39,7 +39,7 @@ func kotlinLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]stri
 	}
 
 	if symbol.RawText != "" {
-		body := stripCommentsAndStrings(symbol.RawText)
+		body := maskCode(symbol.Language, symbol.RawText)
 		for _, m := range kotlinValTypedRe.FindAllStringSubmatch(body, -1) {
 			if typ := kotlinBareType(m[2]); typ != "" {
 				out[m[1]] = typ
@@ -201,7 +201,7 @@ func kotlinArgShapes(symbol *core.SymbolRecord) map[string]string {
 		}
 	}
 	if symbol.RawText != "" {
-		body := stripCommentsAndStrings(symbol.RawText)
+		body := maskCode(symbol.Language, symbol.RawText)
 		for _, m := range kotlinValTypedRe.FindAllStringSubmatch(body, -1) {
 			if shape := kotlinShapeType(m[2]); shape != "" {
 				out[m[1]] = shape

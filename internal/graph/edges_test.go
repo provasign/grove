@@ -74,21 +74,23 @@ func TestFanoutCapRunsAfterTypedReceiverNarrowing(t *testing.T) {
 	}
 }
 
-func TestStripCommentsAndStringsPreservesExecutableSyntax(t *testing.T) {
+func TestMaskCodePreservesExecutableSyntax(t *testing.T) {
 	for name, tc := range map[string]struct {
+		lang  string
 		input string
 		want  string
 	}{
-		"template interpolation": {"return `value=${g.label()}`;", "g.label()"},
-		"python f-string":        {"return f'value={g.label()}'", "g.label()"},
-		"csharp interpolation":   {"return $\"value={g.Label()}\";", "g.Label()"},
-		"rust lifetime":          {"fn f<'a>(x: &'a str) { target(); }", "target()"},
-		"csharp verbatim":        {"var p = @\"C:\\dir\\\"; target();", "target()"},
-		"javascript regex":       {"s.replace(/[\"']/g, ''); target();", "target()"},
+		"template interpolation": {"typescript", "return `value=${g.label()}`;", "g.label()"},
+		"python f-string":        {"python", "return f'value={g.label()}'", "g.label()"},
+		"csharp interpolation":   {"csharp", "return $\"value={g.Label()}\";", "g.Label()"},
+		"rust lifetime":          {"rust", "fn f<'a>(x: &'a str) { target(); }", "target()"},
+		"csharp verbatim":        {"csharp", "var p = @\"C:\\dir\\\"; target();", "target()"},
+		"javascript regex":       {"javascript", "s.replace(/[\"']/g, ''); target();", "target()"},
+		"python single quotes":   {"python", "log('starting up')\nclient = Foo()", "client = Foo()"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if got := stripCommentsAndStrings(tc.input); !strings.Contains(got, tc.want) {
-				t.Fatalf("stripped = %q, want it to retain %q", got, tc.want)
+			if got := maskCode(tc.lang, tc.input); !strings.Contains(got, tc.want) {
+				t.Fatalf("maskCode(%q) = %q, want it to keep %q", tc.input, got, tc.want)
 			}
 		})
 	}

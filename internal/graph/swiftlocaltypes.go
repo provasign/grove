@@ -70,7 +70,7 @@ func swiftLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]strin
 	}
 
 	if symbol.RawText != "" {
-		body := stripCommentsAndStrings(symbol.RawText)
+		body := maskCode(symbol.Language, symbol.RawText)
 		for _, m := range swiftLetTypedRe.FindAllStringSubmatch(body, -1) {
 			if typ := swiftShapeType(m[2]); typ != "" {
 				out[m[1]] = typ

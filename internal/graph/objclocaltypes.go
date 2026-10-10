@@ -34,7 +34,7 @@ func objcLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string
 	}
 
 	if symbol.RawText != "" {
-		body := stripCommentsAndStrings(symbol.RawText)
+		body := maskCode(symbol.Language, symbol.RawText)
 		for _, m := range objcLocalDeclRe.FindAllStringSubmatch(body, -1) {
 			if typ := objcBareType(m[1]); typ != "" {
 				out[m[2]] = typ

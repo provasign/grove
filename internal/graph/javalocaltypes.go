@@ -103,7 +103,7 @@ func javaArgTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 		}
 	}
 	if symbol.RawText != "" {
-		body := stripCommentsAndStrings(symbol.RawText)
+		body := maskCode(symbol.Language, symbol.RawText)
 		if i := strings.IndexByte(body, '{'); i >= 0 {
 			body = body[i+1:]
 		}
@@ -918,7 +918,7 @@ func javaLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string
 
 	// Typed locals in the body (highest precedence).
 	if symbol.RawText != "" {
-		body := stripCommentsAndStrings(symbol.RawText)
+		body := maskCode(symbol.Language, symbol.RawText)
 		// Skip the declaration header so parameters aren't re-parsed with
 		// the wrong regex.
 		if i := strings.IndexByte(body, '{'); i >= 0 {

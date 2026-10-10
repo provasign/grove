@@ -110,7 +110,7 @@ func rustEnumVariantType(idx *edgeIndex, enumName, variant, preferFile string) s
 	if decl == nil {
 		return ""
 	}
-	body := stripCommentsAndStrings(decl.RawText)
+	body := maskCode(decl.Language, decl.RawText)
 	re := regexp.MustCompile(`\b` + regexp.QuoteMeta(variant) + `\s*\(([^()]*)\)`)
 	m := re.FindStringSubmatch(body)
 	if m == nil || strings.ContainsRune(m[1], ',') {
@@ -147,7 +147,7 @@ func rustLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string
 
 	lets := map[string]string{}
 	if symbol.RawText != "" {
-		body := stripCommentsAndStrings(symbol.RawText)
+		body := maskCode(symbol.Language, symbol.RawText)
 		// Function-result lets carry the lowest confidence of the let
 		// family — explicit annotations and constructor conventions
 		// overwrite them below.
@@ -195,7 +195,7 @@ func rustLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string
 		}
 	}
 	if symbol.RawText != "" {
-		body := stripCommentsAndStrings(symbol.RawText)
+		body := maskCode(symbol.Language, symbol.RawText)
 		// `for flag in FLAGS.iter()` over a const/static slice: the element
 		// type is the declared item type's (`&[&dyn Flag]` → Flag), and a
 		// trait element dispatches through the trait's declarations.

@@ -395,7 +395,7 @@ func tsLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 
 	// Body declarations (highest precedence).
 	if symbol.RawText != "" {
-		body := stripCommentsAndStrings(symbol.RawText)
+		body := maskCode(symbol.Language, symbol.RawText)
 		for _, m := range tsVarAnnRe.FindAllStringSubmatch(body, -1) {
 			if t := tsAliasType(idx, symbol.FilePath, tsBareType(m[2])); t != "" {
 				out[m[1]] = t
@@ -536,7 +536,7 @@ func tsClassFieldTypes(idx *edgeIndex, className, preferFile string, out map[str
 				record(member.Name, tsBareType(m[2]))
 			}
 		case core.KindConstructor:
-			body := stripCommentsAndStrings(member.RawText)
+			body := maskCode(member.Language, member.RawText)
 			for _, m := range tsCtorPropRe.FindAllStringSubmatch(body, -1) {
 				record(m[1], tsBareType(m[2]))
 			}
@@ -786,7 +786,7 @@ func tsTypeOwnMember(idx *edgeIndex, typ, calleeName, preferFile string) []*core
 // skipped, so a statement reaching the field regex has no '(' and is a field,
 // not a method signature.
 func tsClassBodyFieldTypes(rawText string, record func(name, typ string)) {
-	body := stripCommentsAndStrings(rawText)
+	body := maskCode("typescript", rawText)
 	open := strings.IndexByte(body, '{')
 	if open < 0 {
 		return

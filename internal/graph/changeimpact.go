@@ -900,7 +900,7 @@ func (g *CodeGraph) typeDeclaresMember(t *core.SymbolRecord, method string) bool
 	default:
 		return false
 	}
-	body := stripCommentsAndStrings(t.RawText)
+	body := maskCode(t.Language, t.RawText)
 	if i := strings.IndexByte(body, '{'); i >= 0 {
 		body = body[i+1:]
 	}

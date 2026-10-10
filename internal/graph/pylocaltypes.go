@@ -324,7 +324,7 @@ func pySetattrTargets(idx *edgeIndex, symbol *core.SymbolRecord, localTypes map[
 	if symbol.RawText == "" {
 		return nil
 	}
-	body := stripCommentsAndStrings(symbol.RawText)
+	body := maskCode(symbol.Language, symbol.RawText)
 	// Shadowing guard for the module-global fallback: a parameter or a plain
 	// local rebinding with the same name as a module global refers to the
 	// LOCAL value, not the global — resolving it through the global's type
@@ -619,7 +619,7 @@ func pyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 
 	// Body declarations (highest precedence).
 	if symbol.RawText != "" {
-		body := stripCommentsAndStrings(symbol.RawText)
+		body := maskCode(symbol.Language, symbol.RawText)
 		for _, m := range pyUnnestedMatches(pyAnnAssignRe, body) {
 			if t := pyAnnotationType(idx, symbol, m[2]); t != "" {
 				out[m[1]] = t
@@ -693,7 +693,7 @@ func pyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 	if idx != nil && (len(idx.pyModuleGlobals) > 0 || len(idx.pyFileGlobals) > 0) {
 		shadowed = pyParamNames(symbol.RawText)
 		if symbol.RawText != "" {
-			for _, m := range pyLocalRebindRe.FindAllStringSubmatch(stripCommentsAndStrings(symbol.RawText), -1) {
+			for _, m := range pyLocalRebindRe.FindAllStringSubmatch(maskCode(symbol.Language, symbol.RawText), -1) {
 				shadowed[m[1]] = true
 			}
 		}
@@ -789,7 +789,7 @@ func pyClassAttrTypes(idx *edgeIndex, symbol *core.SymbolRecord, className strin
 		}
 	}
 	if init != nil {
-		body := stripCommentsAndStrings(init.RawText)
+		body := maskCode(init.Language, init.RawText)
 		for _, m := range pySelfAnnRe.FindAllStringSubmatch(body, -1) {
 			record(m[1], pyAnnotationType(idx, init, m[2]))
 		}
@@ -1228,7 +1228,7 @@ func pyWithTargets(idx *edgeIndex, symbol *core.SymbolRecord, localTypes map[str
 	if symbol.RawText == "" {
 		return nil
 	}
-	body := stripCommentsAndStrings(symbol.RawText)
+	body := maskCode(symbol.Language, symbol.RawText)
 	preferDir := dirOf(symbol.FilePath)
 	seen := map[string]bool{}
 	var out []*core.SymbolRecord
@@ -1287,7 +1287,7 @@ func pySubscriptTargets(idx *edgeIndex, symbol *core.SymbolRecord, localTypes ma
 	}
 	seen := map[string]bool{}
 	var out []*core.SymbolRecord
-	for _, match := range pySubscriptRe.FindAllStringSubmatch(stripCommentsAndStrings(symbol.RawText), -1) {
+	for _, match := range pySubscriptRe.FindAllStringSubmatch(maskCode(symbol.Language, symbol.RawText), -1) {
 		if match[2] != "" {
 			continue
 		}
@@ -1494,7 +1494,7 @@ func pyFixtureType(idx *edgeIndex, symbol *core.SymbolRecord, param string) stri
 			}
 		}
 	}
-	body := stripCommentsAndStrings(best.RawText)
+	body := maskCode(best.Language, best.RawText)
 	if m := pyFixtureValueRe.FindStringSubmatch(body); m != nil && typeSymbolExists(idx, m[1]) {
 		return m[1]
 	}
@@ -1703,7 +1703,7 @@ func pyAttrAnnotation(idx *edgeIndex, className, attr, preferDir string) string 
 		if cand.ParentSymbol != className || cand.Name != "__init__" {
 			continue
 		}
-		for _, m := range pySelfAnnRe.FindAllStringSubmatch(stripCommentsAndStrings(cand.RawText), -1) {
+		for _, m := range pySelfAnnRe.FindAllStringSubmatch(maskCode(cand.Language, cand.RawText), -1) {
 			if m[1] == attr {
 				return m[2]
 			}

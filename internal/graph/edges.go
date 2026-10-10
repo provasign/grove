@@ -2,6 +2,7 @@ package graph
 
 import (
 	"fmt"
+	"github.com/provasign/astkit/textmask"
 	"os"
 	"path"
 	"regexp"
@@ -1329,185 +1330,29 @@ func trimExt(path string) string {
 	return path
 }
 
-// stripCommentsAndStrings removes // line comments, /* */ block comments,
-// # python comments, and string literals from a source body so that
-// regex-based call matching does not produce false positives.
-func stripCommentsAndStrings(src string) string {
-	var out strings.Builder
-	out.Grow(len(src))
-	i, n := 0, len(src)
-	for i < n {
-		ch := src[i]
-		// Block comment
-		if ch == '/' && i+1 < n && src[i+1] == '*' {
-			end := strings.Index(src[i+2:], "*/")
-			if end < 0 {
-				return out.String()
-			}
-			i += end + 4
-			continue
-		}
-		// Line comment // and #
-		if (ch == '/' && i+1 < n && src[i+1] == '/') || ch == '#' {
-			for i < n && src[i] != '\n' {
-				i++
-			}
-			continue
-		}
-		// A slash after an expression opener is a JavaScript/TypeScript regex
-		// literal. Skip it as one unit so quotes inside /["']/ do not open a
-		// fake string that consumes the rest of the source.
-		if ch == '/' && looksLikeRegexLiteral(src, i) {
-			out.WriteByte(' ')
-			i++
-			inClass := false
-			for i < n {
-				if src[i] == '\\' && i+1 < n {
-					i += 2
-					continue
-				}
-				if src[i] == '[' {
-					inClass = true
-				} else if src[i] == ']' {
-					inClass = false
-				} else if src[i] == '/' && !inClass {
-					i++
-					for i < n && isASCIIAlpha(src[i]) {
-						i++
-					}
-					break
-				}
-				if src[i] == '\n' {
-					out.WriteByte('\n')
-				}
-				i++
-			}
-			continue
-		}
-		// Rust lifetimes ('a, 'static) are identifiers, not character strings.
-		if ch == '\'' && rustLifetimeAt(src, i) {
-			out.WriteByte(ch)
-			i++
-			continue
-		}
-		// String literal — preserve newlines and executable interpolation holes.
-		if ch == '"' || ch == '\'' || ch == '`' {
-			quote := ch
-			prefix := literalPrefix(src, i)
-			raw := strings.Contains(prefix, "@") || strings.ContainsAny(prefix, "rR")
-			interpolated := quote == '`' || strings.Contains(prefix, "$") || strings.ContainsAny(prefix, "fF")
-			out.WriteByte(' ')
-			i++
-			for i < n {
-				if interpolated {
-					open := -1
-					if quote == '`' && src[i] == '$' && i+1 < n && src[i+1] == '{' {
-						open = i + 1
-					} else if quote != '`' && src[i] == '{' && (i+1 >= n || src[i+1] != '{') {
-						open = i
-					}
-					if open >= 0 {
-						if end := matchingBrace(src, open); end >= 0 {
-							out.WriteByte(' ')
-							out.WriteString(stripCommentsAndStrings(src[open+1 : end]))
-							out.WriteByte(' ')
-							i = end + 1
-							continue
-						}
-					}
-				}
-				if src[i] == quote {
-					if raw && i+1 < n && src[i+1] == quote {
-						i += 2 // C# verbatim doubled quote
-						continue
-					}
-					i++
-					break
-				}
-				if !raw && src[i] == '\\' && i+1 < n {
-					i += 2
-					continue
-				}
-				if src[i] == '\n' {
-					out.WriteByte('\n')
-				}
-				i++
-			}
-			continue
-		}
-		out.WriteByte(ch)
-		i++
+// maskCode blanks comments and string literals in src (a symbol body in
+// language lang) so regex scans only see code. Offsets and line breaks are
+// kept, so a line index into the result is a line index into src.
+// Interpolation holes stay as code.
+func maskCode(lang, src string) string {
+	if !textmask.Supported(lang) {
+		lang = "c" // unknown languages get the generic C-style lexer
 	}
-	return out.String()
+	return textmask.Mask(lang, src)
+}
+
+// maskedLine returns line idx of maskCode(lang, src). Masking the whole body
+// keeps multi-line comments and strings masked on their middle lines.
+func maskedLine(lang, src string, idx int) string {
+	lines := strings.Split(maskCode(lang, src), "\n")
+	if idx < 0 || idx >= len(lines) {
+		return ""
+	}
+	return lines[idx]
 }
 
 func isASCIIAlpha(ch byte) bool {
 	return ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z'
-}
-
-func rustLifetimeAt(src string, quote int) bool {
-	if quote+1 >= len(src) || !(isASCIIAlpha(src[quote+1]) || src[quote+1] == '_') {
-		return false
-	}
-	i := quote + 2
-	for i < len(src) && (isASCIIAlpha(src[i]) || src[i] == '_' || src[i] >= '0' && src[i] <= '9') {
-		i++
-	}
-	return i >= len(src) || src[i] != '\''
-}
-
-func literalPrefix(src string, quote int) string {
-	i := quote
-	for i > 0 {
-		ch := src[i-1]
-		if ch != '$' && ch != '@' && ch != 'f' && ch != 'F' && ch != 'r' && ch != 'R' {
-			break
-		}
-		i--
-	}
-	return src[i:quote]
-}
-
-func matchingBrace(src string, open int) int {
-	depth := 0
-	for i := open; i < len(src); i++ {
-		switch src[i] {
-		case '{':
-			depth++
-		case '}':
-			depth--
-			if depth == 0 {
-				return i
-			}
-		}
-	}
-	return -1
-}
-
-func looksLikeRegexLiteral(src string, slash int) bool {
-	prev := byte(0)
-	for i := slash - 1; i >= 0; i-- {
-		if src[i] != ' ' && src[i] != '\t' && src[i] != '\r' && src[i] != '\n' {
-			prev = src[i]
-			break
-		}
-	}
-	if prev != 0 && !strings.ContainsRune("(=,:;!&|?{[", rune(prev)) {
-		return false
-	}
-	for i := slash + 1; i < len(src); i++ {
-		if src[i] == '\\' {
-			i++
-			continue
-		}
-		if src[i] == '\n' {
-			return false
-		}
-		if src[i] == '/' {
-			return true
-		}
-	}
-	return false
 }
 
 // buildDefinesAndImports emits "file → symbol" defines edges and
@@ -3577,7 +3422,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 	if symbol.RawText == "" {
 		return edges
 	}
-	stripped := stripCommentsAndStrings(symbol.RawText)
+	stripped := maskCode(symbol.Language, symbol.RawText)
 	if hasAnnotation(&symbol, "syntax-recovery") {
 		stripped = stripRecoveredNestedDeclarations(symbol.Language, stripped)
 	}

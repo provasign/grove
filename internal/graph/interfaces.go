@@ -85,7 +85,7 @@ func interfaceMethodNamesSeen(iface *core.SymbolRecord, idx *edgeIndex, visited 
 			re = csIfaceMethodRe
 		}
 		if re != nil {
-			body := stripCommentsAndStrings(iface.RawText)
+			body := maskCode(iface.Language, iface.RawText)
 			// Drop the declaration line so "type Render interface {" can't
 			// contribute "interface(" style artifacts on unusual formatting.
 			if i := strings.IndexByte(body, '{'); i >= 0 {
@@ -164,7 +164,7 @@ func interfaceMemberSignatures(iface *core.SymbolRecord, methodName string) []st
 	default:
 		return nil
 	}
-	body := stripCommentsAndStrings(iface.RawText)
+	body := maskCode(iface.Language, iface.RawText)
 	if i := strings.IndexByte(body, '{'); i >= 0 {
 		body = body[i+1:]
 	}

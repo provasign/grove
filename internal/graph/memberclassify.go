@@ -579,7 +579,7 @@ func (c *memberClassifier) cDeclaredType(e *core.SymbolRecord, name string) stri
 	if e == nil || name == "" {
 		return ""
 	}
-	text := stripCommentsAndStrings(e.Signature + "\n" + e.RawText)
+	text := maskCode(e.Language, e.Signature+"\n"+e.RawText)
 	re := regexp.MustCompile(`(?:\bstruct\s+)?\b([A-Za-z_]\w*)\s*(?:\*+\s*(?:const\s+)?|&\s*|\s+)(?:\w+\s*(?:\[[^\]]*\])?\s*,\s*\**\s*)*` + regexp.QuoteMeta(name) + `\s*(?:[=;,)\[])`)
 	for _, m := range re.FindAllStringSubmatch(text, -1) {
 		switch m[1] {
@@ -599,7 +599,7 @@ var goTupleAssignRe = regexp.MustCompile(`(?m)\b([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]
 // callee's result list — the shared local-type pass only types the first
 // variable (`c, router := CreateTestContext(w)` left router untyped).
 func (c *memberClassifier) goTupleResultType(e *core.SymbolRecord, name string) string {
-	for _, m := range goTupleAssignRe.FindAllStringSubmatch(stripCommentsAndStrings(e.RawText), -1) {
+	for _, m := range goTupleAssignRe.FindAllStringSubmatch(maskCode(e.Language, e.RawText), -1) {
 		vars := strings.Split(m[1], ",")
 		pos := -1
 		for i, v := range vars {
@@ -785,7 +785,7 @@ func (c *memberClassifier) tsMemberType(owner, name string) string {
 // declared return type, unwrapping Promise) and `for (const m of <expr>)`
 // (the element type of a typed array field or local).
 func (c *memberClassifier) tsNameType(e *core.SymbolRecord, name string) string {
-	body := stripCommentsAndStrings(e.RawText)
+	body := maskCode(e.Language, e.RawText)
 	q := regexp.QuoteMeta(name)
 	callRe := regexp.MustCompile(`(?:const|let|var)\s+` + q + `\s*=\s*(?:await\s+)?[\w.!?]*?([A-Za-z_]\w*)\s*(?:<[^>()]*>)?\(`)
 	if m := callRe.FindStringSubmatch(body); m != nil {
@@ -988,7 +988,7 @@ func (c *memberClassifier) returnTypeOf(f *core.SymbolRecord) string {
 		if m := pyArrowRe.FindStringSubmatch(f.Signature); m != nil && c.typeExists(m[1]) {
 			return m[1]
 		}
-		body := stripCommentsAndStrings(f.RawText)
+		body := maskCode(f.Language, f.RawText)
 		if m := pyReturnCtorRe.FindStringSubmatch(body); m != nil && c.typeExists(m[1]) {
 			return m[1]
 		}

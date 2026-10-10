@@ -136,7 +136,7 @@ func (g *CodeGraph) RenamePlan(query, newName string) (*RenamePlanResult, error)
 		}
 		before := lines[idx]
 		rawN := len(pattern.FindAllStringIndex(before, -1))
-		strippedN := len(pattern.FindAllStringIndex(stripCommentsAndStrings(before), -1))
+		strippedN := len(pattern.FindAllStringIndex(maskedLine(s.Language, s.RawText, idx), -1))
 		if strippedN == 0 {
 			return // only comment/string-literal occurrences on this line
 		}
@@ -242,9 +242,9 @@ func (g *CodeGraph) RenamePlan(query, newName string) (*RenamePlanResult, error)
 			if hash := strings.LastIndexByte(s.ID, '#'); hash > 0 {
 				if t, ok := g.symbols[s.ID[:hash]]; ok && t.RawText != "" {
 					before := len(res.Edits) + len(res.Ambiguous)
-					tLines := strings.Split(t.RawText, "\n")
+					tLines := strings.Split(maskCode(t.Language, t.RawText), "\n")
 					for i := range tLines {
-						if pat.MatchString(stripCommentsAndStrings(tLines[i])) {
+						if pat.MatchString(tLines[i]) {
 							editLine(t, t.Span.Start+i, true)
 						}
 					}
@@ -256,9 +256,9 @@ func (g *CodeGraph) RenamePlan(query, newName string) (*RenamePlanResult, error)
 			continue
 		}
 		declLine := -1
-		lines := strings.Split(s.RawText, "\n")
+		lines := strings.Split(maskCode(s.Language, s.RawText), "\n")
 		for i := range lines {
-			if pat.MatchString(stripCommentsAndStrings(lines[i])) {
+			if pat.MatchString(lines[i]) {
 				declLine = s.Span.Start + i
 				editLine(s, declLine, true)
 				break
@@ -377,6 +377,7 @@ func renameMainframePlanLocked(ci *ChangeImpactResult, query, newName string) *R
 		if site.RawText == "" && site.Signature != "" {
 			lines = []string{site.Signature}
 		}
+		masked := strings.Split(maskCode(site.Language, strings.Join(lines, "\n")), "\n")
 		edited := false
 		callLines := map[int]bool{}
 		for _, call := range site.CallSites {
@@ -389,7 +390,7 @@ func renameMainframePlanLocked(ci *ChangeImpactResult, query, newName string) *R
 			if !declarations[site.ID] && len(callLines) > 0 && !callLines[line] {
 				continue
 			}
-			clean := stripCommentsAndStrings(before)
+			clean := masked[idx]
 			matches := pattern.FindAllStringIndex(clean, -1)
 			if len(matches) == 0 {
 				continue

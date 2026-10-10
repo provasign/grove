@@ -76,7 +76,7 @@ func cFamilyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]str
 
 	// Body locals (highest precedence): new-expressions.
 	if symbol.RawText != "" {
-		body := stripCommentsAndStrings(symbol.RawText)
+		body := maskCode(symbol.Language, symbol.RawText)
 		for _, m := range cppLocalDeclRe.FindAllStringSubmatch(body, -1) {
 			if t := cFamilyBareType(m[1]); t != "" {
 				record(m[2], t)

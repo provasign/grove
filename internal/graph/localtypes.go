@@ -73,7 +73,7 @@ func goLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 
 	// Body declarations (highest precedence).
 	if symbol.RawText != "" {
-		body := stripCommentsAndStrings(symbol.RawText)
+		body := maskCode(symbol.Language, symbol.RawText)
 		for _, re := range []*regexp.Regexp{goVarDeclRe, goCompositeLitRe} {
 			for _, m := range re.FindAllStringSubmatch(body, -1) {
 				if typ := m[2]; !goTypeBlocklist[typ] {

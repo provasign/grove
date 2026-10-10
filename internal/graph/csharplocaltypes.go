@@ -84,7 +84,7 @@ func csharpLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]stri
 
 	// Body declarations (highest precedence).
 	if symbol.RawText != "" {
-		body := stripCommentsAndStrings(symbol.RawText)
+		body := maskCode(symbol.Language, symbol.RawText)
 		if i := strings.IndexByte(body, '{'); i >= 0 {
 			body = body[i+1:]
 		}
@@ -330,7 +330,7 @@ func csharpArgTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string
 		}
 	}
 	if symbol.RawText != "" {
-		body := stripCommentsAndStrings(symbol.RawText)
+		body := maskCode(symbol.Language, symbol.RawText)
 		if i := strings.IndexByte(body, '{'); i >= 0 {
 			body = body[i+1:]
 		}

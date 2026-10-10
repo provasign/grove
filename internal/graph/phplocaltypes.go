@@ -200,7 +200,7 @@ func phpLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string 
 	// ($stmt = BuilderHelpers::normalizeNode($stmt) → Node). A `new` or
 	// declared type already recorded wins.
 	if symbol.RawText != "" {
-		body := stripCommentsAndStrings(symbol.RawText)
+		body := maskCode(symbol.Language, symbol.RawText)
 		for _, m := range phpNewLocalRe.FindAllStringSubmatch(body, -1) {
 			if t := phpBareType(m[2]); t != "" {
 				out[m[1]] = t
@@ -278,7 +278,7 @@ func phpReturnType(s *core.SymbolRecord) string {
 			// the body, where `return $this` pins the concrete class.
 		}
 	}
-	body := stripCommentsAndStrings(s.RawText)
+	body := maskCode(s.Language, s.RawText)
 	if m := phpReturnNewRe.FindStringSubmatch(body); m != nil {
 		if t := phpBareType(m[1]); t != "" {
 			return t
