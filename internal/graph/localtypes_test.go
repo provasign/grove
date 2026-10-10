@@ -1113,3 +1113,17 @@ func TestPythonProxyTypedVariableDoesNotDropForwardedMember(t *testing.T) {
 		t.Fatalf("proxy-typed default_storage.url lost its name-resolved target; edges=%+v", edges)
 	}
 }
+
+func TestCFamilyParamsFromBodyIgnoreComments(t *testing.T) {
+	// doctest's `struct DOCTEST_INTERFACE AssertData` recovered as a
+	// function with no parameter list in its signature: parameters are
+	// read from the body, and the first `(` there was in a comment, so a
+	// comment line decided whether `str` was a parameter (and whether
+	// `content(str)` "passed" a function named str).
+	raw := "struct DOCTEST_INTERFACE AssertData\n{\n    // ghost() { helper(1); }\n    StringContains(const String& str) : content(str) { }\n};"
+	syms := []core.SymbolRecord{{ID: "d.h::AssertData@1", FilePath: "d.h", BlobSHA: "1", Language: "cpp", Kind: core.KindFunction,
+		Name: "AssertData", QualifiedName: "AssertData", Signature: "struct DOCTEST_INTERFACE AssertData", RawText: raw}}
+	if got := cFamilyLocalTypes(newEdgeIndex(syms), &syms[0])["str"]; got != "String" {
+		t.Fatalf("str = %q, want String", got)
+	}
+}
