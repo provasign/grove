@@ -122,10 +122,65 @@ func hasMainframeSymbols(symbols []core.SymbolRecord) bool {
 
 var (
 	reFieldToken     = regexp.MustCompile(`[A-Za-z0-9][A-Za-z0-9-]+`)
-	reQuoted         = regexp.MustCompile(`'[^']*'|"[^"]*"`)
 	reAssignTo       = regexp.MustCompile(`(?i)ASSIGN\s+TO\s+([A-Za-z0-9-]+)`)
 	reFieldQualifier = regexp.MustCompile(`(?i)^\s+(?:OF|IN)\s+([A-Za-z0-9-]+)`)
 )
+
+// cobolStatementVerbs are the procedure-division words that begin a
+// statement. A statement runs from one of them to the next, or to a
+// separator period, across line breaks.
+var cobolStatementVerbs = map[string]bool{
+	"ACCEPT": true, "ADD": true, "ALTER": true, "CALL": true, "CANCEL": true, "CLOSE": true,
+	"COMPUTE": true, "CONTINUE": true, "DELETE": true, "DISPLAY": true, "DIVIDE": true,
+	"ELSE": true, "EVALUATE": true, "EXEC": true, "EXIT": true, "GENERATE": true, "GO": true,
+	"GOBACK": true, "IF": true, "INITIALIZE": true, "INITIATE": true, "INSPECT": true,
+	"MERGE": true, "MOVE": true, "MULTIPLY": true, "OPEN": true, "PERFORM": true, "READ": true,
+	"RELEASE": true, "RETURN": true, "REWRITE": true, "SEARCH": true, "SET": true, "SORT": true,
+	"START": true, "STOP": true, "STRING": true, "SUBTRACT": true, "TERMINATE": true,
+	"UNSTRING": true, "WHEN": true, "WRITE": true,
+}
+
+// cobolStatements splits a masked paragraph or section body (comments and
+// literals already blanked by maskCode) into statements. Line breaks are
+// spaces in COBOL, so `MOVE A\n    TO B.` is one statement whose TO clause
+// makes B a write. A statement ends at the next statement verb or at a
+// separator period (a period followed by a space or the end of the text).
+// END-EXEC closes an EXEC block, whose embedded SQL words are not COBOL verbs.
+func cobolStatements(masked string) []string {
+	text := strings.NewReplacer("\r", " ", "\n", " ").Replace(masked)
+	var out []string
+	start := 0
+	flush := func(end int) {
+		if strings.TrimSpace(text[start:end]) != "" {
+			out = append(out, text[start:end])
+		}
+		start = end
+	}
+	inExec := false
+	pos := 0
+	for _, loc := range reFieldToken.FindAllStringIndex(text, -1) {
+		// Separator periods between the previous token and this one.
+		for i := pos; i < loc[0]; i++ {
+			if text[i] == '.' && !inExec && (i+1 == len(text) || text[i+1] == ' ') {
+				flush(i + 1)
+			}
+		}
+		pos = loc[1]
+		word := strings.ToUpper(text[loc[0]:loc[1]])
+		if inExec {
+			if word == "END-EXEC" {
+				inExec = false
+			}
+			continue
+		}
+		if cobolStatementVerbs[word] {
+			flush(loc[0])
+			inExec = word == "EXEC"
+		}
+	}
+	flush(len(text))
+	return out
+}
 
 // mainframeAccessAt classifies one field occurrence by its position in a
 // COBOL statement. COBOL verbs frequently read and write different operands,
@@ -334,8 +389,9 @@ func buildMainframeDataEdges(idx *edgeIndex, symbols []core.SymbolRecord) []core
 	//
 	// Statement verbs classify direction: MOVE/COMPUTE/ADD/SUBTRACT/SET/
 	// INITIALIZE/GIVING/INTO/VARYING targets are WRITES; every other
-	// referenced field in the statement is a READ. Quoted literals are
-	// stripped first so 'ACCT-NOT-FOUND' never matches a field.
+	// referenced field in the statement is a READ. Comments (`*>`) and
+	// literals are masked first so 'ACCT-NOT-FOUND' never matches a field,
+	// and statements are joined across line breaks (cobolStatements).
 	//
 	// References remain owned by their paragraph/section. Rolling same-file
 	// fields up to the program destroys the caller identity used by impact,
@@ -393,8 +449,7 @@ func buildMainframeDataEdges(idx *edgeIndex, symbols []core.SymbolRecord) []core
 			continue
 		}
 		visible := fieldMap(s.FilePath)
-		for _, stmt := range strings.Split(s.RawText, "\n") {
-			stmt = reQuoted.ReplaceAllString(stmt, " ")
+		for _, stmt := range cobolStatements(maskCode("cobol", s.RawText)) {
 			for _, loc := range reFieldToken.FindAllStringIndex(stmt, -1) {
 				tok := stmt[loc[0]:loc[1]]
 				u := strings.ToUpper(tok)
