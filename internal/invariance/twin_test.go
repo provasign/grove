@@ -31,6 +31,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -87,9 +88,17 @@ func TestCommentStringInvariance(t *testing.T) {
 	for _, mode := range []string{"astkit", "native"} {
 		mode := mode
 		t.Run(mode, func(t *testing.T) {
+			if mode == "native" && testing.Short() && runtime.GOOS == "windows" {
+				// Native analyzers start compilers per fixture, which Windows
+				// runners do slowly; Linux and macOS cover this mode in -short.
+				t.Skip("native mode skipped in -short on Windows")
+			}
 			for _, tc := range cases {
 				tc := tc
 				t.Run(tc.id, func(t *testing.T) {
+					// Each case indexes its own temp repos twice; serially
+					// the table exceeded CI's 2-minute budget on Windows.
+					t.Parallel()
 					runTwin(t, tc, mode == "native")
 				})
 			}
