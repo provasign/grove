@@ -124,7 +124,9 @@ func javaSemanticEdgesIn(symbols []core.SymbolRecord, inScope func(string) bool)
 			continue
 		}
 		if typeKind(symbol.Kind) {
-			for _, ref := range javaInheritanceRefs(symbol.Signature + "\n" + firstLine(symbol.RawText)) {
+			// The masked declaration header only: the raw first line also
+			// carried a trailing comment (`class A { // extends Base`).
+			for _, ref := range javaInheritanceRefs(maskedDeclHeader("java", symbol)) {
 				if target, ok := javaBestType(idx, ref.Name, symbol.FilePath); ok && target.ID != symbol.ID {
 					add(symbolEdge(symbol, target, ref.EdgeType, 0.97))
 				}
@@ -139,24 +141,21 @@ func javaSemanticEdgesIn(symbols []core.SymbolRecord, inScope func(string) bool)
 		// arity-tagged call sites for Java, so the graph layer's narrowed
 		// resolution is authoritative. This pass keeps what text matching
 		// is still good for: inheritance and type-usage evidence.
-		for _, className := range javaConstructedTypes(symbol.RawText) {
+		masked := maskCode("java", symbol.RawText)
+		for _, className := range javaConstructedTypes(masked) {
 			if target, ok := javaBestType(idx, className, symbol.FilePath); ok && target.ID != symbol.ID {
 				add(symbolEdge(symbol, target, core.EdgeUsesType, 0.96))
 			}
 		}
 		names := make([]string, 0, 8)
-		for t := range typeTokensIn(symbol.RawText) {
+		for t := range typeTokensIn(masked) {
 			if _, ok := idx.typesByName[t]; ok {
 				names = append(names, t)
 			}
 		}
 		sort.Strings(names)
-		stripped := ""
-		if len(slowNames) > 0 {
-			stripped = stripQuotedText(symbol.RawText)
-		}
 		for _, name := range slowNames {
-			if containsTypeTokenStripped(stripped, name) {
+			if containsTypeToken(masked, name) {
 				names = append(names, name)
 			}
 		}
@@ -204,28 +203,12 @@ func javaDeclarationTail(text string) string {
 	return tail
 }
 
-type javaQualifiedCall struct {
-	Qualifier string
-	Method    string
-}
-
-var javaQualifiedCallPattern = regexp.MustCompile(`\b([A-Z][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*\(`)
-
-func javaQualifiedCalls(rawText string) []javaQualifiedCall {
-	matches := javaQualifiedCallPattern.FindAllStringSubmatch(stripQuotedText(rawText), -1)
-	out := make([]javaQualifiedCall, 0, len(matches))
-	for _, match := range matches {
-		if len(match) == 3 {
-			out = append(out, javaQualifiedCall{Qualifier: match[1], Method: match[2]})
-		}
-	}
-	return out
-}
-
 var javaNewPattern = regexp.MustCompile(`\bnew\s+([A-Za-z_][A-Za-z0-9_.]*)(?:\s*<[^;(){}]*>)?\s*\(`)
 
-func javaConstructedTypes(rawText string) []string {
-	matches := javaNewPattern.FindAllStringSubmatch(stripQuotedText(rawText), -1)
+// javaConstructedTypes returns the `new T(` class names of masked (see
+// maskCode).
+func javaConstructedTypes(masked string) []string {
+	matches := javaNewPattern.FindAllStringSubmatch(masked, -1)
 	seen := map[string]bool{}
 	var out []string
 	for _, match := range matches {
@@ -309,11 +292,4 @@ func lastDottedName(name string) string {
 		name = name[i+1:]
 	}
 	return name
-}
-
-func firstLine(text string) string {
-	if i := strings.IndexByte(text, '\n'); i >= 0 {
-		return text[:i]
-	}
-	return text
 }

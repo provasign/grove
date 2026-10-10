@@ -21,6 +21,7 @@ import (
 
 	"github.com/provasign/astkit"
 	"github.com/provasign/astkit/strategies"
+	"github.com/provasign/astkit/textmask"
 	"github.com/provasign/grove/internal/core"
 )
 
@@ -114,9 +115,30 @@ func (e *Engine) ParseTree(language string, src []byte) error {
 // syntax errors, the extracted symbols are returned with hasErrors=true so the
 // caller may merge them with regex-extracted ones.
 func extractSymbolsFromAST(language, filePath, blobSHA string, src []byte, fileImports []string) (syms []core.SymbolRecord, ok bool, hasErrors bool) {
+	r := extractASTForMerge(language, filePath, blobSHA, src, fileImports)
+	return r.syms, r.ok, r.hasErrors
+}
+
+// astResult is extractSymbolsFromAST's result plus what the regex recovery
+// pass needs from the partial tree.
+type astResult struct {
+	syms          []core.SymbolRecord
+	ok, hasErrors bool
+	// opaque holds the byte ranges of JSX text when the tree has errors:
+	// prose the textmask lexer reads as code (`class names are applied`
+	// became a class named names).
+	opaque [][2]int
+}
+
+func extractASTForMerge(language, filePath, blobSHA string, src []byte, fileImports []string) (res astResult) {
+	syms, ok, hasErrors, opaque := extractASTSymbols(language, filePath, blobSHA, src, fileImports)
+	return astResult{syms: syms, ok: ok, hasErrors: hasErrors, opaque: opaque}
+}
+
+func extractASTSymbols(language, filePath, blobSHA string, src []byte, fileImports []string) (syms []core.SymbolRecord, ok bool, hasErrors bool, opaque [][2]int) {
 	key, supported := languageToKey(language)
 	if !supported {
-		return nil, false, false
+		return nil, false, false, nil
 	}
 	eng, reg := bridge()
 	ctx, cancel := context.WithTimeout(context.Background(), parseTimeout)
@@ -125,26 +147,58 @@ func extractSymbolsFromAST(language, filePath, blobSHA string, src []byte, fileI
 	// macro lines keeps every byte offset, so the tree parsed from the
 	// blanked copy still addresses the original text.
 	text := src
-	if key == astkit.LangC || key == astkit.LangCPP {
-		if blanked := blankCFamilyMacroLines(src); blanked != nil {
+	// The grammar parses `#if 0` / `#if false` branches as live code; dead
+	// code there (often unfinished, `int ghost(int a) {` with no close)
+	// became symbols and its errors swallowed the real declarations after
+	// the #endif. The parse sees those branches blanked (offsets kept).
+	// live is the source with only that masking, for the alt parse below.
+	live := text
+	// Set when a broken C-family file is parsed with its comments cut:
+	// uncutText is what text was before the cut.
+	var commentCuts *commentCuts
+	var uncutText []byte
+	if preprocessedLanguage(language) || key == astkit.LangObjC {
+		if masked := textmask.MaskInactivePreprocessor(language, string(src)); masked != string(src) {
+			src = []byte(masked)
+			live = src
+		}
+	}
+	if cFamilyKey(key) {
+		if blanked := blankCFamilyMacroLines(language, src); blanked != nil {
 			src = blanked
 		}
 	}
 	tree, err := eng.Parse(ctx, key, src)
 	if err != nil {
-		return nil, false, false
+		return nil, false, false, nil
 	}
 	if tree == nil {
 		// No grammar for this language. Text-capable strategies (astkit
 		// TextStrategy) extract from src alone; everything else has no
 		// AST path. Unreachable for grammar-backed languages.
 		if !reg.TextCapable(key) {
-			return nil, false, false
+			return nil, false, false, nil
 		}
 	} else {
-		defer tree.Close()
 		hasErrors = tree.RootNode().HasError()
-		if hasErrors && preprocessedLanguage(language) {
+		if hasErrors && cFamilyKey(key) {
+			// Error recovery prices the bytes and lines it skips,
+			// comments included: a comment line inside a broken region
+			// changed which declarations the recovered tree kept (a whole
+			// AFNetworking .m file flipped between two different ERROR
+			// soups). A broken file is parsed from code alone (see
+			// parseBrokenCFamily); restore maps lines back and puts the
+			// comments back into symbol bodies. A file that parses
+			// cleanly keeps its comment nodes, which signatures cut.
+			if b := parseBrokenCFamily(ctx, eng, key, language, src, text, live, true); b != nil {
+				tree.Close()
+				tree, src, text = b.tree, b.src, b.text
+				hasErrors = tree.RootNode().HasError()
+				commentCuts, uncutText = b.cuts, b.uncutText
+			}
+		}
+		defer func() { tree.Close() }()
+		if hasErrors && preprocessedLanguage(language) && commentCuts == nil {
 			// `#if A ... else ... #else ... else ... #endif` hands the
 			// grammar two else branches; tree-sitter recovers with ERROR
 			// nodes that swallow call sites. Re-parse with the directives
@@ -157,8 +211,9 @@ func extractSymbolsFromAST(language, filePath, blobSHA string, src []byte, fileI
 						tree.Close()
 						tree, src = altTree, alt
 						// Same line lengths as alt: macro blanking
-						// never touches a directive line.
-						text = blankPreprocessorBranches(text)
+						// never touches a directive line, and live has
+						// the same directive lines as src.
+						text = blankPreprocessorBranches(live)
 						hasErrors = altErrs > 0
 					} else {
 						altTree.Close()
@@ -169,19 +224,29 @@ func extractSymbolsFromAST(language, filePath, blobSHA string, src []byte, fileI
 	}
 	akSyms, err := reg.Extract(key, tree, text)
 	if err != nil {
-		return nil, false, false
+		return nil, false, false, nil
+	}
+	if commentCuts != nil {
+		commentCuts.restore(akSyms, text, uncutText)
 	}
 	syms = make([]core.SymbolRecord, 0, len(akSyms))
+	var jsCode []string
+	if (key == astkit.LangJavaScript || key == astkit.LangTypeScript || key == astkit.LangTSX) &&
+		bytes.Contains(src, []byte("export default")) {
+		jsCode = strings.Split(textmask.Mask(language, string(src)), "\n")
+	}
 	for _, s := range akSyms {
 		projected := projectSymbol(s, filePath, blobSHA, language, fileImports)
-		if (key == astkit.LangJavaScript || key == astkit.LangTypeScript || key == astkit.LangTSX) &&
-			jsDefaultExportAt(src, s.Span.Start) {
+		if jsCode != nil && jsDefaultExportAt(jsCode, s.Span.Start) {
 			projected.Modifiers = append(projected.Modifiers, "default-export")
 		}
 		syms = append(syms, projected)
 	}
-	if key == astkit.LangTypeScript || key == astkit.LangTSX {
-		tsExtendOverloadSpans(syms, src)
+	if tree != nil && (key == astkit.LangTypeScript || key == astkit.LangTSX) {
+		tsExtendOverloadSpans(syms, tree.RootNode(), string(text))
+	}
+	if tree != nil && hasErrors && (key == astkit.LangJavaScript || key == astkit.LangTSX) {
+		opaque = jsxTextRanges(tree.RootNode())
 	}
 	if tree != nil && (key == astkit.LangJavaScript || key == astkit.LangTypeScript || key == astkit.LangTSX) {
 		if topLevel := jsTopLevelSymbol(tree.RootNode(), src, filePath, blobSHA, language, fileImports); topLevel != nil {
@@ -205,7 +270,26 @@ func extractSymbolsFromAST(language, filePath, blobSHA string, src []byte, fileI
 			Imports:       append([]string(nil), fileImports...),
 		})
 	}
-	return syms, true, hasErrors
+	return syms, true, hasErrors, opaque
+}
+
+// jsxTextRanges returns the byte ranges of every jsx_text node under n.
+func jsxTextRanges(n *sitter.Node) [][2]int {
+	var out [][2]int
+	var walk func(*sitter.Node)
+	walk = func(n *sitter.Node) {
+		if n.Type() == "jsx_text" {
+			out = append(out, [2]int{int(n.StartByte()), int(n.EndByte())})
+			return
+		}
+		for i := 0; i < int(n.ChildCount()); i++ {
+			if c := n.Child(i); c != nil {
+				walk(c)
+			}
+		}
+	}
+	walk(n)
+	return out
 }
 
 var jsCallableContainers = map[string]bool{
@@ -331,6 +415,50 @@ func jsTopLevelSymbol(root *sitter.Node, src []byte, filePath, blobSHA, language
 // extractImportsFromAST parses imports through astkit when a strategy exists.
 // Regex extraction remains the fallback for unsupported languages or parse
 // failures.
+// dropComments removes comment text from an import path. Astkit takes a
+// grouped import's path from the source (`use std::{ // note\n io, }`), and a
+// comment there became part of the import string and of the crate heads
+// read from it. Each comment goes with the blanks after it (or, at a line
+// end, before it), and a line left empty is dropped, so the result matches
+// the same import written without comments. Text without comments comes
+// back unchanged.
+func dropComments(language, s string) string {
+	masked := textmask.MaskComments(language, s)
+	if masked == s {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		if masked[i] == s[i] {
+			b.WriteByte(s[i])
+			i++
+			continue
+		}
+		// A comment run: masked bytes, then the blanks that follow it.
+		for i < len(s) && masked[i] != s[i] {
+			i++
+		}
+		for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
+			i++
+		}
+	}
+	lines := strings.Split(b.String(), "\n")
+	orig := strings.Split(s, "\n")
+	kept := lines[:0]
+	for i, line := range lines {
+		if line == orig[i] {
+			kept = append(kept, line)
+			continue
+		}
+		trimmed := strings.TrimRight(line, " \t")
+		if trimmed != strings.TrimRight(orig[i], " \t") && strings.TrimSpace(trimmed) == "" {
+			continue // the line held only a comment
+		}
+		kept = append(kept, trimmed)
+	}
+	return strings.Join(kept, "\n")
+}
+
 func extractImportsFromAST(language string, src []byte) ([]string, bool) {
 	key, supported := languageToKey(language)
 	if !supported {
@@ -342,6 +470,16 @@ func extractImportsFromAST(language string, src []byte) ([]string, bool) {
 	tree, err := eng.Parse(ctx, key, src)
 	if err != nil || (tree == nil && !reg.TextCapable(key)) {
 		return nil, false
+	}
+	if tree != nil && cFamilyKey(key) && tree.RootNode().HasError() {
+		// Read a broken file's includes from code alone, as its symbols
+		// are (see extractASTSymbols): `#include` lines inside an ERROR
+		// region came and went with nearby comments. The candidates that
+		// blank directives would blank the includes.
+		if b := parseBrokenCFamily(ctx, eng, key, language, src, src, src, false); b != nil {
+			tree.Close()
+			tree, src = b.tree, b.text
+		}
 	}
 	if tree != nil {
 		defer tree.Close()
@@ -356,14 +494,14 @@ func extractImportsFromAST(language string, src []byte) ([]string, bool) {
 		if imp.Path == "" {
 			continue
 		}
-		importPath := imp.Path
+		importPath := dropComments(language, imp.Path)
 		if key == astkit.LangRust && strings.HasPrefix(strings.TrimSpace(imp.Raw), "pub ") {
 			// Astkit intentionally normalizes Path to the imported target, but
 			// Grove also needs to know that the dependency is re-exported. Rust
 			// scope traversal follows dependencies transitively only across public
 			// facade edges; losing `pub` here made `grep::printer::X` stop at the
 			// grep facade instead of reaching grep_printer.
-			importPath = "pub use " + imp.Path
+			importPath = "pub use " + importPath
 		}
 		if key == astkit.LangGo && imp.Alias != "" && imp.Alias != "_" && imp.Alias != "." {
 			alias := core.GoImportAlias(imp.Alias, imp.Path)
@@ -386,7 +524,9 @@ func extractImportsFromAST(language string, src []byte) ([]string, bool) {
 		// are dropped there. The "#" form never reaches consumers.
 		for _, imp := range akImports {
 			aliases := map[string]string{}
-			for _, match := range pythonAliasedImportRE.FindAllStringSubmatch(imp.Raw, -1) {
+			// Raw is the statement's source text; a comment inside a
+			// parenthesized import (`# b as c`) is not an alias.
+			for _, match := range pythonAliasedImportRE.FindAllStringSubmatch(textmask.Mask(language, imp.Raw), -1) {
 				aliases[match[1]] = match[2]
 			}
 			if len(imp.Names) == 0 {
@@ -421,28 +561,31 @@ func extractImportsFromAST(language string, src []byte) ([]string, bool) {
 	}
 	if key == astkit.LangJavaScript || key == astkit.LangTypeScript || key == astkit.LangTSX {
 		for _, imp := range akImports {
-			if strings.HasPrefix(strings.TrimSpace(imp.Raw), "export ") {
+			// The alias patterns read imp.Raw with comments and strings
+			// masked: `import { a, /* b as c */ } from "x"` binds no c.
+			raw := textmask.Mask(language, imp.Raw)
+			if strings.HasPrefix(strings.TrimSpace(raw), "export ") {
 				encoded := core.JSImportReExport(imp.Path)
 				if !seen[encoded] {
 					seen[encoded] = true
 					imports = append(imports, encoded)
 				}
 			}
-			if match := jsDefaultImportRE.FindStringSubmatch(imp.Raw); len(match) == 2 {
+			if match := jsDefaultImportRE.FindStringSubmatch(raw); len(match) == 2 {
 				encoded := core.JSImportAlias(match[1], imp.Path+"#default")
 				if !seen[encoded] {
 					seen[encoded] = true
 					imports = append(imports, encoded)
 				}
 			}
-			if match := jsNamespaceImportRE.FindStringSubmatch(imp.Raw); len(match) == 2 {
+			if match := jsNamespaceImportRE.FindStringSubmatch(raw); len(match) == 2 {
 				encoded := core.JSImportAlias(match[1], imp.Path)
 				if !seen[encoded] {
 					seen[encoded] = true
 					imports = append(imports, encoded)
 				}
 			}
-			match := jsNamedImportRE.FindStringSubmatch(imp.Raw)
+			match := jsNamedImportRE.FindStringSubmatch(raw)
 			if len(match) != 2 {
 				continue
 			}
@@ -476,24 +619,23 @@ func lastDottedSegment(value string) string {
 	return value
 }
 
-func jsDefaultExportAt(src []byte, line int) bool {
-	if line < 1 {
+// jsDefaultExportAt reports whether the symbol starting on line is the
+// default export: `export default` on its line or alone on the line above.
+// code is the file's lines with comments and literals masked, so
+// `return "export default"` does not count.
+func jsDefaultExportAt(code []string, line int) bool {
+	if line < 1 || line > len(code) {
 		return false
 	}
-	lines := bytes.Split(src, []byte{'\n'})
-	if line > len(lines) {
-		return false
-	}
-	if bytes.Contains(lines[line-1], []byte("export default")) {
+	if strings.Contains(code[line-1], "export default") {
 		return true
 	}
 	for previous := line - 2; previous >= 0; previous-- {
-		trimmed := bytes.TrimSpace(lines[previous])
+		trimmed := strings.TrimSpace(code[previous])
 		if len(trimmed) == 0 {
 			continue
 		}
-		return bytes.Equal(trimmed, []byte("export default")) ||
-			bytes.Equal(trimmed, []byte("export default;"))
+		return trimmed == "export default" || trimmed == "export default;"
 	}
 	return false
 }
@@ -547,6 +689,11 @@ func projectCallSites(in []astkit.CallSite) []core.CallSite {
 
 func symID(filePath, qualifiedName, blobSHA string) string {
 	return fmt.Sprintf("%s::%s@%s", filePath, qualifiedName, blobSHA)
+}
+
+// cFamilyKey reports whether key is C, C++ or Objective-C.
+func cFamilyKey(key astkit.LanguageKey) bool {
+	return key == astkit.LangC || key == astkit.LangCPP || key == astkit.LangObjC
 }
 
 func preprocessedLanguage(language string) bool {
@@ -617,25 +764,63 @@ var cMacroLineRe = regexp.MustCompile(`^[A-Z_][A-Z0-9_]*[A-Z][A-Z0-9_]*:?$`)
 // cMacroCallLineRe matches a line opening an upper-case macro invocation.
 var cMacroCallLineRe = regexp.MustCompile(`^[A-Z][A-Z0-9_]*_[A-Z0-9_]*\s*\(`)
 
+// cMacroEnumRe matches a `typedef NS_ENUM(...) { ... };` (or NS_OPTIONS,
+// CF_ENUM, ...) in masked text.
+var cMacroEnumRe = regexp.MustCompile(`\btypedef\s+(?:NS|CF)_(?:ENUM|OPTIONS|CLOSED_ENUM|ERROR_ENUM)\s*\([^(){};]*\)\s*\{[^{}]*\}\s*;?`)
+
+// cClassKeyMacroRe matches an upper-case macro between a class key and
+// the class name.
+var cClassKeyMacroRe = regexp.MustCompile(`(?:^|[\s;{}>])(?:class|struct|union)\s+([A-Z][A-Z0-9]*_[A-Z0-9_]*)\s+[A-Za-z_]\w*\s*(?:[:{]|final\b|$)`)
+
+// cSpecifierKeywordRe matches a leading declaration specifier keyword and
+// the blanks after it.
+var cSpecifierKeywordRe = regexp.MustCompile(`^(?:static|inline|virtual|explicit|friend|constexpr|extern)\s+`)
+
+// objcTrailingWordMacroRe matches an upper-case macro word ending an
+// Objective-C method declaration.
+var objcTrailingWordMacroRe = regexp.MustCompile(`[\w)]\s+([A-Z][A-Z0-9]*_[A-Z0-9_]*)\s*;\s*$`)
+
+// cTrailingMacroRe matches an upper-case macro call after a name or `)`.
+var cTrailingMacroRe = regexp.MustCompile(`[A-Za-z0-9_)]\s+([A-Z][A-Z0-9]*_[A-Z0-9_]*)\s*\(`)
+
+// cClassHeaderRe matches a masked line opening a class, struct or union
+// body, brace on it or on the next line; cNamespaceHeaderRe one opening a
+// namespace or an
+// `extern "C"` block (the string is blanked), brace on it or on the next
+// line.
+var cClassHeaderRe = regexp.MustCompile(`^(?:template\s*<.*>\s*)?(?:class|struct|union)\s+[^;()=]*(?:\{|$)`)
+
+var cNamespaceHeaderRe = regexp.MustCompile(`^(?:(?:inline\s+)?namespace(?:\s+[A-Za-z_][\w:]*)?|extern\s+"\s*")\s*(?:\{|$)`)
+
 // cMacroSpecifierRe matches an upper-case specifier macro in front of a
 // declaration: `FMT_CONSTEXPR auto f()`, `FMT_API void g()`,
-// `FMT_CONSTEXPR typed_node(const Arg& arg)`.
-var cMacroSpecifierRe = regexp.MustCompile(`^([A-Z][A-Z0-9]*_[A-Z0-9_]*)\s+(?:auto|void|bool|char|int|long|short|unsigned|signed|float|double|const|constexpr|static|inline|virtual|explicit|friend|typename|struct|class|enum|template|extern|~?[A-Za-z_][A-Za-z0-9_]*\s*\()`)
+// `FMT_CONSTEXPR typed_node(const Arg& arg)`, `DOCTEST_CONSTEXPR
+// size_type len = 24;` (a type and a declarator after it: a macro there
+// cannot be a type itself).
+var cMacroSpecifierRe = regexp.MustCompile(`^([A-Z][A-Z0-9]*_[A-Z0-9_]*)\s+(?:auto|void|bool|char|int|long|short|unsigned|signed|float|double|const|constexpr|static|inline|virtual|explicit|friend|typename|struct|class|enum|template|extern|~?[A-Za-z_][A-Za-z0-9_]*\s*\(|[A-Za-z_][\w:]*(?:<[^;{}()]*>)?[\s*&]+(?:operator\b|[A-Za-z_]\w*\s*[=;({\[,]))`)
 
 // blankCFamilyMacroLines returns src with the macro uses tree-sitter cannot
 // expand replaced by spaces, or nil when there is none. Line numbers and
-// byte offsets are unchanged. Three shapes are blanked:
+// byte offsets are unchanged. Seven shapes are blanked:
 //
 //   - a line that is a lone upper-case identifier
-//     (`NLOHMANN_JSON_NAMESPACE_BEGIN`, `G_BEGIN_DECLS`, `Q_OBJECT`);
+//     (`NLOHMANN_JSON_NAMESPACE_BEGIN`, `G_BEGIN_DECLS`, `Q_OBJECT`,
+//     `NS_ASSUME_NONNULL_BEGIN`);
 //   - an upper-case macro invocation that is a whole line with no `;`, at
-//     file scope or right after a `template<...>` header
+//     file or class scope or right after a `template<...>` header
 //     (`FMT_PRAGMA_GCC(push_options)`, a multi-line
-//     `GTEST_DISABLE_MSC_WARNINGS_PUSH_(...)`, `JSON_HEDLEY_NON_NULL(1)`),
+//     `GTEST_DISABLE_MSC_WARNINGS_PUSH_(...)`, `JSON_HEDLEY_NON_NULL(1)`,
+//     `NS_EXTENSION_UNAVAILABLE_IOS("...")` before `@interface`),
 //     followed by a declaration, not by `{` or an operator
 //     (`GTEST_CHECK_(x)` / `<< "msg";` is an expression whose call must
 //     stay);
-//   - an upper-case specifier macro before a declaration (`FMT_CONSTEXPR`).
+//   - an upper-case macro statement (`FOO_(a, b);`) at file or namespace
+//     scope, where no call can stand;
+//   - an upper-case macro call ending a declaration there
+//     (`... *metrics AF_API_AVAILABLE(ios(10));`);
+//   - an upper-case specifier macro before a declaration (`FMT_CONSTEXPR`)
+//     or between a class key and its name (`class GTEST_API_ RE {`);
+//   - a whole `typedef NS_ENUM(T, Name) { ... };`.
 //
 // nlohmann/json opens every header with a namespace macro, and the grammar
 // read the macro, `namespace` and the whole namespace body as one function
@@ -645,15 +830,31 @@ var cMacroSpecifierRe = regexp.MustCompile(`^([A-Z][A-Z0-9]*_[A-Z0-9_]*)\s+(?:au
 // line looks the same, so inside braces a line qualifies only when the
 // previous code line does not end with `,` and the next one does not start
 // with `}`. Preprocessor lines (with continuations) never qualify.
-func blankCFamilyMacroLines(src []byte) []byte {
-	clean := blankCFamilyComments(string(src))
+func blankCFamilyMacroLines(language string, src []byte) []byte {
+	clean := textmask.Mask(language, string(src))
+	var out []byte
+	// `typedef NS_ENUM(NSUInteger, Mode) { ... };` is unknown to the
+	// grammar, and recovering from it lost the @interface after it.
+	// astkit reads these enums from the text (objcMacroEnums); the parse
+	// sees the whole typedef blanked.
+	if enums := cMacroEnumRe.FindAllStringIndex(clean, -1); enums != nil {
+		out = append([]byte(nil), src...)
+		cleanBytes := []byte(clean)
+		for _, m := range enums {
+			for k := m[0]; k < m[1]; k++ {
+				if out[k] != '\n' && out[k] != '\r' {
+					out[k], cleanBytes[k] = ' ', ' '
+				}
+			}
+		}
+		clean = string(cleanBytes)
+	}
 	lines := strings.Split(clean, "\n")
 	starts := make([]int, len(lines))
 	for i, off := 0, 0; i < len(lines); i++ {
 		starts[i] = off
 		off += len(lines[i]) + 1
 	}
-	var out []byte
 	blank := func(from, to int) {
 		if out == nil {
 			out = append([]byte(nil), src...)
@@ -664,8 +865,26 @@ func blankCFamilyMacroLines(src []byte) []byte {
 			}
 		}
 	}
-	braces, parens := 0, 0
-	continued := false
+	// scopes holds one entry per open brace: a namespace or `extern "C"`
+	// block, whose body is declarations like file scope, a class body, or
+	// anything else.
+	const (
+		otherScope = iota
+		namespaceScope
+		classScope
+	)
+	var scopes []int
+	declScope := func() bool {
+		for _, kind := range scopes {
+			if kind != namespaceScope {
+				return false
+			}
+		}
+		return true
+	}
+	parens := 0
+	continued, objcMemberHeader := false, false
+	pending := otherScope // the kind of a header line whose `{` is on the next line
 	prevCode := ""
 	for i := 0; i < len(lines); i++ {
 		line := lines[i]
@@ -675,20 +894,33 @@ func blankCFamilyMacroLines(src []byte) []byte {
 		if directive {
 			continue
 		}
+		braces := len(scopes)
 		standalone := braces == 0 || (!strings.HasSuffix(prevCode, ",") && !strings.HasPrefix(nextCodeLine(lines, i+1), "}"))
 		if parens == 0 && standalone {
 			if cMacroLineRe.MatchString(trimmed) {
 				blank(starts[i], starts[i]+len(line))
 				continue
 			}
-			if (braces == 0 || strings.HasSuffix(prevCode, ">")) && cMacroCallLineRe.MatchString(trimmed) {
+			if cMacroCallLineRe.MatchString(trimmed) {
 				if end, ok := cMacroCallEnd(clean, starts[i]+strings.Index(line, "(")); ok {
 					endLine := i
 					for endLine+1 < len(lines) && starts[endLine+1] <= end {
 						endLine++
 					}
 					rest := strings.TrimSpace(clean[end+1 : starts[endLine]+len(lines[endLine])])
-					if next := nextCodeLine(lines, endLine+1); rest == "" && (next == "" || cIdentStartByte(next[0]) || next[0] == '}') {
+					next := nextCodeLine(lines, endLine+1)
+					// A macro statement where only declarations may stand
+					// (`GMOCK_DEFINE_DEFAULT_ACTION_FOR_RETURN_TYPE_(float,
+					// 0);` in a namespace) is no call; the grammar read
+					// `float` as a parameter, and recovering from a run of
+					// them folded all of gmock.h into one ERROR.
+					statement := rest == ";" && declScope()
+					// One in a class body (`DOCTEST_DECLARE_INTERFACE(X)`
+					// before `virtual void f() = 0;`) declares members.
+					inClass := braces > 0 && scopes[braces-1] == classScope
+					declaration := rest == "" && (braces == 0 || inClass || strings.HasSuffix(prevCode, ">")) &&
+						(next == "" || cIdentStartByte(next[0]) || next[0] == '}' || next[0] == '@')
+					if statement || declaration {
 						blank(starts[i], starts[endLine]+len(lines[endLine]))
 						if endLine > i {
 							prevCode = strings.TrimSpace(lines[endLine])
@@ -699,9 +931,54 @@ func blankCFamilyMacroLines(src []byte) []byte {
 				}
 			}
 		}
+		objcMethod := language == "objc" && declScope() && (strings.HasPrefix(trimmed, "-") || strings.HasPrefix(trimmed, "+"))
+		objcMember := objcMethod || (language == "objc" && declScope() && strings.HasPrefix(trimmed, "@property"))
+		if parens == 0 && declScope() {
+			// A trailing attribute macro on a declaration or definition
+			// header (`@property NSURLSessionTaskMetrics *metrics
+			// AF_API_AVAILABLE(ios(10));`, `- (void)f:(id)x
+			// AF_API_AVAILABLE(ios(10)) {`, `void f(void)
+			// FOO_DEPRECATED("x");`) is unknown to the grammar;
+			// recovering from a run of them folded a whole .m file into
+			// one ERROR. After a `)` the call ends a declarator; after a
+			// name only in an Objective-C member (`int FOO_F(int);`
+			// declares FOO_F, `typedef NS_ENUM(...)` is a type).
+			if m := cTrailingMacroRe.FindAllStringSubmatchIndex(line, -1); m != nil {
+				last := m[len(m)-1]
+				open := starts[i] + strings.IndexByte(line[last[2]:], '(') + last[2]
+				if end, ok := cMacroCallEnd(clean, open); ok && end < starts[i]+len(line) && (line[last[0]] == ')' || objcMember || objcMemberHeader) {
+					if rest := strings.TrimSpace(clean[end+1 : starts[i]+len(line)]); rest == ";" || rest == "{" || (rest == "" && strings.HasPrefix(nextCodeLine(lines, i+1), "{")) {
+						blank(starts[i]+last[2], end+1)
+					}
+				}
+			}
+		}
+		// `- (instancetype)initWithURL:(NSURL *)url
+		// NS_DESIGNATED_INITIALIZER;`: an argument-less attribute macro
+		// read as one more selector part.
+		if objcMethod || objcMemberHeader {
+			if m := objcTrailingWordMacroRe.FindStringSubmatchIndex(line); m != nil {
+				blank(starts[i]+m[2], starts[i]+m[3])
+			}
+		}
+		// A method header continues over lines until its `;` or `{`.
+		if objcMember || objcMemberHeader {
+			objcMemberHeader = !strings.HasSuffix(trimmed, ";") && !strings.HasSuffix(trimmed, "{")
+		}
 		if parens == 0 {
+			// `class GTEST_API_ RE {`, `struct DOCTEST_INTERFACE
+			// AssertData`: an export macro between the key and the name.
+			if m := cClassKeyMacroRe.FindStringSubmatchIndex(line); m != nil {
+				blank(starts[i]+m[2], starts[i]+m[3])
+			}
 			lead := len(line) - len(strings.TrimLeft(line, " \t"))
 			for {
+				// Specifier keywords may come first
+				// (`static DOCTEST_CONSTEXPR size_type len = 24;`).
+				if k := cSpecifierKeywordRe.FindStringIndex(line[lead:]); k != nil {
+					lead += k[1]
+					continue
+				}
 				m := cMacroSpecifierRe.FindStringSubmatchIndex(line[lead:])
 				if m == nil {
 					break
@@ -711,13 +988,20 @@ func blankCFamilyMacroLines(src []byte) []byte {
 				lead += len(line[lead:]) - len(strings.TrimLeft(line[lead:], " \t"))
 			}
 		}
+		header := otherScope
+		if cNamespaceHeaderRe.MatchString(trimmed) {
+			header = namespaceScope
+		} else if cClassHeaderRe.MatchString(trimmed) {
+			header = classScope
+		}
 		for k := 0; k < len(line); k++ {
 			switch line[k] {
 			case '{':
-				braces++
+				scopes = append(scopes, max(header, pending))
+				header, pending = otherScope, otherScope
 			case '}':
-				if braces > 0 {
-					braces--
+				if len(scopes) > 0 {
+					scopes = scopes[:len(scopes)-1]
 				}
 			case '(':
 				parens++
@@ -729,6 +1013,7 @@ func blankCFamilyMacroLines(src []byte) []byte {
 		}
 		if trimmed != "" {
 			prevCode = trimmed
+			pending = header
 		}
 	}
 	return out
@@ -785,32 +1070,65 @@ func countErrorNodes(n *sitter.Node) int {
 	return c
 }
 
-// tsOverloadLineRe matches one TS overload signature line: an optional
-// modifier run, the member name, a parameter list, and a terminating `;`
-// (no body).
-func tsOverloadLineRe(name string) *regexp.Regexp {
-	return regexp.MustCompile(`^\s*(?:(?:export|declare|public|private|protected|static|async|abstract|override|readonly)\s+)*(?:function\s+)?` +
-		regexp.QuoteMeta(name) + `\s*[<(].*;\s*$`)
-}
-
 // tsExtendOverloadSpans widens a TS function or method to cover the
 // overload signatures stacked directly above its implementation. They are
 // part of its declaration -- renaming the member renames them too (h3
 // EventStream.push has four) -- but carry no body, so Astkit does not
-// extract them.
-func tsExtendOverloadSpans(syms []core.SymbolRecord, src []byte) {
-	lines := strings.Split(string(src), "\n")
+// extract them. An overload is a bodiless signature node
+// (function_signature, method_signature, abstract_method_signature) that
+// declares the same name and ends on the line directly above; a call
+// statement `foo(1);` above `function foo` is not one.
+func tsExtendOverloadSpans(syms []core.SymbolRecord, root *sitter.Node, src string) {
+	type signature struct {
+		name  string
+		start int
+	}
+	byEnd := map[int][]signature{} // 1-based end line -> signatures ending there
+	var walk func(*sitter.Node)
+	walk = func(n *sitter.Node) {
+		switch n.Type() {
+		case "function_signature", "method_signature", "abstract_method_signature":
+			if name := n.ChildByFieldName("name"); name != nil {
+				outer := n
+				for p := n.Parent(); p != nil && (p.Type() == "export_statement" || p.Type() == "ambient_declaration"); p = p.Parent() {
+					outer = p
+				}
+				end := int(outer.EndPoint().Row) + 1
+				byEnd[end] = append(byEnd[end], signature{name.Content([]byte(src)), int(outer.StartPoint().Row) + 1})
+			}
+			return
+		}
+		for i := 0; i < int(n.ChildCount()); i++ {
+			if c := n.Child(i); c != nil {
+				walk(c)
+			}
+		}
+	}
+	if root == nil {
+		return
+	}
+	walk(root)
+	if len(byEnd) == 0 {
+		return
+	}
+	lines := strings.Split(src, "\n")
 	for i := range syms {
 		s := &syms[i]
 		if (s.Kind != core.KindMethod && s.Kind != core.KindFunction) || s.Name == "" || s.Span.Start < 2 {
 			continue
 		}
-		re := tsOverloadLineRe(s.Name)
 		start := s.Span.Start
-		for start > 1 && start-2 < len(lines) && re.MatchString(lines[start-2]) {
-			start--
+	stack:
+		for start > 1 {
+			for _, sig := range byEnd[start-1] {
+				if sig.name == s.Name && sig.start < start {
+					start = sig.start
+					continue stack
+				}
+			}
+			break
 		}
-		if start < s.Span.Start {
+		if start < s.Span.Start && s.Span.Start-1 <= len(lines) {
 			// Keep RawText aligned with Span: line offsets into the body are
 			// computed as line - Span.Start everywhere.
 			s.RawText = strings.Join(lines[start-1:s.Span.Start-1], "\n") + "\n" + s.RawText

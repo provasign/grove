@@ -74,21 +74,23 @@ func TestFanoutCapRunsAfterTypedReceiverNarrowing(t *testing.T) {
 	}
 }
 
-func TestStripCommentsAndStringsPreservesExecutableSyntax(t *testing.T) {
+func TestMaskCodePreservesExecutableSyntax(t *testing.T) {
 	for name, tc := range map[string]struct {
+		lang  string
 		input string
 		want  string
 	}{
-		"template interpolation": {"return `value=${g.label()}`;", "g.label()"},
-		"python f-string":        {"return f'value={g.label()}'", "g.label()"},
-		"csharp interpolation":   {"return $\"value={g.Label()}\";", "g.Label()"},
-		"rust lifetime":          {"fn f<'a>(x: &'a str) { target(); }", "target()"},
-		"csharp verbatim":        {"var p = @\"C:\\dir\\\"; target();", "target()"},
-		"javascript regex":       {"s.replace(/[\"']/g, ''); target();", "target()"},
+		"template interpolation": {"typescript", "return `value=${g.label()}`;", "g.label()"},
+		"python f-string":        {"python", "return f'value={g.label()}'", "g.label()"},
+		"csharp interpolation":   {"csharp", "return $\"value={g.Label()}\";", "g.Label()"},
+		"rust lifetime":          {"rust", "fn f<'a>(x: &'a str) { target(); }", "target()"},
+		"csharp verbatim":        {"csharp", "var p = @\"C:\\dir\\\"; target();", "target()"},
+		"javascript regex":       {"javascript", "s.replace(/[\"']/g, ''); target();", "target()"},
+		"python single quotes":   {"python", "log('starting up')\nclient = Foo()", "client = Foo()"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if got := stripCommentsAndStrings(tc.input); !strings.Contains(got, tc.want) {
-				t.Fatalf("stripped = %q, want it to retain %q", got, tc.want)
+			if got := maskCode(tc.lang, tc.input); !strings.Contains(got, tc.want) {
+				t.Fatalf("maskCode(%q) = %q, want it to keep %q", tc.input, got, tc.want)
 			}
 		})
 	}
@@ -1011,5 +1013,25 @@ func TestMergeEdgesInterfaceDispatchKeepsImplementersOfThatInterface(t *testing.
 	}
 	if got["other.go::xmlDecoder.Unmarshal@1"] {
 		t.Fatal("a same-name method of a non-implementer survived interface dispatch")
+	}
+}
+
+// codeSignature masks a signature the extractor collapsed onto one line by
+// the lexing of RawText, so code after a line comment survives.
+func TestCodeSignatureCollapsedHeader(t *testing.T) {
+	cases := []struct {
+		lang, sig, raw, want string
+	}{
+		{"kotlin", "class K : KBase(), // the base KIface", "class K : KBase(), // the base\n    KIface {\n}", "class K : KBase()," + strings.Repeat(" ", 13) + "KIface"},
+		{"python", "class M( Base, # the (old) Mixin Mixin, ):", "class M(\n    Base,  # the (old) Mixin\n    Mixin,\n):\n    pass", "class M( Base," + strings.Repeat(" ", 19) + "Mixin, ):"},
+		{"csharp", `[Description("class Y : Fake")] public class A`, `[Description("class Y : Fake")] public class A {}`, `[Description(                )] public class A`},
+		// No alignment (synthesized signature): masked on its own.
+		{"go", `func F() // x`, "func G() {}", "func F()     "},
+	}
+	for _, tc := range cases {
+		s := core.SymbolRecord{Language: tc.lang, Signature: tc.sig, RawText: tc.raw}
+		if got := codeSignature(&s); got != tc.want {
+			t.Errorf("%s: codeSignature = %q, want %q", tc.lang, got, tc.want)
+		}
 	}
 }

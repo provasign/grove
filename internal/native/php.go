@@ -4,10 +4,11 @@ import (
 	"context"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 
+	"github.com/provasign/astkit/textmask"
 	"github.com/provasign/grove/internal/core"
-	"sort"
 )
 
 type phpAnalyzer struct{}
@@ -53,7 +54,7 @@ func (phpAnalyzer) Analyze(ctx context.Context, req Request) Result {
 		if err != nil {
 			continue
 		}
-		for _, class := range phpReferencedClasses(string(content)) {
+		for _, class := range phpReferencedClasses(textmask.MaskFile("php", string(content))) {
 			if target, ok := resolvePHPClass(class, psr4, fileScope); ok && target != file {
 				edges = append(edges, nativeImportEdge(file, target, 0.94))
 			}
@@ -93,7 +94,10 @@ func addPSR4(out map[string][]string, in map[string]any) {
 var phpUsePattern = regexp.MustCompile(`(?m)^[ \t]*use[ \t]+([^;\n]+);`)
 var phpNewPattern = regexp.MustCompile(`\bnew\s+\\?([A-Za-z_\\][A-Za-z0-9_\\]*)\s*\(`)
 
-func phpReferencedClasses(content string) []string {
+// phpReferencedClasses returns the classes a file imports (`use`) or
+// constructs (`new`). masked is the file through textmask.MaskFile, so text
+// in comments, strings, heredocs and inline HTML is never read as a class.
+func phpReferencedClasses(masked string) []string {
 	seen := map[string]bool{}
 	var out []string
 	add := func(name string) {
@@ -103,10 +107,10 @@ func phpReferencedClasses(content string) []string {
 			out = append(out, name)
 		}
 	}
-	for _, ref := range phpUseRefs(content) {
+	for _, ref := range phpUseRefs(masked) {
 		add(ref.Name)
 	}
-	for _, match := range phpNewPattern.FindAllStringSubmatch(content, -1) {
+	for _, match := range phpNewPattern.FindAllStringSubmatch(masked, -1) {
 		if len(match) == 2 {
 			add(match[1])
 		}
@@ -192,8 +196,12 @@ func phpSemanticEdges(symbols []core.SymbolRecord, psr4 map[string][]string, fil
 		if symbol.Language != "php" {
 			continue
 		}
+		if !typeKind(symbol.Kind) && !callableKind(symbol.Kind) {
+			continue
+		}
+		masked := maskCode("php", symbol.RawText)
 		if typeKind(symbol.Kind) {
-			for _, ref := range phpInheritanceRefs(symbol.RawText) {
+			for _, ref := range phpInheritanceRefs(masked) {
 				name := phpResolveAlias(ref.Name, aliases[symbol.FilePath])
 				if target, ok := phpBestType(idx, name, symbol.FilePath, psr4, fileScope); ok && target.ID != symbol.ID {
 					add(symbolEdge(symbol, target, ref.EdgeType, 0.95))
@@ -208,25 +216,21 @@ func phpSemanticEdges(symbols []core.SymbolRecord, psr4 map[string][]string, fil
 		// method it saw. The graph layer's call-site resolution owns calls;
 		// this pass keeps only the type-usage evidence text matching is still
 		// reliable for.
-		for _, className := range phpConstructedTypes(symbol.RawText) {
+		for _, className := range phpConstructedTypes(masked) {
 			className = phpResolveAlias(className, aliases[symbol.FilePath])
 			if target, ok := phpBestType(idx, className, symbol.FilePath, psr4, fileScope); ok && target.ID != symbol.ID {
 				add(symbolEdge(symbol, target, core.EdgeUsesType, 0.94))
 			}
 		}
 		names := make([]string, 0, 8)
-		for t := range typeTokensIn(symbol.RawText) {
+		for t := range typeTokensIn(masked) {
 			if _, ok := idx.typesByName[t]; ok {
 				names = append(names, t)
 			}
 		}
 		sort.Strings(names)
-		stripped := ""
-		if len(slowNames) > 0 {
-			stripped = stripQuotedText(symbol.RawText)
-		}
 		for _, name := range slowNames {
-			if containsTypeTokenStripped(stripped, name) {
+			if containsTypeToken(masked, name) {
 				names = append(names, name)
 			}
 		}
@@ -321,16 +325,20 @@ type phpInheritanceRef struct {
 
 var phpTraitUsePattern = regexp.MustCompile(`\buse[ \t]+([^;{\n]+)(?:;|\{)`)
 
-func phpInheritanceRefs(rawText string) []phpInheritanceRef {
+// phpInheritanceRefs reads extends/implements from the top-level headers and
+// trait `use` clauses from the class bodies (depth 1) of masked (see
+// maskCode). Method bodies are out of scope: a closure's `use ($x)` or any
+// `use` text there is not a trait use.
+func phpInheritanceRefs(masked string) []phpInheritanceRef {
 	var refs []phpInheritanceRef
-	declaration := phpTopLevelHeaders(rawText)
+	declaration := phpTopLevelHeaders(masked)
 	for _, name := range inheritanceClause(declaration, "extends", "implements") {
 		refs = append(refs, phpInheritanceRef{Name: strings.Trim(name, "\\"), EdgeType: core.EdgeExtends})
 	}
 	for _, name := range inheritanceClause(declaration, "implements") {
 		refs = append(refs, phpInheritanceRef{Name: strings.Trim(name, "\\"), EdgeType: core.EdgeImplements})
 	}
-	for _, match := range phpTraitUsePattern.FindAllStringSubmatch(rawText, -1) {
+	for _, match := range phpTraitUsePattern.FindAllStringSubmatch(phpClassBodyText(masked), -1) {
 		if len(match) != 2 {
 			continue
 		}
@@ -369,26 +377,41 @@ func phpTopLevelHeaders(rawText string) string {
 	return out.String()
 }
 
-type phpStaticCall struct {
-	Class  string
-	Method string
-}
-
-var phpStaticCallPattern = regexp.MustCompile(`\b\\?([A-Za-z_\\][A-Za-z0-9_\\]*)::([A-Za-z_][A-Za-z0-9_]*)\s*\(`)
-
-func phpStaticCalls(rawText string) []phpStaticCall {
-	matches := phpStaticCallPattern.FindAllStringSubmatch(stripQuotedText(rawText), -1)
-	out := make([]phpStaticCall, 0, len(matches))
-	for _, match := range matches {
-		if len(match) == 3 && match[2] != "class" {
-			out = append(out, phpStaticCall{Class: strings.Trim(match[1], "\\"), Method: match[2]})
+// phpClassBodyText returns the depth-1 text of masked: class-body members
+// with every nested block reduced to `{}`, statements separated by newlines.
+func phpClassBodyText(masked string) string {
+	var out strings.Builder
+	depth := 0
+	for i := 0; i < len(masked); i++ {
+		switch c := masked[i]; c {
+		case '{':
+			depth++
+			if depth == 2 {
+				out.WriteByte('{')
+			}
+		case '}':
+			if depth == 2 {
+				out.WriteByte('}')
+			}
+			if depth == 1 {
+				out.WriteByte('\n')
+			}
+			if depth > 0 {
+				depth--
+			}
+		default:
+			if depth == 1 {
+				out.WriteByte(c)
+			}
 		}
 	}
-	return out
+	return out.String()
 }
 
-func phpConstructedTypes(rawText string) []string {
-	matches := phpNewPattern.FindAllStringSubmatch(stripQuotedText(rawText), -1)
+// phpConstructedTypes returns the `new T(` class names of masked (see
+// maskCode).
+func phpConstructedTypes(masked string) []string {
+	matches := phpNewPattern.FindAllStringSubmatch(masked, -1)
 	seen := map[string]bool{}
 	var out []string
 	for _, match := range matches {

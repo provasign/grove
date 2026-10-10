@@ -2,6 +2,7 @@ package graph
 
 import (
 	"fmt"
+	"github.com/provasign/astkit/textmask"
 	"os"
 	"path"
 	"regexp"
@@ -71,6 +72,11 @@ type edgeIndex struct {
 	// walk once per call site otherwise. Values are READ-ONLY; nothing
 	// mutates a returned map.
 	qualifierFiles sync.Map // string("file\x00qualifier") → qualifierFileSet
+	// classBodies / maskedLines memoize classBody and maskedSymbolLines
+	// (localtypes.go) per symbol ID; classBodies also holds PHP trait rules
+	// (phpClassTraitRules) under a "php-traits\x00" key prefix.
+	classBodies sync.Map
+	maskedLines sync.Map
 
 	// Rust crate topology: visibility in Rust is crate-wide (any item is
 	// reachable through crate:: paths without a per-file use), so scope is
@@ -351,7 +357,9 @@ func segmentSuffixIndex(m map[string][]string) map[string][]string {
 // candidates whose file lies under the last module segment before the
 // type (pcre2). Without a path nothing is preferred — an own-crate
 // preference was tried and lost 143 real cross-crate edges on ripgrep.
-func rustPinByPath(idx *edgeIndex, symbol *core.SymbolRecord, cs core.CallSite, qualifier string, cands []*core.SymbolRecord) []*core.SymbolRecord {
+// body is the caller's masked RawText (maskCode), so a path in a trailing
+// comment on the call line pins nothing.
+func rustPinByPath(idx *edgeIndex, symbol *core.SymbolRecord, body string, cs core.CallSite, qualifier string, cands []*core.SymbolRecord) []*core.SymbolRecord {
 	if qualifier == "" || qualifier[0] < 'A' || qualifier[0] > 'Z' || cs.Line <= 0 || symbol.Span.Start <= 0 {
 		return cands
 	}
@@ -361,7 +369,7 @@ func rustPinByPath(idx *edgeIndex, symbol *core.SymbolRecord, cs core.CallSite, 
 	}
 	mod := ""
 	off := cs.Line - symbol.Span.Start
-	lines := strings.Split(symbol.RawText, "\n")
+	lines := strings.Split(body, "\n")
 	if off >= 0 && off < len(lines) {
 		re := localFnRes.get(`((?:[a-z_][a-z0-9_]*::)+)` + regexp.QuoteMeta(qualifier) + `::` + regexp.QuoteMeta(name) + `\b`)
 		if m := re.FindStringSubmatch(lines[off]); m != nil {
@@ -588,17 +596,25 @@ func (idx *edgeIndex) buildRustInlineRefs(symbols []core.SymbolRecord) {
 		if s.Language != "rust" || s.RawText == "" {
 			continue
 		}
+		// Comments and strings name paths too (`// Same contract as
+		// beta::normalize`); only code paths widen the scope. The body is
+		// masked only when the raw text mentions a workspace crate at all.
+		var segs []string
 		for _, m := range rustInlinePathRe.FindAllStringSubmatch(s.RawText, -1) {
-			seg := m[1]
-			switch seg {
-			case "crate", "super", "self", "std", "core", "alloc":
-				continue
+			if idx.rustWorkspaceCrateSeg(m[1]) {
+				segs = append(segs, m[1])
 			}
-			if _, ok := idx.rustCrateByName[seg]; !ok {
-				if i := strings.LastIndexByte(seg, '_'); i < 0 || idx.rustCrateByName[seg[i+1:]] == "" {
-					continue
-				}
+		}
+		if len(segs) == 0 {
+			continue
+		}
+		segs = segs[:0]
+		for _, m := range rustInlinePathRe.FindAllStringSubmatch(maskCode(s.Language, s.RawText), -1) {
+			if idx.rustWorkspaceCrateSeg(m[1]) {
+				segs = append(segs, m[1])
 			}
+		}
+		for _, seg := range segs {
 			if seen[s.FilePath] == nil {
 				seen[s.FilePath] = map[string]bool{}
 			}
@@ -608,6 +624,21 @@ func (idx *edgeIndex) buildRustInlineRefs(symbols []core.SymbolRecord) {
 			}
 		}
 	}
+}
+
+// rustWorkspaceCrateSeg reports whether an inline path's leading segment
+// names a workspace crate (or its last underscore token does: grep_regex ->
+// regex).
+func (idx *edgeIndex) rustWorkspaceCrateSeg(seg string) bool {
+	switch seg {
+	case "crate", "super", "self", "std", "core", "alloc":
+		return false
+	}
+	if _, ok := idx.rustCrateByName[seg]; ok {
+		return true
+	}
+	i := strings.LastIndexByte(seg, '_')
+	return i >= 0 && idx.rustCrateByName[seg[i+1:]] != ""
 }
 
 // buildPyModuleGlobals collects the name→class-type map from Python
@@ -683,8 +714,10 @@ var pyModuleVarCtorRe = regexp.MustCompile(`^\s*([A-Za-z_]\w*)\s*=\s*(?:\w+\.)*(
 
 // creationSite reports whether the call site's source line instantiates
 // the callee (`new Name(` / `new Name<`), for the languages whose
-// extractors emit the type name as the callee of an object creation.
-func creationSite(symbol *core.SymbolRecord, cs core.CallSite) bool {
+// extractors emit the type name as the callee of an object creation. body is
+// the caller's masked RawText (maskCode): `new X(` in a comment or string on
+// the call line is not a creation.
+func creationSite(symbol *core.SymbolRecord, body string, cs core.CallSite) bool {
 	switch symbol.Language {
 	case "java", "csharp", "typescript", "tsx", "javascript", "php":
 	default:
@@ -697,7 +730,7 @@ func creationSite(symbol *core.SymbolRecord, cs core.CallSite) bool {
 	if off < 0 {
 		return false
 	}
-	lines := strings.Split(symbol.RawText, "\n")
+	lines := strings.Split(body, "\n")
 	if off >= len(lines) {
 		return false
 	}
@@ -708,9 +741,10 @@ func creationSite(symbol *core.SymbolRecord, cs core.CallSite) bool {
 // function named name: JS/TS `function name(`, Python `def name(`, Go
 // `name := func`, Rust `fn name(`. The declaration line of the caller
 // itself (which also matches `def name(` when the caller IS name) is
-// excluded by requiring the match to start after the first line.
-func declaresLocalFunction(symbol *core.SymbolRecord, name string) bool {
-	body := symbol.RawText
+// excluded by requiring the match to start after the first line. body is the
+// caller's masked RawText (maskCode): a `def name(` in a docstring example, a
+// comment or a template literal declares nothing.
+func declaresLocalFunction(symbol *core.SymbolRecord, body, name string) bool {
 	if body == "" || name == "" {
 		return false
 	}
@@ -805,13 +839,13 @@ func sortedFileKeys(m map[string][]*core.SymbolRecord) []string {
 // because package names commonly prefix the directory name (grep-searcher
 // lives in crates/searcher).
 func (idx *edgeIndex) buildRustCrates() {
-	roots := map[string]bool{}
+	roots := map[string]struct{}{}
 	for _, f := range sortedFileKeys(idx.byFile) {
 		if !strings.HasSuffix(f, ".rs") {
 			continue
 		}
 		if base := baseNameNoExt(f); base == "lib" || base == "main" {
-			roots[dirOf(f)] = true
+			roots[dirOf(f)] = struct{}{}
 		}
 		// Cargo's integration tests, benches and examples are crates of
 		// their own: every file directly under tests/ is a crate root,
@@ -819,7 +853,7 @@ func (idx *edgeIndex) buildRustCrates() {
 		// Without a root they scoped to their own file only (fd's
 		// TestEnv::new from tests/tests.rs resolved nothing).
 		if d := baseOf(dirOf(f)); d == "tests" || d == "benches" || d == "examples" {
-			roots[dirOf(f)] = true
+			roots[dirOf(f)] = struct{}{}
 		}
 	}
 	if len(roots) == 0 {
@@ -834,7 +868,7 @@ func (idx *edgeIndex) buildRustCrates() {
 		}
 		root := dirOf(f)
 		for d := root; ; {
-			if roots[d] {
+			if _, ok := roots[d]; ok {
 				root = d
 				break
 			}
@@ -854,13 +888,29 @@ func (idx *edgeIndex) buildRustCrates() {
 		}
 		return strings.ToLower(strings.ReplaceAll(name, "-", "_"))
 	}
-	for root := range roots {
+	// Integration-test, bench and example targets are crates nothing can
+	// name: registering them put every `tests`/`benches` root under the
+	// one name, and a library's own `mod tests` paths (`tests::helper`)
+	// pulled whichever one won the map iteration into the library's scope.
+	// Names are registered in sorted root order so a clash between two
+	// real crates resolves the same way on every run.
+	var named []string
+	for _, root := range sortedKeys(roots) {
+		switch baseOf(root) {
+		case "tests", "benches", "examples":
+			continue
+		}
+		named = append(named, root)
+	}
+	for _, root := range named {
 		if name := crateName(root); name != "" && name != "." {
-			idx.rustCrateByName[name] = root
+			if _, dup := idx.rustCrateByName[name]; !dup {
+				idx.rustCrateByName[name] = root
+			}
 		}
 	}
 	// Token aliases never displace an exact crate name.
-	for root := range roots {
+	for _, root := range named {
 		name := crateName(root)
 		if i := strings.LastIndexByte(name, '_'); i >= 0 && i+1 < len(name) {
 			if tok := name[i+1:]; idx.rustCrateByName[tok] == "" {
@@ -1329,185 +1379,125 @@ func trimExt(path string) string {
 	return path
 }
 
-// stripCommentsAndStrings removes // line comments, /* */ block comments,
-// # python comments, and string literals from a source body so that
-// regex-based call matching does not produce false positives.
-func stripCommentsAndStrings(src string) string {
-	var out strings.Builder
-	out.Grow(len(src))
-	i, n := 0, len(src)
-	for i < n {
-		ch := src[i]
-		// Block comment
-		if ch == '/' && i+1 < n && src[i+1] == '*' {
-			end := strings.Index(src[i+2:], "*/")
-			if end < 0 {
-				return out.String()
-			}
-			i += end + 4
-			continue
-		}
-		// Line comment // and #
-		if (ch == '/' && i+1 < n && src[i+1] == '/') || ch == '#' {
-			for i < n && src[i] != '\n' {
-				i++
-			}
-			continue
-		}
-		// A slash after an expression opener is a JavaScript/TypeScript regex
-		// literal. Skip it as one unit so quotes inside /["']/ do not open a
-		// fake string that consumes the rest of the source.
-		if ch == '/' && looksLikeRegexLiteral(src, i) {
-			out.WriteByte(' ')
-			i++
-			inClass := false
-			for i < n {
-				if src[i] == '\\' && i+1 < n {
-					i += 2
-					continue
-				}
-				if src[i] == '[' {
-					inClass = true
-				} else if src[i] == ']' {
-					inClass = false
-				} else if src[i] == '/' && !inClass {
-					i++
-					for i < n && isASCIIAlpha(src[i]) {
-						i++
-					}
-					break
-				}
-				if src[i] == '\n' {
-					out.WriteByte('\n')
-				}
-				i++
-			}
-			continue
-		}
-		// Rust lifetimes ('a, 'static) are identifiers, not character strings.
-		if ch == '\'' && rustLifetimeAt(src, i) {
-			out.WriteByte(ch)
-			i++
-			continue
-		}
-		// String literal — preserve newlines and executable interpolation holes.
-		if ch == '"' || ch == '\'' || ch == '`' {
-			quote := ch
-			prefix := literalPrefix(src, i)
-			raw := strings.Contains(prefix, "@") || strings.ContainsAny(prefix, "rR")
-			interpolated := quote == '`' || strings.Contains(prefix, "$") || strings.ContainsAny(prefix, "fF")
-			out.WriteByte(' ')
-			i++
-			for i < n {
-				if interpolated {
-					open := -1
-					if quote == '`' && src[i] == '$' && i+1 < n && src[i+1] == '{' {
-						open = i + 1
-					} else if quote != '`' && src[i] == '{' && (i+1 >= n || src[i+1] != '{') {
-						open = i
-					}
-					if open >= 0 {
-						if end := matchingBrace(src, open); end >= 0 {
-							out.WriteByte(' ')
-							out.WriteString(stripCommentsAndStrings(src[open+1 : end]))
-							out.WriteByte(' ')
-							i = end + 1
-							continue
-						}
-					}
-				}
-				if src[i] == quote {
-					if raw && i+1 < n && src[i+1] == quote {
-						i += 2 // C# verbatim doubled quote
-						continue
-					}
-					i++
-					break
-				}
-				if !raw && src[i] == '\\' && i+1 < n {
-					i += 2
-					continue
-				}
-				if src[i] == '\n' {
-					out.WriteByte('\n')
-				}
-				i++
-			}
-			continue
-		}
-		out.WriteByte(ch)
-		i++
+// maskCode blanks comments and string literals in src (a symbol body in
+// language lang) so regex scans only see code. Offsets and line breaks are
+// kept, so a line index into the result is a line index into src.
+// Interpolation holes stay as code.
+func maskCode(lang, src string) string {
+	if !textmask.Supported(lang) {
+		lang = "c" // unknown languages get the generic C-style lexer
 	}
-	return out.String()
+	if lang == "cobol" {
+		// The parser normalizes COBOL symbol text: the sequence and
+		// indicator areas (columns 1-7) and the identification area are
+		// cut off, so a statement starts in column 1. textmask defaults
+		// to fixed format and would skip the first 7 bytes of every line
+		// (and open a literal on a quote it never saw start); lex the
+		// normalized text as free format instead.
+		const free = ">>SOURCE FORMAT FREE\n"
+		return textmask.Mask(lang, free+src)[len(free):]
+	}
+	return textmask.Mask(lang, src)
+}
+
+// maskedLine returns line idx of maskCode(lang, src). Masking the whole body
+// keeps multi-line comments and strings masked on their middle lines.
+func maskedLine(lang, src string, idx int) string {
+	lines := strings.Split(maskCode(lang, src), "\n")
+	if idx < 0 || idx >= len(lines) {
+		return ""
+	}
+	return lines[idx]
+}
+
+// codeSignature returns s.Signature with comments and string literals
+// blanked, for scans that parse a signature as code (base lists, type
+// names). Extractors collapse some multi-line headers onto one line (Python
+// and Kotlin class headers), which turns a `# ...` or `// ...` comment into
+// one running to the end of the signature: masking that text on its own
+// would hide the code after it. So the signature is aligned with the
+// symbol's RawText, where the header keeps its line breaks, and masked by
+// RawText's lexing. Only a signature that does not align is masked alone.
+func codeSignature(s *core.SymbolRecord) string {
+	sig := s.Signature
+	if sig == "" {
+		return ""
+	}
+	if s.RawText != "" && !strings.HasPrefix(s.RawText, sig) {
+		if masked, ok := maskAlignedSignature(s.Language, sig, s.RawText); ok {
+			return masked
+		}
+	}
+	return maskCode(s.Language, sig)
+}
+
+// maskAlignedSignature masks sig by the lexing of raw, the source text it
+// was derived from. The two are aligned byte for byte ignoring whitespace,
+// starting at the first occurrence in raw of sig's first token that aligns
+// through the end of sig. ok is false when no alignment exists (the
+// signature was synthesized or reordered).
+func maskAlignedSignature(lang, sig, raw string) (string, bool) {
+	sig0 := strings.TrimLeft(sig, " \t\r\n")
+	if sig0 == "" {
+		return sig, true
+	}
+	lead := len(sig) - len(sig0)
+	first := sig0
+	if i := strings.IndexAny(first, " \t\r\n"); i >= 0 {
+		first = first[:i]
+	}
+	pos := make([]int, len(sig))
+	for from, tries := 0, 0; tries < 4; tries++ {
+		start := strings.Index(raw[from:], first)
+		if start < 0 {
+			return "", false
+		}
+		start += from
+		from = start + 1
+		j := start
+		ok := true
+		for i := lead; i < len(sig); i++ {
+			c := sig[i]
+			if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+				pos[i] = -1
+				continue
+			}
+			for j < len(raw) && (raw[j] == ' ' || raw[j] == '\t' || raw[j] == '\n' || raw[j] == '\r') {
+				j++
+			}
+			if j >= len(raw) || raw[j] != c {
+				ok = false
+				break
+			}
+			pos[i] = j
+			j++
+		}
+		if !ok {
+			continue
+		}
+		masked := maskCode(lang, raw[:j])
+		out := []byte(sig)
+		for i := lead; i < len(sig); i++ {
+			if p := pos[i]; p >= 0 && masked[p] == ' ' {
+				out[i] = ' '
+			}
+		}
+		return string(out), true
+	}
+	return "", false
+}
+
+// declHeader is the masked declaration header of a type: its signature, or
+// the first line of its source when the extractor left no signature.
+func declHeader(s *core.SymbolRecord) string {
+	if text := codeSignature(s); text != "" {
+		return text
+	}
+	return maskCode(s.Language, firstLine(s.RawText))
 }
 
 func isASCIIAlpha(ch byte) bool {
 	return ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z'
-}
-
-func rustLifetimeAt(src string, quote int) bool {
-	if quote+1 >= len(src) || !(isASCIIAlpha(src[quote+1]) || src[quote+1] == '_') {
-		return false
-	}
-	i := quote + 2
-	for i < len(src) && (isASCIIAlpha(src[i]) || src[i] == '_' || src[i] >= '0' && src[i] <= '9') {
-		i++
-	}
-	return i >= len(src) || src[i] != '\''
-}
-
-func literalPrefix(src string, quote int) string {
-	i := quote
-	for i > 0 {
-		ch := src[i-1]
-		if ch != '$' && ch != '@' && ch != 'f' && ch != 'F' && ch != 'r' && ch != 'R' {
-			break
-		}
-		i--
-	}
-	return src[i:quote]
-}
-
-func matchingBrace(src string, open int) int {
-	depth := 0
-	for i := open; i < len(src); i++ {
-		switch src[i] {
-		case '{':
-			depth++
-		case '}':
-			depth--
-			if depth == 0 {
-				return i
-			}
-		}
-	}
-	return -1
-}
-
-func looksLikeRegexLiteral(src string, slash int) bool {
-	prev := byte(0)
-	for i := slash - 1; i >= 0; i-- {
-		if src[i] != ' ' && src[i] != '\t' && src[i] != '\r' && src[i] != '\n' {
-			prev = src[i]
-			break
-		}
-	}
-	if prev != 0 && !strings.ContainsRune("(=,:;!&|?{[", rune(prev)) {
-		return false
-	}
-	for i := slash + 1; i < len(src); i++ {
-		if src[i] == '\\' {
-			i++
-			continue
-		}
-		if src[i] == '\n' {
-			return false
-		}
-		if src[i] == '/' {
-			return true
-		}
-	}
-	return false
 }
 
 // buildDefinesAndImports emits "file → symbol" defines edges and
@@ -1629,7 +1619,7 @@ func buildContains(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
 var (
 	extendsRe        = regexp.MustCompile(`\bextends\s+([A-Za-z_][A-Za-z0-9_.]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_.]*)*)`)
 	implementsRe     = regexp.MustCompile(`\bimplements\s+([A-Za-z_][A-Za-z0-9_.]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_.]*)*)`)
-	pythonClassBase  = regexp.MustCompile(`^\s*class\s+[A-Za-z_][A-Za-z0-9_]*\s*\(([^)]+)\)`)
+	pythonClassHead  = regexp.MustCompile(`^\s*class\s+[A-Za-z_][A-Za-z0-9_]*\s*(?:\[[^\]]*\]\s*)?`)
 	rustImplForRe    = regexp.MustCompile(`\bimpl(?:\s*<[^>]+>)?\s+([A-Za-z_][A-Za-z0-9_:]*)(?:<[^{}]+>)?\s+for\s+&?\s*([A-Za-z_][A-Za-z0-9_:]*)(?:<[^{}]+>)?`)
 	usesTypeIdent    = regexp.MustCompile(`\b([A-Z][A-Za-z0-9_]+)\b`)
 	goEmbeddedTypeRe = regexp.MustCompile(`^\s*\*?((?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z_][A-Za-z0-9_]*)(?:\[[^]\n]+\])?\s*(?://.*)?$`)
@@ -1671,10 +1661,7 @@ func buildExtendsImplements(idx *edgeIndex, symbols []core.SymbolRecord) []core.
 			if symbol.Kind != core.KindClass && symbol.Kind != core.KindInterface {
 				continue
 			}
-			text := symbol.Signature
-			if text == "" {
-				text = firstLine(symbol.RawText)
-			}
+			text := declHeader(&symbol)
 			// Drop balanced <...> sections so generic arguments and bounds
 			// (`class Foo<T extends Bar> extends Baz<Qux>`) neither confuse
 			// the extends regex nor emit bogus edges to type parameters.
@@ -1697,10 +1684,7 @@ func buildExtendsImplements(idx *edgeIndex, symbols []core.SymbolRecord) []core.
 			if symbol.Kind != core.KindClass && symbol.Kind != core.KindInterface {
 				continue
 			}
-			text := symbol.Signature
-			if text == "" {
-				text = firstLine(symbol.RawText)
-			}
+			text := declHeader(&symbol)
 			for i, name := range csharpBaseNames(text) {
 				edgeType := core.EdgeImplements
 				if symbol.Kind == core.KindClass && i == 0 && !strings.HasPrefix(name, "I") {
@@ -1712,10 +1696,7 @@ func buildExtendsImplements(idx *edgeIndex, symbols []core.SymbolRecord) []core.
 			if symbol.Kind != core.KindClass && symbol.Kind != core.KindInterface && symbol.Kind != core.KindTrait {
 				continue
 			}
-			text := symbol.Signature
-			if text == "" {
-				text = firstLine(symbol.RawText)
-			}
+			text := declHeader(&symbol)
 			for _, name := range inheritanceClauseTypes(text, "extends", "implements") {
 				edges = append(edges, resolveTypeEdges(idx, symbol, name, core.EdgeExtends, 0.85)...)
 			}
@@ -1753,16 +1734,7 @@ func buildExtendsImplements(idx *edgeIndex, symbols []core.SymbolRecord) []core.
 			if symbol.Kind != core.KindClass {
 				continue
 			}
-			line := firstLine(symbol.RawText)
-			matches := pythonClassBase.FindStringSubmatch(line)
-			if len(matches) < 2 {
-				continue
-			}
-			for _, base := range splitTrim(matches[1], ',') {
-				base = stripPythonBase(base)
-				if base == "" {
-					continue
-				}
+			for _, base := range pythonClassBases(&symbol) {
 				edges = append(edges, resolveTypeEdges(idx, symbol, base, core.EdgeExtends, 0.85)...)
 			}
 		case "rust":
@@ -1806,10 +1778,7 @@ func buildExtendsImplements(idx *edgeIndex, symbols []core.SymbolRecord) []core.
 				symbol.Kind != core.KindEnum && symbol.Kind != core.KindInterface {
 				continue
 			}
-			text := symbol.Signature
-			if text == "" {
-				text = firstLine(symbol.RawText)
-			}
+			text := declHeader(&symbol)
 			for i, name := range swiftBaseNames(text) {
 				if name == "" {
 					continue
@@ -1828,10 +1797,7 @@ func buildExtendsImplements(idx *edgeIndex, symbols []core.SymbolRecord) []core.
 			if symbol.Kind != core.KindClass && symbol.Kind != core.KindInterface {
 				continue
 			}
-			text := symbol.Signature
-			if text == "" {
-				text = firstLine(symbol.RawText)
-			}
+			text := declHeader(&symbol)
 			for _, raw := range kotlinBaseNames(text) {
 				name, isCtorCall := kotlinBaseNameAndCtor(raw)
 				if name == "" {
@@ -1853,10 +1819,7 @@ func buildExtendsImplements(idx *edgeIndex, symbols []core.SymbolRecord) []core.
 			// function treats one interface extending another elsewhere).
 			switch symbol.Kind {
 			case core.KindClass:
-				text := symbol.Signature
-				if text == "" {
-					text = firstLine(symbol.RawText)
-				}
+				text := declHeader(&symbol)
 				if m := objcSuperclassRe.FindStringSubmatch(text); len(m) == 2 {
 					edges = append(edges, resolveTypeEdges(idx, symbol, m[1], core.EdgeExtends, 0.85)...)
 				}
@@ -1864,10 +1827,7 @@ func buildExtendsImplements(idx *edgeIndex, symbols []core.SymbolRecord) []core.
 					edges = append(edges, resolveTypeEdges(idx, symbol, name, core.EdgeImplements, 0.85)...)
 				}
 			case core.KindInterface:
-				text := symbol.Signature
-				if text == "" {
-					text = firstLine(symbol.RawText)
-				}
+				text := declHeader(&symbol)
 				for _, name := range objcProtocolNames(text) {
 					edges = append(edges, resolveTypeEdges(idx, symbol, name, core.EdgeExtends, 0.85)...)
 				}
@@ -1960,7 +1920,13 @@ func buildUsesType(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
 			continue
 		}
 		scope := idx.importedFiles(symbol.FilePath)
-		matches := usesTypeIdent.FindAllStringSubmatch(symbol.Signature, -1)
+		sig := codeSignature(&symbol)
+		matches := usesTypeIdent.FindAllStringSubmatch(sig, -1)
+		if symbol.Language == "csharp" && len(symbol.Annotations) > 0 {
+			for _, name := range csharpAttributeTypeNames(idx, &symbol) {
+				matches = append(matches, []string{name, name})
+			}
+		}
 		for _, m := range matches {
 			candidateName := m[1]
 			if candidateName == symbol.Name {
@@ -1968,7 +1934,8 @@ func buildUsesType(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
 			}
 			var targets []*core.SymbolRecord
 			for _, target := range idx.byName[strings.ToLower(candidateName)] {
-				if target.ID == symbol.ID || target.Name != candidateName {
+				if target.ID == symbol.ID || target.Name != candidateName ||
+					!typeRefLanguagesCompatible(symbol.Language, target.Language) {
 					continue
 				}
 				switch target.Kind {
@@ -1982,7 +1949,7 @@ func buildUsesType(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
 				targets = append(targets, target)
 			}
 			if symbol.Language == "cpp" && len(targets) > 1 {
-				qualified := localFnRes.get(`\b(?:[A-Za-z_]\w*::)+`+regexp.QuoteMeta(candidateName)+`\b`).FindAllString(symbol.Signature, -1)
+				qualified := localFnRes.get(`\b(?:[A-Za-z_]\w*::)+`+regexp.QuoteMeta(candidateName)+`\b`).FindAllString(sig, -1)
 				var pinned []*core.SymbolRecord
 				if len(qualified) > 0 {
 					for _, target := range targets {
@@ -2095,6 +2062,21 @@ func callLanguagesCompatible(caller, candidate string) bool {
 	return tsFamilyLang(caller) && tsFamilyLang(candidate)
 }
 
+// typeRefLanguagesCompatible reports whether a signature in language from
+// can name a type declared in language to: the call-compatible pairs plus
+// the interop families whose signatures share types (Java/Kotlin on the JVM;
+// C, C++, Objective-C and Swift through Clang modules). Without it a Kotlin
+// signature naming Gadget took a uses-type edge to a Python class Gadget in
+// the same directory.
+func typeRefLanguagesCompatible(from, to string) bool {
+	if callLanguagesCompatible(from, to) {
+		return true
+	}
+	jvm := func(l string) bool { return l == "java" || l == "kotlin" }
+	native := func(l string) bool { return l == "c" || l == "cpp" || l == "objc" || l == "swift" }
+	return jvm(from) && jvm(to) || native(from) && native(to)
+}
+
 func sameCSharpPrivateScope(callerOwner, candidateOwner string) bool {
 	if callerOwner == "" || candidateOwner == "" {
 		return false
@@ -2117,6 +2099,11 @@ func graphCallableSymbol(symbol *core.SymbolRecord) bool {
 		return false
 	}
 	text := symbol.Signature + "\n" + symbol.RawText
+	if !strings.Contains(text, "=>") && !strings.Contains(text, "function") {
+		return false
+	}
+	// `label = "a => b"` is a string field, not a callable one.
+	text = maskCode(symbol.Language, text)
 	return strings.Contains(text, "=>") || strings.Contains(text, "function")
 }
 
@@ -2329,6 +2316,17 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 		}
 		var javaArgTypeCache map[string]string
 		var csArgTypeCache map[string]string
+		// codeBody is the caller's RawText with comments and strings
+		// masked, for the source-line checks below; masked once, on first
+		// use.
+		var maskedBody *string
+		codeBody := func() string {
+			if maskedBody == nil {
+				m := maskCode(symbol.Language, symbol.RawText)
+				maskedBody = &m
+			}
+			return *maskedBody
+		}
 		var ktShapeCache map[string]string
 		javaTypesFor := func(cands []*core.SymbolRecord, cs core.CallSite) map[string]string {
 			if javaArgTypeCache == nil {
@@ -2473,7 +2471,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			// receiver syntax, so the same source recovery applies:
 			// `w.serializer.serialize(...)` → chain "w.serializer").
 			if (tsFamilyLang(symbol.Language) || symbol.Language == "java") && qualifier != "" && cs.Line > 0 {
-				if chain := tsReceiverChainAt(symbol.RawText, cs.Line-symbol.Span.Start, calleeName); chain != "" {
+				if chain := tsReceiverChainAt(idx, &symbol, cs.Line-symbol.Span.Start, calleeName); chain != "" {
 					fullChain = chain
 				}
 			}
@@ -2483,7 +2481,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// constructor in scope.
 				continue
 			}
-			localDefinition := qualifier == "" && symbol.Name != "<top-level>" && declaresLocalFunction(&symbol, calleeName)
+			localDefinition := qualifier == "" && symbol.Name != "<top-level>" && declaresLocalFunction(&symbol, codeBody(), calleeName)
 			if localDefinition && (symbol.Language != "python" || len(pythonLexicalChild(idx, &symbol, calleeName)) == 0) {
 				// A function declared inside the caller's own body
 				// (`function run(i)` nested in Socket.run, a nested `def`)
@@ -2677,7 +2675,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				fmt.Fprintf(os.Stderr, "grove-trace %s: callee=%q qual=%q args=%v cands=%d capped=%v scope=%d first=%v\n", symbol.QualifiedName, cs.Callee, qualifier, cs.Args, len(cands), capped, len(scope), ids)
 			}
 			if symbol.Language == "python" && qualifier != "" && cs.Argc > 0 && len(cands) > 0 &&
-				!pyCallHasSplat(&symbol, cs) {
+				!pyCallHasSplat(idx, &symbol, cs) {
 				// Python has no overloading: a method whose parameters cannot
 				// take this call's argument count is not its target (click:
 				// ctx.invoke(other_cmd, arg=42) is not Command.invoke(self, ctx)).
@@ -2898,7 +2896,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					cands = csNarrowOverloads(idx, cands, cs.Args, csArgTypeCache)
 				}
 			}
-			if creationSite(&symbol, cs) {
+			if creationSite(&symbol, codeBody(), cs) {
 				// `new X(...)`: only a constructor can be the target. A
 				// same-named method elsewhere (a test named List() for
 				// `new List<Animal>()`) is never it.
@@ -3132,7 +3130,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				}
 			}
 			if symbol.Language == "rust" && qualifier != "" && len(cands) > 1 {
-				cands = rustPinByPath(idx, &symbol, cs, qualifier, cands)
+				cands = rustPinByPath(idx, &symbol, codeBody(), cs, qualifier, cands)
 			}
 			if symbol.Language == "rust" && qualifier == "" && len(cands) > 0 && !anyInFile(cands, symbol.FilePath) && rustImportedExternal(idx, &symbol, calleeName) {
 				// `use regex_syntax::escape;` then `escape(pattern)`: the
@@ -3217,7 +3215,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			if qualifier == "super()" || qualifier == "super" || (symbol.Language == "csharp" && qualifier == "base") ||
 				(symbol.Language == "php" && qualifier == "parent") {
 				if traceCalls {
-					fmt.Fprintf(os.Stderr, "grove-trace %s: super bases=%v matched=%d\n", symbol.QualifiedName, baseClassesFor(idx, symbol.Language, symbol.ParentSymbol, dirOf(symbol.FilePath)), len(narrowBySuper(idx, &symbol, cands)))
+					fmt.Fprintf(os.Stderr, "grove-trace %s: super bases=%v matched=%d\n", symbol.QualifiedName, baseClassesInFileFor(idx, symbol.Language, symbol.ParentSymbol, symbol.FilePath), len(narrowBySuper(idx, &symbol, cands)))
 				}
 				viaSuper := narrowBySuper(idx, &symbol, cands)
 				// `base.WriteValue(x)` binds ONE overload on the base type,
@@ -3577,7 +3575,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 	if symbol.RawText == "" {
 		return edges
 	}
-	stripped := stripCommentsAndStrings(symbol.RawText)
+	stripped := maskCode(symbol.Language, symbol.RawText)
 	if hasAnnotation(&symbol, "syntax-recovery") {
 		stripped = stripRecoveredNestedDeclarations(symbol.Language, stripped)
 	}
@@ -3932,7 +3930,7 @@ func declParamCount(s *core.SymbolRecord) (int, bool, bool) {
 	if s.Language == "go" {
 		params, parsed = goDeclParamsOK(src)
 	} else {
-		params = tsDeclParams(src)
+		params = tsDeclParams(s.Language, src)
 		parsed = params != "" || strings.Contains(src, "()")
 	}
 	if params == "" {
@@ -3941,7 +3939,7 @@ func declParamCount(s *core.SymbolRecord) (int, bool, bool) {
 		}
 		return 0, false, false
 	}
-	groups := splitTopLevel(params, ',')
+	groups := splitParams(s.Language, params)
 	if s.Language == "java" {
 		groups = splitJavaParamGroups(params)
 	}
@@ -4333,10 +4331,69 @@ func splitTrim(s string, sep byte) []string {
 	return out
 }
 
+// pythonClassBases returns the simple names of a Python class's bases. The
+// base list is read from the whole masked header, so a list spanning lines
+// or carrying comments (`class C(Base,  # the (old) Mixin`) keeps every
+// base. The signature normally holds the full header; when it stops early,
+// the header is read from the masked source.
+func pythonClassBases(s *core.SymbolRecord) []string {
+	list, ok := pythonClassBaseList(s)
+	if !ok {
+		return nil
+	}
+	var out []string
+	for _, base := range splitTopLevel(list, ',') {
+		if base = stripPythonBase(base); base != "" {
+			out = append(out, base)
+		}
+	}
+	return out
+}
+
+// pythonClassBaseList returns the masked text between the parentheses of a
+// Python class header, read from the signature or, when the signature is cut
+// off, from the class text. Comments in the header are masked.
+func pythonClassBaseList(s *core.SymbolRecord) (string, bool) {
+	list, ok := pythonBaseList(codeSignature(s))
+	if !ok && s.RawText != "" {
+		list, ok = pythonBaseList(maskCode(s.Language, s.RawText))
+	}
+	return list, ok
+}
+
+// pythonBaseList returns the text between the parentheses of a masked
+// `class Name(...)` header. ok is false when the header is cut off before
+// its closing parenthesis; a header with no parentheses has no bases.
+func pythonBaseList(header string) (string, bool) {
+	loc := pythonClassHead.FindStringIndex(header)
+	if loc == nil {
+		return "", false
+	}
+	rest := header[loc[1]:]
+	if !strings.HasPrefix(rest, "(") {
+		return "", true
+	}
+	depth := 0
+	for i := 0; i < len(rest); i++ {
+		switch rest[i] {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			depth--
+			if depth == 0 {
+				return rest[1:i], true
+			}
+		}
+	}
+	return "", false
+}
+
 func stripPythonBase(b string) string {
 	b = strings.TrimSpace(b)
 	// Strip default ABC bases that add noise (object, Generic[T], etc.)
-	if strings.HasPrefix(b, "metaclass=") || b == "object" {
+	if strings.Contains(b, "=") || strings.HasPrefix(b, "*") || b == "object" {
+		// Keyword arguments (metaclass=M, total=False) and unpacked
+		// base lists are not bases.
 		return ""
 	}
 	if i := strings.Index(b, "["); i >= 0 {
@@ -4516,7 +4573,10 @@ func objcProtocolNames(text string) []string {
 func goEmbeddedTypes(body string) []string {
 	// Look at lines between the first `{` and the matching `}` of the struct
 	// declaration. We consider each non-empty line consisting of a single
-	// identifier (or *Identifier) to be an embedded type.
+	// identifier (or *Identifier) to be an embedded type. Comments and
+	// struct tags are masked first: a lone name inside a /* */ block is
+	// prose, and a tagged embed (`Base `+"`json:\"b\"`"+`) is still an embed.
+	body = maskCode("go", body)
 	open := strings.IndexByte(body, '{')
 	if open < 0 {
 		return nil

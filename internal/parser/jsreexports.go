@@ -8,10 +8,30 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/provasign/astkit/textmask"
 	"github.com/provasign/grove/internal/core"
 )
 
-var jsExportClauseRE = regexp.MustCompile(`(?s)\bexport\s+(?:type\s+)?\{([^}]*)\}(?:\s*from\s*["']([^"']+)["'])?`)
+// jsExportClauseRE matches an export clause in masked source (comments and
+// string literals blanked); jsExportFromRE matches the `from` that may
+// follow it, whose module string is read from the original source.
+var (
+	jsExportClauseRE = regexp.MustCompile(`(?s)\bexport\s+(?:type\s+)?\{([^}]*)\}`)
+	jsExportFromRE   = regexp.MustCompile(`^\s*from\b`)
+)
+
+// jsMaskLanguage is the textmask language key for a TS/JS path.
+func jsMaskLanguage(path string) string {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".tsx":
+		return "tsx"
+	case ".ts", ".mts", ".cts":
+		return "typescript"
+	case ".jsx":
+		return "jsx"
+	}
+	return "javascript"
+}
 
 func jsSourceExt(path string) bool {
 	switch strings.ToLower(filepath.Ext(path)) {
@@ -86,14 +106,25 @@ func scanJSExports(root string, prefilter []byte, name string) (map[string][]cor
 // jsExportSpecifiersIn returns the specifiers of one file; name == "" means all.
 func jsExportSpecifiersIn(rel string, orig []byte, name string) []core.JSExportSpecifier {
 	var out []core.JSExportSpecifier
-	// Comments are blanked (newlines kept) so offsets and lines stay valid:
-	// zod's `/** @deprecated Use z.gte() */ _gte as _min` is a specifier.
-	src := blankJSComments(orig)
+	// Comments and literals are blanked (offsets kept) so lines stay valid
+	// and an export clause inside a string, template literal or comment
+	// never matches: zod's `/** @deprecated Use z.gte() */ _gte as _min`
+	// is a specifier.
+	src := []byte(textmask.Mask(jsMaskLanguage(rel), string(orig)))
 	for _, m := range jsExportClauseRE.FindAllSubmatchIndex(src, -1) {
 		bodyStart, bodyEnd := m[2], m[3]
 		source := ""
-		if m[4] >= 0 {
-			source = string(orig[m[4]:m[5]])
+		if f := jsExportFromRE.FindIndex(src[m[1]:]); f != nil {
+			// The module string is masked in src; read it from orig.
+			q := m[1] + f[1]
+			for q < len(orig) && (orig[q] == ' ' || orig[q] == '\t' || orig[q] == '\n' || orig[q] == '\r') {
+				q++
+			}
+			if q < len(orig) && (orig[q] == '"' || orig[q] == '\'') {
+				if end := bytes.IndexByte(orig[q+1:], orig[q]); end > 0 {
+					source = string(orig[q+1 : q+1+end])
+				}
+			}
 		}
 		offset := bodyStart
 		for _, item := range bytes.Split(src[bodyStart:bodyEnd], []byte(",")) {
@@ -121,54 +152,6 @@ func jsExportSpecifiersIn(rel string, orig []byte, name string) []core.JSExportS
 				File: rel, Line: line, Local: local, Exported: exported, Source: source,
 				Text: strings.TrimSpace(lineAt(orig, at)),
 			})
-		}
-	}
-	return out
-}
-
-// blankJSComments replaces comment bytes and string-literal contents with
-// spaces (quotes and newlines kept), so an export clause inside a string or
-// comment never matches and every offset still indexes the original source.
-func blankJSComments(src []byte) []byte {
-	out := append([]byte(nil), src...)
-	var quote byte
-	for i := 0; i < len(out); i++ {
-		c := out[i]
-		if quote != 0 {
-			switch {
-			case c == '\\':
-				out[i] = ' '
-				if i+1 < len(out) && out[i+1] != '\n' {
-					i++
-					out[i] = ' '
-				}
-			case c == quote || c == '\n' && quote != '`':
-				quote = 0
-			case c != '\n':
-				out[i] = ' '
-			}
-			continue
-		}
-		switch {
-		case c == '"' || c == '\'' || c == '`':
-			quote = c
-		case c == '/' && i+1 < len(out) && out[i+1] == '/':
-			for ; i < len(out) && out[i] != '\n'; i++ {
-				out[i] = ' '
-			}
-		case c == '/' && i+1 < len(out) && out[i+1] == '*':
-			out[i], out[i+1] = ' ', ' '
-			i += 2
-			for ; i < len(out); i++ {
-				if out[i] == '*' && i+1 < len(out) && out[i+1] == '/' {
-					out[i], out[i+1] = ' ', ' '
-					i++
-					break
-				}
-				if out[i] != '\n' {
-					out[i] = ' '
-				}
-			}
 		}
 	}
 	return out

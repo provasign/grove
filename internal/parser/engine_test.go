@@ -1581,3 +1581,70 @@ func TestFileBlobSHA_RejectsNonRegularAndOversize(t *testing.T) {
 		t.Fatalf("FileBlobSHA(regular) errored: %v", err)
 	}
 }
+
+// Syntax recovery merges regex names the AST missed; prose in comments must
+// not become symbols. A broken Java file with "class that" in its Javadoc
+// produced a class named "that" spanning the comment through the next
+// unbalanced brace.
+func TestJavaSyntaxRecoveryIgnoresCommentProse(t *testing.T) {
+	content := `package p;
+
+/**
+ * Deserializer class that can deserialize things.
+ * The methods in this class want to throw, e.g.
+ * public static double sqrt(double value) {
+ */
+public class Foo {
+    public Object run(Object o) {
+        if (o == null) {
+            o = "x";
+        }
+        int broken = 0;
+        else if (o instanceof String) {
+            o = "a class named nothing";
+        }
+        return o;
+    }
+
+    public int other() { return 2; }
+}
+`
+	syms := extractSymbols("java", "Foo.java", "sha", content, nil)
+	names := nameIndex(syms)
+	for _, phantom := range []string{"that", "want", "sqrt", "named"} {
+		if s, ok := names[phantom]; ok {
+			t.Fatalf("syntax recovery emitted %s %q from a comment or string (lines %d-%d)", s.Kind, phantom, s.Span.Start, s.Span.End)
+		}
+	}
+	for _, real := range []string{"Foo", "run", "other"} {
+		if _, ok := names[real]; !ok {
+			t.Fatalf("real symbol %q missing after recovery", real)
+		}
+	}
+}
+
+func TestJavaSyntaxRecoveryStillRecoversDeclarationInBrokenRegion(t *testing.T) {
+	content := "/** Holder class for things. */\npublic class Holder {\n    void bad() {\n        work(\n    public void good() { keep(); }\n}\n"
+	syms := extractSymbols("java", "Holder.java", "sha", content, nil)
+	names := nameIndex(syms)
+	if _, ok := names["good"]; !ok {
+		t.Fatal("declaration after the broken method was not recovered")
+	}
+	if _, ok := names["for"]; ok {
+		t.Fatal("comment prose recovered as class \"for\"")
+	}
+}
+
+func TestPythonRegexIgnoresDocstringProse(t *testing.T) {
+	content := "def f(:\n    \"\"\"Explain things.\n\n    class attribute is shared;\n    def example(x):\n    \"\"\"\n    return 1  # class comment\n\ndef g():\n    return 2\n"
+	syms := extractSymbols("python", "m.py", "sha", content, nil)
+	names := nameIndex(syms)
+	for _, phantom := range []string{"attribute", "example", "comment"} {
+		if _, ok := names[phantom]; ok {
+			t.Fatalf("python recovery emitted %q from a docstring or comment", phantom)
+		}
+	}
+	if _, ok := names["g"]; !ok {
+		t.Fatal("real function g missing")
+	}
+}

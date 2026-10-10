@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/provasign/astkit/textmask"
 	"github.com/provasign/grove/internal/core"
 )
 
@@ -141,9 +142,9 @@ func lexicalSemanticEdges(symbols []core.SymbolRecord, languages map[string]bool
 		if !languages[caller.Language] || caller.RawText == "" || !callableKind(caller.Kind) {
 			continue
 		}
-		// Strip and tokenize once per caller instead of compiling a regex
-		// and re-stripping the body for every (caller, target) pair.
-		stripped := stripQuotedText(caller.RawText)
+		// Mask and tokenize once per caller instead of compiling a regex
+		// and re-masking the body for every (caller, target) pair.
+		stripped := maskCode(caller.Language, caller.RawText)
 		callNames := map[string]bool{}
 		for _, m := range lexCallRe.FindAllStringSubmatch(stripped, -1) {
 			callNames[m[1]] = true
@@ -180,12 +181,11 @@ func typeKind(kind core.SymbolKind) bool {
 	}
 }
 
-// Pattern caches: the per-language analyzers call containsCall /
-// containsTypeToken inside (symbol × candidate) loops; compiling a fresh
-// regex per probe dominated their cost.
+// Pattern cache: the per-language analyzers call containsTypeToken inside
+// (symbol × candidate) loops; compiling a fresh regex per probe dominated
+// their cost.
 var (
 	patternCacheMu    sync.Mutex
-	callPatternCache  = map[string]*regexp.Regexp{}
 	tokenPatternCache = map[string]*regexp.Regexp{}
 )
 
@@ -200,19 +200,10 @@ func cachedPattern(cache map[string]*regexp.Regexp, name, prefix, suffix string)
 	return p
 }
 
-func containsCall(text, name string) bool {
-	if name == "" {
-		return false
-	}
-	pattern := cachedPattern(callPatternCache, name, `\b`, `\s*\(`)
-	return pattern.MatchString(stripQuotedText(text))
-}
-
 // identTokenRe extracts identifier-shaped tokens for typeTokensIn.
 var identTokenRe = regexp.MustCompile(`[A-Za-z_$][A-Za-z0-9_$]*`)
 
-// typeTokensIn returns the distinct identifier tokens of text with quoted
-// text stripped. Type-use passes scan the body ONCE and look tokens up,
+// Type-use passes tokenize the masked body ONCE (typeTokensIn) and look tokens up,
 // replacing the per-(symbol, type-name) regex scans that made the java/
 // csharp/php analyzers quadratic (285s on a 1.2k-file repo — never noticed
 // while the 5s timeout killed them before completion).
@@ -239,62 +230,82 @@ func slowTypeNames(typesByName map[string][]core.SymbolRecord) []string {
 	return out
 }
 
-func typeTokensIn(text string) map[string]bool {
+// typeTokensIn returns the distinct identifier tokens of masked (see
+// maskCode).
+func typeTokensIn(masked string) map[string]bool {
 	tokens := map[string]bool{}
-	for _, t := range identTokenRe.FindAllString(stripQuotedText(text), -1) {
+	for _, t := range identTokenRe.FindAllString(masked, -1) {
 		tokens[t] = true
 	}
 	return tokens
 }
 
-// containsTypeTokenStripped is containsTypeToken on text already passed
-// through stripQuotedText, for loops probing one body with many names.
-func containsTypeTokenStripped(stripped, name string) bool {
+// containsTypeToken reports whether name occurs as a whole token in masked
+// (see maskCode).
+func containsTypeToken(masked, name string) bool {
 	if name == "" {
 		return false
 	}
-	return cachedPattern(tokenPatternCache, name, `\b`, `\b`).MatchString(stripped)
+	return cachedPattern(tokenPatternCache, name, `\b`, `\b`).MatchString(masked)
 }
 
-func containsTypeToken(text, name string) bool {
-	if name == "" {
-		return false
+// maskCode blanks the comments and string/char literals of a symbol snippet
+// (lexed as code from byte 0) so this package's text passes never read prose or
+// literal text as a type, call or clause. Offsets and newlines are kept.
+// Every regex or token scan over RawText, Signature or file content in this
+// package must run on masked text: native edges carry 0.9+ confidence, so a
+// comment-derived one is the worst kind of wrong edge.
+func maskCode(lang, src string) string {
+	if !textmask.Supported(lang) {
+		lang = "c" // unknown languages get the generic C-style lexer
 	}
-	pattern := cachedPattern(tokenPatternCache, name, `\b`, `\b`)
-	return pattern.MatchString(stripQuotedText(text))
+	return textmask.Mask(lang, src)
 }
 
-func stripQuotedText(text string) string {
-	var out strings.Builder
-	out.Grow(len(text))
-	inString := false
-	var quote rune
-	escaped := false
-	for _, r := range text {
-		if inString {
-			if escaped {
-				escaped = false
-				out.WriteRune(' ')
-				continue
-			}
-			if r == '\\' {
-				escaped = true
-				out.WriteRune(' ')
-				continue
-			}
-			if r == quote {
-				inString = false
-			}
-			out.WriteRune(' ')
-			continue
-		}
-		if r == '"' || r == '\'' || r == '`' {
-			inString = true
-			quote = r
-			out.WriteRune(' ')
-			continue
-		}
-		out.WriteRune(r)
+// maskedDeclHeader returns a type declaration's header — annotations or
+// attributes, modifiers, name, type parameters and base clauses — masked and
+// with whitespace runs collapsed to one space: the masked RawText up to the
+// first `{` or `;` outside parentheses and brackets (annotation arguments
+// like `@A({1})` and attribute arguments may hold braces). Without RawText it
+// falls back to the masked Signature. The header never includes member
+// bodies, so a comment after the brace (`class A { // extends B`) is out of
+// reach twice over.
+func maskedDeclHeader(lang string, symbol core.SymbolRecord) string {
+	text := symbol.RawText
+	if text == "" {
+		text = symbol.Signature
 	}
-	return out.String()
+	// A class RawText can be a whole file; the header is almost always in
+	// the first few KB. The mask is a forward lexer, so masking a prefix
+	// gives the prefix of the full mask.
+	if len(text) > declHeaderProbe {
+		if header, ok := declHeaderCut(maskCode(lang, text[:declHeaderProbe])); ok {
+			return header
+		}
+	}
+	header, _ := declHeaderCut(maskCode(lang, text))
+	return header
+}
+
+const declHeaderProbe = 4096
+
+// declHeaderCut cuts masked at its first `{` or `;` outside () and [] and
+// collapses whitespace; ok is false when there is no such cut.
+func declHeaderCut(masked string) (string, bool) {
+	depth := 0
+	for i := 0; i < len(masked); i++ {
+		switch masked[i] {
+		case '(', '[':
+			depth++
+		case ')', ']':
+			if depth > 0 {
+				depth--
+			}
+		case '{', ';':
+			if depth == 0 {
+				return strings.Join(strings.Fields(masked[:i]), " "), true
+			}
+		}
+	}
+	return strings.Join(strings.Fields(masked), " "), false
 }

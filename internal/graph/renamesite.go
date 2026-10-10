@@ -186,7 +186,7 @@ func chainFromLine(caller *core.SymbolRecord, line int, methodName string) strin
 		return ""
 	}
 	re := chainRe(methodName)
-	ms := re.FindAllStringSubmatch(stripCommentsAndStrings(lines[idx]), -1)
+	ms := re.FindAllStringSubmatch(maskedLine(caller.Language, caller.RawText, idx), -1)
 	if len(ms) != 1 {
 		return ""
 	}

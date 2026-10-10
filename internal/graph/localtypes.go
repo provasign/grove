@@ -53,12 +53,10 @@ func goLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 
 	// Receiver struct fields (lowest precedence: locals shadow fields).
 	if symbol.Kind == core.KindMethod && symbol.ParentSymbol != "" {
-		if t := findTypeSymbol(idx, symbol); t != nil && t.RawText != "" {
-			body := t.RawText
-			if i := strings.IndexByte(body, '{'); i >= 0 {
-				body = body[i+1:]
-			}
-			for _, m := range goStructFieldRe.FindAllStringSubmatch(body, -1) {
+		if t := findTypeSymbol(idx, symbol); t != nil {
+			// Top-level struct fields only (classBody): a commented-out
+			// field or a nested anonymous struct's field is not one.
+			for _, m := range goStructFieldRe.FindAllStringSubmatch(classBody(idx, t), -1) {
 				if typ := m[2]; !goTypeBlocklist[typ] && !goTypeBlocklist[m[1]] {
 					out[m[1]] = typ
 				}
@@ -73,7 +71,7 @@ func goLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 
 	// Body declarations (highest precedence).
 	if symbol.RawText != "" {
-		body := stripCommentsAndStrings(symbol.RawText)
+		body := maskCode(symbol.Language, symbol.RawText)
 		for _, re := range []*regexp.Regexp{goVarDeclRe, goCompositeLitRe} {
 			for _, m := range re.FindAllStringSubmatch(body, -1) {
 				if typ := m[2]; !goTypeBlocklist[typ] {
@@ -302,12 +300,174 @@ func goParamList(signature string) (string, bool) {
 	return "", false
 }
 
+// classBody returns a class/struct declaration's body reduced to its own
+// member declarations: comments and strings masked, and everything nested
+// inside a member (method bodies, initializer blocks, anonymous classes,
+// property accessors) blanked. Field regexes run over this, never over the
+// raw class text, where a method-local `Foo helper = ...` or a commented-out
+// declaration read as a field. Byte offsets and newlines are preserved.
+//
+// Brace languages keep only brace depth 1 (the braces opening and closing a
+// member body stay, so `Bar P { get; }` and `void a() { }` keep their shape).
+// Python keeps only the statements at the class body's own indentation.
+// Memoized per class symbol: every method of the class asks for it.
+func classBody(idx *edgeIndex, cls *core.SymbolRecord) string {
+	if cls == nil || cls.RawText == "" {
+		return ""
+	}
+	if idx != nil && cls.ID != "" {
+		if v, ok := idx.classBodies.Load(cls.ID); ok {
+			return v.(string)
+		}
+	}
+	var body string
+	if cls.Language == "python" {
+		body = pyClassBodyTopLevel(maskCode(cls.Language, cls.RawText))
+	} else {
+		body = braceClassBodyTopLevel(maskCode(cls.Language, cls.RawText))
+	}
+	if idx != nil && cls.ID != "" {
+		idx.classBodies.Store(cls.ID, body)
+	}
+	return body
+}
+
+// maskedSymbolLines returns s.RawText masked (maskCode) and split into lines,
+// memoized per symbol ID: the per-call-site line recoveries (receiver
+// chains, argument lists, `new` namespaces) read one line of a body that
+// may hold hundreds of call sites, and a comment or string on that line, or
+// a block comment spanning it, must not read as the call.
+func maskedSymbolLines(idx *edgeIndex, s *core.SymbolRecord) []string {
+	if s == nil || s.RawText == "" {
+		return nil
+	}
+	if idx != nil && s.ID != "" {
+		if v, ok := idx.maskedLines.Load(s.ID); ok {
+			return v.([]string)
+		}
+	}
+	lines := strings.Split(maskCode(s.Language, s.RawText), "\n")
+	if idx != nil && s.ID != "" {
+		idx.maskedLines.Store(s.ID, lines)
+	}
+	return lines
+}
+
+// braceClassBodyTopLevel blanks masked text outside brace depth 1 of the
+// first '{' that is not inside parens or brackets (a class annotation like
+// `@JsonSubTypes({...})` comes before the body).
+func braceClassBodyTopLevel(masked string) string {
+	b := []byte(masked)
+	open, paren := -1, 0
+	for i, c := range b {
+		if c == '(' || c == '[' {
+			paren++
+		} else if (c == ')' || c == ']') && paren > 0 {
+			paren--
+		} else if c == '{' && paren == 0 {
+			open = i
+			break
+		}
+	}
+	if open < 0 {
+		return ""
+	}
+	depth := 0
+	for i := range b {
+		c := b[i]
+		if i <= open {
+			if c != '\n' {
+				b[i] = ' '
+			}
+			if i == open {
+				depth = 1
+			}
+			continue
+		}
+		switch {
+		case c == '{':
+			depth++
+			if depth == 2 {
+				continue
+			}
+		case c == '}':
+			depth--
+			if depth == 1 {
+				continue
+			}
+		}
+		if depth != 1 && c != '\n' {
+			b[i] = ' '
+		}
+	}
+	return string(b)
+}
+
+// pyClassBodyTopLevel keeps the masked class text's body statements at the
+// body's own indentation (the first indented line after the header), plus
+// their continuation lines while a bracket is open; method bodies, nested
+// class bodies, and the header are blanked. Docstrings are already spaces.
+func pyClassBodyTopLevel(masked string) string {
+	lines := strings.Split(masked, "\n")
+	indent := -1
+	open := 0 // bracket depth carried by a kept statement
+	for i, line := range lines {
+		blank := func() { lines[i] = strings.Repeat(" ", len(line)) }
+		if i == 0 {
+			blank()
+			continue
+		}
+		trimmed := strings.TrimLeft(line, " \t")
+		if trimmed == "" {
+			continue
+		}
+		lead := len(line) - len(trimmed)
+		if open == 0 {
+			if indent < 0 {
+				indent = lead
+			}
+			if lead != indent {
+				blank()
+				continue
+			}
+		}
+		for j := 0; j < len(trimmed); j++ {
+			switch trimmed[j] {
+			case '(', '[', '{':
+				open++
+			case ')', ']', '}':
+				if open > 0 {
+					open--
+				}
+			}
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// splitParams splits a parameter or argument list (tsDeclParams) on
+// top-level commas, judged on the list masked as lang: a `<`, `,` or paren
+// inside a default-value string (`open: string = "<"`) or a comment neither
+// opens a generic nor splits a group. The groups are slices of params.
+func splitParams(lang, params string) []string {
+	if !strings.ContainsAny(params, "\"'`/#") {
+		return splitTopLevel(params, ',')
+	}
+	return splitTopLevelOf(params, maskCode(lang, params), ',')
+}
+
 // splitTopLevel splits on sep outside any (), [], {} nesting.
 func splitTopLevel(s string, sep byte) []string {
+	return splitTopLevelOf(s, s, sep)
+}
+
+// splitTopLevelOf splits s at the top-level seps of scan, a same-length
+// view of s (s itself, or s masked).
+func splitTopLevelOf(s, scan string, sep byte) []string {
 	var out []string
 	depth, angle, last := 0, 0, 0
-	for i := 0; i < len(s); i++ {
-		switch s[i] {
+	for i := 0; i < len(scan); i++ {
+		switch scan[i] {
 		case '(', '[', '{':
 			depth++
 		case ')', ']', '}':
@@ -623,9 +783,9 @@ func typeOrInheritedMethodTargets(idx *edgeIndex, caller *core.SymbolRecord, typ
 func csharpExtensionTargets(cands []*core.SymbolRecord, receiverType string) []*core.SymbolRecord {
 	var out []*core.SymbolRecord
 	for _, cand := range cands {
-		params := tsDeclParams(cand.Signature)
+		params := tsDeclParams(cand.Language, cand.Signature)
 		if params == "" {
-			params = tsDeclParams(cand.RawText)
+			params = tsDeclParams(cand.Language, cand.RawText)
 		}
 		first := strings.TrimSpace(strings.SplitN(params, ",", 2)[0])
 		fields := strings.Fields(first)

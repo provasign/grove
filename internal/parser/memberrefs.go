@@ -103,6 +103,14 @@ func (e *Engine) MemberOccurrences(root, name string, languages []string) ([]cor
 						continue
 					}
 					lang := astkit.DetectLanguage(t.abs, string(src))
+					if strings.EqualFold(filepath.Ext(t.abs), ".h") {
+						// Parse a header as the language it is indexed in:
+						// astkit's own .h sniff reads markers in comments
+						// and `#ifdef __cplusplus` guards as C++.
+						if key, ok := languageToKey(DetectLanguageContent(t.rel, src)); ok {
+							lang = key
+						}
+					}
 					if lang == astkit.LangObjC && !want[lang] && strings.EqualFold(filepath.Ext(t.abs), ".h") {
 						lang = astkit.LangC
 					}

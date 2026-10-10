@@ -739,10 +739,7 @@ func declaredSuperNames(s *core.SymbolRecord) []string {
 		if s.Kind != core.KindClass && s.Kind != core.KindInterface {
 			return nil
 		}
-		text := s.Signature
-		if text == "" {
-			text = firstLine(s.RawText)
-		}
+		text := declHeader(s)
 		text = stripAngleBrackets(text)
 		names := matchNameList(extendsRe, text)
 		return append(names, matchNameList(implementsRe, text)...)
@@ -753,29 +750,20 @@ func declaredSuperNames(s *core.SymbolRecord) []string {
 		if s.Kind != core.KindClass && s.Kind != core.KindInterface && s.Kind != core.KindStruct {
 			return nil
 		}
-		text := s.Signature
-		if text == "" {
-			text = firstLine(s.RawText)
-		}
+		text := declHeader(s)
 		return csharpBaseNames(stripAngleBrackets(text))
 	case "swift":
 		if s.Kind != core.KindClass && s.Kind != core.KindStruct &&
 			s.Kind != core.KindEnum && s.Kind != core.KindInterface {
 			return nil
 		}
-		text := s.Signature
-		if text == "" {
-			text = firstLine(s.RawText)
-		}
+		text := declHeader(s)
 		return swiftBaseNames(text)
 	case "kotlin":
 		if s.Kind != core.KindClass && s.Kind != core.KindInterface {
 			return nil
 		}
-		text := s.Signature
-		if text == "" {
-			text = firstLine(s.RawText)
-		}
+		text := declHeader(s)
 		var out []string
 		for _, raw := range kotlinBaseNames(text) {
 			if name, _ := kotlinBaseNameAndCtor(raw); name != "" {
@@ -787,10 +775,7 @@ func declaredSuperNames(s *core.SymbolRecord) []string {
 		if s.Kind != core.KindClass && s.Kind != core.KindInterface {
 			return nil
 		}
-		text := s.Signature
-		if text == "" {
-			text = firstLine(s.RawText)
-		}
+		text := declHeader(s)
 		var out []string
 		if m := objcSuperclassRe.FindStringSubmatch(text); len(m) == 2 {
 			out = append(out, m[1])
@@ -800,17 +785,7 @@ func declaredSuperNames(s *core.SymbolRecord) []string {
 		if s.Kind != core.KindClass {
 			return nil
 		}
-		m := pythonClassBase.FindStringSubmatch(firstLine(s.RawText))
-		if len(m) < 2 {
-			return nil
-		}
-		var out []string
-		for _, base := range splitTrim(m[1], ',') {
-			if base = stripPythonBase(base); base != "" {
-				out = append(out, base)
-			}
-		}
-		return out
+		return pythonClassBases(s)
 	}
 	// Go and Rust have NO declared-supertype clause on the type: Go interface
 	// satisfaction is structural (derived by method-set inclusion, and only
@@ -900,7 +875,7 @@ func (g *CodeGraph) typeDeclaresMember(t *core.SymbolRecord, method string) bool
 	default:
 		return false
 	}
-	body := stripCommentsAndStrings(t.RawText)
+	body := maskCode(t.Language, t.RawText)
 	if i := strings.IndexByte(body, '{'); i >= 0 {
 		body = body[i+1:]
 	}
@@ -1357,7 +1332,7 @@ func paramTypesOf(s *core.SymbolRecord) []string {
 	if !strings.Contains(src, ")") {
 		src = s.RawText
 	}
-	inner := tsDeclParams(src)
+	inner := tsDeclParams(s.Language, src)
 	if s.Language == "go" {
 		gi, ok := goDeclParamsOK(src)
 		if !ok {
@@ -1383,7 +1358,7 @@ func paramTypesOf(s *core.SymbolRecord) []string {
 		return pyParamTypeTokens(inner)
 	}
 	var out []string
-	for _, gr := range splitTopLevel(inner, ',') {
+	for _, gr := range splitParams(s.Language, inner) {
 		token := bareTypeToken(gr)
 		switch s.Language {
 		case "typescript", "tsx", "javascript":
@@ -1405,7 +1380,7 @@ func paramTypesOf(s *core.SymbolRecord) []string {
 // so one unannotated parameter makes the whole list neutral (nil).
 func pyParamTypeTokens(inner string) []string {
 	var out []string
-	for i, gr := range splitTopLevel(inner, ',') {
+	for i, gr := range splitParams("python", inner) {
 		gr = strings.TrimSpace(gr)
 		name, ann, annotated := strings.Cut(gr, ":")
 		name = strings.TrimSpace(name)
@@ -1443,7 +1418,7 @@ func pyParamTypeTokens(inner string) []string {
 // Returns nil (neutral evidence, like paramTypesOf) when a token cannot be
 // recovered.
 func goParamTokens(inner string) []string {
-	groups := splitTopLevel(inner, ',')
+	groups := splitParams("go", inner)
 	n := len(groups)
 	types := make([]string, n)
 	named := false

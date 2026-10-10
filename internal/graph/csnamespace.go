@@ -272,9 +272,9 @@ func csIsExtensionMethod(s *core.SymbolRecord) bool {
 	if s.Language != "csharp" || s.Kind != core.KindMethod {
 		return false
 	}
-	params := tsDeclParams(s.Signature)
+	params := tsDeclParams(s.Language, s.Signature)
 	if params == "" {
-		params = tsDeclParams(s.RawText)
+		params = tsDeclParams(s.Language, s.RawText)
 	}
 	first := strings.TrimSpace(strings.SplitN(params, ",", 2)[0])
 	return strings.HasPrefix(first, "this ")
@@ -317,4 +317,125 @@ func csImplicitConstructorShadows(idx *edgeIndex, caller *core.SymbolRecord, cal
 		}
 	}
 	return false
+}
+
+// csharpAttributeTypeNames returns the type names a C# symbol's attribute
+// sections ([JsonConverter(typeof(StringEnumConverter))], [JsonObject(
+// MemberSerialization.OptIn)]) refer to: each attribute's class (Name +
+// "Attribute" when the index holds that class, as C# resolves it), every
+// typeof(T), and the type of each member-access value (Enum.Member,
+// Ns.Enum.Member). The signature no longer carries attributes (astkit cuts
+// them; they stay on Annotations), so buildUsesType reads them here, on
+// masked text: a string argument or a named argument's name (`Name = "x"`)
+// is never a type.
+func csharpAttributeTypeNames(idx *edgeIndex, s *core.SymbolRecord) []string {
+	var out []string
+	for _, ann := range s.Annotations {
+		if !strings.HasPrefix(strings.TrimSpace(ann), "[") {
+			continue
+		}
+		out = csharpAttributeSectionTypes(idx, maskCode("csharp", ann), out)
+	}
+	return out
+}
+
+func csharpAttributeSectionTypes(idx *edgeIndex, masked string, out []string) []string {
+	isIdent := func(c byte) bool {
+		return c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
+	}
+	// dotted reads a (global::)Ns.Type.Member path at i: its segments and
+	// the index after it.
+	dotted := func(i int) ([]string, int) {
+		var segs []string
+		for {
+			for i < len(masked) && (masked[i] == ' ' || masked[i] == '\t' || masked[i] == '\n' || masked[i] == '\r') {
+				i++
+			}
+			start := i
+			for i < len(masked) && isIdent(masked[i]) {
+				i++
+			}
+			if start == i || masked[start] >= '0' && masked[start] <= '9' {
+				return segs, start
+			}
+			segs = append(segs, masked[start:i])
+			j := i
+			for j < len(masked) && (masked[j] == ' ' || masked[j] == '\t') {
+				j++
+			}
+			switch {
+			case strings.HasPrefix(masked[j:], "::"):
+				i = j + 2
+			case j < len(masked) && masked[j] == '.':
+				i = j + 1
+			default:
+				return segs, i
+			}
+		}
+	}
+	nextNonSpace := func(i int) byte {
+		for i < len(masked) && (masked[i] == ' ' || masked[i] == '\t' || masked[i] == '\n' || masked[i] == '\r') {
+			i++
+		}
+		if i < len(masked) {
+			return masked[i]
+		}
+		return 0
+	}
+	depth := 0          // parens inside the section
+	expectName := false // after '[' or a top-level ',': an attribute name
+	for i := 0; i < len(masked); {
+		c := masked[i]
+		switch {
+		case c == '[' && depth == 0:
+			expectName = true
+			i++
+		case c == ',' && depth == 0:
+			expectName = true
+			i++
+		case c == '(':
+			depth++
+			i++
+		case c == ')':
+			if depth > 0 {
+				depth--
+			}
+			i++
+		case isIdent(c) && (i == 0 || !isIdent(masked[i-1]) && masked[i-1] != '.'):
+			segs, end := dotted(i)
+			if end <= i {
+				i++
+				continue
+			}
+			next := nextNonSpace(end)
+			switch {
+			case expectName && depth == 0 && next == ':' && !strings.HasPrefix(masked[end:], "::"):
+				// `[return: X]`: a target, the name follows.
+				end++
+			case expectName && depth == 0:
+				name := segs[len(segs)-1]
+				if !strings.HasSuffix(name, "Attribute") && len(idx.byName[strings.ToLower(name+"Attribute")]) > 0 {
+					name += "Attribute"
+				}
+				out = append(out, name)
+				expectName = false
+			case len(segs) == 1 && segs[0] == "typeof" && next == '(':
+				open := strings.IndexByte(masked[end:], '(') + end
+				depth++
+				end = open + 1
+				if inner, after := dotted(end); len(inner) > 0 {
+					out = append(out, inner[len(inner)-1])
+					end = after
+				}
+			case len(segs) >= 2 && next != '(':
+				// A member-access value: the segment before the member
+				// names its type (Enum.Member, Ns.Enum.Member).
+				out = append(out, segs[len(segs)-2])
+			}
+			i = end
+		default:
+			i++
+		}
+	}
+	return out
 }

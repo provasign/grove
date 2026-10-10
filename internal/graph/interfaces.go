@@ -85,7 +85,7 @@ func interfaceMethodNamesSeen(iface *core.SymbolRecord, idx *edgeIndex, visited 
 			re = csIfaceMethodRe
 		}
 		if re != nil {
-			body := stripCommentsAndStrings(iface.RawText)
+			body := maskCode(iface.Language, iface.RawText)
 			// Drop the declaration line so "type Render interface {" can't
 			// contribute "interface(" style artifacts on unusual formatting.
 			if i := strings.IndexByte(body, '{'); i >= 0 {
@@ -164,7 +164,7 @@ func interfaceMemberSignatures(iface *core.SymbolRecord, methodName string) []st
 	default:
 		return nil
 	}
-	body := stripCommentsAndStrings(iface.RawText)
+	body := maskCode(iface.Language, iface.RawText)
 	if i := strings.IndexByte(body, '{'); i >= 0 {
 		body = body[i+1:]
 	}
@@ -215,6 +215,14 @@ func buildInterfaceSatisfaction(idx *edgeIndex, symbols []core.SymbolRecord) (*i
 	// grafana-bigblast 1.00→0.02 regression).
 	methodsByType := map[typeKey]map[string][]*core.SymbolRecord{}
 	typeSymbols := map[typeKey]*core.SymbolRecord{}
+	// An anonymous class's name is unique only in its own file: key it by
+	// the file, or two files' `<anonymous@259:9>` pool their methods.
+	scopeOf := func(s *core.SymbolRecord, typeName string) string {
+		if fileLocalTypeName(typeName) {
+			return s.FilePath
+		}
+		return dirOf(s.FilePath)
+	}
 	for i := range symbols {
 		s := &symbols[i]
 		switch s.Kind {
@@ -222,14 +230,14 @@ func buildInterfaceSatisfaction(idx *edgeIndex, symbols []core.SymbolRecord) (*i
 			if s.ParentSymbol == "" {
 				continue
 			}
-			key := typeKey{s.Language, dirOf(s.FilePath), s.ParentSymbol}
+			key := typeKey{s.Language, scopeOf(s, s.ParentSymbol), s.ParentSymbol}
 			if methodsByType[key] == nil {
 				methodsByType[key] = map[string][]*core.SymbolRecord{}
 			}
 			ln := strings.ToLower(s.Name)
 			methodsByType[key][ln] = append(methodsByType[key][ln], s)
 		case core.KindStruct, core.KindClass, core.KindType:
-			typeSymbols[typeKey{s.Language, dirOf(s.FilePath), s.Name}] = s
+			typeSymbols[typeKey{s.Language, scopeOf(s, s.Name), s.Name}] = s
 		}
 	}
 

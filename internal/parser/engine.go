@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/provasign/astkit/textmask"
 	"github.com/provasign/grove/internal/core"
 )
 
@@ -188,6 +189,16 @@ func extractImports(language string, content string) []string {
 		return imports
 	}
 
+	// Fallback (unsupported grammar, parse failure or timeout): the
+	// line patterns read only code. Paths are string literals, so for the
+	// languages that quote them only comments are blanked; the others
+	// blank literals too (a docstring line "import os" is prose).
+	switch language {
+	case "go", "typescript", "tsx", "javascript", "c", "cpp", "php":
+		content = textmask.MaskComments(language, content)
+	default:
+		content = textmask.Mask(language, content)
+	}
 	if language == "go" {
 		return extractGoImports(content)
 	}
@@ -288,7 +299,10 @@ func extractGoImports(content string) []string {
 }
 
 // extractBody returns the end line number (1-indexed, inclusive) and full body text
-// starting from startIdx (0-indexed into lines).
+// starting from startIdx (0-indexed into lines). Callers pass the scanMask
+// lines (comments and literals blanked) so a brace or dedent inside a
+// comment, string, text block or docstring does not end the body, and cut
+// the source body by the returned line.
 func extractBody(lines []string, startIdx int, language string) (endLine int, body string) {
 	switch language {
 	case "go", "typescript", "tsx", "javascript", "java", "rust", "c", "cpp", "csharp":
@@ -302,55 +316,38 @@ func extractBody(lines []string, startIdx int, language string) (endLine int, bo
 
 // extractBraceBody scans forward from startIdx, tracking brace depth,
 // and returns when the opening brace is balanced (depth returns to 0).
+// lines are masked (scanMask), so every brace counted is code. The scan
+// gives up after maxLines lines of code; blank lines (comment lines are
+// blank once masked) do not count, so a comment cannot move the cut.
 func extractBraceBody(lines []string, startIdx int) (endLine int, body string) {
-	var bodyLines []string
 	depth := 0
 	opened := false
 
 	const maxLines = 500
-	limit := startIdx + maxLines
-	if limit > len(lines) {
-		limit = len(lines)
+	limit := len(lines)
+	for i, code := startIdx, 0; i < len(lines); i++ {
+		if strings.TrimSpace(lines[i]) != "" {
+			if code == maxLines {
+				limit = i
+				break
+			}
+			code++
+		}
 	}
 
 	for i := startIdx; i < limit; i++ {
 		line := lines[i]
-		bodyLines = append(bodyLines, line)
-
-		// Count braces, naively ignoring strings/comments (good enough for typical Go/TS/Java)
-		inString := false
-		var stringChar byte
 		for j := 0; j < len(line); j++ {
-			ch := line[j]
-			if inString {
-				if ch == '\\' {
-					j++ // skip escaped char
-					continue
-				}
-				if ch == stringChar {
-					inString = false
-				}
-				continue
-			}
-			if ch == '"' || ch == '\'' || ch == '`' {
-				inString = true
-				stringChar = ch
-				continue
-			}
-			// Inline comment
-			if ch == '/' && j+1 < len(line) && line[j+1] == '/' {
-				break
-			}
-			if ch == '{' {
+			switch line[j] {
+			case '{':
 				depth++
 				opened = true
-			} else if ch == '}' {
+			case '}':
 				depth--
 			}
 		}
-
 		if opened && depth <= 0 {
-			return i + 1, strings.Join(bodyLines, "\n")
+			return i + 1, strings.Join(lines[startIdx:i+1], "\n")
 		}
 	}
 
@@ -358,7 +355,7 @@ func extractBraceBody(lines []string, startIdx int) (endLine int, body string) {
 	if !opened {
 		return startIdx + 1, lines[startIdx]
 	}
-	return startIdx + len(bodyLines), strings.Join(bodyLines, "\n")
+	return limit, strings.Join(lines[startIdx:limit], "\n")
 }
 
 // extractIndentBody collects Python body lines based on indentation.
@@ -372,8 +369,12 @@ func extractIndentBody(lines []string, startIdx int) (endLine int, body string) 
 	var bodyLines []string
 	bodyLines = append(bodyLines, startLine)
 
+	// The window counts code lines only. Callers pass masked lines, so
+	// comment and docstring lines are blank here; counting them let a
+	// comment move where a recovered body was cut off.
 	const maxLines = 200
-	for i := startIdx + 1; i < len(lines) && i < startIdx+maxLines; i++ {
+	code := 1
+	for i := startIdx + 1; i < len(lines); i++ {
 		line := lines[i]
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" {
@@ -381,9 +382,10 @@ func extractIndentBody(lines []string, startIdx int) (endLine int, body string) 
 			continue
 		}
 		indent := len(line) - len(strings.TrimLeft(line, " \t"))
-		if indent <= baseIndent {
+		if indent <= baseIndent || code == maxLines {
 			return i, strings.Join(bodyLines, "\n")
 		}
+		code++
 		bodyLines = append(bodyLines, line)
 	}
 	return startIdx + len(bodyLines), strings.Join(bodyLines, "\n")
@@ -450,7 +452,8 @@ func symbolPatterns(language string) []symbolPattern {
 			// Free function: return-type name(  — anchored to avoid matching variable decls
 			{regexp.MustCompile(`^(?:[\w*&:<>\s]+\s+)+\*?([A-Za-z_][A-Za-z0-9_:]*)\s*\([^;]*$`), core.KindFunction, "", false},
 			{regexp.MustCompile(`^\s*(?:typedef\s+)?struct\s+([A-Za-z_][A-Za-z0-9_]*)\s*[{;]`), core.KindStruct, "", false},
-			{regexp.MustCompile(`^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)\b`), core.KindClass, "", false},
+			// `class GTEST_API_ RE {`: the export macro is not the name.
+			{regexp.MustCompile(`^\s*class\s+(?:[A-Z][A-Z0-9]*_[A-Z0-9_]*\s+)?([A-Za-z_][A-Za-z0-9_]*)\b`), core.KindClass, "", false},
 			{regexp.MustCompile(`^\s*enum\s+(?:class\s+)?([A-Za-z_][A-Za-z0-9_]*)\b`), core.KindEnum, "", false},
 			{regexp.MustCompile(`^\s*namespace\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{`), core.KindNamespace, "", false},
 		}
@@ -486,22 +489,25 @@ func symbolPatterns(language string) []symbolPattern {
 // missed is added. This prevents a partially-typed function from disappearing
 // from the index entirely while the developer is writing it.
 func extractSymbols(language, filePath, blobSHA, content string, fileImports []string) []core.SymbolRecord {
-	astSyms, ok, hasErrors := extractSymbolsFromAST(language, filePath, blobSHA, []byte(content), fileImports)
+	ast := extractASTForMerge(language, filePath, blobSHA, []byte(content), fileImports)
+	astSyms, ok, hasErrors := ast.syms, ast.ok, ast.hasErrors
 	if !ok {
-		syms := extractSymbolsRegex(language, filePath, blobSHA, content, fileImports)
+		scan := scanMask(language, content)
+		syms := extractSymbolsRegexScan(language, filePath, blobSHA, content, scan, fileImports)
 		if language == "cpp" {
-			syms = enrichCppNamespaces(syms, content)
+			syms = enrichCppNamespaces(syms, scan)
 		}
 		attachDocstrings(language, content, syms)
 		return syms
 	}
 	if !hasErrors {
 		if language == "c" || language == "cpp" {
-			regexSyms := extractSymbolsRegex(language, filePath, blobSHA, content, fileImports)
+			scan := scanMask(language, content)
+			regexSyms := extractSymbolsRegexScan(language, filePath, blobSHA, content, scan, fileImports)
 			if language == "cpp" {
 				regexSyms = dropCppNamespaceTwins(astSyms, regexSyms)
 				n := len(astSyms)
-				combined := enrichCppNamespaces(append(append([]core.SymbolRecord(nil), astSyms...), regexSyms...), content)
+				combined := enrichCppNamespaces(append(append([]core.SymbolRecord(nil), astSyms...), regexSyms...), scan)
 				astSyms, regexSyms = combined[:n], combined[n:]
 			}
 			astSyms = mergeSymbolsByShape(astSyms, regexSyms)
@@ -511,14 +517,17 @@ func extractSymbols(language, filePath, blobSHA, content string, fileImports []s
 	}
 	// Syntax errors present — supplement AST results with regex to recover symbols
 	// that fell inside ERROR subtrees (e.g. a function being actively typed).
-	regexSyms := extractSymbolsRegex(language, filePath, blobSHA, content, fileImports)
+	// JSX text is prose the textmask lexer reads as code; the partial tree
+	// still knows it, so it is blanked by node range.
+	scan := blankByteRanges(scanMask(language, content), ast.opaque)
+	regexSyms := extractSymbolsRegexScan(language, filePath, blobSHA, content, scan, fileImports)
 	for idx := range regexSyms {
 		regexSyms[idx].Annotations = append(regexSyms[idx].Annotations, "syntax-recovery")
 	}
 	if language == "cpp" {
 		regexSyms = dropCppNamespaceTwins(astSyms, regexSyms)
 		n := len(astSyms)
-		combined := enrichCppNamespaces(append(append([]core.SymbolRecord(nil), astSyms...), regexSyms...), content)
+		combined := enrichCppNamespaces(append(append([]core.SymbolRecord(nil), astSyms...), regexSyms...), scan)
 		astSyms, regexSyms = combined[:n], combined[n:]
 	}
 	merged := mergeSymbols(astSyms, regexSyms)
@@ -527,6 +536,43 @@ func extractSymbols(language, filePath, blobSHA, content string, fileImports []s
 	}
 	attachDocstrings(language, content, merged)
 	return merged
+}
+
+// statementKeywords precede a call in a statement, never a declared name:
+// `new JArray(1, 2),` and `return Build(x);` are calls. The C# and Java
+// method patterns accept any word before the name as a return type, so a
+// recovered file's call lines became methods named after the callee.
+var statementKeywords = map[string]bool{"new": true, "return": true, "await": true, "throw": true,
+	"else": true, "yield": true, "case": true, "goto": true, "is": true, "as": true, "in": true,
+	"using": true, "lock": true, "typeof": true, "nameof": true, "sizeof": true, "default": true,
+	"when": true, "assert": true, "do": true}
+
+// statementCallMatch reports whether a method-pattern match is a call
+// statement: the word right before the name is a statement keyword.
+func statementCallMatch(language, match, name string) bool {
+	if language != "csharp" && language != "java" {
+		return false
+	}
+	head := match[:strings.LastIndex(match, name)]
+	fields := strings.Fields(head)
+	return len(fields) > 0 && statementKeywords[fields[len(fields)-1]]
+}
+
+// blankByteRanges returns s with the bytes of every [start, end) range
+// replaced by spaces, newlines kept.
+func blankByteRanges(s string, ranges [][2]int) string {
+	if len(ranges) == 0 {
+		return s
+	}
+	out := []byte(s)
+	for _, r := range ranges {
+		for k := r[0]; k < r[1] && k < len(out); k++ {
+			if out[k] != '\n' && out[k] != '\r' {
+				out[k] = ' '
+			}
+		}
+	}
+	return string(out)
 }
 
 // dropCppNamespaceTwins removes the line scanner's copy of every namespace
@@ -562,8 +608,12 @@ func enrichRecoveredClassParents(symbols []core.SymbolRecord) {
 		if symbol.ParentSymbol != "" || (symbol.Kind != core.KindMethod && symbol.Kind != core.KindConstructor) {
 			continue
 		}
+		// The innermost enclosing class is the one that opens later, then
+		// the one that closes earlier: the same answer as the narrowest
+		// span for proper nesting, but recovered spans can overlap without
+		// nesting, and there span widths let a comment line elsewhere in
+		// one of them pick the other (as enrichCppNamespaces).
 		best := -1
-		bestWidth := int(^uint(0) >> 1)
 		for parentIdx := range symbols {
 			parent := &symbols[parentIdx]
 			switch parent.Kind {
@@ -574,8 +624,13 @@ func enrichRecoveredClassParents(symbols []core.SymbolRecord) {
 			if parent.FilePath != symbol.FilePath || parent.Span.Start > symbol.Span.Start || parent.Span.End < symbol.Span.End {
 				continue
 			}
-			if width := parent.Span.End - parent.Span.Start; width < bestWidth {
-				best, bestWidth = parentIdx, width
+			if best < 0 {
+				best = parentIdx
+				continue
+			}
+			cur := &symbols[best]
+			if parent.Span.Start > cur.Span.Start || parent.Span.Start == cur.Span.Start && parent.Span.End < cur.Span.End {
+				best = parentIdx
 			}
 		}
 		if best < 0 {
@@ -612,7 +667,9 @@ func cppStripTemplateArgs(name string) string {
 	return strings.TrimSpace(out.String())
 }
 
-func enrichCppNamespaces(symbols []core.SymbolRecord, content string) []core.SymbolRecord {
+// enrichCppNamespaces qualifies symbols by their enclosing namespaces and
+// attaches the file's namespace bindings. scan is the file's scanMask.
+func enrichCppNamespaces(symbols []core.SymbolRecord, scan string) []core.SymbolRecord {
 	type scope struct {
 		index  int
 		parent int
@@ -624,10 +681,23 @@ func enrichCppNamespaces(symbols []core.SymbolRecord, content string) []core.Sym
 			scopes = append(scopes, scope{index: i, parent: -1})
 		}
 	}
+	// inner reports whether namespace a is a closer scope than b, both
+	// enclosing the same lines: the later opening, then the earlier
+	// close, then the shorter text. Recovered spans can overlap without
+	// nesting (`namespace testing {` 10417-11159, `namespace internal {`
+	// 10418-11161); comparing line counts there let a comment line
+	// elsewhere in the span pick the other one.
+	inner := func(a, b *core.SymbolRecord) bool {
+		if a.Span.Start != b.Span.Start {
+			return a.Span.Start > b.Span.Start
+		}
+		if a.Span.End != b.Span.End {
+			return a.Span.End < b.Span.End
+		}
+		return len(a.RawText) < len(b.RawText)
+	}
 	for i := range scopes {
 		child := symbols[scopes[i].index]
-		bestWidth := int(^uint(0) >> 1)
-		bestRawWidth := int(^uint(0) >> 1)
 		for j := range scopes {
 			if i == j {
 				continue
@@ -636,16 +706,12 @@ func enrichCppNamespaces(symbols []core.SymbolRecord, content string) []core.Sym
 			if parent.Span.Start > child.Span.Start || parent.Span.End < child.Span.End {
 				continue
 			}
-			width := parent.Span.End - parent.Span.Start
-			rawWidth := len(parent.RawText)
-			strictlyContains := width > child.Span.End-child.Span.Start ||
-				(rawWidth > len(child.RawText) && strings.Contains(parent.RawText, child.RawText))
+			strictlyContains := parent.Span.Start < child.Span.Start || parent.Span.End > child.Span.End ||
+				(len(parent.RawText) > len(child.RawText) && strings.Contains(parent.RawText, child.RawText))
 			if !strictlyContains {
 				continue
 			}
-			if width < bestWidth || (width == bestWidth && rawWidth < bestRawWidth) {
-				bestWidth = width
-				bestRawWidth = rawWidth
+			if best := scopes[i].parent; best < 0 || inner(&parent, &symbols[scopes[best].index]) {
 				scopes[i].parent = j
 			}
 		}
@@ -676,7 +742,7 @@ func enrichCppNamespaces(symbols []core.SymbolRecord, content string) []core.Sym
 		path := scopePath(i)
 		symbols[scopes[i].index].QualifiedName = path
 	}
-	bindings := cppFileNamespaceBindings(content)
+	bindings := cppFileNamespaceBindings(scan)
 	for i := range symbols {
 		symbol := &symbols[i]
 		symbol.Annotations = append(symbol.Annotations, bindings...)
@@ -684,21 +750,21 @@ func enrichCppNamespaces(symbols []core.SymbolRecord, content string) []core.Sym
 			continue
 		}
 		namespace := ""
-		bestWidth := int(^uint(0) >> 1)
-		bestRawWidth := int(^uint(0) >> 1)
+		best := -1
 		for j := range scopes {
-			ns := symbols[scopes[j].index]
+			ns := &symbols[scopes[j].index]
 			if ns.Span.Start <= symbol.Span.Start && ns.Span.End >= symbol.Span.End {
-				width, rawWidth := ns.Span.End-ns.Span.Start, len(ns.RawText)
-				if width < bestWidth || (width == bestWidth && rawWidth < bestRawWidth) {
-					bestWidth = width
-					bestRawWidth = rawWidth
+				if best < 0 || inner(ns, &symbols[scopes[best].index]) {
+					best = j
 					namespace = scopePath(j)
 				}
 			}
 		}
 		owner, name := symbol.ParentSymbol, symbol.Name
-		if match := cppQualifiedCallableRe.FindStringSubmatch(symbol.Signature); len(match) == 3 {
+		// A line-scanned symbol's Signature is its raw source line, trailing
+		// comment included: `void helper(int x) { // see Widget::draw(x)`
+		// must not become Widget::draw.
+		if match := cppQualifiedCallableRe.FindStringSubmatch(textmask.Mask("cpp", symbol.Signature)); len(match) == 3 {
 			owner, name = cppStripTemplateArgs(match[1]), strings.ReplaceAll(match[2], " ", "")
 		} else if split := strings.LastIndex(symbol.Name, "::"); split >= 0 {
 			owner, name = symbol.Name[:split], symbol.Name[split+2:]
@@ -763,11 +829,14 @@ var (
 	cppUsingTypeLineRe      = regexp.MustCompile(`^using\s+([A-Za-z_][A-Za-z0-9_:]*)::([A-Za-z_][A-Za-z0-9_]*)\s*;`)
 )
 
-func cppFileNamespaceBindings(content string) []string {
-	clean := stripCppCommentsAndStrings(content)
+// cppFileNamespaceBindings reads file-scope using-directives, namespace
+// aliases and using-declarations from scan (scanMask: comments, literals and
+// #if 0 branches blanked; a digit separator or `#error don't` no longer
+// opens a quote that swallows the rest of the file).
+func cppFileNamespaceBindings(scan string) []string {
 	depth := 0
 	var out []string
-	for _, line := range strings.Split(clean, "\n") {
+	for _, line := range strings.Split(scan, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if depth == 0 {
 			switch {
@@ -794,57 +863,6 @@ func cppFileNamespaceBindings(content string) []string {
 		}
 	}
 	return out
-}
-
-func stripCppCommentsAndStrings(content string) string {
-	out := []byte(content)
-	for i := 0; i < len(out); {
-		if i+1 < len(out) && out[i] == '/' && out[i+1] == '/' {
-			for i < len(out) && out[i] != '\n' {
-				out[i] = ' '
-				i++
-			}
-			continue
-		}
-		if i+1 < len(out) && out[i] == '/' && out[i+1] == '*' {
-			out[i], out[i+1] = ' ', ' '
-			i += 2
-			for i+1 < len(out) && !(out[i] == '*' && out[i+1] == '/') {
-				if out[i] != '\n' {
-					out[i] = ' '
-				}
-				i++
-			}
-			if i+1 < len(out) {
-				out[i], out[i+1] = ' ', ' '
-				i += 2
-			}
-			continue
-		}
-		if out[i] == '\'' || out[i] == '"' {
-			quote := out[i]
-			out[i] = ' '
-			i++
-			for i < len(out) {
-				if out[i] == '\\' && i+1 < len(out) {
-					out[i], out[i+1] = ' ', ' '
-					i += 2
-					continue
-				}
-				end := out[i] == quote
-				if out[i] != '\n' {
-					out[i] = ' '
-				}
-				i++
-				if end {
-					break
-				}
-			}
-			continue
-		}
-		i++
-	}
-	return string(out)
 }
 
 // mergeSymbols returns the union of astSyms and regexSyms, preferring AST
@@ -908,7 +926,7 @@ func cFamilyMarkPrototype(s *core.SymbolRecord) {
 			return
 		}
 	}
-	body := stripCppCommentsAndStrings(s.RawText)
+	body := textmask.Mask(s.Language, s.RawText)
 	semi := strings.IndexByte(body, ';')
 	brace := strings.IndexByte(body, '{')
 	if semi < 0 || (brace >= 0 && brace < semi) {
@@ -1048,7 +1066,7 @@ func symbolShapeKey(s core.SymbolRecord) string {
 //     (`//`, `///`, `/** ... */`).
 //   - Python: triple-quoted string as the first statement of the symbol body.
 func attachDocstrings(language, content string, symbols []core.SymbolRecord) {
-	lines := strings.Split(content, "\n")
+	var lines, code []string
 	for i := range symbols {
 		sym := &symbols[i]
 		if sym.Docstring != "" || sym.Span.Start <= 0 {
@@ -1058,37 +1076,64 @@ func attachDocstrings(language, content string, symbols []core.SymbolRecord) {
 			sym.Docstring = pythonDocstring(sym.RawText)
 			continue
 		}
-		sym.Docstring = precedingCommentBlock(lines, sym.Span.Start)
+		if lines == nil {
+			lines = strings.Split(content, "\n")
+			code = commentMaskedLines(language, content)
+		}
+		sym.Docstring = precedingCommentBlock(lines, code, sym.Span.Start)
 	}
 }
 
-func precedingCommentBlock(lines []string, startLine int) string {
+// precedingCommentBlock returns the doc comment directly above startLine:
+// a `/** ... */` block or a run of `//` / `///` lines. code is lines with
+// comments blanked (commentMaskedLines; nil when the language has no
+// lexer), so a comment line is one that is blank in code but not in lines.
+// The block is found by walking up through comment lines only: a code line
+// (`int x; /* trailing */`, `const glob = "src/**";`) ends the walk and is
+// never part of a docstring, and a plain `/* */` block is not a doc
+// comment.
+func precedingCommentBlock(lines, code []string, startLine int) string {
 	idx := startLine - 2 // line just above the symbol (0-indexed)
 	if idx < 0 || idx >= len(lines) {
 		return ""
 	}
+	isComment := func(i int) bool {
+		t := strings.TrimSpace(lines[i])
+		if t == "" {
+			return false
+		}
+		if code == nil || i >= len(code) {
+			return strings.HasPrefix(t, "//") || strings.HasPrefix(t, "/*") || strings.HasPrefix(t, "*")
+		}
+		return strings.TrimSpace(code[i]) == ""
+	}
+	if !isComment(idx) {
+		return ""
+	}
 
-	// /** ... */ block: walk upward to find opening "/**".
+	// /** ... */ block: walk upward through its lines to the opening "/*".
 	if strings.HasSuffix(strings.TrimSpace(lines[idx]), "*/") {
 		end := idx
-		for idx >= 0 && !strings.Contains(lines[idx], "/**") {
-			idx--
+		for ; idx >= 0 && isComment(idx); idx-- {
+			line := strings.TrimSpace(lines[idx])
+			if strings.HasPrefix(line, "/*") {
+				if !strings.HasPrefix(line, "/**") {
+					return ""
+				}
+				return cleanBlockComment(strings.Join(lines[idx:end+1], "\n"))
+			}
 		}
-		if idx < 0 {
-			return ""
-		}
-		return cleanBlockComment(strings.Join(lines[idx:end+1], "\n"))
+		return ""
 	}
 
 	// Contiguous //-style or ///-style comments (and Rust ///).
 	var collected []string
-	for idx >= 0 {
+	for ; idx >= 0 && isComment(idx); idx-- {
 		line := strings.TrimSpace(lines[idx])
-		if !(strings.HasPrefix(line, "//") || strings.HasPrefix(line, "///")) {
+		if !strings.HasPrefix(line, "//") {
 			break
 		}
 		collected = append([]string{stripLineComment(line)}, collected...)
-		idx--
 	}
 	if len(collected) == 0 {
 		return ""
@@ -1160,36 +1205,52 @@ func pythonDocstring(body string) string {
 
 // extractSymbolsRegex is the regex-based fallback extractor.
 func extractSymbolsRegex(language, filePath, blobSHA, content string, fileImports []string) []core.SymbolRecord {
+	return extractSymbolsRegexScan(language, filePath, blobSHA, content, scanMask(language, content), fileImports)
+}
+
+// extractSymbolsRegexScan is extractSymbolsRegex over a precomputed
+// scanMask(language, content). Patterns match, braces and indentation are
+// counted, and export keywords are read on the masked copy (line numbers
+// kept); signatures and bodies still come from the source. Syntax recovery
+// merges every regex name the AST missed, and the Java patterns are
+// unanchored: Javadoc prose such as " * Deserializer class that can ..."
+// became a class named "that" spanning hundreds of lines, and a text block,
+// raw string, template literal or heredoc holding code became symbols.
+func extractSymbolsRegexScan(language, filePath, blobSHA, content, scan string, fileImports []string) []core.SymbolRecord {
 	patterns := symbolPatterns(language)
 	if len(patterns) == 0 {
 		return nil
 	}
 
 	if language == "go" {
-		return extractGoSymbols(filePath, blobSHA, content, fileImports)
+		return extractGoSymbols(filePath, blobSHA, content, scan, fileImports)
 	}
 	if language == "c" || language == "cpp" {
-		return extractCFamilySymbols(language, filePath, blobSHA, content, fileImports)
+		return extractCFamilySymbols(language, filePath, blobSHA, content, scan, fileImports)
 	}
 
 	lines := strings.Split(content, "\n")
+	clean := strings.Split(scan, "\n")
 	var symbols []core.SymbolRecord
 
 	for i := 0; i < len(lines); i++ {
 		line := lines[i]
-		trimmed := strings.TrimSpace(line)
+		trimmed := strings.TrimSpace(clean[i])
 		if trimmed == "" || strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "#") {
 			continue
 		}
 
 		for _, pattern := range patterns {
-			matches := pattern.regex.FindStringSubmatch(line)
+			matches := pattern.regex.FindStringSubmatch(clean[i])
 			if len(matches) < 2 {
 				continue
 			}
 
 			name, parentSymbol := extractNameAndParent(matches, pattern)
 			if name == "" {
+				continue
+			}
+			if pattern.kind == core.KindMethod && statementCallMatch(language, matches[0], name) {
 				continue
 			}
 
@@ -1201,7 +1262,8 @@ func extractSymbolsRegex(language, filePath, blobSHA, content string, fileImport
 				qualifiedName = parentSymbol + "." + name
 			}
 
-			endLine, body := extractBody(lines, i, language)
+			endLine, _ := extractBody(clean, i, language)
+			body := strings.Join(lines[i:endLine], "\n")
 			symbol := core.SymbolRecord{
 				ID:            fmt.Sprintf("%s::%s@%s", filePath, qualifiedName, blobSHA),
 				FilePath:      filePath,
@@ -1212,7 +1274,7 @@ func extractSymbolsRegex(language, filePath, blobSHA, content string, fileImport
 				QualifiedName: qualifiedName,
 				Signature:     strings.TrimSpace(line),
 				Span:          core.LineRange{Start: i + 1, End: endLine},
-				Exports:       isExported(language, name, line),
+				Exports:       isExported(language, name, clean[i]),
 				RawText:       body,
 				ParentSymbol:  parentSymbol,
 				Imports:       fileImports,
@@ -1227,15 +1289,17 @@ func extractSymbolsRegex(language, filePath, blobSHA, content string, fileImport
 
 // extractCFamilySymbols handles top-level C/C++ declarations plus simple
 // in-class C++ method and constructor declarations.
-func extractCFamilySymbols(language, filePath, blobSHA, content string, fileImports []string) []core.SymbolRecord {
+func extractCFamilySymbols(language, filePath, blobSHA, content, scan string, fileImports []string) []core.SymbolRecord {
 	patterns := symbolPatterns(language)
 	lines := strings.Split(content, "\n")
-	// Patterns match, and braces are counted, on a copy with comments and
-	// string literals blanked (line numbers kept): the scanner read
-	// ` * Copyright (c) 2009` in license headers as a function named
-	// Copyright, and prose in block comments as functions spanning hundreds
-	// of lines. Signatures and bodies still come from the source.
-	clean := strings.Split(blankCFamilyComments(content), "\n")
+	// Patterns match, and braces are counted, on scan (scanMask: comments,
+	// literals, inactive #if 0 branches and directive lines blanked, line
+	// numbers kept): the scanner read ` * Copyright (c) 2009` in license
+	// headers as a function named Copyright, prose in block comments as
+	// functions spanning hundreds of lines, and a raw string or a multi-line
+	// #define body as definitions. Signatures and bodies still come from
+	// the source.
+	clean := strings.Split(scan, "\n")
 	var symbols []core.SymbolRecord
 
 	for i := 0; i < len(lines); i++ {
@@ -1363,60 +1427,83 @@ var cFamilyReservedName = map[string]bool{
 	"throw": true, "noexcept": true, "static_assert": true, "alignas": true,
 }
 
-// blankCFamilyComments returns content with every comment and string or
-// character literal replaced by spaces; newlines stay, so line numbers and
-// line lengths are unchanged. Unlike stripCppCommentsAndStrings a literal
-// never runs past the end of its line, so an apostrophe in prose
-// (`#error don't`) or a digit separator cannot swallow the rest of the file.
-func blankCFamilyComments(content string) string {
-	out := []byte(content)
-	for i := 0; i < len(out); {
-		switch {
-		case out[i] == '/' && i+1 < len(out) && out[i+1] == '/':
-			for i < len(out) && out[i] != '\n' {
-				out[i] = ' '
-				i++
-			}
-		case out[i] == '/' && i+1 < len(out) && out[i+1] == '*':
-			out[i], out[i+1] = ' ', ' '
-			i += 2
-			for i < len(out) && !(out[i] == '*' && i+1 < len(out) && out[i+1] == '/') {
-				if out[i] != '\n' {
-					out[i] = ' '
-				}
-				i++
-			}
-			if i+1 < len(out) {
-				out[i], out[i+1] = ' ', ' '
-				i += 2
-			} else {
-				i = len(out)
-			}
-		case out[i] == '"' || (out[i] == '\'' && !(i > 0 && isHexDigitByte(out[i-1]) && i+1 < len(out) && isHexDigitByte(out[i+1]))):
-			quote := out[i]
-			i++
-			for i < len(out) && out[i] != '\n' {
-				if out[i] == '\\' && i+1 < len(out) && out[i+1] != '\n' {
-					out[i], out[i+1] = ' ', ' '
-					i += 2
-					continue
-				}
-				if out[i] == quote {
-					i++
-					break
-				}
-				out[i] = ' '
-				i++
-			}
-		default:
-			i++
+// scanMask returns the copy of a whole file that the line scanners match
+// on: comments, string literals (raw strings, text blocks, heredocs,
+// template literals), PHP inline HTML and inactive `#if 0` / `#if false`
+// branches are blanked by astkit textmask, keeping every byte offset and
+// newline, so a line index or column into the result indexes content. In
+// C, C++ and Objective-C the lines of every preprocessor directive,
+// backslash continuations included, are blanked too: a multi-line
+// `#define` body is macro text, not declarations, and its braces must not
+// move a brace count. Without this the scanners read Javadoc prose, raw
+// strings and macro bodies as classes and functions.
+func scanMask(language, content string) string {
+	if !textmask.Supported(language) {
+		return content
+	}
+	masked := textmask.MaskFile(language, textmask.MaskInactivePreprocessor(language, content))
+	switch language {
+	case "c", "cpp", "objc":
+		masked = blankDirectiveLines(masked)
+	}
+	return masked
+}
+
+// blankDirectiveLines blanks every preprocessor directive line of masked
+// (comments already blanked), with its backslash-continued lines.
+func blankDirectiveLines(masked string) string {
+	var out []byte
+	continued := false
+	for ls := 0; ls < len(masked); {
+		le := strings.IndexByte(masked[ls:], '\n')
+		if le < 0 {
+			le = len(masked)
+		} else {
+			le += ls
 		}
+		trimmed := strings.TrimSpace(masked[ls:le])
+		directive := continued || strings.HasPrefix(trimmed, "#")
+		continued = directive && strings.HasSuffix(trimmed, "\\")
+		if directive && trimmed != "" {
+			if out == nil {
+				out = []byte(masked)
+			}
+			for k := ls; k < le; k++ {
+				if out[k] != '\r' {
+					out[k] = ' '
+				}
+			}
+		}
+		ls = le + 1
+	}
+	if out == nil {
+		return masked
 	}
 	return string(out)
 }
 
-func isHexDigitByte(b byte) bool {
-	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')
+// commentMaskedLines returns content's lines with only comments blanked
+// (string literals kept), for telling comment lines from code lines.
+func commentMaskedLines(language, content string) []string {
+	if !textmask.Supported(language) {
+		return nil
+	}
+	if language == "php" {
+		// MaskComments lexes from byte 0 as code; a PHP file starts in
+		// inline HTML, where an apostrophe would open a string. textmask
+		// has no comments-only file mode, so the HTML before the first
+		// `<?` is blanked here (newlines kept); later `?>` HTML is handled.
+		if open := strings.Index(content, "<?"); open > 0 {
+			head := []byte(content[:open])
+			for k, c := range head {
+				if c != '\n' && c != '\r' {
+					head[k] = ' '
+				}
+			}
+			content = string(head) + content[open:]
+		}
+	}
+	return strings.Split(textmask.MaskComments(language, content), "\n")
 }
 
 // extractNameAndParent returns (name, parentSymbol) from regex matches.
@@ -1434,9 +1521,14 @@ func extractNameAndParent(matches []string, pattern symbolPattern) (string, stri
 // function/method body we can skip i past the end of that body, preventing
 // local variables inside the body (e.g. "var req struct{...}") from being
 // mistakenly extracted as package-level symbols.
-func extractGoSymbols(filePath, blobSHA, content string, fileImports []string) []core.SymbolRecord {
+func extractGoSymbols(filePath, blobSHA, content, scan string, fileImports []string) []core.SymbolRecord {
 	patterns := symbolPatterns("go")
 	lines := strings.Split(content, "\n")
+	// Declarations are matched, and braces counted, on scan (comments and
+	// literals blanked, line numbers kept): a func or type inside a block
+	// comment or a raw string is not a declaration, and `const (` inside
+	// one would put every following line in block mode.
+	clean := strings.Split(scan, "\n")
 	var symbols []core.SymbolRecord
 
 	// Pre-compile block-member regex once.
@@ -1446,10 +1538,10 @@ func extractGoSymbols(filePath, blobSHA, content string, fileImports []string) [
 	inVarBlock := false
 
 	for i := 0; i < len(lines); i++ {
-		line := lines[i]
+		line := clean[i]
 		trimmed := strings.TrimSpace(line)
 
-		if trimmed == "" || strings.HasPrefix(trimmed, "//") {
+		if trimmed == "" {
 			continue
 		}
 
@@ -1479,11 +1571,11 @@ func extractGoSymbols(filePath, blobSHA, content string, fileImports []string) [
 					Kind:          core.KindConst,
 					Name:          name,
 					QualifiedName: name,
-					Signature:     strings.TrimSpace(line),
+					Signature:     strings.TrimSpace(lines[i]),
 					Span:          core.LineRange{Start: i + 1, End: i + 1},
 					Exports:       isExported("go", name, line),
-					RawText:       strings.TrimSpace(line),
-					TokenEstimate: estimateTokens(line),
+					RawText:       strings.TrimSpace(lines[i]),
+					TokenEstimate: estimateTokens(lines[i]),
 				})
 			}
 			continue
@@ -1499,11 +1591,11 @@ func extractGoSymbols(filePath, blobSHA, content string, fileImports []string) [
 					Kind:          core.KindVariable,
 					Name:          name,
 					QualifiedName: name,
-					Signature:     strings.TrimSpace(line),
+					Signature:     strings.TrimSpace(lines[i]),
 					Span:          core.LineRange{Start: i + 1, End: i + 1},
 					Exports:       isExported("go", name, line),
-					RawText:       strings.TrimSpace(line),
-					TokenEstimate: estimateTokens(line),
+					RawText:       strings.TrimSpace(lines[i]),
+					TokenEstimate: estimateTokens(lines[i]),
 				})
 			}
 			continue
@@ -1530,7 +1622,8 @@ func extractGoSymbols(filePath, blobSHA, content string, fileImports []string) [
 				qualifiedName = parentSymbol + "." + name
 			}
 
-			endLine, body := extractBody(lines, i, "go")
+			endLine, _ := extractBody(clean, i, "go")
+			body := strings.Join(lines[i:endLine], "\n")
 
 			symbols = append(symbols, core.SymbolRecord{
 				ID:            fmt.Sprintf("%s::%s@%s", filePath, qualifiedName, blobSHA),
@@ -1540,7 +1633,7 @@ func extractGoSymbols(filePath, blobSHA, content string, fileImports []string) [
 				Kind:          pattern.kind,
 				Name:          name,
 				QualifiedName: qualifiedName,
-				Signature:     strings.TrimSpace(line),
+				Signature:     strings.TrimSpace(lines[i]),
 				Span:          core.LineRange{Start: i + 1, End: endLine},
 				Exports:       isExported("go", name, line),
 				RawText:       body,
@@ -1551,7 +1644,7 @@ func extractGoSymbols(filePath, blobSHA, content string, fileImports []string) [
 			// re-extracted. During syntax recovery an unclosed function may swallow
 			// every later top-level declaration; keep scanning so column-zero
 			// declarations after the edit point remain visible.
-			if bracesBalanced(body) {
+			if bracesBalanced(clean[i:endLine]) {
 				i = endLine - 1
 			}
 			break
@@ -1560,27 +1653,14 @@ func extractGoSymbols(filePath, blobSHA, content string, fileImports []string) [
 	return symbols
 }
 
-func bracesBalanced(body string) bool {
+// bracesBalanced reports whether the masked lines (comments and literals
+// blanked) open no brace or close every brace they open.
+func bracesBalanced(masked []string) bool {
 	depth := 0
 	opened := false
-	for _, line := range strings.Split(body, "\n") {
-		inString := false
-		var quote rune
-		for idx, char := range line {
-			if inString {
-				if char == quote && (idx == 0 || line[idx-1] != '\\') {
-					inString = false
-				}
-				continue
-			}
-			if char == '/' && idx+1 < len(line) && line[idx+1] == '/' {
-				break
-			}
-			if char == '\'' || char == '"' || char == '`' {
-				inString, quote = true, char
-				continue
-			}
-			switch char {
+	for _, line := range masked {
+		for k := 0; k < len(line); k++ {
+			switch line[k] {
 			case '{':
 				depth++
 				opened = true

@@ -372,8 +372,8 @@ func tsLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 	}
 
 	// Parameter annotations from the declaration's own parens.
-	if params := tsDeclParams(symbol.RawText); params != "" {
-		for _, g := range splitTopLevel(params, ',') {
+	if params := tsDeclParams(symbol.Language, symbol.RawText); params != "" {
+		for _, g := range splitParams(symbol.Language, params) {
 			g = strings.TrimSpace(g)
 			name, ann, ok := strings.Cut(g, ":")
 			if !ok {
@@ -395,7 +395,7 @@ func tsLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 
 	// Body declarations (highest precedence).
 	if symbol.RawText != "" {
-		body := stripCommentsAndStrings(symbol.RawText)
+		body := maskCode(symbol.Language, symbol.RawText)
 		for _, m := range tsVarAnnRe.FindAllStringSubmatch(body, -1) {
 			if t := tsAliasType(idx, symbol.FilePath, tsBareType(m[2])); t != "" {
 				out[m[1]] = t
@@ -428,7 +428,9 @@ func tsCollectionFieldElementTypes(idx *edgeIndex, className, preferFile string)
 			(cand.Kind != core.KindClass && cand.Kind != core.KindInterface) {
 			continue
 		}
-		for _, match := range tsCollectionFieldRe.FindAllStringSubmatch(cand.RawText, -1) {
+		// Top-level members only (classBody): a comment or a method-local
+		// `items: Set<Bar>` is not the field's declaration.
+		for _, match := range tsCollectionFieldRe.FindAllStringSubmatch(classBody(idx, cand), -1) {
 			out[match[1]] = tsAliasType(idx, cand.FilePath, match[2])
 		}
 		break
@@ -536,7 +538,7 @@ func tsClassFieldTypes(idx *edgeIndex, className, preferFile string, out map[str
 				record(member.Name, tsBareType(m[2]))
 			}
 		case core.KindConstructor:
-			body := stripCommentsAndStrings(member.RawText)
+			body := maskCode(member.Language, member.RawText)
 			for _, m := range tsCtorPropRe.FindAllStringSubmatch(body, -1) {
 				record(m[1], tsBareType(m[2]))
 			}
@@ -548,8 +550,8 @@ func tsClassFieldTypes(idx *edgeIndex, className, preferFile string, out map[str
 			// this.transport = transport — a plain assignment from a typed
 			// constructor parameter carries the parameter's annotation.
 			ctorParams := map[string]string{}
-			if params := tsDeclParams(member.RawText); params != "" {
-				for _, g := range splitTopLevel(params, ',') {
+			if params := tsDeclParams(member.Language, member.RawText); params != "" {
+				for _, g := range splitParams(member.Language, params) {
 					name, ann, ok := strings.Cut(strings.TrimSpace(g), ":")
 					if !ok {
 						continue
@@ -587,40 +589,41 @@ func tsReceiverChainRe(method string) *regexp.Regexp {
 }
 
 // tsReceiverChainAt recovers the full receiver chain of a `.<calleeName>(` call
-// from the caller's source. relLine is 0-based into rawText; the call may wrap,
-// so a small window around it is searched. Returns "" if no chain is found.
-func tsReceiverChainAt(rawText string, relLine int, calleeName string) string {
-	if rawText == "" {
+// from the caller's masked source. relLine is 0-based into the caller's raw
+// text. The call's own line wins; a call wrapped over lines is read from a
+// small window around it, and a line outside the captured body (astkit line
+// vs Span drift) from the whole body, both only when exactly one call
+// matches there: a neighbouring line's or another statement's call to the
+// same method must not supply the chain. Returns "" if no chain is found.
+func tsReceiverChainAt(idx *edgeIndex, symbol *core.SymbolRecord, relLine int, calleeName string) string {
+	lines := maskedSymbolLines(idx, symbol)
+	if len(lines) == 0 {
 		return ""
-	}
-	lines := strings.Split(rawText, "\n")
-	if relLine < 0 || relLine >= len(lines) {
-		// Line outside the captured body (astkit line vs Span drift): fall
-		// back to scanning the whole body for the first matching call.
-		relLine = -1
 	}
 	re := tsReceiverChainRe(calleeName)
-	tryLines := func(s string) string {
-		if m := re.FindStringSubmatch(s); m != nil {
-			return strings.Join(strings.FieldsFunc(m[1], func(r rune) bool {
-				return r == ' ' || r == '\t'
-			}), "")
+	chainIn := func(s string, unique bool) string {
+		ms := re.FindAllStringSubmatch(s, 2)
+		if len(ms) == 0 || (unique && len(ms) > 1) {
+			return ""
 		}
-		return ""
+		return strings.Join(strings.FieldsFunc(ms[0][1], func(r rune) bool {
+			return r == ' ' || r == '\t'
+		}), "")
 	}
-	if relLine >= 0 {
-		lo, hi := relLine-1, relLine+2
-		if lo < 0 {
-			lo = 0
-		}
-		if hi > len(lines) {
-			hi = len(lines)
-		}
-		if chain := tryLines(strings.Join(lines[lo:hi], "")); chain != "" {
-			return chain
-		}
+	if relLine < 0 || relLine >= len(lines) {
+		return chainIn(strings.Join(lines, ""), true)
 	}
-	return tryLines(strings.Join(lines, ""))
+	if chain := chainIn(lines[relLine], false); chain != "" {
+		return chain
+	}
+	lo, hi := relLine-1, relLine+2
+	if lo < 0 {
+		lo = 0
+	}
+	if hi > len(lines) {
+		hi = len(lines)
+	}
+	return chainIn(strings.Join(lines[lo:hi], ""), true)
 }
 
 // tsFamilyLang reports whether a language uses the TS/JS class-field model.
@@ -676,7 +679,7 @@ func tsResolveReceiverChain(idx *edgeIndex, localTypes map[string]string, chain,
 }
 
 // javaClassFieldTypes records one Java class's field name → type from its
-// source (javaFieldRe), scoped like tsClassFieldTypes: className resolves to
+// fields (javaClassFields), scoped like tsClassFieldTypes: className resolves to
 // one file from preferFile's perspective, and that file is returned so a
 // chain walk can scope its next hop.
 func javaClassFieldTypes(idx *edgeIndex, className, preferFile string, out map[string]string) string {
@@ -693,24 +696,7 @@ func javaClassFieldTypes(idx *edgeIndex, className, preferFile string, out map[s
 		default:
 			continue
 		}
-		for _, m := range javaFieldRe.FindAllStringSubmatch(cls.RawText, -1) {
-			if t := javaBareType(m[1]); t != "" {
-				if _, exists := out[m[2]]; !exists {
-					out[m[2]] = t
-				}
-			}
-		}
-		for _, f := range idx.byFile[cls.FilePath] {
-			if f.Kind != core.KindField || (f.ParentSymbol != className && f.ParentSymbol != cls.Name && f.ParentSymbol != cls.QualifiedName) {
-				continue
-			}
-			if _, exists := out[f.Name]; exists {
-				continue
-			}
-			if t := javaBareType(javaIndexedFieldType(f.RawText)); t != "" {
-				out[f.Name] = t
-			}
-		}
+		javaClassFields(idx, cls, className, out)
 		break
 	}
 	return classFile
@@ -745,6 +731,18 @@ func narrowByChainType(idx *edgeIndex, sat *interfaceSatisfaction, localTypes ma
 			if impls := sat.implementorsFor(iface, calleeName); len(impls) > 0 {
 				return nil, impls, true
 			}
+		}
+	}
+	if symbol.Language == "java" {
+		// A type declared outside the repo (`result.values.size()` on a
+		// `Map<String, Integer> values` field) or a member inherited from a
+		// base: resolve the last hop exactly as a single-hop receiver of
+		// that type (subclass overrides, base walk, fan-out cap). It used to
+		// arrive by accident, through an outer-class field map that read
+		// nested classes' fields.
+		last := fullChain[strings.LastIndexByte(fullChain, '.')+1:]
+		if byType, dispatch, _ := narrowByLocalType(idx, sat, symbol, map[string]string{last: typ}, last, calleeName, cands, nil); len(byType) > 0 || len(dispatch) > 0 {
+			return byType, dispatch, true
 		}
 	}
 	// The chain resolved to a type we know nothing more about (no candidate
@@ -786,7 +784,7 @@ func tsTypeOwnMember(idx *edgeIndex, typ, calleeName, preferFile string) []*core
 // skipped, so a statement reaching the field regex has no '(' and is a field,
 // not a method signature.
 func tsClassBodyFieldTypes(rawText string, record func(name, typ string)) {
-	body := stripCommentsAndStrings(rawText)
+	body := maskCode("typescript", rawText)
 	open := strings.IndexByte(body, '{')
 	if open < 0 {
 		return
@@ -859,26 +857,48 @@ func tsClassBodyFieldTypes(rawText string, record func(name, typ string)) {
 	flush()
 }
 
-// tsDeclParams extracts the parameter list from a TS/JS declaration's raw
-// text by scanning the first balanced paren group.
-func tsDeclParams(rawText string) string {
-	start := strings.IndexByte(rawText, '(')
-	if start < 0 {
-		return ""
+// tsDeclParams extracts the parameter list from a declaration's text (TS/JS,
+// Java, C#, Python, ...): the first balanced paren group, found in the text
+// masked as lang, so a `)` inside a default-value string
+// (`close: string = ")"`) or a comment does not end the list. The returned
+// slice is the original text (a string annotation such as Python's
+// `other: "Node"` is type syntax); split it with splitParams.
+func tsDeclParams(lang, text string) string {
+	// Masking is a forward pass, so a prefix masks exactly as it would in
+	// the whole text; most parameter lists close well inside the first
+	// couple of KB of a body.
+	const prefix = 2048
+	if len(text) > prefix {
+		if start, end, ok := declParamGroup(maskCode(lang, text[:prefix])); ok {
+			return text[start:end]
+		}
+	}
+	if start, end, ok := declParamGroup(maskCode(lang, text)); ok {
+		return text[start:end]
+	}
+	return ""
+}
+
+// declParamGroup returns the bounds of the inside of masked's first balanced
+// paren group; ok is false when there is none or it does not close.
+func declParamGroup(masked string) (start, end int, ok bool) {
+	open := strings.IndexByte(masked, '(')
+	if open < 0 {
+		return 0, 0, false
 	}
 	depth := 0
-	for k := start; k < len(rawText); k++ {
-		switch rawText[k] {
+	for k := open; k < len(masked); k++ {
+		switch masked[k] {
 		case '(', '[', '{':
 			depth++
 		case ')', ']', '}':
 			depth--
 			if depth == 0 {
-				return rawText[start+1 : k]
+				return open + 1, k, true
 			}
 		}
 	}
-	return ""
+	return 0, 0, false
 }
 
 // tsChosenTypeDecl picks the declaration that tsBaseClasses reads
@@ -918,6 +938,27 @@ func constructorBaseClasses(idx *edgeIndex, language, className, preferDir strin
 		return uniqueStrings(inheritanceClauseTypes(sig, "extends", "implements"))
 	}
 	return baseClassesFor(idx, language, className, preferDir)
+}
+
+// fileLocalTypeName reports whether className is a name the parser made up
+// for an anonymous class (`<anonymous@193:9>`). Its line and column are
+// unique only inside its own file and move with every line above it, so
+// looked up by name it binds whichever other file has a class at the same
+// position (guava: AbstractIteratorTest's and ImmutableSortedMapTest's
+// `<anonymous@193:9>` share a directory).
+func fileLocalTypeName(className string) bool {
+	return strings.HasPrefix(className, "<")
+}
+
+// baseClassesInFileFor is baseClassesFor for a class declared in file: a
+// file-local (anonymous) class is read from its declaration in that file,
+// any other name resolves as baseClassesFor does from file's directory.
+func baseClassesInFileFor(idx *edgeIndex, language, className, file string) []string {
+	if fileLocalTypeName(className) {
+		bases, _ := tsBaseClassesInFile(idx, className, file)
+		return bases
+	}
+	return baseClassesFor(idx, language, className, dirOf(file))
 }
 
 // tsBaseClassesInFile reads the inheritance clauses of the class-like

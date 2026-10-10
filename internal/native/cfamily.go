@@ -7,7 +7,9 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/provasign/astkit/textmask"
 	"github.com/provasign/grove/internal/core"
+	"github.com/provasign/grove/internal/parser"
 )
 
 type cFamilyAnalyzer struct{}
@@ -49,7 +51,7 @@ func (cFamilyAnalyzer) Analyze(ctx context.Context, req Request) Result {
 		if err != nil {
 			continue
 		}
-		for _, inc := range cIncludes(string(content)) {
+		for _, inc := range cIncludes(cIncludeScanText(file, string(content))) {
 			if target, ok := resolveCInclude(req.Root, file, inc, includeDirs, fileScope); ok {
 				edges = append(edges, nativeImportEdge(file, target, 0.95))
 				includeTargets[file] = append(includeTargets[file], target)
@@ -118,6 +120,18 @@ func cIncludeDirs(root string, commands []compileCommand) []string {
 
 var cIncludePattern = regexp.MustCompile(`(?m)^\s*#\s*include\s+["<]([^">]+)[">]`)
 
+// cIncludeScanText is file content prepared for cIncludes: comments and
+// `#if 0` branches masked, string literals kept (the `"x.h"` path is one).
+func cIncludeScanText(file, content string) string {
+	lang := parser.DetectLanguage(file)
+	if lang != "c" && lang != "cpp" {
+		lang = "cpp"
+	}
+	return textmask.MaskComments(lang, textmask.MaskInactivePreprocessor(lang, content))
+}
+
+// cIncludes returns the include paths of content, which must already have
+// comments and inactive preprocessor branches masked (cIncludeScanText).
 func cIncludes(content string) []string {
 	matches := cIncludePattern.FindAllStringSubmatch(content, -1)
 	out := make([]string, 0, len(matches))
@@ -212,6 +226,7 @@ func cFamilySemanticEdges(symbols []core.SymbolRecord, includeTargets map[string
 		if (caller.Language != "c" && caller.Language != "cpp") || caller.RawText == "" || !callableKind(caller.Kind) {
 			continue
 		}
+		masked := maskCode(caller.Language, caller.RawText)
 		// Call edges intentionally NOT emitted here (same lesson as the Java,
 		// Rust, C#, and PHP native passes): text matching edged every
 		// same-named callable it saw. The graph layer's call-site resolution
@@ -223,12 +238,12 @@ func cFamilySemanticEdges(symbols []core.SymbolRecord, includeTargets map[string
 				if target.ID == caller.ID {
 					continue
 				}
-				if typeKind(target.Kind) && cFamilyContainsType(caller, target, file != caller.FilePath) {
+				if typeKind(target.Kind) && cFamilyContainsType(caller, masked, target, file != caller.FilePath) {
 					add(symbolEdge(caller, target, core.EdgeUsesType, 0.91))
 				}
 			}
 		}
-		for _, typeName := range cFamilyConstructedTypes(caller.RawText) {
+		for _, typeName := range cFamilyConstructedTypes(masked) {
 			if target, ok := cFamilyBestType(idx, typeName, caller); ok && target.ID != caller.ID {
 				add(symbolEdge(caller, target, core.EdgeUsesType, 0.93))
 			}
@@ -249,21 +264,9 @@ func cFamilyScopeFiles(fromFile string, includeTargets map[string][]string) []st
 	return out
 }
 
-func cFamilyContainsCallable(rawText string, target core.SymbolRecord, crossFile bool) bool {
-	if !crossFile {
-		return containsCall(rawText, target.Name)
-	}
-	if target.ParentSymbol != "" {
-		pattern := regexp.MustCompile(`\b` + regexp.QuoteMeta(target.ParentSymbol) + `::` + regexp.QuoteMeta(target.Name) + `\s*\(`)
-		if pattern.MatchString(stripQuotedText(rawText)) {
-			return true
-		}
-	}
-	return containsCall(rawText, target.Name)
-}
-
-func cFamilyContainsType(caller, target core.SymbolRecord, crossFile bool) bool {
-	clean := stripCStyleComments(stripQuotedText(caller.RawText))
+// cFamilyContainsType reports whether the caller body names target. clean
+// is caller.RawText through maskCode.
+func cFamilyContainsType(caller core.SymbolRecord, clean string, target core.SymbolRecord, crossFile bool) bool {
 	if strings.Contains(target.QualifiedName, "::") {
 		pattern := regexp.MustCompile(`\b` + regexp.QuoteMeta(target.QualifiedName) + `\b`)
 		if pattern.MatchString(clean) {
@@ -303,57 +306,12 @@ func cFamilyContainsType(caller, target core.SymbolRecord, crossFile bool) bool 
 	return containsTypeToken(clean, target.Name)
 }
 
-func stripCStyleComments(text string) string {
-	var out strings.Builder
-	out.Grow(len(text))
-	for i := 0; i < len(text); {
-		if i+1 < len(text) && text[i] == '/' && text[i+1] == '/' {
-			for i < len(text) && text[i] != '\n' {
-				i++
-			}
-			continue
-		}
-		if i+1 < len(text) && text[i] == '/' && text[i+1] == '*' {
-			i += 2
-			for i+1 < len(text) && !(text[i] == '*' && text[i+1] == '/') {
-				if text[i] == '\n' {
-					out.WriteByte('\n')
-				}
-				i++
-			}
-			if i+1 < len(text) {
-				i += 2
-			}
-			continue
-		}
-		out.WriteByte(text[i])
-		i++
-	}
-	return out.String()
-}
-
-type cFamilyQualifiedCall struct {
-	Qualifier string
-	Method    string
-}
-
-var cFamilyQualifiedCallPattern = regexp.MustCompile(`\b([A-Z_][A-Za-z0-9_]*)::([A-Za-z_][A-Za-z0-9_]*)\s*\(`)
-
-func cFamilyQualifiedCalls(rawText string) []cFamilyQualifiedCall {
-	matches := cFamilyQualifiedCallPattern.FindAllStringSubmatch(stripQuotedText(rawText), -1)
-	out := make([]cFamilyQualifiedCall, 0, len(matches))
-	for _, match := range matches {
-		if len(match) == 3 {
-			out = append(out, cFamilyQualifiedCall{Qualifier: match[1], Method: match[2]})
-		}
-	}
-	return out
-}
-
 var cFamilyConstructorPattern = regexp.MustCompile(`\b(?:new\s+)?([A-Z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)*)\s*\(`)
 
-func cFamilyConstructedTypes(rawText string) []string {
-	matches := cFamilyConstructorPattern.FindAllStringSubmatch(stripQuotedText(rawText), -1)
+// cFamilyConstructedTypes returns the constructor-call type names of masked
+// (see maskCode).
+func cFamilyConstructedTypes(masked string) []string {
+	matches := cFamilyConstructorPattern.FindAllStringSubmatch(masked, -1)
 	seen := map[string]bool{}
 	var out []string
 	for _, match := range matches {

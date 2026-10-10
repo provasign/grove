@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/provasign/astkit/textmask"
 	"github.com/provasign/grove/internal/core"
 )
 
@@ -324,7 +325,7 @@ func pySetattrTargets(idx *edgeIndex, symbol *core.SymbolRecord, localTypes map[
 	if symbol.RawText == "" {
 		return nil
 	}
-	body := stripCommentsAndStrings(symbol.RawText)
+	body := maskCode(symbol.Language, symbol.RawText)
 	// Shadowing guard for the module-global fallback: a parameter or a plain
 	// local rebinding with the same name as a module global refers to the
 	// LOCAL value, not the global — resolving it through the global's type
@@ -579,8 +580,11 @@ func pyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 		// show_server_banner()` is the imported cli module, not the
 		// AppGroup in self.cli) — drop the attribute reading for it.
 		if symbol.RawText != "" {
+			// Masked: a comment or docstring mentioning `self.cli` is not
+			// a use of the attribute.
+			code := maskCode(symbol.Language, symbol.RawText)
 			for name := range out {
-				if !strings.Contains(symbol.RawText, "self."+name) && !strings.Contains(symbol.RawText, "cls."+name) {
+				if !strings.Contains(code, "self."+name) && !strings.Contains(code, "cls."+name) {
 					delete(out, name)
 				}
 			}
@@ -619,7 +623,7 @@ func pyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 
 	// Body declarations (highest precedence).
 	if symbol.RawText != "" {
-		body := stripCommentsAndStrings(symbol.RawText)
+		body := maskCode(symbol.Language, symbol.RawText)
 		for _, m := range pyUnnestedMatches(pyAnnAssignRe, body) {
 			if t := pyAnnotationType(idx, symbol, m[2]); t != "" {
 				out[m[1]] = t
@@ -693,7 +697,7 @@ func pyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 	if idx != nil && (len(idx.pyModuleGlobals) > 0 || len(idx.pyFileGlobals) > 0) {
 		shadowed = pyParamNames(symbol.RawText)
 		if symbol.RawText != "" {
-			for _, m := range pyLocalRebindRe.FindAllStringSubmatch(stripCommentsAndStrings(symbol.RawText), -1) {
+			for _, m := range pyLocalRebindRe.FindAllStringSubmatch(maskCode(symbol.Language, symbol.RawText), -1) {
 				shadowed[m[1]] = true
 			}
 		}
@@ -764,12 +768,13 @@ func pyClassAttrTypes(idx *edgeIndex, symbol *core.SymbolRecord, className strin
 		}
 	}
 	if class != nil {
-		for _, m := range pyClassAnnRe.FindAllStringSubmatch(class.RawText, -1) {
-			record(m[1], pyAnnotationType(idx, class, m[2]))
+		attrs := pyClassBodyAttrs(idx, class)
+		for _, a := range attrs.anns {
+			record(a[0], pyAnnotationType(idx, class, a[1]))
 		}
-		for _, m := range pyClassRefRe.FindAllStringSubmatch(class.RawText, -1) {
-			if typeSymbolExists(idx, m[2]) {
-				record(m[1], "class:"+m[2])
+		for _, a := range attrs.refs {
+			if typeSymbolExists(idx, a[1]) {
+				record(a[0], "class:"+a[1])
 			}
 		}
 	}
@@ -789,7 +794,7 @@ func pyClassAttrTypes(idx *edgeIndex, symbol *core.SymbolRecord, className strin
 		}
 	}
 	if init != nil {
-		body := stripCommentsAndStrings(init.RawText)
+		body := maskCode(init.Language, init.RawText)
 		for _, m := range pySelfAnnRe.FindAllStringSubmatch(body, -1) {
 			record(m[1], pyAnnotationType(idx, init, m[2]))
 		}
@@ -799,6 +804,48 @@ func pyClassAttrTypes(idx *edgeIndex, symbol *core.SymbolRecord, className strin
 			}
 		}
 	}
+}
+
+// pyClassAttrs holds a class body's own attribute statements: annotations
+// (`name: T`, `name: T = v`) and class references (`name = SomeClass`), as
+// (name, text) pairs in source order.
+type pyClassAttrs struct{ anns, refs [][2]string }
+
+// pyClassBodyAttrs reads the class-body attribute statements of cls, memoized
+// per class. Only statements at the class body's own indentation count
+// (classBody): a method's local `tmp: Bar` or a docstring's numpy
+// "client : Bar" line is not an attribute. The annotation text is read with
+// only comments masked, since a string annotation (`parent: "Node"`) is type
+// syntax; a match counts only where the fully masked body has code, so a
+// docstring is never read.
+func pyClassBodyAttrs(idx *edgeIndex, cls *core.SymbolRecord) pyClassAttrs {
+	key := "py-attrs\x00" + cls.ID
+	if idx != nil && cls.ID != "" {
+		if v, ok := idx.classBodies.Load(key); ok {
+			return v.(pyClassAttrs)
+		}
+	}
+	var attrs pyClassAttrs
+	if top := classBody(idx, cls); top != "" {
+		text := textmask.MaskComments(cls.Language, cls.RawText)
+		inCode := func(loc []int) bool {
+			return loc[2] < len(top) && top[loc[2]] != ' ' && top[loc[2]] != '\t'
+		}
+		for _, loc := range pyClassAnnRe.FindAllStringSubmatchIndex(text, -1) {
+			if inCode(loc) {
+				attrs.anns = append(attrs.anns, [2]string{text[loc[2]:loc[3]], text[loc[4]:loc[5]]})
+			}
+		}
+		for _, loc := range pyClassRefRe.FindAllStringSubmatchIndex(text, -1) {
+			if inCode(loc) {
+				attrs.refs = append(attrs.refs, [2]string{text[loc[2]:loc[3]], text[loc[4]:loc[5]]})
+			}
+		}
+	}
+	if idx != nil && cls.ID != "" {
+		idx.classBodies.Store(key, attrs)
+	}
+	return attrs
 }
 
 // pyBaseClasses parses the base-class names from a class declaration
@@ -838,14 +885,12 @@ func pyBaseRefs(idx *edgeIndex, className, preferDir string) []pyBaseRef {
 		}
 	}
 	if chosen != nil {
-		sig := chosen.Signature
-		open := strings.IndexByte(sig, '(')
-		closeIdx := strings.LastIndexByte(sig, ')')
-		if open < 0 || closeIdx <= open {
+		list, ok := pythonClassBaseList(chosen)
+		if !ok || strings.TrimSpace(list) == "" {
 			return nil
 		}
 		var bases []pyBaseRef
-		for _, b := range splitTopLevel(sig[open+1:closeIdx], ',') {
+		for _, b := range splitTopLevel(list, ',') {
 			b = strings.TrimSpace(b)
 			if b == "" || strings.Contains(b, "=") {
 				continue
@@ -964,7 +1009,7 @@ func inheritedTargets(idx *edgeIndex, symbol *core.SymbolRecord, calleeName stri
 	if len(all) == 0 {
 		return nil
 	}
-	bases := baseClassesFor(idx, symbol.Language, symbol.ParentSymbol, dirOf(symbol.FilePath))
+	bases := baseClassesInFileFor(idx, symbol.Language, symbol.ParentSymbol, symbol.FilePath)
 	// TS/JS: a base class name is resolved through the subclass file's
 	// imports. A monorepo declares `class Transport` in both engine.io and
 	// engine.io-client; `this.onError()` in the client's Fetch transport
@@ -1025,7 +1070,7 @@ func narrowBySuper(idx *edgeIndex, symbol *core.SymbolRecord, cands []*core.Symb
 		}
 		return nil
 	}
-	bases := baseClassesFor(idx, symbol.Language, symbol.ParentSymbol, dirOf(symbol.FilePath))
+	bases := baseClassesInFileFor(idx, symbol.Language, symbol.ParentSymbol, symbol.FilePath)
 	for level := 0; level < 3 && len(bases) > 0; level++ {
 		var matched []*core.SymbolRecord
 		for _, base := range bases {
@@ -1058,14 +1103,13 @@ func pyImportedDirectBaseTargets(idx *edgeIndex, symbol *core.SymbolRecord, cand
 	if class == nil {
 		return nil
 	}
-	open := strings.IndexByte(class.Signature, '(')
-	closeIdx := strings.LastIndexByte(class.Signature, ')')
-	if open < 0 || closeIdx <= open {
+	list, ok := pythonClassBaseList(class)
+	if !ok || strings.TrimSpace(list) == "" {
 		return nil
 	}
 	seen := map[string]bool{}
 	var out []*core.SymbolRecord
-	for _, rawBase := range splitTopLevel(class.Signature[open+1:closeIdx], ',') {
+	for _, rawBase := range splitTopLevel(list, ',') {
 		base := strings.TrimSpace(rawBase)
 		if base == "" || strings.Contains(base, "=") {
 			continue
@@ -1228,7 +1272,7 @@ func pyWithTargets(idx *edgeIndex, symbol *core.SymbolRecord, localTypes map[str
 	if symbol.RawText == "" {
 		return nil
 	}
-	body := stripCommentsAndStrings(symbol.RawText)
+	body := maskCode(symbol.Language, symbol.RawText)
 	preferDir := dirOf(symbol.FilePath)
 	seen := map[string]bool{}
 	var out []*core.SymbolRecord
@@ -1287,7 +1331,7 @@ func pySubscriptTargets(idx *edgeIndex, symbol *core.SymbolRecord, localTypes ma
 	}
 	seen := map[string]bool{}
 	var out []*core.SymbolRecord
-	for _, match := range pySubscriptRe.FindAllStringSubmatch(stripCommentsAndStrings(symbol.RawText), -1) {
+	for _, match := range pySubscriptRe.FindAllStringSubmatch(maskCode(symbol.Language, symbol.RawText), -1) {
 		if match[2] != "" {
 			continue
 		}
@@ -1384,8 +1428,14 @@ func subclassOverrides(idx *edgeIndex, language, className, calleeName, preferDi
 				if c.Language == "cpp" && strings.Contains(c.QualifiedName, "::") {
 					className = c.QualifiedName
 				}
-				for _, base := range baseClassesFor(idx, c.Language, className, dirOf(c.FilePath)) {
-					byLang[base] = append(byLang[base], className)
+				sub := className
+				if fileLocalTypeName(className) {
+					// Kept apart from same-named anonymous classes of
+					// other files; see subclassMembers.
+					sub = className + "\x00" + c.FilePath
+				}
+				for _, base := range baseClassesInFileFor(idx, c.Language, className, c.FilePath) {
+					byLang[base] = append(byLang[base], sub)
 				}
 			}
 		}
@@ -1420,10 +1470,27 @@ func subclassOverrides(idx *edgeIndex, language, className, calleeName, preferDi
 				}
 				visited[sub] = true
 				next = append(next, sub)
-				out = append(out, filterByParent(methods, sub)...)
+				out = append(out, subclassMembers(methods, sub)...)
 			}
 		}
 		frontier = next
+	}
+	return out
+}
+
+// subclassMembers filters methods to those of the subclass key sub: a class
+// name, or for a file-local (anonymous) class its name and file joined by
+// NUL.
+func subclassMembers(methods []*core.SymbolRecord, sub string) []*core.SymbolRecord {
+	name, file, local := strings.Cut(sub, "\x00")
+	if !local {
+		return filterByParent(methods, sub)
+	}
+	var out []*core.SymbolRecord
+	for _, m := range filterByParent(methods, name) {
+		if m.FilePath == file {
+			out = append(out, m)
+		}
 	}
 	return out
 }
@@ -1494,7 +1561,7 @@ func pyFixtureType(idx *edgeIndex, symbol *core.SymbolRecord, param string) stri
 			}
 		}
 	}
-	body := stripCommentsAndStrings(best.RawText)
+	body := maskCode(best.Language, best.RawText)
 	if m := pyFixtureValueRe.FindStringSubmatch(body); m != nil && typeSymbolExists(idx, m[1]) {
 		return m[1]
 	}
@@ -1592,11 +1659,12 @@ func pyArityCompatible(cands []*core.SymbolRecord, argc int) []*core.SymbolRecor
 // pyCallHasSplat reports whether the call at cs unpacks arguments (*a, **kw)
 // -- then its real argument count is unknown -- or cannot be located (also
 // unknown). Only a located call with plain arguments has a known count.
-func pyCallHasSplat(symbol *core.SymbolRecord, cs core.CallSite) bool {
+func pyCallHasSplat(idx *edgeIndex, symbol *core.SymbolRecord, cs core.CallSite) bool {
 	if symbol.RawText == "" || cs.Line < symbol.Span.Start {
 		return true
 	}
-	lines := strings.Split(symbol.RawText, "\n")
+	// Masked: a `leaf(` or `*` inside a string or comment is not the call.
+	lines := maskedSymbolLines(idx, symbol)
 	off := cs.Line - symbol.Span.Start
 	if off < 0 || off >= len(lines) {
 		return true
@@ -1694,16 +1762,16 @@ func pyAttrAnnotation(idx *edgeIndex, className, attr, preferDir string) string 
 	if cls == nil {
 		return ""
 	}
-	for _, m := range pyClassAnnRe.FindAllStringSubmatch(cls.RawText, -1) {
-		if m[1] == attr {
-			return m[2]
+	for _, a := range pyClassBodyAttrs(idx, cls).anns {
+		if a[0] == attr {
+			return a[1]
 		}
 	}
 	for _, cand := range idx.byFile[cls.FilePath] {
 		if cand.ParentSymbol != className || cand.Name != "__init__" {
 			continue
 		}
-		for _, m := range pySelfAnnRe.FindAllStringSubmatch(stripCommentsAndStrings(cand.RawText), -1) {
+		for _, m := range pySelfAnnRe.FindAllStringSubmatch(maskCode(cand.Language, cand.RawText), -1) {
 			if m[1] == attr {
 				return m[2]
 			}

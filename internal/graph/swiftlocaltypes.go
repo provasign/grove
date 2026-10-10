@@ -22,9 +22,9 @@ func swiftBaseClasses(idx *edgeIndex, className, preferDir string) []string {
 	if decl == nil {
 		return nil
 	}
-	text := decl.Signature
+	text := codeSignature(decl)
 	if text == "" {
-		text = firstLine(decl.RawText)
+		text = maskCode(decl.Language, firstLine(decl.RawText))
 	}
 	names := swiftBaseNames(text)
 	if len(names) == 0 || !namedSymbolIsClass(idx, names[0]) {
@@ -65,12 +65,12 @@ func swiftLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]strin
 	// Array receiver whose subscript/methods are the standard library's,
 	// never JSONSubscriptType's — unwrapping it misattributed every
 	// `path[0]` to the in-repo type's own subscripts.
-	for name, typ := range swiftParamShapes(symbol.Signature) {
+	for name, typ := range swiftParamShapes(codeSignature(symbol)) {
 		out[name] = typ
 	}
 
 	if symbol.RawText != "" {
-		body := stripCommentsAndStrings(symbol.RawText)
+		body := maskCode(symbol.Language, symbol.RawText)
 		for _, m := range swiftLetTypedRe.FindAllStringSubmatch(body, -1) {
 			if typ := swiftShapeType(m[2]); typ != "" {
 				out[m[1]] = typ
@@ -99,11 +99,11 @@ func swiftLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]strin
 			if _, shadowed := out[cand.Name]; shadowed {
 				continue
 			}
-			if m := swiftLetTypedRe.FindStringSubmatch(cand.Signature); m != nil {
+			if m := swiftLetTypedRe.FindStringSubmatch(codeSignature(cand)); m != nil {
 				if typ := swiftShapeType(m[2]); typ != "" {
 					out[cand.Name] = typ
 				}
-			} else if m := swiftLetCtorRe.FindStringSubmatch(cand.Signature); m != nil {
+			} else if m := swiftLetCtorRe.FindStringSubmatch(codeSignature(cand)); m != nil {
 				out[cand.Name] = m[2]
 			}
 		}
@@ -160,9 +160,9 @@ func swiftTypealiasTarget(idx *edgeIndex, name string) string {
 		if cand.Language != "swift" || cand.Kind != core.KindType {
 			continue
 		}
-		m := swiftTypealiasRe.FindStringSubmatch(cand.Signature)
+		m := swiftTypealiasRe.FindStringSubmatch(codeSignature(cand))
 		if m == nil {
-			m = swiftTypealiasRe.FindStringSubmatch(firstLine(cand.RawText))
+			m = swiftTypealiasRe.FindStringSubmatch(maskCode(cand.Language, firstLine(cand.RawText)))
 		}
 		if m != nil && m[1] == name {
 			target := m[2]
@@ -215,9 +215,9 @@ func swiftParamShapes(signature string) map[string]string {
 
 // swiftDeclParamShapes returns a candidate's parameter shapes by position.
 func swiftDeclParamShapes(s *core.SymbolRecord) []string {
-	src := s.Signature
+	src := codeSignature(s)
 	if !strings.Contains(src, ")") {
-		src = firstLine(s.RawText)
+		src = maskCode(s.Language, firstLine(s.RawText))
 	}
 	list, ok := swiftParamList(src)
 	if !ok {
@@ -358,9 +358,9 @@ type swiftParam struct {
 // narrowing cannot split) collapses to. ok is false when the signature has
 // no parseable parameter list, which callers treat as neutral.
 func swiftDeclParams(s *core.SymbolRecord) (params []swiftParam, ok bool) {
-	src := s.Signature
+	src := codeSignature(s)
 	if !strings.Contains(src, ")") {
-		src = firstLine(s.RawText)
+		src = maskCode(s.Language, firstLine(s.RawText))
 	}
 	list, found := swiftParamList(src)
 	if !found {
@@ -460,7 +460,7 @@ func swiftNarrowByLabels(cands []*core.SymbolRecord, args []string) (out []*core
 // re-source the same-name members it just ruled out.
 func swiftNarrowCall(cands []*core.SymbolRecord, cs core.CallSite, caller *core.SymbolRecord) (out []*core.SymbolRecord, decided bool) {
 	if out, decided = swiftNarrowByLabels(cands, cs.Args); decided {
-		return swiftNarrowByArgShapes(out, cs.Args, swiftParamShapes(caller.Signature), caller), true
+		return swiftNarrowByArgShapes(out, cs.Args, swiftParamShapes(codeSignature(caller)), caller), true
 	}
 	return filterByArgc(cands, cs.Argc), false
 }

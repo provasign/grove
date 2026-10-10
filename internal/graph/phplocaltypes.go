@@ -26,6 +26,11 @@ type phpTraitRules struct {
 	traits    []string
 }
 
+// phpTraitRulesFor reads a class's trait composition from its raw text.
+// Only `use` statements at class-body depth 1 of the masked text count: a
+// comment ("We no longer use Loud;") or a closure's `use` inside a method
+// is not trait composition. The adaptation block `{ ... }` is read from the
+// masked text at the statement's offset.
 func phpTraitRulesFor(rawText string) phpTraitRules {
 	rules := phpTraitRules{
 		used:      map[string]bool{},
@@ -33,7 +38,18 @@ func phpTraitRulesFor(rawText string) phpTraitRules {
 		excluded:  map[string]map[string]bool{},
 		aliases:   map[string]phpTraitAlias{},
 	}
-	for _, match := range phpTraitUseRe.FindAllStringSubmatch(rawText, -1) {
+	masked := maskCode("php", rawText)
+	top := braceClassBodyTopLevel(masked)
+	for _, loc := range phpTraitUseRe.FindAllStringSubmatchIndex(masked, -1) {
+		if loc[0] >= len(top) || !strings.HasPrefix(top[loc[0]:], "use") {
+			continue
+		}
+		match := make([]string, len(loc)/2)
+		for i := range match {
+			if loc[2*i] >= 0 {
+				match[i] = masked[loc[2*i]:loc[2*i+1]]
+			}
+		}
 		if len(match) < 2 || strings.ContainsAny(match[1], "($") {
 			continue // closure `use ($x) { ... }`, not trait composition
 		}
@@ -79,6 +95,18 @@ func phpTraitRulesFor(rawText string) phpTraitRules {
 	return rules
 }
 
+// phpClassTraitRules is phpTraitRulesFor memoized per class symbol (asked
+// once per self call).
+func phpClassTraitRules(idx *edgeIndex, class *core.SymbolRecord) phpTraitRules {
+	key := "php-traits\x00" + class.ID
+	if v, ok := idx.classBodies.Load(key); ok {
+		return v.(phpTraitRules)
+	}
+	rules := phpTraitRulesFor(class.RawText)
+	idx.classBodies.Store(key, rules)
+	return rules
+}
+
 func phpSimpleTypeName(raw string) string {
 	raw = strings.Trim(strings.TrimSpace(raw), "\\")
 	if i := strings.LastIndexByte(raw, '\\'); i >= 0 {
@@ -101,7 +129,7 @@ func phpTraitCallTargets(idx *edgeIndex, caller *core.SymbolRecord, name string,
 	if class == nil {
 		return initial, false
 	}
-	rules := phpTraitRulesFor(class.RawText)
+	rules := phpClassTraitRules(idx, class)
 	lookupName := name
 	wantedTrait := ""
 	aliased := false
@@ -175,7 +203,9 @@ func phpLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string 
 					default:
 						continue
 					}
-					for _, m := range phpPropertyRe.FindAllStringSubmatch(cls.RawText, -1) {
+					// Top-level members only (classBody): a commented-out
+					// property is not one.
+					for _, m := range phpPropertyRe.FindAllStringSubmatch(classBody(idx, cls), -1) {
 						if t := phpBareType(m[1]); t != "" {
 							if _, exists := out[m[2]]; !exists {
 								out[m[2]] = t
@@ -200,7 +230,7 @@ func phpLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string 
 	// ($stmt = BuilderHelpers::normalizeNode($stmt) → Node). A `new` or
 	// declared type already recorded wins.
 	if symbol.RawText != "" {
-		body := stripCommentsAndStrings(symbol.RawText)
+		body := maskCode(symbol.Language, symbol.RawText)
 		for _, m := range phpNewLocalRe.FindAllStringSubmatch(body, -1) {
 			if t := phpBareType(m[2]); t != "" {
 				out[m[1]] = t
@@ -278,7 +308,7 @@ func phpReturnType(s *core.SymbolRecord) string {
 			// the body, where `return $this` pins the concrete class.
 		}
 	}
-	body := stripCommentsAndStrings(s.RawText)
+	body := maskCode(s.Language, s.RawText)
 	if m := phpReturnNewRe.FindStringSubmatch(body); m != nil {
 		if t := phpBareType(m[1]); t != "" {
 			return t
@@ -394,7 +424,7 @@ func phpNarrowNewByNamespace(idx *edgeIndex, symbol *core.SymbolRecord, cs core.
 		return ctors
 	}
 	off := cs.Line - symbol.Span.Start
-	lines := strings.Split(symbol.RawText, "\n")
+	lines := maskedSymbolLines(idx, symbol)
 	if off < 0 || off >= len(lines) {
 		return ctors
 	}

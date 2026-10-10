@@ -86,3 +86,31 @@ func TestTSOverloadSignaturesJoinTheDeclaration(t *testing.T) {
 	}
 	t.Fatal("EventStream.push not extracted")
 }
+
+// Function overloads are bodiless function_signature nodes naming the same
+// function (exported, multi-line); a call statement or another function's
+// signature above is not one.
+func TestTSFunctionOverloadsJoinTheDeclaration(t *testing.T) {
+	src := "export function g(a: string): void;\n" +
+		"export function f(a: string): void;\n" +
+		"export function f(\n  a: number,\n): void;\n" +
+		"export function f(a: any) {\n  return a;\n}\n" +
+		"f(1);\n" +
+		"function h(x: number) {\n  return x;\n}\n"
+	syms, err := parser.NewEngine().ExtractContent("a.ts", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string][2]int{"f": {2, 8}, "h": {10, 12}}
+	for _, s := range syms {
+		if w, ok := want[s.Name]; ok {
+			if s.Span.Start != w[0] || s.Span.End != w[1] {
+				t.Errorf("%s spans %d-%d, want %d-%d", s.Name, s.Span.Start, s.Span.End, w[0], w[1])
+			}
+			delete(want, s.Name)
+		}
+	}
+	if len(want) > 0 {
+		t.Errorf("missing %v", want)
+	}
+}

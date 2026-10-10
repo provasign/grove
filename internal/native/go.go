@@ -891,12 +891,12 @@ func goImportScope(caller core.SymbolRecord, idx *goNativeIndex, pkgDirsByImport
 	return scope
 }
 
-// goIdentRe extracts identifier tokens from a stripped body in one pass.
+// goIdentRe extracts identifier tokens from a masked body in one pass.
 var goIdentRe = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]*`)
 var goQualifiedIdentRe = regexp.MustCompile(`\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b`)
 
-// goTypeUseEdges emits lexical type-use edges. Each caller body is stripped
-// and tokenized exactly once and tokens are resolved through the type index;
+// goTypeUseEdges emits lexical type-use edges. Each caller body is masked
+// (comments and literals blanked) and tokenized exactly once and tokens are resolved through the type index;
 // the previous implementation compiled a fresh regex and re-stripped the
 // body for every (caller, type-name) pair, unbounded by the analyzer
 // completion (linear cost; the deadline governs subprocesses, not pure-Go passes).
@@ -915,7 +915,7 @@ func goTypeUseEdges(ctx context.Context, callers, all []core.SymbolRecord, pkgDi
 			continue
 		}
 		scope := goImportScope(caller, idx, pkgDirsByImport)
-		stripped := stripQuotedText(caller.RawText)
+		stripped := maskCode("go", caller.RawText)
 		emit := func(target core.SymbolRecord) {
 			if target.ID == caller.ID {
 				return
@@ -960,14 +960,15 @@ func goTypeUseEdges(ctx context.Context, callers, all []core.SymbolRecord, pkgDi
 }
 
 // goContainsType reports whether name appears as a bare or package-qualified
-// type token in rawText. Retained for direct callers and tests; the hot path
-// in goTypeUseEdges tokenizes instead.
+// type token in rawText's code. Retained for direct callers and tests; the
+// hot path in goTypeUseEdges tokenizes instead.
 func goContainsType(rawText, name string) bool {
-	if containsTypeToken(rawText, name) {
+	masked := maskCode("go", rawText)
+	if containsTypeToken(masked, name) {
 		return true
 	}
 	pattern := regexp.MustCompile(`\b[A-Za-z_][A-Za-z0-9_]*\.` + regexp.QuoteMeta(name) + `\b`)
-	return pattern.MatchString(stripQuotedText(rawText))
+	return pattern.MatchString(masked)
 }
 
 // goListTopologyKey hashes everything go list output depends on: module
