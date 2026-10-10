@@ -316,15 +316,23 @@ func extractBody(lines []string, startIdx int, language string) (endLine int, bo
 
 // extractBraceBody scans forward from startIdx, tracking brace depth,
 // and returns when the opening brace is balanced (depth returns to 0).
-// lines are masked (scanMask), so every brace counted is code.
+// lines are masked (scanMask), so every brace counted is code. The scan
+// gives up after maxLines lines of code; blank lines (comment lines are
+// blank once masked) do not count, so a comment cannot move the cut.
 func extractBraceBody(lines []string, startIdx int) (endLine int, body string) {
 	depth := 0
 	opened := false
 
 	const maxLines = 500
-	limit := startIdx + maxLines
-	if limit > len(lines) {
-		limit = len(lines)
+	limit := len(lines)
+	for i, code := startIdx, 0; i < len(lines); i++ {
+		if strings.TrimSpace(lines[i]) != "" {
+			if code == maxLines {
+				limit = i
+				break
+			}
+			code++
+		}
 	}
 
 	for i := startIdx; i < limit; i++ {
@@ -439,7 +447,8 @@ func symbolPatterns(language string) []symbolPattern {
 			// Free function: return-type name(  — anchored to avoid matching variable decls
 			{regexp.MustCompile(`^(?:[\w*&:<>\s]+\s+)+\*?([A-Za-z_][A-Za-z0-9_:]*)\s*\([^;]*$`), core.KindFunction, "", false},
 			{regexp.MustCompile(`^\s*(?:typedef\s+)?struct\s+([A-Za-z_][A-Za-z0-9_]*)\s*[{;]`), core.KindStruct, "", false},
-			{regexp.MustCompile(`^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)\b`), core.KindClass, "", false},
+			// `class GTEST_API_ RE {`: the export macro is not the name.
+			{regexp.MustCompile(`^\s*class\s+(?:[A-Z][A-Z0-9]*_[A-Z0-9_]*\s+)?([A-Za-z_][A-Za-z0-9_]*)\b`), core.KindClass, "", false},
 			{regexp.MustCompile(`^\s*enum\s+(?:class\s+)?([A-Za-z_][A-Za-z0-9_]*)\b`), core.KindEnum, "", false},
 			{regexp.MustCompile(`^\s*namespace\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{`), core.KindNamespace, "", false},
 		}
@@ -658,10 +667,23 @@ func enrichCppNamespaces(symbols []core.SymbolRecord, scan string) []core.Symbol
 			scopes = append(scopes, scope{index: i, parent: -1})
 		}
 	}
+	// inner reports whether namespace a is a closer scope than b, both
+	// enclosing the same lines: the later opening, then the earlier
+	// close, then the shorter text. Recovered spans can overlap without
+	// nesting (`namespace testing {` 10417-11159, `namespace internal {`
+	// 10418-11161); comparing line counts there let a comment line
+	// elsewhere in the span pick the other one.
+	inner := func(a, b *core.SymbolRecord) bool {
+		if a.Span.Start != b.Span.Start {
+			return a.Span.Start > b.Span.Start
+		}
+		if a.Span.End != b.Span.End {
+			return a.Span.End < b.Span.End
+		}
+		return len(a.RawText) < len(b.RawText)
+	}
 	for i := range scopes {
 		child := symbols[scopes[i].index]
-		bestWidth := int(^uint(0) >> 1)
-		bestRawWidth := int(^uint(0) >> 1)
 		for j := range scopes {
 			if i == j {
 				continue
@@ -670,16 +692,12 @@ func enrichCppNamespaces(symbols []core.SymbolRecord, scan string) []core.Symbol
 			if parent.Span.Start > child.Span.Start || parent.Span.End < child.Span.End {
 				continue
 			}
-			width := parent.Span.End - parent.Span.Start
-			rawWidth := len(parent.RawText)
-			strictlyContains := width > child.Span.End-child.Span.Start ||
-				(rawWidth > len(child.RawText) && strings.Contains(parent.RawText, child.RawText))
+			strictlyContains := parent.Span.Start < child.Span.Start || parent.Span.End > child.Span.End ||
+				(len(parent.RawText) > len(child.RawText) && strings.Contains(parent.RawText, child.RawText))
 			if !strictlyContains {
 				continue
 			}
-			if width < bestWidth || (width == bestWidth && rawWidth < bestRawWidth) {
-				bestWidth = width
-				bestRawWidth = rawWidth
+			if best := scopes[i].parent; best < 0 || inner(&parent, &symbols[scopes[best].index]) {
 				scopes[i].parent = j
 			}
 		}
@@ -718,15 +736,12 @@ func enrichCppNamespaces(symbols []core.SymbolRecord, scan string) []core.Symbol
 			continue
 		}
 		namespace := ""
-		bestWidth := int(^uint(0) >> 1)
-		bestRawWidth := int(^uint(0) >> 1)
+		best := -1
 		for j := range scopes {
-			ns := symbols[scopes[j].index]
+			ns := &symbols[scopes[j].index]
 			if ns.Span.Start <= symbol.Span.Start && ns.Span.End >= symbol.Span.End {
-				width, rawWidth := ns.Span.End-ns.Span.Start, len(ns.RawText)
-				if width < bestWidth || (width == bestWidth && rawWidth < bestRawWidth) {
-					bestWidth = width
-					bestRawWidth = rawWidth
+				if best < 0 || inner(ns, &symbols[scopes[best].index]) {
+					best = j
 					namespace = scopePath(j)
 				}
 			}
