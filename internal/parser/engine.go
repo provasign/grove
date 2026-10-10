@@ -369,8 +369,12 @@ func extractIndentBody(lines []string, startIdx int) (endLine int, body string) 
 	var bodyLines []string
 	bodyLines = append(bodyLines, startLine)
 
+	// The window counts code lines only. Callers pass masked lines, so
+	// comment and docstring lines are blank here; counting them let a
+	// comment move where a recovered body was cut off.
 	const maxLines = 200
-	for i := startIdx + 1; i < len(lines) && i < startIdx+maxLines; i++ {
+	code := 1
+	for i := startIdx + 1; i < len(lines); i++ {
 		line := lines[i]
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" {
@@ -378,9 +382,10 @@ func extractIndentBody(lines []string, startIdx int) (endLine int, body string) 
 			continue
 		}
 		indent := len(line) - len(strings.TrimLeft(line, " \t"))
-		if indent <= baseIndent {
+		if indent <= baseIndent || code == maxLines {
 			return i, strings.Join(bodyLines, "\n")
 		}
+		code++
 		bodyLines = append(bodyLines, line)
 	}
 	return startIdx + len(bodyLines), strings.Join(bodyLines, "\n")
