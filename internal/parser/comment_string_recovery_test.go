@@ -184,3 +184,19 @@ func TestCommentStringRecovery_HeaderLanguageSniff(t *testing.T) {
 		})
 	}
 }
+
+func TestImportPathsDropComments(t *testing.T) {
+	clean := "pub use crate::{\n    error::{Error, ErrorKind},\n};\nuse std::{\n    io,\n};\n"
+	decoy := "pub use crate::{\n    // decoy: use Fake; don't 'quote\n    error::{Error, ErrorKind}, // trailing\n};\nuse std::{\n    /* block */ io,\n};\n"
+	want, ok := extractImportsFromAST("rust", []byte(clean))
+	if !ok {
+		t.Fatal("clean imports not extracted")
+	}
+	got, ok := extractImportsFromAST("rust", []byte(decoy))
+	if !ok {
+		t.Fatal("decoy imports not extracted")
+	}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("comments leaked into import paths:\n got %q\nwant %q", got, want)
+	}
+}

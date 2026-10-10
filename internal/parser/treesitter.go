@@ -392,6 +392,50 @@ func jsTopLevelSymbol(root *sitter.Node, src []byte, filePath, blobSHA, language
 // extractImportsFromAST parses imports through astkit when a strategy exists.
 // Regex extraction remains the fallback for unsupported languages or parse
 // failures.
+// dropComments removes comment text from an import path. Astkit takes a
+// grouped import's path from the source (`use std::{ // note\n io, }`), and a
+// comment there became part of the import string and of the crate heads
+// read from it. Each comment goes with the blanks after it (or, at a line
+// end, before it), and a line left empty is dropped, so the result matches
+// the same import written without comments. Text without comments comes
+// back unchanged.
+func dropComments(language, s string) string {
+	masked := textmask.MaskComments(language, s)
+	if masked == s {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		if masked[i] == s[i] {
+			b.WriteByte(s[i])
+			i++
+			continue
+		}
+		// A comment run: masked bytes, then the blanks that follow it.
+		for i < len(s) && masked[i] != s[i] {
+			i++
+		}
+		for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
+			i++
+		}
+	}
+	lines := strings.Split(b.String(), "\n")
+	orig := strings.Split(s, "\n")
+	kept := lines[:0]
+	for i, line := range lines {
+		if line == orig[i] {
+			kept = append(kept, line)
+			continue
+		}
+		trimmed := strings.TrimRight(line, " \t")
+		if trimmed != strings.TrimRight(orig[i], " \t") && strings.TrimSpace(trimmed) == "" {
+			continue // the line held only a comment
+		}
+		kept = append(kept, trimmed)
+	}
+	return strings.Join(kept, "\n")
+}
+
 func extractImportsFromAST(language string, src []byte) ([]string, bool) {
 	key, supported := languageToKey(language)
 	if !supported {
@@ -417,14 +461,14 @@ func extractImportsFromAST(language string, src []byte) ([]string, bool) {
 		if imp.Path == "" {
 			continue
 		}
-		importPath := imp.Path
+		importPath := dropComments(language, imp.Path)
 		if key == astkit.LangRust && strings.HasPrefix(strings.TrimSpace(imp.Raw), "pub ") {
 			// Astkit intentionally normalizes Path to the imported target, but
 			// Grove also needs to know that the dependency is re-exported. Rust
 			// scope traversal follows dependencies transitively only across public
 			// facade edges; losing `pub` here made `grep::printer::X` stop at the
 			// grep facade instead of reaching grep_printer.
-			importPath = "pub use " + imp.Path
+			importPath = "pub use " + importPath
 		}
 		if key == astkit.LangGo && imp.Alias != "" && imp.Alias != "_" && imp.Alias != "." {
 			alias := core.GoImportAlias(imp.Alias, imp.Path)
