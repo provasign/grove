@@ -67,14 +67,20 @@ func cFamilyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]str
 		}
 	}
 
-	// Parameters.
-	for name, typ := range cFamilyParamTypes(symbol.Signature, symbol.RawText) {
+	// Parameters. Read on masked text: a symbol whose signature has no
+	// parameter list falls back to its body, and the first `(` there
+	// could be in a comment (`// ghost() { helper(1) }`), which hid the
+	// real parameters.
+	body := ""
+	if symbol.RawText != "" {
+		body = maskCode(symbol.Language, symbol.RawText)
+	}
+	for name, typ := range cFamilyParamTypes(maskCode(symbol.Language, symbol.Signature), body) {
 		record(name, typ)
 	}
 
 	// Body locals (highest precedence): new-expressions.
-	if symbol.RawText != "" {
-		body := maskCode(symbol.Language, symbol.RawText)
+	if body != "" {
 		for _, m := range cppLocalDeclRe.FindAllStringSubmatch(body, -1) {
 			if t := cFamilyBareType(m[1]); t != "" {
 				record(m[2], t)
