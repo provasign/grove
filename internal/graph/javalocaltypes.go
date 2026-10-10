@@ -124,7 +124,7 @@ func javaArgTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 	}
 	if params := tsDeclParams("java", javaDeclSource(symbol)); params != "" {
 		for _, g := range splitParams("java", params) {
-			fields := strings.Fields(strings.TrimSpace(g))
+			fields := strings.Fields(javaCollapseGenericSpaces(strings.TrimSpace(g)))
 			for len(fields) > 2 || (len(fields) == 2 && (fields[0] == "final" || strings.HasPrefix(fields[0], "@"))) {
 				fields = fields[1:]
 			}
@@ -916,7 +916,8 @@ func javaLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string
 	// Parameters: "Type name" pairs from the declaration's paren group.
 	if params := tsDeclParams("java", javaDeclSource(symbol)); params != "" {
 		for _, g := range splitParams("java", params) {
-			fields := strings.Fields(strings.TrimSpace(g))
+			// "Table<R, C, V> table" is one type token, as in javaParamTypes.
+			fields := strings.Fields(javaCollapseGenericSpaces(strings.TrimSpace(g)))
 			// Drop modifiers and annotations: "final @Nullable CharSequence seq"
 			for len(fields) > 2 || (len(fields) == 2 && (fields[0] == "final" || strings.HasPrefix(fields[0], "@"))) {
 				fields = fields[1:]
