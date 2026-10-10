@@ -200,3 +200,13 @@ func TestImportPathsDropComments(t *testing.T) {
 		t.Fatalf("comments leaked into import paths:\n got %q\nwant %q", got, want)
 	}
 }
+
+func TestCSharpRecoveryIgnoresCallStatements(t *testing.T) {
+	src := "class T {\n  void A() {\n    var x = Make(\n      new JArray(1, 2),\n      new JValue(3));\n    return Build(x);\n  }\n  void Broken( {\n}\n"
+	for _, s := range extractSymbols("csharp", "t.cs", "sha", src, nil) {
+		switch s.Name {
+		case "JArray", "JValue", "Build", "Make":
+			t.Errorf("call statement recovered as a declaration: %s %s", s.Kind, s.Name)
+		}
+	}
+}

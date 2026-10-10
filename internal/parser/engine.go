@@ -524,6 +524,26 @@ func extractSymbols(language, filePath, blobSHA, content string, fileImports []s
 	return merged
 }
 
+// statementKeywords precede a call in a statement, never a declared name:
+// `new JArray(1, 2),` and `return Build(x);` are calls. The C# and Java
+// method patterns accept any word before the name as a return type, so a
+// recovered file's call lines became methods named after the callee.
+var statementKeywords = map[string]bool{"new": true, "return": true, "await": true, "throw": true,
+	"else": true, "yield": true, "case": true, "goto": true, "is": true, "as": true, "in": true,
+	"using": true, "lock": true, "typeof": true, "nameof": true, "sizeof": true, "default": true,
+	"when": true, "assert": true, "do": true}
+
+// statementCallMatch reports whether a method-pattern match is a call
+// statement: the word right before the name is a statement keyword.
+func statementCallMatch(language, match, name string) bool {
+	if language != "csharp" && language != "java" {
+		return false
+	}
+	head := match[:strings.LastIndex(match, name)]
+	fields := strings.Fields(head)
+	return len(fields) > 0 && statementKeywords[fields[len(fields)-1]]
+}
+
 // blankByteRanges returns s with the bytes of every [start, end) range
 // replaced by spaces, newlines kept.
 func blankByteRanges(s string, ranges [][2]int) string {
@@ -1199,6 +1219,9 @@ func extractSymbolsRegexScan(language, filePath, blobSHA, content, scan string, 
 
 			name, parentSymbol := extractNameAndParent(matches, pattern)
 			if name == "" {
+				continue
+			}
+			if pattern.kind == core.KindMethod && statementCallMatch(language, matches[0], name) {
 				continue
 			}
 
