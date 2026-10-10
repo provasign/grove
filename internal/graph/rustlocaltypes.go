@@ -53,7 +53,7 @@ func rustConstElementType(idx *edgeIndex, name string) string {
 		if (cand.Kind != core.KindVariable && cand.Kind != core.KindConst) || cand.Language != "rust" {
 			continue
 		}
-		sig := cand.Signature
+		sig := codeSignature(cand)
 		colon := strings.IndexByte(sig, ':')
 		if colon < 0 {
 			continue
@@ -140,7 +140,7 @@ func rustLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string
 		}
 	}
 
-	params := rustParamTypes(symbol.Signature)
+	params := rustParamTypes(codeSignature(symbol))
 	for name, typ := range params {
 		out[name] = typ
 	}
@@ -297,7 +297,7 @@ func rustCallResultTypes(idx *edgeIndex, qualifier string, symbol *core.SymbolRe
 		if _, ok := scope[cand.FilePath]; !ok {
 			continue
 		}
-		r := rustReturnType(cand.Signature)
+		r := rustReturnType(codeSignature(cand))
 		if r == "Self" {
 			r = cand.ParentSymbol
 		}
@@ -456,7 +456,7 @@ func rustFieldTypes(idx *edgeIndex, typeName, preferFile string) map[string]stri
 		// Field signature: "pub mode: Mode," / "haystack: PathBuf," — or,
 		// for a tuple struct's positional field (`struct Override(Gitignore)`,
 		// reached as `self.0`), the bare type alone.
-		sig := cand.Signature
+		sig := codeSignature(cand)
 		if i := strings.IndexByte(sig, ':'); i >= 0 {
 			sig = sig[i+1:]
 		}

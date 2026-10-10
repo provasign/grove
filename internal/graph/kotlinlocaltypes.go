@@ -34,7 +34,7 @@ var kotlinPrimitives = map[string]bool{
 func kotlinLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 	out := map[string]string{}
 
-	for name, typ := range kotlinParamTypes(symbol.Signature) {
+	for name, typ := range kotlinParamTypes(codeSignature(symbol)) {
 		out[name] = typ
 	}
 
@@ -120,9 +120,9 @@ func kotlinBaseClasses(idx *edgeIndex, className, preferDir string) []string {
 	if decl == nil {
 		return nil
 	}
-	text := decl.Signature
+	text := codeSignature(decl)
 	if text == "" {
-		text = firstLine(decl.RawText)
+		text = maskCode(decl.Language, firstLine(decl.RawText))
 	}
 	for _, raw := range kotlinBaseNames(text) {
 		if name, isCtor := kotlinBaseNameAndCtor(raw); isCtor && name != "" {
@@ -143,9 +143,9 @@ func kotlinFieldType(idx *edgeIndex, class, name string) string {
 		if cand.Kind != core.KindField || cand.Name != name || cand.ParentSymbol != class || cand.Language != "kotlin" {
 			continue
 		}
-		sig := cand.Signature
+		sig := codeSignature(cand)
 		if sig == "" {
-			sig = firstLine(cand.RawText)
+			sig = maskCode(cand.Language, firstLine(cand.RawText))
 		}
 		if m := kotlinValTypedRe.FindStringSubmatch(sig); m != nil {
 			return kotlinShapeType(m[2])
@@ -190,7 +190,7 @@ func kotlinShapeType(t string) string {
 // constructor-initialized bindings.
 func kotlinArgShapes(symbol *core.SymbolRecord) map[string]string {
 	out := map[string]string{}
-	if params, ok := kotlinParamGroups(symbol.Signature); ok {
+	if params, ok := kotlinParamGroups(codeSignature(symbol)); ok {
 		for _, g := range params {
 			g = strings.TrimPrefix(strings.TrimPrefix(strings.TrimSpace(g), "val "), "var ")
 			if m := kotlinParamRe.FindStringSubmatch(g); m != nil {
@@ -255,9 +255,9 @@ func kotlinParamGroups(signature string) ([]string, bool) {
 // kotlinDeclParamShapes returns a candidate's parameter shapes by position
 // and whether its last parameter is a vararg.
 func kotlinDeclParamShapes(s *core.SymbolRecord) (shapes []string, variadic bool, ok bool) {
-	src := s.Signature
+	src := codeSignature(s)
 	if !strings.Contains(src, ")") {
-		src = firstLine(s.RawText)
+		src = maskCode(s.Language, firstLine(s.RawText))
 	}
 	groups, ok := kotlinParamGroups(src)
 	if !ok {
@@ -430,7 +430,7 @@ func kotlinExtensionReceiver(signature string) string {
 func kotlinExtensionCandidates(cands []*core.SymbolRecord, typ string) []*core.SymbolRecord {
 	var out []*core.SymbolRecord
 	for _, cand := range cands {
-		recv := kotlinExtensionReceiver(cand.Signature)
+		recv := kotlinExtensionReceiver(codeSignature(cand))
 		if recv == "" {
 			continue
 		}
@@ -458,7 +458,7 @@ func kotlinCallResultTypes(idx *edgeIndex, qualifier string) map[string]bool {
 		}
 		switch cand.Kind {
 		case core.KindFunction, core.KindMethod:
-			if ret := kotlinReturnType(cand.Signature); ret != "" {
+			if ret := kotlinReturnType(codeSignature(cand)); ret != "" {
 				out[ret] = true
 			}
 		case core.KindConstructor:
