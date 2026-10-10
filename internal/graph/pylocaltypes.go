@@ -885,14 +885,12 @@ func pyBaseRefs(idx *edgeIndex, className, preferDir string) []pyBaseRef {
 		}
 	}
 	if chosen != nil {
-		sig := chosen.Signature
-		open := strings.IndexByte(sig, '(')
-		closeIdx := strings.LastIndexByte(sig, ')')
-		if open < 0 || closeIdx <= open {
+		list, ok := pythonClassBaseList(chosen)
+		if !ok || strings.TrimSpace(list) == "" {
 			return nil
 		}
 		var bases []pyBaseRef
-		for _, b := range splitTopLevel(sig[open+1:closeIdx], ',') {
+		for _, b := range splitTopLevel(list, ',') {
 			b = strings.TrimSpace(b)
 			if b == "" || strings.Contains(b, "=") {
 				continue
@@ -1105,14 +1103,13 @@ func pyImportedDirectBaseTargets(idx *edgeIndex, symbol *core.SymbolRecord, cand
 	if class == nil {
 		return nil
 	}
-	open := strings.IndexByte(class.Signature, '(')
-	closeIdx := strings.LastIndexByte(class.Signature, ')')
-	if open < 0 || closeIdx <= open {
+	list, ok := pythonClassBaseList(class)
+	if !ok || strings.TrimSpace(list) == "" {
 		return nil
 	}
 	seen := map[string]bool{}
 	var out []*core.SymbolRecord
-	for _, rawBase := range splitTopLevel(class.Signature[open+1:closeIdx], ',') {
+	for _, rawBase := range splitTopLevel(list, ',') {
 		base := strings.TrimSpace(rawBase)
 		if base == "" || strings.Contains(base, "=") {
 			continue

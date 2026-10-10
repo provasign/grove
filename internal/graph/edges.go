@@ -4332,10 +4332,7 @@ func splitTrim(s string, sep byte) []string {
 // base. The signature normally holds the full header; when it stops early,
 // the header is read from the masked source.
 func pythonClassBases(s *core.SymbolRecord) []string {
-	list, ok := pythonBaseList(codeSignature(s))
-	if !ok && s.RawText != "" {
-		list, ok = pythonBaseList(maskCode(s.Language, s.RawText))
-	}
+	list, ok := pythonClassBaseList(s)
 	if !ok {
 		return nil
 	}
@@ -4346,6 +4343,17 @@ func pythonClassBases(s *core.SymbolRecord) []string {
 		}
 	}
 	return out
+}
+
+// pythonClassBaseList returns the masked text between the parentheses of a
+// Python class header, read from the signature or, when the signature is cut
+// off, from the class text. Comments in the header are masked.
+func pythonClassBaseList(s *core.SymbolRecord) (string, bool) {
+	list, ok := pythonBaseList(codeSignature(s))
+	if !ok && s.RawText != "" {
+		list, ok = pythonBaseList(maskCode(s.Language, s.RawText))
+	}
+	return list, ok
 }
 
 // pythonBaseList returns the text between the parentheses of a masked
