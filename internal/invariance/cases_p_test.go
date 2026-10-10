@@ -432,12 +432,15 @@ def after():
 			// TS overload widening: a call statement above a function was
 			// taken as an overload signature and widened the span upward.
 			// Not a comment/string twin: the clean form has a blank line
-			// where the decoy has the call (same line numbers).
+			// where the decoy has the call (same line numbers), and makes
+			// the same call after the function, so both forms carry the
+			// real <top-level> -> foo call.
 			id: "P16-ts-overload-widening",
 			clean: one("a.ts", `
 function foo(x: number) {
   return x;
 }
+foo(1);
 `),
 			decoy: one("a.ts", `foo(1);
 function foo(x: number) {
