@@ -429,9 +429,7 @@ func javaDependentDirs(req Request, files []string) map[string]bool {
 		data, err := os.ReadFile(filepath.Join(req.Root, f))
 		pkg := ""
 		if err == nil {
-			if m := javaPackageDecl.FindSubmatch(data); m != nil {
-				pkg = string(m[1])
-			}
+			pkg = javaPackageOf(data)
 		}
 		classes := map[string]bool{strings.TrimSuffix(filepath.Base(f), ".java"): true}
 		for _, list := range [][]core.SymbolRecord{req.PrevChanged, req.Symbols} {
@@ -465,6 +463,8 @@ func javaDependentDirs(req Request, files []string) map[string]bool {
 					break
 				}
 			}
+			// Raw text on purpose: a fully qualified name in a comment only
+			// widens the re-attributed set (more javac work), never an edge.
 			if hit || (r.pkg != "" && s.ParentSymbol == "" && strings.Contains(s.RawText, fq)) {
 				out[packageDir(s.FilePath)] = true
 				break
@@ -475,6 +475,16 @@ func javaDependentDirs(req Request, files []string) map[string]bool {
 }
 
 var javaPackageDecl = regexp.MustCompile(`(?m)^\s*package\s+([A-Za-z_$][\w$.]*)\s*;`)
+
+// javaPackageOf returns the file's package name ("" for the default
+// package), read from masked source so a commented-out or Javadoc
+// `package x;` line is not taken for the declaration.
+func javaPackageOf(data []byte) string {
+	if m := javaPackageDecl.FindStringSubmatch(maskCode("java", string(data))); m != nil {
+		return m[1]
+	}
+	return ""
+}
 
 func javacResolve(ctx context.Context, req Request) ([]core.Edge, []string) {
 	edges, diags, _ := javacResolveScoped(ctx, req)
@@ -752,11 +762,11 @@ func javaSourceRoot(root, file string) string {
 	if err != nil {
 		return dir
 	}
-	m := javaPackageDecl.FindSubmatch(data)
-	if m == nil {
+	pkg := javaPackageOf(data)
+	if pkg == "" {
 		return dir
 	}
-	pkgPath := strings.ReplaceAll(string(m[1]), ".", "/")
+	pkgPath := strings.ReplaceAll(pkg, ".", "/")
 	switch {
 	case dir == pkgPath:
 		return "."
