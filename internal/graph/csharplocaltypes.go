@@ -44,14 +44,9 @@ func csharpLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]stri
 				}
 				seen[className] = true
 				for _, cls := range csharpTypeFragments(idx, className, dirOf(symbol.FilePath)) {
-					if cls.RawText == "" {
-						continue
-					}
-					body := cls.RawText
-					if i := strings.IndexByte(body, '{'); i >= 0 {
-						body = body[i+1:]
-					}
-					for _, m := range csharpFieldRe.FindAllStringSubmatch(body, -1) {
+					// Top-level members only (classBody): a method's local
+					// `Foo helper = ...` or a commented-out field is not one.
+					for _, m := range csharpFieldRe.FindAllStringSubmatch(classBody(idx, cls), -1) {
 						if t := javaBareType(m[1]); t != "" && !csharpKeyword(t) {
 							if _, exists := out[m[2]]; !exists {
 								out[m[2]] = t
@@ -66,8 +61,8 @@ func csharpLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]stri
 	}
 
 	// Parameters: "Type name" pairs from the declaration's paren group.
-	if params := tsDeclParams(symbol.RawText); params != "" {
-		for _, g := range splitTopLevel(params, ',') {
+	if params := tsDeclParams(symbol.Language, symbol.RawText); params != "" {
+		for _, g := range splitParams(symbol.Language, params) {
 			fields := strings.Fields(strings.TrimSpace(g))
 			// Drop C# parameter modifiers and attributes.
 			for len(fields) > 2 || (len(fields) == 2 && csharpParamModifier(fields[0])) {
@@ -262,11 +257,11 @@ func csDeclSource(s *core.SymbolRecord) string {
 // csParamTypes parses a C# callable's parameter type tokens (normalized)
 // and whether the last one is a `params` array.
 func csParamTypes(s *core.SymbolRecord) (types []string, variadic bool) {
-	params := tsDeclParams(csDeclSource(s))
+	params := tsDeclParams("csharp", csDeclSource(s))
 	if params == "" {
 		return nil, false
 	}
-	for _, g := range splitTopLevel(params, ',') {
+	for _, g := range splitParams("csharp", params) {
 		g = strings.TrimSpace(g)
 		if eq := strings.Index(g, "="); eq >= 0 {
 			g = g[:eq] // default value
@@ -314,8 +309,8 @@ func csharpArgTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string
 			out[name] = typ
 		}
 	}
-	if params := tsDeclParams(csDeclSource(symbol)); params != "" {
-		for _, g := range splitTopLevel(params, ',') {
+	if params := tsDeclParams("csharp", csDeclSource(symbol)); params != "" {
+		for _, g := range splitParams("csharp", params) {
 			g = strings.TrimSpace(g)
 			if eq := strings.Index(g, "="); eq >= 0 {
 				g = g[:eq]
@@ -936,7 +931,8 @@ func csRecoverArgs(idx *edgeIndex, symbol *core.SymbolRecord, cs core.CallSite, 
 	if cs.Argc == 0 || cs.Line < symbol.Span.Start || symbol.RawText == "" {
 		return nil
 	}
-	lines := strings.Split(symbol.RawText, "\n")
+	// Masked: `Log("Foo(1, 2)"); Foo(x)` located the call inside the string.
+	lines := maskedSymbolLines(idx, symbol)
 	off := cs.Line - symbol.Span.Start
 	if off < 0 || off >= len(lines) {
 		return nil
@@ -991,16 +987,6 @@ func csRecoverArgs(idx *edgeIndex, symbol *core.SymbolRecord, cs core.CallSite, 
 			depth--
 			if depth == 0 {
 				end = k
-			}
-		case '"', '\'':
-			// Skip a literal: overload-relevant literals were already
-			// classified by the extractor, so any call reaching here has
-			// none at top level worth parsing exactly.
-			q := line[k]
-			for k++; k < len(line) && line[k] != q; k++ {
-				if line[k] == '\\' {
-					k++
-				}
 			}
 		}
 		if end >= 0 {

@@ -72,6 +72,11 @@ type edgeIndex struct {
 	// walk once per call site otherwise. Values are READ-ONLY; nothing
 	// mutates a returned map.
 	qualifierFiles sync.Map // string("file\x00qualifier") → qualifierFileSet
+	// classBodies / maskedLines memoize classBody and maskedSymbolLines
+	// (localtypes.go) per symbol ID; classBodies also holds PHP trait rules
+	// (phpClassTraitRules) under a "php-traits\x00" key prefix.
+	classBodies sync.Map
+	maskedLines sync.Map
 
 	// Rust crate topology: visibility in Rust is crate-wide (any item is
 	// reachable through crate:: paths without a per-file use), so scope is
@@ -2318,7 +2323,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			// receiver syntax, so the same source recovery applies:
 			// `w.serializer.serialize(...)` → chain "w.serializer").
 			if (tsFamilyLang(symbol.Language) || symbol.Language == "java") && qualifier != "" && cs.Line > 0 {
-				if chain := tsReceiverChainAt(symbol.RawText, cs.Line-symbol.Span.Start, calleeName); chain != "" {
+				if chain := tsReceiverChainAt(idx, &symbol, cs.Line-symbol.Span.Start, calleeName); chain != "" {
 					fullChain = chain
 				}
 			}
@@ -2522,7 +2527,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				fmt.Fprintf(os.Stderr, "grove-trace %s: callee=%q qual=%q args=%v cands=%d capped=%v scope=%d first=%v\n", symbol.QualifiedName, cs.Callee, qualifier, cs.Args, len(cands), capped, len(scope), ids)
 			}
 			if symbol.Language == "python" && qualifier != "" && cs.Argc > 0 && len(cands) > 0 &&
-				!pyCallHasSplat(&symbol, cs) {
+				!pyCallHasSplat(idx, &symbol, cs) {
 				// Python has no overloading: a method whose parameters cannot
 				// take this call's argument count is not its target (click:
 				// ctx.invoke(other_cmd, arg=42) is not Command.invoke(self, ctx)).
@@ -3777,7 +3782,7 @@ func declParamCount(s *core.SymbolRecord) (int, bool, bool) {
 	if s.Language == "go" {
 		params, parsed = goDeclParamsOK(src)
 	} else {
-		params = tsDeclParams(src)
+		params = tsDeclParams(s.Language, src)
 		parsed = params != "" || strings.Contains(src, "()")
 	}
 	if params == "" {

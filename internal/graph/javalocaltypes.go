@@ -47,11 +47,9 @@ var (
 	// anchored to statement starts so "return x =" / cast fragments can't
 	// masquerade as declarations
 	javaTypedLocalRe = regexp.MustCompile(`(?m)(?:^|[;{()]\s*)\s*(?:final\s+)?((?:boolean|byte|char|short|int|long|float|double|[A-Z][\w.]*)(?:<[^<>]*>)?(?:\[\])?)\s+(\w+)\s*[=;]`)
-	// field declaration line in a class body
+	// field declaration line in a class body; run only over classBody
+	// (masked, member bodies blanked)
 	javaFieldRe = regexp.MustCompile(`(?m)^\s+(?:@[\w.]+(?:\([^)]*\))?\s+)*(?:(?:public|private|protected|static|final|transient|volatile)\s+)*([A-Z]\w*)(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?(?:\[\])?\s+(\w+)\s*[;=]`)
-	// field declaration line, primitives included, raw type token kept —
-	// for overload matching (AT_SIGN is a char; javaFieldRe skips it)
-	javaFieldArgRe = regexp.MustCompile(`(?m)^\s+(?:@[\w.]+(?:\([^)]*\))?\s+)*(?:(?:public|private|protected|static|final|transient|volatile)\s+)*((?:boolean|byte|char|short|int|long|float|double|[A-Z]\w*)(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?(?:\[\])?)\s+(\w+)\s*[;=]`)
 	// Type prefix for an indexed field symbol. The symbol already supplies the
 	// declarator name, so this deliberately accepts a comma after the first
 	// declarator: `JsonSerializer<Object> key, value;` gives both indexed field
@@ -61,11 +59,43 @@ var (
 )
 
 func javaIndexedFieldType(raw string) string {
+	if strings.ContainsAny(raw, "/\"'") {
+		// `@Named("a)b")` would end the annotation's arguments early.
+		raw = maskCode("java", raw)
+	}
 	m := javaIndexedFieldTypeRe.FindStringSubmatch(" " + strings.TrimSpace(raw))
 	if m == nil {
 		return ""
 	}
 	return m[1]
+}
+
+// javaClassFields records one Java class's own field name → bare type into
+// out (names already present win). Indexed field symbols come first: they
+// keep every declarator of `Foo a, b;`. The masked top-level class body
+// (classBody) then fills names with no field symbol; a method-local or a
+// commented-out declaration is never at that level.
+func javaClassFields(idx *edgeIndex, cls *core.SymbolRecord, className string, out map[string]string) {
+	if idx != nil {
+		for _, f := range idx.byFile[cls.FilePath] {
+			if f.Kind != core.KindField || (f.ParentSymbol != className && f.ParentSymbol != cls.Name && f.ParentSymbol != cls.QualifiedName) {
+				continue
+			}
+			if _, exists := out[f.Name]; exists {
+				continue
+			}
+			if t := javaBareType(javaIndexedFieldType(f.RawText)); t != "" {
+				out[f.Name] = t
+			}
+		}
+	}
+	for _, m := range javaFieldRe.FindAllStringSubmatch(classBody(idx, cls), -1) {
+		if t := javaBareType(m[1]); t != "" {
+			if _, exists := out[m[2]]; !exists {
+				out[m[2]] = t
+			}
+		}
+	}
 }
 
 // javaArgTypes infers identifier → raw type token (primitives and arrays
@@ -91,8 +121,8 @@ func javaArgTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 			out[name] = typ
 		}
 	}
-	if params := tsDeclParams(javaDeclSource(symbol)); params != "" {
-		for _, g := range splitTopLevel(params, ',') {
+	if params := tsDeclParams("java", javaDeclSource(symbol)); params != "" {
+		for _, g := range splitParams("java", params) {
 			fields := strings.Fields(strings.TrimSpace(g))
 			for len(fields) > 2 || (len(fields) == 2 && (fields[0] == "final" || strings.HasPrefix(fields[0], "@"))) {
 				fields = fields[1:]
@@ -258,12 +288,12 @@ func javaCollapseGenericSpaces(s string) string {
 
 func javaParamTypes(s *core.SymbolRecord) []string {
 	src := javaDeclSource(s)
-	params := tsDeclParams(src)
+	params := tsDeclParams("java", src)
 	if params == "" {
 		return nil
 	}
 	var out []string
-	for _, g := range splitTopLevel(params, ',') {
+	for _, g := range splitParams("java", params) {
 		// strings.Fields splits on ANY whitespace: "Function<Integer, T>
 		// allocator" (the conventional space-after-comma generic style)
 		// tore into four fields ("Function<Integer,", "T>", "allocator")
@@ -438,7 +468,7 @@ func narrowOverloadsByArgTypes(cands []*core.SymbolRecord, args []string, argTyp
 // javaVariadic reports whether the callable's last parameter is declared
 // with "..."; javaParamTypes flattens it to "[]" for comparison.
 func javaVariadic(s *core.SymbolRecord) bool {
-	return strings.Contains(tsDeclParams(javaDeclSource(s)), "...")
+	return strings.Contains(tsDeclParams("java", javaDeclSource(s)), "...")
 }
 
 // javaShapeMismatch reports bindings the wildcard rule must not rescue:
@@ -631,7 +661,7 @@ func javaCallResultOwners(idx *edgeIndex, candidates []*core.SymbolRecord, name 
 		return nil
 	}
 	off := cs.Line - symbol.Span.Start
-	lines := strings.Split(symbol.RawText, "\n")
+	lines := maskedSymbolLines(idx, symbol)
 	if off < 0 || off >= len(lines) {
 		return nil
 	}
@@ -870,28 +900,8 @@ func javaLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string
 					continue
 				}
 				seen[className] = true
-				if cls := javaOwnerType(idx, className, symbol.FilePath); cls != nil && cls.RawText != "" {
-					for _, m := range javaFieldRe.FindAllStringSubmatch(cls.RawText, -1) {
-						if t := javaBareType(m[1]); t != "" {
-							if _, exists := out[m[2]]; !exists {
-								out[m[2]] = t
-							}
-						}
-					}
-					// Multi-declarator fields only let javaFieldRe see the first
-					// name. Indexed field symbols retain every declarator; recover
-					// their shared type from the declaration prefix.
-					for _, f := range idx.byFile[cls.FilePath] {
-						if f.Kind != core.KindField || (f.ParentSymbol != className && f.ParentSymbol != cls.Name && f.ParentSymbol != cls.QualifiedName) {
-							continue
-						}
-						if _, exists := out[f.Name]; exists {
-							continue
-						}
-						if t := javaBareType(javaIndexedFieldType(f.RawText)); t != "" {
-							out[f.Name] = t
-						}
-					}
+				if cls := javaOwnerType(idx, className, symbol.FilePath); cls != nil {
+					javaClassFields(idx, cls, className, out)
 				}
 				next = append(next, tsBaseClasses(idx, className, dirOf(symbol.FilePath))...)
 			}
@@ -900,8 +910,8 @@ func javaLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string
 	}
 
 	// Parameters: "Type name" pairs from the declaration's paren group.
-	if params := tsDeclParams(javaDeclSource(symbol)); params != "" {
-		for _, g := range splitTopLevel(params, ',') {
+	if params := tsDeclParams("java", javaDeclSource(symbol)); params != "" {
+		for _, g := range splitParams("java", params) {
 			fields := strings.Fields(strings.TrimSpace(g))
 			// Drop modifiers and annotations: "final @Nullable CharSequence seq"
 			for len(fields) > 2 || (len(fields) == 2 && (fields[0] == "final" || strings.HasPrefix(fields[0], "@"))) {

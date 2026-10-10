@@ -1357,7 +1357,7 @@ func paramTypesOf(s *core.SymbolRecord) []string {
 	if !strings.Contains(src, ")") {
 		src = s.RawText
 	}
-	inner := tsDeclParams(src)
+	inner := tsDeclParams(s.Language, src)
 	if s.Language == "go" {
 		gi, ok := goDeclParamsOK(src)
 		if !ok {
