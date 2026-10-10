@@ -26,10 +26,7 @@ func implicitSuperBases(idx *edgeIndex, ctor *core.SymbolRecord) []string {
 		if cls.Kind != core.KindClass || cls.Name != ctor.ParentSymbol {
 			continue
 		}
-		sig := cls.Signature
-		if sig == "" {
-			sig = firstLine(cls.RawText)
-		}
+		sig := declHeader(cls)
 		switch ctor.Language {
 		case "java":
 			return uniqueStrings(inheritanceClauseTypes(stripLeadingGenericParams(sig), "extends", "implements"))
