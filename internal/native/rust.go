@@ -112,7 +112,7 @@ func rustModuleEdges(root string, files []string) []core.Edge {
 		if err != nil {
 			continue
 		}
-		for _, mod := range rustModuleNames(string(content)) {
+		for _, mod := range rustModuleNames(maskCode("rust", string(content))) {
 			for _, target := range rustModuleCandidates(file, mod) {
 				if fileScope[target] {
 					edges = append(edges, nativeImportEdge(file, target, 0.93))
@@ -124,6 +124,8 @@ func rustModuleEdges(root string, files []string) []core.Edge {
 	return edges
 }
 
+// rustModuleNames returns the `mod x;` declarations of masked file content
+// (see maskCode), so a commented-out declaration is not a module edge.
 func rustModuleNames(content string) []string {
 	lines := strings.Split(content, "\n")
 	var mods []string
@@ -181,9 +183,13 @@ func rustSemanticEdges(symbols []core.SymbolRecord, files []string) []core.Edge 
 		seen[key] = true
 		edges = append(edges, edge)
 	}
-	for _, symbol := range symbols {
+	// Mask each body once; the impl and type-use passes below read only
+	// masked text.
+	masked := make([]string, len(symbols))
+	for i, symbol := range symbols {
 		if symbol.Language == "rust" && symbol.RawText != "" {
-			for _, ref := range rustImplRefs(symbol.RawText) {
+			masked[i] = maskCode("rust", symbol.RawText)
+			for _, ref := range rustImplRefs(masked[i]) {
 				concrete, okConcrete := rustBestType(typesByName, ref.TypeName, symbol.FilePath)
 				trait, okTrait := rustBestType(typesByName, ref.TraitName, symbol.FilePath)
 				if okConcrete && okTrait && concrete.ID != trait.ID {
@@ -192,10 +198,11 @@ func rustSemanticEdges(symbols []core.SymbolRecord, files []string) []core.Edge 
 			}
 		}
 	}
-	for _, caller := range symbols {
+	for i, caller := range symbols {
 		if caller.Language != "rust" || caller.RawText == "" || !callableKind(caller.Kind) {
 			continue
 		}
+		body := masked[i]
 		// Call edges intentionally NOT emitted here (same lesson as the Java
 		// native pass): the text-matching approach edged every same-named
 		// function/method it saw, a multi-x edge explosion on a crate with
@@ -206,17 +213,17 @@ func rustSemanticEdges(symbols []core.SymbolRecord, files []string) []core.Edge 
 		// (This analyzer only runs when `cargo` is on PATH — CI runners and
 		// dev machines with rustup — so the explosion was invisible wherever
 		// cargo was absent.)
-		for _, file := range append([]string{caller.FilePath}, rustModuleScopeFiles(caller.FilePath, caller.RawText, moduleFiles)...) {
+		for _, file := range append([]string{caller.FilePath}, rustModuleScopeFiles(caller.FilePath, body, moduleFiles)...) {
 			for _, target := range byFile[file] {
 				if target.ID == caller.ID {
 					continue
 				}
-				if typeKind(target.Kind) && rustContainsType(caller.RawText, target, file != caller.FilePath) {
+				if typeKind(target.Kind) && rustContainsType(body, target, file != caller.FilePath) {
 					add(symbolEdge(caller, target, core.EdgeUsesType, 0.93))
 				}
 			}
 		}
-		for _, typeName := range rustSignatureTypes(caller.Signature + "\n" + caller.RawText) {
+		for _, typeName := range rustSignatureTypes(maskCode("rust", caller.Signature) + "\n" + body) {
 			if target, ok := rustBestType(typesByName, typeName, caller.FilePath); ok && target.ID != caller.ID {
 				add(symbolEdge(caller, target, core.EdgeUsesType, 0.94))
 			}
@@ -230,6 +237,8 @@ type rustImplRef struct {
 	TypeName  string
 }
 
+// rustImplRefs returns the `impl Trait for Type` pairs of masked (see
+// maskCode).
 func rustImplRefs(rawText string) []rustImplRef {
 	var out []rustImplRef
 	for search := 0; search < len(rawText); {
@@ -361,6 +370,8 @@ func rustImplBaseName(text string) string {
 
 var rustSignatureTypePattern = regexp.MustCompile(`(?:->|:)\s*&?(?:'[A-Za-z_][A-Za-z0-9_]*\s+)?(?:mut\s+)?([A-Z][A-Za-z0-9_:]*)`)
 
+// rustSignatureTypes returns the `: Type` / `-> Type` names of masked text
+// (see maskCode).
 func rustSignatureTypes(text string) []string {
 	matches := rustSignatureTypePattern.FindAllStringSubmatch(text, -1)
 	seen := map[string]bool{}
@@ -422,6 +433,7 @@ func rustModuleFileIndex(files []string) map[string]string {
 	return out
 }
 
+// rustModuleScopeFiles: rawText is masked (see maskCode).
 func rustModuleScopeFiles(fromFile, rawText string, moduleFiles map[string]string) []string {
 	seen := map[string]bool{}
 	var out []string
@@ -449,13 +461,15 @@ func rustPathPrefixes(rawText string) []string {
 	return out
 }
 
-func rustContainsType(rawText string, target core.SymbolRecord, qualified bool) bool {
+// rustContainsType reports whether masked (see maskCode) names target, as a
+// bare token in its own file or module-qualified across files.
+func rustContainsType(masked string, target core.SymbolRecord, qualified bool) bool {
 	if !qualified {
-		return containsTypeToken(rawText, target.Name)
+		return containsTypeToken(masked, target.Name)
 	}
 	module := rustModuleName(target.FilePath)
 	pattern := regexp.MustCompile(`\b` + regexp.QuoteMeta(module) + `::` + regexp.QuoteMeta(target.Name) + `\b`)
-	return pattern.MatchString(stripQuotedText(rawText))
+	return pattern.MatchString(masked)
 }
 
 func rustModuleName(file string) string {
