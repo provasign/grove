@@ -1922,6 +1922,11 @@ func buildUsesType(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
 		scope := idx.importedFiles(symbol.FilePath)
 		sig := codeSignature(&symbol)
 		matches := usesTypeIdent.FindAllStringSubmatch(sig, -1)
+		if symbol.Language == "csharp" && len(symbol.Annotations) > 0 {
+			for _, name := range csharpAttributeTypeNames(idx, &symbol) {
+				matches = append(matches, []string{name, name})
+			}
+		}
 		for _, m := range matches {
 			candidateName := m[1]
 			if candidateName == symbol.Name {
@@ -3210,7 +3215,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			if qualifier == "super()" || qualifier == "super" || (symbol.Language == "csharp" && qualifier == "base") ||
 				(symbol.Language == "php" && qualifier == "parent") {
 				if traceCalls {
-					fmt.Fprintf(os.Stderr, "grove-trace %s: super bases=%v matched=%d\n", symbol.QualifiedName, baseClassesFor(idx, symbol.Language, symbol.ParentSymbol, dirOf(symbol.FilePath)), len(narrowBySuper(idx, &symbol, cands)))
+					fmt.Fprintf(os.Stderr, "grove-trace %s: super bases=%v matched=%d\n", symbol.QualifiedName, baseClassesInFileFor(idx, symbol.Language, symbol.ParentSymbol, symbol.FilePath), len(narrowBySuper(idx, &symbol, cands)))
 				}
 				viaSuper := narrowBySuper(idx, &symbol, cands)
 				// `base.WriteValue(x)` binds ONE overload on the base type,

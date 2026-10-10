@@ -733,6 +733,18 @@ func narrowByChainType(idx *edgeIndex, sat *interfaceSatisfaction, localTypes ma
 			}
 		}
 	}
+	if symbol.Language == "java" {
+		// A type declared outside the repo (`result.values.size()` on a
+		// `Map<String, Integer> values` field) or a member inherited from a
+		// base: resolve the last hop exactly as a single-hop receiver of
+		// that type (subclass overrides, base walk, fan-out cap). It used to
+		// arrive by accident, through an outer-class field map that read
+		// nested classes' fields.
+		last := fullChain[strings.LastIndexByte(fullChain, '.')+1:]
+		if byType, dispatch, _ := narrowByLocalType(idx, sat, symbol, map[string]string{last: typ}, last, calleeName, cands, nil); len(byType) > 0 || len(dispatch) > 0 {
+			return byType, dispatch, true
+		}
+	}
 	// The chain resolved to a type we know nothing more about (no candidate
 	// on it, no satisfaction entry). Unlike narrowByLocalType's single-hop
 	// contract, do NOT claim decided here: chain resolution is heuristic
@@ -926,6 +938,27 @@ func constructorBaseClasses(idx *edgeIndex, language, className, preferDir strin
 		return uniqueStrings(inheritanceClauseTypes(sig, "extends", "implements"))
 	}
 	return baseClassesFor(idx, language, className, preferDir)
+}
+
+// fileLocalTypeName reports whether className is a name the parser made up
+// for an anonymous class (`<anonymous@193:9>`). Its line and column are
+// unique only inside its own file and move with every line above it, so
+// looked up by name it binds whichever other file has a class at the same
+// position (guava: AbstractIteratorTest's and ImmutableSortedMapTest's
+// `<anonymous@193:9>` share a directory).
+func fileLocalTypeName(className string) bool {
+	return strings.HasPrefix(className, "<")
+}
+
+// baseClassesInFileFor is baseClassesFor for a class declared in file: a
+// file-local (anonymous) class is read from its declaration in that file,
+// any other name resolves as baseClassesFor does from file's directory.
+func baseClassesInFileFor(idx *edgeIndex, language, className, file string) []string {
+	if fileLocalTypeName(className) {
+		bases, _ := tsBaseClassesInFile(idx, className, file)
+		return bases
+	}
+	return baseClassesFor(idx, language, className, dirOf(file))
 }
 
 // tsBaseClassesInFile reads the inheritance clauses of the class-like

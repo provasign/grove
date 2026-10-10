@@ -608,8 +608,12 @@ func enrichRecoveredClassParents(symbols []core.SymbolRecord) {
 		if symbol.ParentSymbol != "" || (symbol.Kind != core.KindMethod && symbol.Kind != core.KindConstructor) {
 			continue
 		}
+		// The innermost enclosing class is the one that opens later, then
+		// the one that closes earlier: the same answer as the narrowest
+		// span for proper nesting, but recovered spans can overlap without
+		// nesting, and there span widths let a comment line elsewhere in
+		// one of them pick the other (as enrichCppNamespaces).
 		best := -1
-		bestWidth := int(^uint(0) >> 1)
 		for parentIdx := range symbols {
 			parent := &symbols[parentIdx]
 			switch parent.Kind {
@@ -620,8 +624,13 @@ func enrichRecoveredClassParents(symbols []core.SymbolRecord) {
 			if parent.FilePath != symbol.FilePath || parent.Span.Start > symbol.Span.Start || parent.Span.End < symbol.Span.End {
 				continue
 			}
-			if width := parent.Span.End - parent.Span.Start; width < bestWidth {
-				best, bestWidth = parentIdx, width
+			if best < 0 {
+				best = parentIdx
+				continue
+			}
+			cur := &symbols[best]
+			if parent.Span.Start > cur.Span.Start || parent.Span.Start == cur.Span.Start && parent.Span.End < cur.Span.End {
+				best = parentIdx
 			}
 		}
 		if best < 0 {

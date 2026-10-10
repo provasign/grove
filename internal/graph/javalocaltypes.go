@@ -38,11 +38,12 @@ func javaFunctionalInterfaceArity(paramType string) (int, bool) {
 // class body. Same shallow, harness-bounded approach as the other languages.
 
 var (
-	// Type x = ... (typed local; also matches enhanced-for "for (Type x :")
+	// Type x = ... (typed local; also matches enhanced-for "for (Type x :"
+	// and a declaration assigned later, `Map<K, V> map;` before a try).
 	// The generic group tolerates one nesting level (JsonDeserializer<Enum<?>>,
 	// Map<String, List<T>>) — regexes can't balance arbitrarily, one level
 	// covers real declarations.
-	javaLocalDeclRe = regexp.MustCompile(`\b([A-Z]\w*)(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?(?:\[\])?\s+(\w+)\s*[=:)]`)
+	javaLocalDeclRe = regexp.MustCompile(`\b([A-Z]\w*)(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?(?:\[\])?\s+(\w+)\s*[=:);]`)
 	// typed local including primitives and arrays, for overload matching:
 	// anchored to statement starts so "return x =" / cast fragments can't
 	// masquerade as declarations
@@ -123,7 +124,7 @@ func javaArgTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 	}
 	if params := tsDeclParams("java", javaDeclSource(symbol)); params != "" {
 		for _, g := range splitParams("java", params) {
-			fields := strings.Fields(strings.TrimSpace(g))
+			fields := strings.Fields(javaCollapseGenericSpaces(strings.TrimSpace(g)))
 			for len(fields) > 2 || (len(fields) == 2 && (fields[0] == "final" || strings.HasPrefix(fields[0], "@"))) {
 				fields = fields[1:]
 			}
@@ -170,7 +171,7 @@ func javaArgTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 						}
 					}
 				}
-				next = append(next, tsBaseClasses(idx, className, dirOf(symbol.FilePath))...)
+				next = append(next, baseClassesInFileFor(idx, "java", className, symbol.FilePath)...)
 			}
 			classes = next
 		}
@@ -179,81 +180,73 @@ func javaArgTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 }
 
 // javaDeclSource returns the text to parse a Java declaration's head from,
-// with leading annotations removed. `@SuppressWarnings("unchecked")` on the
-// line before the method made the annotation's parens the "parameter
+// with leading annotations and comments removed. `@SuppressWarnings("unchecked")`
+// on the line before the method made the annotation's parens the "parameter
 // list" (and the Signature — the first line — was the annotation alone),
 // so every such method parsed as ("unchecked") and slipped through
 // overload narrowing as neutral. Prefers the raw text; falls back to the
-// signature when the raw text is absent.
+// signature when the raw text is absent. The annotations are skipped on
+// masked text, so a comment inside an annotation's arguments (a quote or
+// paren in it) cannot end them early.
 func javaDeclSource(s *core.SymbolRecord) string {
 	src := s.RawText
 	if src == "" {
 		src = s.Signature
 	}
+	// Masking is a forward pass, so a prefix masks exactly as the whole
+	// text would; annotations rarely run past the first couple of KB.
+	const prefix = 2048
+	if len(src) > prefix {
+		if off, ok := javaDeclStart(maskCode("java", src[:prefix])); ok {
+			return src[off:]
+		}
+	}
+	off, _ := javaDeclStart(maskCode("java", src))
+	return src[off:]
+}
+
+// javaDeclStart returns the offset in masked of the first byte after the
+// leading whitespace and annotations; ok is false when an annotation's
+// argument list does not close within masked (the offset is then that
+// annotation's start).
+func javaDeclStart(masked string) (int, bool) {
+	pos := 0
 	for {
-		trimmed := strings.TrimLeft(src, " \t\r\n")
-		// Leading comments (a Javadoc "(may be {@code null})" has parens
-		// too) go the same way as annotations.
-		if strings.HasPrefix(trimmed, "/*") {
-			end := strings.Index(trimmed, "*/")
-			if end < 0 {
-				return trimmed
-			}
-			src = trimmed[end+2:]
-			continue
+		for pos < len(masked) && (masked[pos] == ' ' || masked[pos] == '\t' || masked[pos] == '\r' || masked[pos] == '\n') {
+			pos++
 		}
-		if strings.HasPrefix(trimmed, "//") {
-			nl := strings.IndexByte(trimmed, '\n')
-			if nl < 0 {
-				return trimmed
-			}
-			src = trimmed[nl+1:]
-			continue
+		if pos >= len(masked) || masked[pos] != '@' {
+			return pos, true
 		}
-		if !strings.HasPrefix(trimmed, "@") {
-			return trimmed
-		}
-		i := 1
-		for i < len(trimmed) && (trimmed[i] == '.' || trimmed[i] == '_' || trimmed[i] == '$' ||
-			(trimmed[i] >= 'a' && trimmed[i] <= 'z') || (trimmed[i] >= 'A' && trimmed[i] <= 'Z') || (trimmed[i] >= '0' && trimmed[i] <= '9')) {
+		i := pos + 1
+		for i < len(masked) && (masked[i] == '.' || masked[i] == '_' || masked[i] == '$' ||
+			(masked[i] >= 'a' && masked[i] <= 'z') || (masked[i] >= 'A' && masked[i] <= 'Z') || (masked[i] >= '0' && masked[i] <= '9')) {
 			i++
 		}
 		j := i
-		for j < len(trimmed) && (trimmed[j] == ' ' || trimmed[j] == '\t') {
+		for j < len(masked) && (masked[j] == ' ' || masked[j] == '\t') {
 			j++
 		}
-		if j < len(trimmed) && trimmed[j] == '(' {
+		if j < len(masked) && masked[j] == '(' {
 			depth := 0
-			var quote byte
 			k := j
-			for ; k < len(trimmed); k++ {
-				c := trimmed[k]
-				if quote != 0 {
-					if c == '\\' {
-						k++
-					} else if c == quote {
-						quote = 0
-					}
-					continue
-				}
-				switch c {
-				case '"', '\'':
-					quote = c
+			for ; k < len(masked); k++ {
+				switch masked[k] {
 				case '(':
 					depth++
 				case ')':
 					depth--
 				}
-				if depth == 0 && c == ')' {
+				if depth == 0 {
 					break
 				}
 			}
-			if k >= len(trimmed) {
-				return trimmed
+			if k >= len(masked) {
+				return pos, false
 			}
 			i = k + 1
 		}
-		src = trimmed[i:]
+		pos = i
 	}
 }
 
@@ -686,7 +679,7 @@ func javaCallResultOwners(idx *edgeIndex, candidates []*core.SymbolRecord, name 
 	for depth := 0; depth < 4 && len(level) > 0; depth++ {
 		next := map[string]bool{}
 		for owner := range level {
-			for _, base := range baseClassesFor(idx, "java", owner, dirOf(symbol.FilePath)) {
+			for _, base := range baseClassesInFileFor(idx, "java", owner, symbol.FilePath) {
 				if !owners[base] {
 					owners[base] = true
 					next[base] = true
@@ -903,7 +896,7 @@ func javaLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string
 				if cls := javaOwnerType(idx, className, symbol.FilePath); cls != nil {
 					javaClassFields(idx, cls, className, out)
 				}
-				next = append(next, tsBaseClasses(idx, className, dirOf(symbol.FilePath))...)
+				next = append(next, baseClassesInFileFor(idx, "java", className, symbol.FilePath)...)
 			}
 			classes = next
 		}
@@ -923,7 +916,8 @@ func javaLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string
 	// Parameters: "Type name" pairs from the declaration's paren group.
 	if params := tsDeclParams("java", javaDeclSource(symbol)); params != "" {
 		for _, g := range splitParams("java", params) {
-			fields := strings.Fields(strings.TrimSpace(g))
+			// "Table<R, C, V> table" is one type token, as in javaParamTypes.
+			fields := strings.Fields(javaCollapseGenericSpaces(strings.TrimSpace(g)))
 			// Drop modifiers and annotations: "final @Nullable CharSequence seq"
 			for len(fields) > 2 || (len(fields) == 2 && (fields[0] == "final" || strings.HasPrefix(fields[0], "@"))) {
 				fields = fields[1:]

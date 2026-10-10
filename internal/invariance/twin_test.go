@@ -71,6 +71,7 @@ func allTwinCases() []twinCase {
 	all = append(all, casesA()...)
 	all = append(all, casesE()...)
 	all = append(all, casesC()...)
+	all = append(all, casesJ()...)
 	return all
 }
 
