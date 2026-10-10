@@ -834,13 +834,13 @@ func sortedFileKeys(m map[string][]*core.SymbolRecord) []string {
 // because package names commonly prefix the directory name (grep-searcher
 // lives in crates/searcher).
 func (idx *edgeIndex) buildRustCrates() {
-	roots := map[string]bool{}
+	roots := map[string]struct{}{}
 	for _, f := range sortedFileKeys(idx.byFile) {
 		if !strings.HasSuffix(f, ".rs") {
 			continue
 		}
 		if base := baseNameNoExt(f); base == "lib" || base == "main" {
-			roots[dirOf(f)] = true
+			roots[dirOf(f)] = struct{}{}
 		}
 		// Cargo's integration tests, benches and examples are crates of
 		// their own: every file directly under tests/ is a crate root,
@@ -848,7 +848,7 @@ func (idx *edgeIndex) buildRustCrates() {
 		// Without a root they scoped to their own file only (fd's
 		// TestEnv::new from tests/tests.rs resolved nothing).
 		if d := baseOf(dirOf(f)); d == "tests" || d == "benches" || d == "examples" {
-			roots[dirOf(f)] = true
+			roots[dirOf(f)] = struct{}{}
 		}
 	}
 	if len(roots) == 0 {
@@ -863,7 +863,7 @@ func (idx *edgeIndex) buildRustCrates() {
 		}
 		root := dirOf(f)
 		for d := root; ; {
-			if roots[d] {
+			if _, ok := roots[d]; ok {
 				root = d
 				break
 			}
@@ -883,13 +883,29 @@ func (idx *edgeIndex) buildRustCrates() {
 		}
 		return strings.ToLower(strings.ReplaceAll(name, "-", "_"))
 	}
-	for root := range roots {
+	// Integration-test, bench and example targets are crates nothing can
+	// name: registering them put every `tests`/`benches` root under the
+	// one name, and a library's own `mod tests` paths (`tests::helper`)
+	// pulled whichever one won the map iteration into the library's scope.
+	// Names are registered in sorted root order so a clash between two
+	// real crates resolves the same way on every run.
+	var named []string
+	for _, root := range sortedKeys(roots) {
+		switch baseOf(root) {
+		case "tests", "benches", "examples":
+			continue
+		}
+		named = append(named, root)
+	}
+	for _, root := range named {
 		if name := crateName(root); name != "" && name != "." {
-			idx.rustCrateByName[name] = root
+			if _, dup := idx.rustCrateByName[name]; !dup {
+				idx.rustCrateByName[name] = root
+			}
 		}
 	}
 	// Token aliases never displace an exact crate name.
-	for root := range roots {
+	for _, root := range named {
 		name := crateName(root)
 		if i := strings.LastIndexByte(name, '_'); i >= 0 && i+1 < len(name) {
 			if tok := name[i+1:]; idx.rustCrateByName[tok] == "" {
