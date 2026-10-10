@@ -909,6 +909,17 @@ func javaLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string
 		}
 	}
 
+	// A lambda or local class member sees the parameters and locals of the
+	// method it is written in (effectively-final captures), above fields.
+	// The lambda symbol is parented to the class, so the method is found by
+	// span. These used to arrive by accident, through a field map that
+	// regexed every method body of the class.
+	if outer := enclosingCallable(idx, symbol); outer != nil {
+		for name, typ := range javaLocalTypes(idx, outer) {
+			out[name] = typ
+		}
+	}
+
 	// Parameters: "Type name" pairs from the declaration's paren group.
 	if params := tsDeclParams("java", javaDeclSource(symbol)); params != "" {
 		for _, g := range splitParams("java", params) {
@@ -942,4 +953,28 @@ func javaLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string
 	}
 	delete(out, "this")
 	return out
+}
+
+// enclosingCallable returns the narrowest method, constructor or function in
+// the symbol's file whose span strictly contains it, or nil.
+func enclosingCallable(idx *edgeIndex, symbol *core.SymbolRecord) *core.SymbolRecord {
+	var best *core.SymbolRecord
+	for _, cand := range idx.byFile[symbol.FilePath] {
+		if cand.ID == symbol.ID {
+			continue
+		}
+		switch cand.Kind {
+		case core.KindMethod, core.KindConstructor, core.KindFunction:
+		default:
+			continue
+		}
+		if cand.Span.Start > symbol.Span.Start || cand.Span.End < symbol.Span.End ||
+			cand.Span.Start == symbol.Span.Start && cand.Span.End == symbol.Span.End {
+			continue
+		}
+		if best == nil || cand.Span.End-cand.Span.Start < best.Span.End-best.Span.Start {
+			best = cand
+		}
+	}
+	return best
 }
