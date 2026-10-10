@@ -60,7 +60,8 @@ func (e *Engine) PreviewChangeImpacts(ctx context.Context, queries [][2]string, 
 			Family: r.Family, Callers: r.Callers, DeclaringTypes: r.DeclaringTypes,
 			ExternalSupers: r.ExternalSupers, OverridesExternal: r.OverridesExternal,
 			Completeness: r.Completeness, CallerCoverage: r.CallerCoverage,
-			HasHeuristicRefs: r.HasHeuristicRefs,
+			HasHeuristicRefs:   r.HasHeuristicRefs,
+			NameMatchedCallers: r.NameMatchedCallers,
 		}
 	}
 	return results, failures, nil

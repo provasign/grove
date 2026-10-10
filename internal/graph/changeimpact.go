@@ -64,6 +64,14 @@ type ChangeImpactResult struct {
 	// caller distinguishing "certain" from "probably right" should check
 	// this rather than parse Completeness.
 	HasHeuristicRefs bool
+	// NameMatchedCallers are the IDs of callers whose every edge into the
+	// change set is name-derived (Heuristic or Regex). A caller that also
+	// has a compiler- or AST-resolved edge is certain, even when name
+	// matching adds more targets for it. HasHeuristicRefs is true exactly
+	// when this is non-empty: one name-matched caller used to label a whole
+	// mostly compiler-verified answer "heuristic" (hono Router.match: 13 of
+	// 14 callers compiler-resolved).
+	NameMatchedCallers []string
 
 	// Data-member anchors (fields, properties, constants, variables) only —
 	// see memberimpact.go. MemberKind is non-empty exactly for those.
@@ -84,6 +92,30 @@ type ChangeImpactResult struct {
 	// ReExports: TS/JS export-specifier lines that re-export or alias the
 	// queried function (reexports.go). Not symbols, so not in Sites().
 	ReExports []MemberAccess
+}
+
+// callerEvidence records, per caller, whether any of its edges into the
+// change set is certain (resolved by the AST or the compiler).
+type callerEvidence map[string]bool
+
+func (c callerEvidence) note(e core.Edge) {
+	if e.Source != core.EvidenceSourceHeuristic && e.Source != core.EvidenceSourceRegex {
+		c[e.From] = true
+	} else if _, ok := c[e.From]; !ok {
+		c[e.From] = false
+	}
+}
+
+// nameMatched returns the callers with no certain edge, sorted.
+func (c callerEvidence) nameMatched() []string {
+	var out []string
+	for id, certain := range c {
+		if !certain {
+			out = append(out, id)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Sites returns every METHOD in the change-set — declarations, family,
@@ -478,7 +510,7 @@ func (g *CodeGraph) changeImpactScoped(query, file string) (*ChangeImpactResult,
 		memberIDs[s.ID] = true
 	}
 	callerSeen := make(map[string]bool)
-	heuristicCallers := false
+	evidence := callerEvidence{}
 	var callers []core.SymbolRecord
 	for id := range memberIDs {
 		for _, ei := range g.inbound[id] {
@@ -491,8 +523,8 @@ func (g *CodeGraph) changeImpactScoped(query, file string) (*ChangeImpactResult,
 			if edge.Type != core.EdgeCalls && !nativeRef {
 				continue
 			}
-			if edge.Source == core.EvidenceSourceHeuristic || edge.Source == core.EvidenceSourceRegex {
-				heuristicCallers = true
+			if !memberIDs[edge.From] {
+				evidence.note(edge)
 			}
 			if memberIDs[edge.From] || callerSeen[edge.From] {
 				continue
@@ -532,16 +564,17 @@ func (g *CodeGraph) changeImpactScoped(query, file string) (*ChangeImpactResult,
 	sortSymbols(callers)
 	sortSymbols(declTypes)
 	return &ChangeImpactResult{
-		Query:             query,
-		Declarations:      decls,
-		Supers:            supers,
-		Family:            family,
-		Callers:           callers,
-		DeclaringTypes:    declTypes,
-		ExternalSupers:    externalSupers,
-		OverridesExternal: overridesExternal,
-		Completeness:      completeness,
-		HasHeuristicRefs:  heuristicCallers,
+		Query:              query,
+		Declarations:       decls,
+		Supers:             supers,
+		Family:             family,
+		Callers:            callers,
+		DeclaringTypes:     declTypes,
+		ExternalSupers:     externalSupers,
+		OverridesExternal:  overridesExternal,
+		Completeness:       completeness,
+		HasHeuristicRefs:   len(evidence.nameMatched()) > 0,
+		NameMatchedCallers: evidence.nameMatched(),
 	}, nil
 }
 
@@ -692,7 +725,7 @@ func (g *CodeGraph) externalRootedImpact(query, typeName, methodName string, que
 		memberIDs[m.ID] = true
 	}
 	callerSeen := make(map[string]bool)
-	heuristicCallers := false
+	evidence := callerEvidence{}
 	var callers []core.SymbolRecord
 	for id := range memberIDs {
 		for _, ei := range g.inbound[id] {
@@ -700,8 +733,8 @@ func (g *CodeGraph) externalRootedImpact(query, typeName, methodName string, que
 			if edge.Type != core.EdgeCalls {
 				continue
 			}
-			if edge.Source == core.EvidenceSourceHeuristic || edge.Source == core.EvidenceSourceRegex {
-				heuristicCallers = true
+			if !memberIDs[edge.From] {
+				evidence.note(edge)
 			}
 			if memberIDs[edge.From] || callerSeen[edge.From] {
 				continue
@@ -716,13 +749,14 @@ func (g *CodeGraph) externalRootedImpact(query, typeName, methodName string, que
 	sortSymbols(family)
 	sortSymbols(callers)
 	return &ChangeImpactResult{
-		Query:             query,
-		Family:            family,
-		Callers:           callers,
-		ExternalSupers:    []string{typeName},
-		OverridesExternal: []string{typeName + "#" + methodName},
-		Completeness:      "project-local",
-		HasHeuristicRefs:  heuristicCallers,
+		Query:              query,
+		Family:             family,
+		Callers:            callers,
+		ExternalSupers:     []string{typeName},
+		OverridesExternal:  []string{typeName + "#" + methodName},
+		Completeness:       "project-local",
+		HasHeuristicRefs:   len(evidence.nameMatched()) > 0,
+		NameMatchedCallers: evidence.nameMatched(),
 	}, nil
 }
 
@@ -1108,7 +1142,7 @@ func (g *CodeGraph) freeFunctionImpactLocked(query, file string) *ChangeImpactRe
 			break
 		}
 	}
-	heuristicEdges := false
+	evidence := callerEvidence{}
 	seen := map[string]bool{}
 	var callers []core.SymbolRecord
 	for id := range declIDs {
@@ -1116,11 +1150,12 @@ func (g *CodeGraph) freeFunctionImpactLocked(query, file string) *ChangeImpactRe
 			edge := g.edges[ei]
 			accept := edge.Type == core.EdgeCalls ||
 				(dataAnchor && (edge.Type == core.EdgeReads || edge.Type == core.EdgeWrites || edge.Type == core.EdgeRedefines))
-			if !accept || declIDs[edge.From] || seen[edge.From] {
+			if !accept || declIDs[edge.From] {
 				continue
 			}
-			if edge.Source == core.EvidenceSourceHeuristic || edge.Source == core.EvidenceSourceRegex {
-				heuristicEdges = true
+			evidence.note(edge)
+			if seen[edge.From] {
+				continue
 			}
 			seen[edge.From] = true
 			if s, ok := g.symbols[edge.From]; ok {
@@ -1131,12 +1166,13 @@ func (g *CodeGraph) freeFunctionImpactLocked(query, file string) *ChangeImpactRe
 	sortSymbols(decls)
 	sortSymbols(callers)
 	return &ChangeImpactResult{
-		Query:            query,
-		Declarations:     decls,
-		Callers:          callers,
-		Completeness:     "callers-only",
-		HasHeuristicRefs: heuristicEdges,
-		ReExports:        g.jsReExportsLocked(decls),
+		Query:              query,
+		Declarations:       decls,
+		Callers:            callers,
+		Completeness:       "callers-only",
+		HasHeuristicRefs:   len(evidence.nameMatched()) > 0,
+		NameMatchedCallers: evidence.nameMatched(),
+		ReExports:          g.jsReExportsLocked(decls),
 	}
 }
 

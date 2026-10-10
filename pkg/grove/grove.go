@@ -521,10 +521,13 @@ type ChangeImpactResult struct {
 	// CallerCoverage describes resolved call evidence separately from
 	// family closure: indexed, heuristic, or partial (dynamic languages).
 	CallerCoverage string
-	// HasHeuristicRefs is true when the caller set includes at least one
-	// name-derived edge (framework template/JPA references) rather than
-	// only AST-certain ones — over-inclusive by design, not certain.
-	HasHeuristicRefs bool
+	// HasHeuristicRefs is true when at least one caller is reached only by
+	// name-derived edges (framework template/JPA references, name matches)
+	// rather than AST- or compiler-resolved ones — over-inclusive by
+	// design, not certain. NameMatchedCallers lists those callers' IDs; a
+	// caller with any resolved edge into the set is certain.
+	HasHeuristicRefs   bool
+	NameMatchedCallers []string
 
 	// Data-member anchors only (fields, properties, constants, variables):
 	// MemberKind is non-empty, Accesses are the confirmed read/write/init/
@@ -619,25 +622,26 @@ func (e *Engine) ChangeImpactScoped(ctx context.Context, query, file string) (Ch
 		return ChangeImpactResult{}, err
 	}
 	return ChangeImpactResult{
-		Query:             raw.Query,
-		Declarations:      raw.Declarations,
-		Supers:            raw.Supers,
-		Family:            raw.Family,
-		Callers:           raw.Callers,
-		DeclaringTypes:    raw.DeclaringTypes,
-		ExternalSupers:    raw.ExternalSupers,
-		OverridesExternal: raw.OverridesExternal,
-		Completeness:      raw.Completeness,
-		CallerCoverage:    raw.CallerCoverage,
-		HasHeuristicRefs:  raw.HasHeuristicRefs,
-		MemberKind:        raw.MemberKind,
-		Accesses:          raw.Accesses,
-		AmbiguousAccesses: raw.AmbiguousAccesses,
-		ExcludedAccesses:  raw.ExcludedAccesses,
-		AccessCoverage:    raw.AccessCoverage,
-		AccessNote:        raw.AccessNote,
-		Related:           g.RelatedSites(raw),
-		ReExports:         raw.ReExports,
+		Query:              raw.Query,
+		Declarations:       raw.Declarations,
+		Supers:             raw.Supers,
+		Family:             raw.Family,
+		Callers:            raw.Callers,
+		DeclaringTypes:     raw.DeclaringTypes,
+		ExternalSupers:     raw.ExternalSupers,
+		OverridesExternal:  raw.OverridesExternal,
+		Completeness:       raw.Completeness,
+		CallerCoverage:     raw.CallerCoverage,
+		HasHeuristicRefs:   raw.HasHeuristicRefs,
+		NameMatchedCallers: raw.NameMatchedCallers,
+		MemberKind:         raw.MemberKind,
+		Accesses:           raw.Accesses,
+		AmbiguousAccesses:  raw.AmbiguousAccesses,
+		ExcludedAccesses:   raw.ExcludedAccesses,
+		AccessCoverage:     raw.AccessCoverage,
+		AccessNote:         raw.AccessNote,
+		Related:            g.RelatedSites(raw),
+		ReExports:          raw.ReExports,
 	}, nil
 }
 
