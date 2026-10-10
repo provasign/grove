@@ -98,7 +98,11 @@ func TestCommentStringInvariance(t *testing.T) {
 				t.Run(tc.id, func(t *testing.T) {
 					// Each case indexes its own temp repos twice; serially
 					// the table exceeded CI's 2-minute budget on Windows.
-					t.Parallel()
+					// Native cases stay serial: concurrent javac/go runs
+					// starved other packages' compiler-timeout tests.
+					if mode == "astkit" {
+						t.Parallel()
+					}
 					runTwin(t, tc, mode == "native")
 				})
 			}
