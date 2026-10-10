@@ -103,9 +103,56 @@ func (jsTSAnalyzer) Available(_ context.Context, root string) Availability {
 		if untrustedMode() {
 			return Availability{Reason: tsUntrustedSkipReason}
 		}
+		if plainJavaScriptProject(root) {
+			return Availability{Reason: tsPlainJSReason}
+		}
 		return Availability{Reason: "typescript not resolvable in the project"}
 	}
 	return Availability{Available: true}
+}
+
+// tsPlainJSReason marks a repo where the TypeScript checker does not apply:
+// plain JavaScript that never depended on typescript (express). Tree-sitter
+// is the whole analysis there, so callers must not report it as degraded or
+// tell the user to install dependencies that would not bring typescript.
+const tsPlainJSReason = "not applicable: the project does not use the TypeScript compiler (no typescript dependency, no tsconfig.json or jsconfig.json); tree-sitter analysis only"
+
+// plainJavaScriptProject reports whether no package.json in the repo names
+// typescript and no tsconfig.json/jsconfig.json exists outside node_modules.
+// A repo that declares typescript but has not installed it is NOT plain
+// JavaScript: its dependencies really are missing.
+func plainJavaScriptProject(root string) bool {
+	plain := true
+	seen := 0
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if !plain {
+			return filepath.SkipAll
+		}
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			switch d.Name() {
+			case "node_modules", ".git", ".grove":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if seen++; seen > 200000 {
+			plain = false // too large to tell; keep the conservative report
+			return filepath.SkipAll
+		}
+		switch d.Name() {
+		case "tsconfig.json", "jsconfig.json":
+			plain = false
+		case "package.json":
+			if data, err := os.ReadFile(path); err == nil && bytes.Contains(data, []byte(`"typescript"`)) {
+				plain = false
+			}
+		}
+		return nil
+	})
+	return plain
 }
 
 func (jsTSAnalyzer) Analyze(ctx context.Context, req Request) Result {
