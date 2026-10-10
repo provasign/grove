@@ -153,13 +153,17 @@ func extractASTSymbols(language, filePath, blobSHA string, src []byte, fileImpor
 	// the #endif. The parse sees those branches blanked (offsets kept).
 	// live is the source with only that masking, for the alt parse below.
 	live := text
+	// Set when a broken C-family file is parsed with its comments cut:
+	// uncutText is what text was before the cut.
+	var commentCuts *commentCuts
+	var uncutText []byte
 	if preprocessedLanguage(language) || key == astkit.LangObjC {
 		if masked := textmask.MaskInactivePreprocessor(language, string(src)); masked != string(src) {
 			src = []byte(masked)
 			live = src
 		}
 	}
-	if key == astkit.LangC || key == astkit.LangCPP {
+	if cFamilyKey(key) {
 		if blanked := blankCFamilyMacroLines(language, src); blanked != nil {
 			src = blanked
 		}
@@ -176,9 +180,25 @@ func extractASTSymbols(language, filePath, blobSHA string, src []byte, fileImpor
 			return nil, false, false, nil
 		}
 	} else {
-		defer tree.Close()
 		hasErrors = tree.RootNode().HasError()
-		if hasErrors && preprocessedLanguage(language) {
+		if hasErrors && cFamilyKey(key) {
+			// Error recovery prices the bytes and lines it skips,
+			// comments included: a comment line inside a broken region
+			// changed which declarations the recovered tree kept (a whole
+			// AFNetworking .m file flipped between two different ERROR
+			// soups). A broken file is parsed from code alone (see
+			// parseBrokenCFamily); restore maps lines back and puts the
+			// comments back into symbol bodies. A file that parses
+			// cleanly keeps its comment nodes, which signatures cut.
+			if b := parseBrokenCFamily(ctx, eng, key, language, src, text, live, true); b != nil {
+				tree.Close()
+				tree, src, text = b.tree, b.src, b.text
+				hasErrors = tree.RootNode().HasError()
+				commentCuts, uncutText = b.cuts, b.uncutText
+			}
+		}
+		defer func() { tree.Close() }()
+		if hasErrors && preprocessedLanguage(language) && commentCuts == nil {
 			// `#if A ... else ... #else ... else ... #endif` hands the
 			// grammar two else branches; tree-sitter recovers with ERROR
 			// nodes that swallow call sites. Re-parse with the directives
@@ -205,6 +225,9 @@ func extractASTSymbols(language, filePath, blobSHA string, src []byte, fileImpor
 	akSyms, err := reg.Extract(key, tree, text)
 	if err != nil {
 		return nil, false, false, nil
+	}
+	if commentCuts != nil {
+		commentCuts.restore(akSyms, text, uncutText)
 	}
 	syms = make([]core.SymbolRecord, 0, len(akSyms))
 	var jsCode []string
@@ -448,6 +471,16 @@ func extractImportsFromAST(language string, src []byte) ([]string, bool) {
 	if err != nil || (tree == nil && !reg.TextCapable(key)) {
 		return nil, false
 	}
+	if tree != nil && cFamilyKey(key) && tree.RootNode().HasError() {
+		// Read a broken file's includes from code alone, as its symbols
+		// are (see extractASTSymbols): `#include` lines inside an ERROR
+		// region came and went with nearby comments. The candidates that
+		// blank directives would blank the includes.
+		if b := parseBrokenCFamily(ctx, eng, key, language, src, src, src, false); b != nil {
+			tree.Close()
+			tree, src = b.tree, b.text
+		}
+	}
 	if tree != nil {
 		defer tree.Close()
 	}
@@ -658,6 +691,11 @@ func symID(filePath, qualifiedName, blobSHA string) string {
 	return fmt.Sprintf("%s::%s@%s", filePath, qualifiedName, blobSHA)
 }
 
+// cFamilyKey reports whether key is C, C++ or Objective-C.
+func cFamilyKey(key astkit.LanguageKey) bool {
+	return key == astkit.LangC || key == astkit.LangCPP || key == astkit.LangObjC
+}
+
 func preprocessedLanguage(language string) bool {
 	return language == "csharp" || language == "c" || language == "cpp"
 }
@@ -726,25 +764,63 @@ var cMacroLineRe = regexp.MustCompile(`^[A-Z_][A-Z0-9_]*[A-Z][A-Z0-9_]*:?$`)
 // cMacroCallLineRe matches a line opening an upper-case macro invocation.
 var cMacroCallLineRe = regexp.MustCompile(`^[A-Z][A-Z0-9_]*_[A-Z0-9_]*\s*\(`)
 
+// cMacroEnumRe matches a `typedef NS_ENUM(...) { ... };` (or NS_OPTIONS,
+// CF_ENUM, ...) in masked text.
+var cMacroEnumRe = regexp.MustCompile(`\btypedef\s+(?:NS|CF)_(?:ENUM|OPTIONS|CLOSED_ENUM|ERROR_ENUM)\s*\([^(){};]*\)\s*\{[^{}]*\}\s*;?`)
+
+// cClassKeyMacroRe matches an upper-case macro between a class key and
+// the class name.
+var cClassKeyMacroRe = regexp.MustCompile(`(?:^|[\s;{}>])(?:class|struct|union)\s+([A-Z][A-Z0-9]*_[A-Z0-9_]*)\s+[A-Za-z_]\w*\s*(?:[:{]|final\b|$)`)
+
+// cSpecifierKeywordRe matches a leading declaration specifier keyword and
+// the blanks after it.
+var cSpecifierKeywordRe = regexp.MustCompile(`^(?:static|inline|virtual|explicit|friend|constexpr|extern)\s+`)
+
+// objcTrailingWordMacroRe matches an upper-case macro word ending an
+// Objective-C method declaration.
+var objcTrailingWordMacroRe = regexp.MustCompile(`[\w)]\s+([A-Z][A-Z0-9]*_[A-Z0-9_]*)\s*;\s*$`)
+
+// cTrailingMacroRe matches an upper-case macro call after a name or `)`.
+var cTrailingMacroRe = regexp.MustCompile(`[A-Za-z0-9_)]\s+([A-Z][A-Z0-9]*_[A-Z0-9_]*)\s*\(`)
+
+// cClassHeaderRe matches a masked line opening a class, struct or union
+// body, brace on it or on the next line; cNamespaceHeaderRe one opening a
+// namespace or an
+// `extern "C"` block (the string is blanked), brace on it or on the next
+// line.
+var cClassHeaderRe = regexp.MustCompile(`^(?:template\s*<.*>\s*)?(?:class|struct|union)\s+[^;()=]*(?:\{|$)`)
+
+var cNamespaceHeaderRe = regexp.MustCompile(`^(?:(?:inline\s+)?namespace(?:\s+[A-Za-z_][\w:]*)?|extern\s+"\s*")\s*(?:\{|$)`)
+
 // cMacroSpecifierRe matches an upper-case specifier macro in front of a
 // declaration: `FMT_CONSTEXPR auto f()`, `FMT_API void g()`,
-// `FMT_CONSTEXPR typed_node(const Arg& arg)`.
-var cMacroSpecifierRe = regexp.MustCompile(`^([A-Z][A-Z0-9]*_[A-Z0-9_]*)\s+(?:auto|void|bool|char|int|long|short|unsigned|signed|float|double|const|constexpr|static|inline|virtual|explicit|friend|typename|struct|class|enum|template|extern|~?[A-Za-z_][A-Za-z0-9_]*\s*\()`)
+// `FMT_CONSTEXPR typed_node(const Arg& arg)`, `DOCTEST_CONSTEXPR
+// size_type len = 24;` (a type and a declarator after it: a macro there
+// cannot be a type itself).
+var cMacroSpecifierRe = regexp.MustCompile(`^([A-Z][A-Z0-9]*_[A-Z0-9_]*)\s+(?:auto|void|bool|char|int|long|short|unsigned|signed|float|double|const|constexpr|static|inline|virtual|explicit|friend|typename|struct|class|enum|template|extern|~?[A-Za-z_][A-Za-z0-9_]*\s*\(|[A-Za-z_][\w:]*(?:<[^;{}()]*>)?[\s*&]+(?:operator\b|[A-Za-z_]\w*\s*[=;({\[,]))`)
 
 // blankCFamilyMacroLines returns src with the macro uses tree-sitter cannot
 // expand replaced by spaces, or nil when there is none. Line numbers and
-// byte offsets are unchanged. Three shapes are blanked:
+// byte offsets are unchanged. Seven shapes are blanked:
 //
 //   - a line that is a lone upper-case identifier
-//     (`NLOHMANN_JSON_NAMESPACE_BEGIN`, `G_BEGIN_DECLS`, `Q_OBJECT`);
+//     (`NLOHMANN_JSON_NAMESPACE_BEGIN`, `G_BEGIN_DECLS`, `Q_OBJECT`,
+//     `NS_ASSUME_NONNULL_BEGIN`);
 //   - an upper-case macro invocation that is a whole line with no `;`, at
-//     file scope or right after a `template<...>` header
+//     file or class scope or right after a `template<...>` header
 //     (`FMT_PRAGMA_GCC(push_options)`, a multi-line
-//     `GTEST_DISABLE_MSC_WARNINGS_PUSH_(...)`, `JSON_HEDLEY_NON_NULL(1)`),
+//     `GTEST_DISABLE_MSC_WARNINGS_PUSH_(...)`, `JSON_HEDLEY_NON_NULL(1)`,
+//     `NS_EXTENSION_UNAVAILABLE_IOS("...")` before `@interface`),
 //     followed by a declaration, not by `{` or an operator
 //     (`GTEST_CHECK_(x)` / `<< "msg";` is an expression whose call must
 //     stay);
-//   - an upper-case specifier macro before a declaration (`FMT_CONSTEXPR`).
+//   - an upper-case macro statement (`FOO_(a, b);`) at file or namespace
+//     scope, where no call can stand;
+//   - an upper-case macro call ending a declaration there
+//     (`... *metrics AF_API_AVAILABLE(ios(10));`);
+//   - an upper-case specifier macro before a declaration (`FMT_CONSTEXPR`)
+//     or between a class key and its name (`class GTEST_API_ RE {`);
+//   - a whole `typedef NS_ENUM(T, Name) { ... };`.
 //
 // nlohmann/json opens every header with a namespace macro, and the grammar
 // read the macro, `namespace` and the whole namespace body as one function
@@ -756,13 +832,29 @@ var cMacroSpecifierRe = regexp.MustCompile(`^([A-Z][A-Z0-9]*_[A-Z0-9_]*)\s+(?:au
 // with `}`. Preprocessor lines (with continuations) never qualify.
 func blankCFamilyMacroLines(language string, src []byte) []byte {
 	clean := textmask.Mask(language, string(src))
+	var out []byte
+	// `typedef NS_ENUM(NSUInteger, Mode) { ... };` is unknown to the
+	// grammar, and recovering from it lost the @interface after it.
+	// astkit reads these enums from the text (objcMacroEnums); the parse
+	// sees the whole typedef blanked.
+	if enums := cMacroEnumRe.FindAllStringIndex(clean, -1); enums != nil {
+		out = append([]byte(nil), src...)
+		cleanBytes := []byte(clean)
+		for _, m := range enums {
+			for k := m[0]; k < m[1]; k++ {
+				if out[k] != '\n' && out[k] != '\r' {
+					out[k], cleanBytes[k] = ' ', ' '
+				}
+			}
+		}
+		clean = string(cleanBytes)
+	}
 	lines := strings.Split(clean, "\n")
 	starts := make([]int, len(lines))
 	for i, off := 0, 0; i < len(lines); i++ {
 		starts[i] = off
 		off += len(lines[i]) + 1
 	}
-	var out []byte
 	blank := func(from, to int) {
 		if out == nil {
 			out = append([]byte(nil), src...)
@@ -773,8 +865,26 @@ func blankCFamilyMacroLines(language string, src []byte) []byte {
 			}
 		}
 	}
-	braces, parens := 0, 0
-	continued := false
+	// scopes holds one entry per open brace: a namespace or `extern "C"`
+	// block, whose body is declarations like file scope, a class body, or
+	// anything else.
+	const (
+		otherScope = iota
+		namespaceScope
+		classScope
+	)
+	var scopes []int
+	declScope := func() bool {
+		for _, kind := range scopes {
+			if kind != namespaceScope {
+				return false
+			}
+		}
+		return true
+	}
+	parens := 0
+	continued, objcMemberHeader := false, false
+	pending := otherScope // the kind of a header line whose `{` is on the next line
 	prevCode := ""
 	for i := 0; i < len(lines); i++ {
 		line := lines[i]
@@ -784,20 +894,33 @@ func blankCFamilyMacroLines(language string, src []byte) []byte {
 		if directive {
 			continue
 		}
+		braces := len(scopes)
 		standalone := braces == 0 || (!strings.HasSuffix(prevCode, ",") && !strings.HasPrefix(nextCodeLine(lines, i+1), "}"))
 		if parens == 0 && standalone {
 			if cMacroLineRe.MatchString(trimmed) {
 				blank(starts[i], starts[i]+len(line))
 				continue
 			}
-			if (braces == 0 || strings.HasSuffix(prevCode, ">")) && cMacroCallLineRe.MatchString(trimmed) {
+			if cMacroCallLineRe.MatchString(trimmed) {
 				if end, ok := cMacroCallEnd(clean, starts[i]+strings.Index(line, "(")); ok {
 					endLine := i
 					for endLine+1 < len(lines) && starts[endLine+1] <= end {
 						endLine++
 					}
 					rest := strings.TrimSpace(clean[end+1 : starts[endLine]+len(lines[endLine])])
-					if next := nextCodeLine(lines, endLine+1); rest == "" && (next == "" || cIdentStartByte(next[0]) || next[0] == '}') {
+					next := nextCodeLine(lines, endLine+1)
+					// A macro statement where only declarations may stand
+					// (`GMOCK_DEFINE_DEFAULT_ACTION_FOR_RETURN_TYPE_(float,
+					// 0);` in a namespace) is no call; the grammar read
+					// `float` as a parameter, and recovering from a run of
+					// them folded all of gmock.h into one ERROR.
+					statement := rest == ";" && declScope()
+					// One in a class body (`DOCTEST_DECLARE_INTERFACE(X)`
+					// before `virtual void f() = 0;`) declares members.
+					inClass := braces > 0 && scopes[braces-1] == classScope
+					declaration := rest == "" && (braces == 0 || inClass || strings.HasSuffix(prevCode, ">")) &&
+						(next == "" || cIdentStartByte(next[0]) || next[0] == '}' || next[0] == '@')
+					if statement || declaration {
 						blank(starts[i], starts[endLine]+len(lines[endLine]))
 						if endLine > i {
 							prevCode = strings.TrimSpace(lines[endLine])
@@ -808,9 +931,54 @@ func blankCFamilyMacroLines(language string, src []byte) []byte {
 				}
 			}
 		}
+		objcMethod := language == "objc" && declScope() && (strings.HasPrefix(trimmed, "-") || strings.HasPrefix(trimmed, "+"))
+		objcMember := objcMethod || (language == "objc" && declScope() && strings.HasPrefix(trimmed, "@property"))
+		if parens == 0 && declScope() {
+			// A trailing attribute macro on a declaration or definition
+			// header (`@property NSURLSessionTaskMetrics *metrics
+			// AF_API_AVAILABLE(ios(10));`, `- (void)f:(id)x
+			// AF_API_AVAILABLE(ios(10)) {`, `void f(void)
+			// FOO_DEPRECATED("x");`) is unknown to the grammar;
+			// recovering from a run of them folded a whole .m file into
+			// one ERROR. After a `)` the call ends a declarator; after a
+			// name only in an Objective-C member (`int FOO_F(int);`
+			// declares FOO_F, `typedef NS_ENUM(...)` is a type).
+			if m := cTrailingMacroRe.FindAllStringSubmatchIndex(line, -1); m != nil {
+				last := m[len(m)-1]
+				open := starts[i] + strings.IndexByte(line[last[2]:], '(') + last[2]
+				if end, ok := cMacroCallEnd(clean, open); ok && end < starts[i]+len(line) && (line[last[0]] == ')' || objcMember || objcMemberHeader) {
+					if rest := strings.TrimSpace(clean[end+1 : starts[i]+len(line)]); rest == ";" || rest == "{" || (rest == "" && strings.HasPrefix(nextCodeLine(lines, i+1), "{")) {
+						blank(starts[i]+last[2], end+1)
+					}
+				}
+			}
+		}
+		// `- (instancetype)initWithURL:(NSURL *)url
+		// NS_DESIGNATED_INITIALIZER;`: an argument-less attribute macro
+		// read as one more selector part.
+		if objcMethod || objcMemberHeader {
+			if m := objcTrailingWordMacroRe.FindStringSubmatchIndex(line); m != nil {
+				blank(starts[i]+m[2], starts[i]+m[3])
+			}
+		}
+		// A method header continues over lines until its `;` or `{`.
+		if objcMember || objcMemberHeader {
+			objcMemberHeader = !strings.HasSuffix(trimmed, ";") && !strings.HasSuffix(trimmed, "{")
+		}
 		if parens == 0 {
+			// `class GTEST_API_ RE {`, `struct DOCTEST_INTERFACE
+			// AssertData`: an export macro between the key and the name.
+			if m := cClassKeyMacroRe.FindStringSubmatchIndex(line); m != nil {
+				blank(starts[i]+m[2], starts[i]+m[3])
+			}
 			lead := len(line) - len(strings.TrimLeft(line, " \t"))
 			for {
+				// Specifier keywords may come first
+				// (`static DOCTEST_CONSTEXPR size_type len = 24;`).
+				if k := cSpecifierKeywordRe.FindStringIndex(line[lead:]); k != nil {
+					lead += k[1]
+					continue
+				}
 				m := cMacroSpecifierRe.FindStringSubmatchIndex(line[lead:])
 				if m == nil {
 					break
@@ -820,13 +988,20 @@ func blankCFamilyMacroLines(language string, src []byte) []byte {
 				lead += len(line[lead:]) - len(strings.TrimLeft(line[lead:], " \t"))
 			}
 		}
+		header := otherScope
+		if cNamespaceHeaderRe.MatchString(trimmed) {
+			header = namespaceScope
+		} else if cClassHeaderRe.MatchString(trimmed) {
+			header = classScope
+		}
 		for k := 0; k < len(line); k++ {
 			switch line[k] {
 			case '{':
-				braces++
+				scopes = append(scopes, max(header, pending))
+				header, pending = otherScope, otherScope
 			case '}':
-				if braces > 0 {
-					braces--
+				if len(scopes) > 0 {
+					scopes = scopes[:len(scopes)-1]
 				}
 			case '(':
 				parens++
@@ -838,6 +1013,7 @@ func blankCFamilyMacroLines(language string, src []byte) []byte {
 		}
 		if trimmed != "" {
 			prevCode = trimmed
+			pending = header
 		}
 	}
 	return out
