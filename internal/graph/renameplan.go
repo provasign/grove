@@ -362,7 +362,6 @@ func (g *CodeGraph) RenamePlan(query, newName string) (*RenamePlanResult, error)
 func renameMainframePlanLocked(ci *ChangeImpactResult, query, newName string) *RenamePlanResult {
 	oldName := ci.Declarations[0].Name
 	pattern := regexp.MustCompile(`(?i)(^|[^A-Za-z0-9-])(` + regexp.QuoteMeta(oldName) + `)([^A-Za-z0-9-]|$)`)
-	replacement := "${1}" + strings.ReplaceAll(newName, "$", "$$") + "${3}"
 	result := &RenamePlanResult{
 		Query: query, NewName: newName, SitesTotal: len(ci.Sites()),
 		ExternalSupers: ci.ExternalSupers, OverridesExternal: ci.OverridesExternal,
@@ -391,11 +390,22 @@ func renameMainframePlanLocked(ci *ChangeImpactResult, query, newName string) *R
 				continue
 			}
 			clean := masked[idx]
-			matches := pattern.FindAllStringIndex(clean, -1)
+			matches := pattern.FindAllStringSubmatchIndex(clean, -1)
 			if len(matches) == 0 {
 				continue
 			}
-			after := pattern.ReplaceAllString(before, replacement)
+			// Replace only the code occurrences: the masked line keeps
+			// offsets, so a name inside a `*>` comment or a literal on the
+			// same line stays as written.
+			var b strings.Builder
+			last := 0
+			for _, m := range matches {
+				b.WriteString(before[last:m[4]])
+				b.WriteString(newName)
+				last = m[5]
+			}
+			b.WriteString(before[last:])
+			after := b.String()
 			if after == before {
 				continue
 			}

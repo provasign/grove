@@ -57,3 +57,37 @@ func TestImportedFiles_RustCrateScopeIsSharedPerCrate(t *testing.T) {
 		t.Fatalf("files of one crate must share one scope map")
 	}
 }
+
+// A library's own `mod tests` paths (`tests::TempDir`) must not pull an
+// integration-test directory (the workspace's tests/, another crate's
+// crates/x/tests/) into its scope. Those targets are crates nothing can
+// name; before, every one registered as crate "tests" and the map
+// iteration picked which one a library reached (ripgrep's ignore crate
+// got tests/ on one run and crates/ignore/tests on the next).
+func TestImportedFiles_RustTestTargetsAreNotNamedCrates(t *testing.T) {
+	mk := func(f, name, raw string) core.SymbolRecord {
+		return core.SymbolRecord{
+			ID: f + "::" + name + "@sha", FilePath: f, BlobSHA: "sha", Language: "rust",
+			Kind: core.KindFunction, Name: name, QualifiedName: name, RawText: raw,
+		}
+	}
+	for run := 0; run < 20; run++ {
+		idx := newEdgeIndex([]core.SymbolRecord{
+			mk("crates/ignore/src/lib.rs", "run", "fn run() {\n    let d = tests::TempDir::new();\n}"),
+			mk("crates/ignore/src/walk.rs", "walk", "fn walk() {}"),
+			mk("crates/ignore/tests/matched.rs", "matched", "fn matched() {}"),
+			mk("crates/matcher/src/lib.rs", "find", "fn find() {}"),
+			mk("crates/matcher/tests/util.rs", "util", "fn util() {}"),
+			mk("tests/json.rs", "json", "fn json() {}"),
+		})
+		scope := idx.importedFiles("crates/ignore/src/lib.rs")
+		for _, f := range []string{"tests/json.rs", "crates/ignore/tests/matched.rs", "crates/matcher/tests/util.rs"} {
+			if _, ok := scope[f]; ok {
+				t.Fatalf("run %d: ignore's scope reached test target %s: %v", run, f, sortedKeys(scope))
+			}
+		}
+		if _, ok := scope["crates/ignore/src/walk.rs"]; !ok {
+			t.Fatalf("run %d: crate scope lost its own module: %v", run, sortedKeys(scope))
+		}
+	}
+}

@@ -2,6 +2,7 @@ package graph
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/provasign/grove/internal/core"
@@ -310,10 +311,7 @@ func classExtendsNames(t *core.SymbolRecord) []string {
 	}
 	switch t.Language {
 	case "typescript", "tsx", "javascript", "java":
-		text := t.Signature
-		if text == "" {
-			text = firstLine(t.RawText)
-		}
+		text := declHeader(t)
 		return matchNameList(extendsRe, stripAngleBrackets(text))
 	case "csharp":
 		// The base class (first non-interface entry) grants implementation
@@ -321,10 +319,7 @@ func classExtendsNames(t *core.SymbolRecord) []string {
 		// subtype with an unresolved/external base could never set
 		// escapesIndex and would be wrongly bucketed Missing rather than
 		// Unverifiable.
-		text := t.Signature
-		if text == "" {
-			text = firstLine(t.RawText)
-		}
+		text := declHeader(t)
 		names := csharpBaseNames(text)
 		if len(names) > 0 && !strings.HasPrefix(names[0], "I") {
 			return names[:1]
@@ -341,7 +336,7 @@ func classExtendsNames(t *core.SymbolRecord) []string {
 // method, or a concrete (non-abstract) method on a class seed.
 func contractProvidesBody(contract []core.SymbolRecord, seedKinds map[string]core.SymbolKind) bool {
 	for _, c := range contract {
-		if hasModifier(&c, "default") || strings.Contains(c.Signature, "default ") {
+		if hasModifier(&c, "default") || strings.Contains(codeSignature(&c), "default ") {
 			return true
 		}
 		if hasModifier(&c, "abstract") {
@@ -359,8 +354,12 @@ func contractProvidesBody(contract []core.SymbolRecord, seedKinds map[string]cor
 				(c.Language == "rust" && k == core.KindTrait) ||
 				(c.Language == "csharp" && k == core.KindInterface)
 			if inheritsBody {
-				if strings.Contains(c.RawText, "{") || c.Language == "python" ||
-					(c.Language == "csharp" && strings.Contains(c.RawText, "=>")) {
+				if c.Language == "python" {
+					return true
+				}
+				// A body, not a `{` or `=>` inside a comment or string.
+				if body := maskCode(c.Language, c.RawText); strings.Contains(body, "{") ||
+					(c.Language == "csharp" && strings.Contains(body, "=>")) {
 					return true
 				}
 			}
@@ -387,7 +386,7 @@ var knownEmptyBases = map[string]bool{
 // contract (abstract method, Python @abstractmethod, or a
 // raise-NotImplementedError stub, which fails the contract at runtime).
 func providesImplementation(m *core.SymbolRecord) bool {
-	if hasModifier(m, "abstract") || strings.Contains(m.Signature, "abstract ") {
+	if hasModifier(m, "abstract") || strings.Contains(codeSignature(m), "abstract ") {
 		return false
 	}
 	if pythonAbstractMethod(m) {
@@ -401,15 +400,58 @@ func pythonAbstractMethod(method *core.SymbolRecord) bool {
 		return false
 	}
 	for _, annotation := range method.Annotations {
-		if annotation == "abstractmethod" || strings.HasSuffix(annotation, ".abstractmethod") {
+		// Annotations hold the decorator text: "abstractmethod",
+		// "abc.abstractmethod", and the deprecated abstractclassmethod /
+		// abstractstaticmethod / abstractproperty forms.
+		name, _, _ := strings.Cut(strings.TrimPrefix(annotation, "@"), "(")
+		if i := strings.LastIndexByte(name, '.'); i >= 0 {
+			name = name[i+1:]
+		}
+		switch strings.TrimSpace(name) {
+		case "abstractmethod", "abstractclassmethod", "abstractstaticmethod", "abstractproperty":
 			return true
 		}
 	}
-	return strings.Contains(method.RawText, "abstractmethod") || strings.Contains(method.RawText, "NotImplementedError")
+	return pythonStubBody(method.RawText)
+}
+
+// pythonNotImplementedRe matches `raise NotImplementedError` (bare, called,
+// or module-qualified) at the start of a masked statement.
+var pythonNotImplementedRe = regexp.MustCompile(`^raise\s+(?:[A-Za-z_]\w*\.)*NotImplementedError\b`)
+
+// pythonStubBody reports whether a Python def's first real statement — after
+// the header and any docstring — is `raise NotImplementedError`. The body is
+// masked, so a docstring or comment that mentions NotImplementedError does
+// not make an implementation abstract.
+func pythonStubBody(raw string) bool {
+	if !strings.Contains(raw, "NotImplementedError") {
+		return false
+	}
+	body := maskCode("python", raw)
+	// The header ends at the first ':' outside brackets (parameters may
+	// carry annotations and defaults with colons inside brackets).
+	depth := 0
+	end := -1
+	for i := 0; i < len(body) && end < 0; i++ {
+		switch body[i] {
+		case '(', '[', '{':
+			depth++
+		case ')', ']', '}':
+			depth--
+		case ':':
+			if depth == 0 {
+				end = i + 1
+			}
+		}
+	}
+	if end < 0 {
+		return false
+	}
+	return pythonNotImplementedRe.MatchString(strings.TrimLeft(body[end:], " \t\r\n;"))
 }
 
 func isAbstractType(t *core.SymbolRecord) bool {
-	return hasModifier(t, "abstract") || strings.Contains(t.Signature, "abstract class ")
+	return hasModifier(t, "abstract") || strings.Contains(codeSignature(t), "abstract class ")
 }
 
 func hasModifier(s *core.SymbolRecord, mod string) bool {

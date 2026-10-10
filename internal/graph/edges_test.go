@@ -1015,3 +1015,23 @@ func TestMergeEdgesInterfaceDispatchKeepsImplementersOfThatInterface(t *testing.
 		t.Fatal("a same-name method of a non-implementer survived interface dispatch")
 	}
 }
+
+// codeSignature masks a signature the extractor collapsed onto one line by
+// the lexing of RawText, so code after a line comment survives.
+func TestCodeSignatureCollapsedHeader(t *testing.T) {
+	cases := []struct {
+		lang, sig, raw, want string
+	}{
+		{"kotlin", "class K : KBase(), // the base KIface", "class K : KBase(), // the base\n    KIface {\n}", "class K : KBase()," + strings.Repeat(" ", 13) + "KIface"},
+		{"python", "class M( Base, # the (old) Mixin Mixin, ):", "class M(\n    Base,  # the (old) Mixin\n    Mixin,\n):\n    pass", "class M( Base," + strings.Repeat(" ", 19) + "Mixin, ):"},
+		{"csharp", `[Description("class Y : Fake")] public class A`, `[Description("class Y : Fake")] public class A {}`, `[Description(                )] public class A`},
+		// No alignment (synthesized signature): masked on its own.
+		{"go", `func F() // x`, "func G() {}", "func F()     "},
+	}
+	for _, tc := range cases {
+		s := core.SymbolRecord{Language: tc.lang, Signature: tc.sig, RawText: tc.raw}
+		if got := codeSignature(&s); got != tc.want {
+			t.Errorf("%s: codeSignature = %q, want %q", tc.lang, got, tc.want)
+		}
+	}
+}
