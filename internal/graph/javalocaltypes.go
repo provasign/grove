@@ -38,11 +38,12 @@ func javaFunctionalInterfaceArity(paramType string) (int, bool) {
 // class body. Same shallow, harness-bounded approach as the other languages.
 
 var (
-	// Type x = ... (typed local; also matches enhanced-for "for (Type x :")
+	// Type x = ... (typed local; also matches enhanced-for "for (Type x :"
+	// and a declaration assigned later, `Map<K, V> map;` before a try).
 	// The generic group tolerates one nesting level (JsonDeserializer<Enum<?>>,
 	// Map<String, List<T>>) — regexes can't balance arbitrarily, one level
 	// covers real declarations.
-	javaLocalDeclRe = regexp.MustCompile(`\b([A-Z]\w*)(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?(?:\[\])?\s+(\w+)\s*[=:)]`)
+	javaLocalDeclRe = regexp.MustCompile(`\b([A-Z]\w*)(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?(?:\[\])?\s+(\w+)\s*[=:);]`)
 	// typed local including primitives and arrays, for overload matching:
 	// anchored to statement starts so "return x =" / cast fragments can't
 	// masquerade as declarations

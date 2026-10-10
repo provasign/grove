@@ -39,5 +39,37 @@ class Impl extends Builder {
 			want:           []string{"E Impl.properties overrides Builder"},
 			rawAnnotations: true,
 		},
+		{
+			// A local declared without an initializer and assigned later
+			// (`Map<K, V> map;` before a try). Its type used to arrive by
+			// accident, from a class "field" regex run over every method
+			// body; masking the class body to depth 1 lost it.
+			id: "J3-java-local-declared-then-assigned",
+			clean: one("src/p/U.java", `package p;
+interface Store { int size(); }
+class Mem implements Store { public int size() { return 0; } }
+class U {
+  Store make() { return new Mem(); }
+  void m() {
+    Store s;
+    s = make();
+    s.size();
+  }
+}
+`),
+			decoy: one("src/p/U.java", `package p;
+interface Store { int size(); }
+class Mem implements Store { public int size() { return 0; } }
+class U {
+  Store make() { return new Mem(); } // Mem s;
+  void m() {
+    Store s; /* Mem s; */
+    s = make();
+    s.size(); // Mem.size()
+  }
+}
+`),
+			want: []string{"E U.m calls Store.size"},
+		},
 	}
 }
