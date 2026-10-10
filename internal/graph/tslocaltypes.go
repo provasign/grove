@@ -733,6 +733,18 @@ func narrowByChainType(idx *edgeIndex, sat *interfaceSatisfaction, localTypes ma
 			}
 		}
 	}
+	if symbol.Language == "java" {
+		// A type declared outside the repo (`result.values.size()` on a
+		// `Map<String, Integer> values` field) or a member inherited from a
+		// base: resolve the last hop exactly as a single-hop receiver of
+		// that type (subclass overrides, base walk, fan-out cap). It used to
+		// arrive by accident, through an outer-class field map that read
+		// nested classes' fields.
+		last := fullChain[strings.LastIndexByte(fullChain, '.')+1:]
+		if byType, dispatch, _ := narrowByLocalType(idx, sat, symbol, map[string]string{last: typ}, last, calleeName, cands, nil); len(byType) > 0 || len(dispatch) > 0 {
+			return byType, dispatch, true
+		}
+	}
 	// The chain resolved to a type we know nothing more about (no candidate
 	// on it, no satisfaction entry). Unlike narrowByLocalType's single-hop
 	// contract, do NOT claim decided here: chain resolution is heuristic
