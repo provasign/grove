@@ -162,7 +162,7 @@ func csharpSemanticEdges(symbols []core.SymbolRecord) []core.Edge {
 			continue
 		}
 		if typeKind(symbol.Kind) {
-			for _, ref := range csharpInheritanceRefs(symbol.Signature+"\n"+firstLine(symbol.RawText), symbol.Kind) {
+			for _, ref := range csharpInheritanceRefs(maskedDeclHeader("csharp", symbol), symbol.Kind) {
 				if target, ok := csharpBestType(idx, ref.Name, symbol.FilePath); ok && target.ID != symbol.ID {
 					edgeType := ref.EdgeType
 					if symbol.Kind != core.KindInterface {
@@ -185,24 +185,21 @@ func csharpSemanticEdges(symbols []core.SymbolRecord) []core.Edge {
 		// libraries (Newtonsoft: P 0.20). The graph layer's call-site
 		// resolution owns calls; this pass keeps only the type-usage
 		// evidence text matching is still reliable for.
-		for _, className := range csharpConstructedTypes(symbol.RawText) {
+		masked := maskCode("csharp", symbol.RawText)
+		for _, className := range csharpConstructedTypes(masked) {
 			if target, ok := csharpBestType(idx, className, symbol.FilePath); ok && target.ID != symbol.ID {
 				add(symbolEdge(symbol, target, core.EdgeUsesType, 0.95))
 			}
 		}
 		names := make([]string, 0, 8)
-		for t := range typeTokensIn(symbol.RawText) {
+		for t := range typeTokensIn(masked) {
 			if _, ok := idx.typesByName[t]; ok {
 				names = append(names, t)
 			}
 		}
 		sort.Strings(names)
-		stripped := ""
-		if len(slowNames) > 0 {
-			stripped = stripQuotedText(symbol.RawText)
-		}
 		for _, name := range slowNames {
-			if containsTypeTokenStripped(stripped, name) {
+			if containsTypeToken(masked, name) {
 				names = append(names, name)
 			}
 		}
@@ -220,12 +217,11 @@ type csharpInheritanceRef struct {
 	EdgeType core.EdgeType
 }
 
-// The base-list capture excludes newlines ([ \t], not \s): the caller feeds
-// `Signature + "\n" + firstLine(RawText)`, and a \s here swallowed the join
-// and ran into the duplicated second line, producing a garbage name that
-// resolved to nothing — so C# extends/implements resolution emitted zero
-// edges on real code. `{` is also excluded so a same-line body brace can't
-// leak in.
+// csharpDeclHeadPattern runs on maskedDeclHeader output (one line, comments
+// and strings masked) with leading attribute sections skipped, so `class`
+// inside an attribute argument (`[Description("class Y : Fake")]`) is never
+// taken for the declaration. The base list still stops at a newline, `{` or
+// `;` for callers passing raw multi-line text.
 var csharpDeclHeadPattern = regexp.MustCompile(`\b(?:class|struct|interface|record(?:\s+(?:class|struct))?)\s+[A-Za-z_][A-Za-z0-9_]*`)
 
 func csharpInheritanceRefs(text string, kind core.SymbolKind) []csharpInheritanceRef {
@@ -245,7 +241,21 @@ func csharpInheritanceRefs(text string, kind core.SymbolKind) []csharpInheritanc
 	return refs
 }
 
+// csharpSkipAttributes drops the `[...]` attribute sections that open a
+// declaration header.
+func csharpSkipAttributes(text string) string {
+	for {
+		text = strings.TrimLeft(text, " \t\r\n")
+		n := balancedSuffixEnd(text, '[', ']')
+		if n == 0 {
+			return text
+		}
+		text = text[n:]
+	}
+}
+
 func csharpBaseList(text string) string {
+	text = csharpSkipAttributes(text)
 	loc := csharpDeclHeadPattern.FindStringIndex(text)
 	if loc == nil {
 		return ""
@@ -286,8 +296,10 @@ func csharpBaseList(text string) string {
 
 var csharpNewPattern = regexp.MustCompile(`\bnew\s+([A-Za-z_][A-Za-z0-9_.]*)(?:\s*<[^;(){}]*>)?\s*\(`)
 
-func csharpConstructedTypes(rawText string) []string {
-	matches := csharpNewPattern.FindAllStringSubmatch(stripQuotedText(rawText), -1)
+// csharpConstructedTypes returns the `new T(` class names of masked (see
+// maskCode).
+func csharpConstructedTypes(masked string) []string {
+	matches := csharpNewPattern.FindAllStringSubmatch(masked, -1)
 	seen := map[string]bool{}
 	var out []string
 	for _, match := range matches {

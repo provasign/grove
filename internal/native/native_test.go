@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/provasign/astkit/textmask"
 	"github.com/provasign/grove/internal/core"
 )
 
@@ -1839,4 +1840,81 @@ func TestTSPayloadSkipsStrayStdout(t *testing.T) {
 	if got := string(tsPayload([]byte(`{"files":1}`))); got != `{"files":1}` {
 		t.Fatalf("output without sentinel must pass through, got %q", got)
 	}
+}
+
+// Comment/string-as-code audit (2026-10-10), native text passes: every scan
+// runs on textmask output, and declaration clauses come from the masked
+// header only.
+func TestNativeTextPassesIgnoreCommentsAndStrings(t *testing.T) {
+	names := func(refs []phpInheritanceRef) []string {
+		var out []string
+		for _, r := range refs {
+			out = append(out, r.Name)
+		}
+		return out
+	}
+	php := "class A {\n  public function run() {\n    $f = function () use ($x) { return 1; };\n    // we no longer use Loggable;\n    $s = \"use Other;\";\n  }\n  use RealTrait;\n}"
+	if got := names(phpInheritanceRefs(maskCode("php", php))); !reflect.DeepEqual(got, []string{"RealTrait"}) {
+		t.Errorf("PHP trait uses: got %v, want [RealTrait]", got)
+	}
+	if got := phpReferencedClasses(textmask.MaskFile("php", "<p>new \\App\\Html()</p>\n<?php\n// use App\\Dead;\n$s = \"new \\App\\Fake()\";\n$x = new \\App\\Real();\n")); !reflect.DeepEqual(got, []string{"App\\Real"}) {
+		t.Errorf("PHP referenced classes: got %v, want [App\\Real]", got)
+	}
+	if got := rustModuleNames(maskCode("rust", "/*\nmod dead;\n*/\n// mod gone;\nmod live;\n")); !reflect.DeepEqual(got, []string{"live"}) {
+		t.Errorf("Rust modules: got %v, want [live]", got)
+	}
+	if got := rustSignatureTypes(maskCode("rust", "fn convert<'a>(x: &'a mut Input) -> &'a Output {\n    let c = 'x';\n    let m = \"err: Config\"; // y: Shape\n}")); !reflect.DeepEqual(got, []string{"Input", "Output"}) {
+		t.Errorf("Rust signature types: got %v, want [Input Output]", got)
+	}
+	if got := rustImplRefs(maskCode("rust", "fn f() {\n    // impl Shape for Wrapper {}\n    let s = \"impl Shape for Other {}\";\n}")); len(got) != 0 {
+		t.Errorf("Rust impl refs from comment/string: %v", got)
+	}
+	if got := javaPackageOf([]byte("/*\npackage wrong;\n*/\n// package gone;\npackage right.one;\n")); got != "right.one" {
+		t.Errorf("Java package: got %q", got)
+	}
+	java := core.SymbolRecord{RawText: "@Ann({\"x\"})\npublic class A<T extends Comparable<T>>\n    extends Base\n    implements I, J { // extends Fake implements K\n  void m() { /* extends Q */ }\n}"}
+	var java2 []string
+	for _, r := range javaInheritanceRefs(maskedDeclHeader("java", java)) {
+		java2 = append(java2, string(r.EdgeType)+" "+r.Name)
+	}
+	if want := []string{"extends Base", "implements I", "implements J"}; !reflect.DeepEqual(java2, want) {
+		t.Errorf("Java inheritance: got %v, want %v", java2, want)
+	}
+	for _, raw := range []string{
+		"class A extends B {" + strings.Repeat("\n  int x;", 1000) + "\n}",
+		"@Ann(\"" + strings.Repeat("x", 5000) + "\") class A extends B {}",
+	} {
+		if got := maskedDeclHeader("java", core.SymbolRecord{RawText: raw}); !strings.HasSuffix(got, "class A extends B") {
+			t.Errorf("long Java header: got %q", clipTail(got))
+		}
+	}
+	cs := core.SymbolRecord{RawText: "[Description(\"e.g. class Y : Fake, IOther\")]\n[Obsolete]\npublic class A<T> : // not Fake\n  Base,\n  IReal where T : new() {\n  void M() {}\n}"}
+	var csNames []string
+	for _, r := range csharpInheritanceRefs(maskedDeclHeader("csharp", cs), core.KindClass) {
+		csNames = append(csNames, r.Name)
+	}
+	if want := []string{"Base", "IReal"}; !reflect.DeepEqual(csNames, want) {
+		t.Errorf("C# bases: got %v, want %v", csNames, want)
+	}
+	cSrc := "#include \"a.h\"\n/*\n#include \"dead.h\"\n*/\n#if 0\n#include \"off.h\"\n#else\n#include <on.h>\n#endif\n// #include \"c.h\"\nconst char *s = \"#include \\\"q.h\\\"\";\n"
+	if got := cIncludes(cIncludeScanText("a.c", cSrc)); !reflect.DeepEqual(got, []string{"a.h", "on.h"}) {
+		t.Errorf("C includes: got %v, want [a.h on.h]", got)
+	}
+	if got := cFamilyConstructedTypes(maskCode("cpp", "void f() {\n  // Widget(arg) is legacy\n  auto s = \"Gadget(1)\";\n  Real r = Real(2);\n}")); !reflect.DeepEqual(got, []string{"Real"}) {
+		t.Errorf("C++ constructed types: got %v, want [Real]", got)
+	}
+	if goContainsType("func f() int { // auth.User\n\ts := \"User\"\n\treturn len(s)\n}", "User") {
+		t.Error("Go type token from comment/string")
+	}
+	// An apostrophe in a comment no longer blanks the code after it.
+	if got := csharpConstructedTypes(maskCode("csharp", "void M() {\n  // don't use Real yet\n  var r = new Real(); var c = 'x';\n}")); !reflect.DeepEqual(got, []string{"Real"}) {
+		t.Errorf("C# constructed types after apostrophe: got %v", got)
+	}
+}
+
+func clipTail(s string) string {
+	if len(s) > 80 {
+		return "..." + s[len(s)-80:]
+	}
+	return s
 }
