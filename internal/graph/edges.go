@@ -1551,6 +1551,49 @@ func buildDefinesAndImports(symbols []core.SymbolRecord) []core.Edge {
 	return edges
 }
 
+// enclosingWhenAmbiguous narrows same-file type candidates for a child's
+// ParentSymbol (a simple name) to the one whose span encloses the child, when
+// more than one same-file type carries that name. A test file with three
+// nested `static class Factory` (gson JsonAdapterAnnotationOnClassesTest)
+// otherwise linked every Factory to every Factory.create, and change_impact
+// listed each implementation three times. A unique candidate is kept as is:
+// Go and Rust methods sit outside their type's span.
+func enclosingWhenAmbiguous(symbol core.SymbolRecord, candidates []*core.SymbolRecord) []*core.SymbolRecord {
+	sameFile := 0
+	for _, c := range candidates {
+		if c.FilePath == symbol.FilePath && c.Name == symbol.ParentSymbol {
+			sameFile++
+		}
+	}
+	if sameFile < 2 {
+		return candidates
+	}
+	var enclosing []*core.SymbolRecord
+	for _, c := range candidates {
+		if c.FilePath == symbol.FilePath && c.Span.Start <= symbol.Span.Start && c.Span.End >= symbol.Span.End {
+			enclosing = append(enclosing, c)
+		}
+	}
+	if len(enclosing) == 0 {
+		return candidates
+	}
+	// Innermost first wins: an outer class with the same name as a nested
+	// one (rare) also encloses the child, so keep the narrowest span.
+	best := enclosing[0]
+	for _, c := range enclosing[1:] {
+		if c.Span.End-c.Span.Start < best.Span.End-best.Span.Start {
+			best = c
+		}
+	}
+	out := []*core.SymbolRecord{best}
+	for _, c := range candidates {
+		if c.FilePath != symbol.FilePath {
+			out = append(out, c) // cross-file rules below still apply
+		}
+	}
+	return out
+}
+
 // buildContains emits parent-symbol → child-symbol edges.
 func buildContains(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
 	var edges []core.Edge
@@ -1558,7 +1601,7 @@ func buildContains(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
 		if symbol.ParentSymbol == "" {
 			continue
 		}
-		for _, parent := range namedSymbols(idx, symbol.ParentSymbol) {
+		for _, parent := range enclosingWhenAmbiguous(symbol, namedSymbols(idx, symbol.ParentSymbol)) {
 			// The byName key is lowercase but identifiers are case-sensitive
 			// (PHP class names excepted): without this check a method whose
 			// receiver is `responseWriter` also attached to the interface
