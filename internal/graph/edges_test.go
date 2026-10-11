@@ -1035,3 +1035,53 @@ func TestCodeSignatureCollapsedHeader(t *testing.T) {
 		}
 	}
 }
+
+// gson JsonAdapterAnnotationOnClassesTest has three sibling outer classes,
+// each with a nested `static class Factory` and its own `create`. ParentSymbol
+// is the simple name "Factory", so every Factory claimed every create and
+// change_impact listed each implementation three times.
+func TestJavaSameNamedNestedClassesContainOnlyTheirOwnMembers(t *testing.T) {
+	f := "T.java"
+	sym := func(id, kind, name, qual, parent string, start, end int) core.SymbolRecord {
+		return core.SymbolRecord{ID: id, FilePath: f, Language: "java", Kind: core.SymbolKind(kind), Name: name,
+			QualifiedName: qual, ParentSymbol: parent, Span: core.LineRange{Start: start, End: end}}
+	}
+	syms := []core.SymbolRecord{
+		sym("T.java::T.A.Factory", "class", "Factory", "T.A.Factory", "A", 2, 6),
+		sym("T.java::T.A.Factory.create", "method", "create", "T.A.Factory.create", "Factory", 3, 5),
+		sym("T.java::T.B.Factory", "class", "Factory", "T.B.Factory", "B", 10, 14),
+		sym("T.java::T.B.Factory.create", "method", "create", "T.B.Factory.create", "Factory", 11, 13),
+		sym("T.java::T.C.Factory", "class", "Factory", "T.C.Factory", "C", 20, 24),
+		sym("T.java::T.C.Factory.create", "method", "create", "T.C.Factory.create", "Factory", 21, 23),
+	}
+	g := New()
+	g.Replace(syms, 2)
+	for _, outer := range []string{"A", "B", "C"} {
+		for _, inner := range []string{"A", "B", "C"} {
+			from, to := "T.java::T."+outer+".Factory", "T.java::T."+inner+".Factory.create"
+			if got := hasEdge(g, core.EdgeContains, from, to); got != (outer == inner) {
+				t.Errorf("contains %s -> %s = %v, want %v", from, to, got, outer == inner)
+			}
+		}
+	}
+}
+
+// A Java constructor shares its class's name; with overloads there are
+// several same-file symbols named like the parent, and none of them may be
+// taken for the parent of the others.
+func TestJavaOverloadedConstructorsAttachToTheirClass(t *testing.T) {
+	f := "P.java"
+	syms := []core.SymbolRecord{
+		{ID: "P.java::P", FilePath: f, Language: "java", Kind: core.KindClass, Name: "P", QualifiedName: "P", Span: core.LineRange{Start: 1, End: 20}},
+		{ID: "P.java::P.P#1", FilePath: f, Language: "java", Kind: core.SymbolKind("constructor"), Name: "P", QualifiedName: "P.P", ParentSymbol: "P", Span: core.LineRange{Start: 2, End: 4}},
+		{ID: "P.java::P.P#2", FilePath: f, Language: "java", Kind: core.SymbolKind("constructor"), Name: "P", QualifiedName: "P.P", ParentSymbol: "P", Span: core.LineRange{Start: 5, End: 7}},
+		{ID: "P.java::P.next", FilePath: f, Language: "java", Kind: core.KindMethod, Name: "next", QualifiedName: "P.next", ParentSymbol: "P", Span: core.LineRange{Start: 8, End: 10}},
+	}
+	g := New()
+	g.Replace(syms, 2)
+	for _, child := range []string{"P.java::P.P#1", "P.java::P.P#2", "P.java::P.next"} {
+		if !hasEdge(g, core.EdgeContains, "P.java::P", child) {
+			t.Errorf("class P does not contain %s", child)
+		}
+	}
+}
