@@ -762,8 +762,9 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 	result.Native = append(result.Native, nativeResult.Diagnostics...)
 	// The analyzers ran: their verdict is what this database's native
 	// edges reflect from now on (a no-change re-index returns above and
-	// leaves the stored verdict alone).
-	prog.native(nativeResult.Diagnostics)
+	// leaves the stored verdict alone). An analyzer skipped with its edges
+	// carried forward keeps its stored verdict, see carryForwardVerdict.
+	prog.native(carryForwardVerdict(ctx, i.store, nativeResult.Diagnostics))
 	tick("native-analyzers")
 
 	// Carry forward stored native edges for the skipped analyzers' languages:
@@ -1102,4 +1103,38 @@ func remapEdgeEndpoints(edges []core.Edge, remap map[string]string) {
 		edges[i].From = fix(edges[i].From)
 		edges[i].To = fix(edges[i].To)
 	}
+}
+
+// carryForwardVerdict keeps the stored per-analyzer verdict for every
+// analyzer this run skipped with "previous edges carried forward". The
+// persisted verdict describes the native edges in the database, and those
+// edges did not change. Without this, editing a README after a full Java
+// index rewrote the verdict to "java: skipped: no changed files", and prism
+// then marked every change-impact answer on the untouched Java graph as
+// unconfirmed (all compiled-language cells in the 2026-10-11 bench).
+func carryForwardVerdict(ctx context.Context, st *store.Store, current []string) []string {
+	raw, ok, err := st.GetMeta(ctx, core.MetaIndexNative)
+	if err != nil || !ok || raw == "" {
+		return current
+	}
+	var previous []string
+	if json.Unmarshal([]byte(raw), &previous) != nil || len(previous) == 0 {
+		return current
+	}
+	var merged []string
+	for _, line := range current {
+		name, rest, found := strings.Cut(line, ": ")
+		carried := found && strings.Contains(rest, "carried forward") &&
+			(strings.HasPrefix(rest, "skipped:") || strings.Contains(rest, "previous native edges carried forward"))
+		if carried {
+			for _, prev := range previous {
+				prevName, prevRest, prevFound := strings.Cut(prev, ": ")
+				if prevFound && prevName == name && !strings.HasPrefix(prevRest, "skipped:") {
+					merged = append(merged, prev)
+				}
+			}
+		}
+		merged = append(merged, line)
+	}
+	return merged
 }

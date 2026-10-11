@@ -21,6 +21,10 @@ func TestIndex_RecordsRunStateInStatus(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n\nfunc helper() {}\n\nfunc main() { helper() }\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// A go.mod lets the Go analyzer run, so the verdict names a real tier.
+	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module example.com/runstate\n\ngo 1.22\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	st, err := store.Open(root)
 	if err != nil {
 		t.Fatal(err)
@@ -60,6 +64,43 @@ func TestIndex_RecordsRunStateInStatus(t *testing.T) {
 	}
 	if again.Phase != "complete" {
 		t.Fatalf("phase after no-op = %q", again.Phase)
+	}
+	// A re-index where only a non-source file changed skips the analyzers
+	// and carries their edges forward. The stored verdict must still say
+	// which tier built those edges, or a README edit downgrades every later
+	// answer on the unchanged graph to "unconfirmed".
+	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("# notes\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, res, err := idx.Index(ctx, root); err != nil || res.FilesUpdated == 0 {
+		t.Fatalf("markdown re-index: %v %#v", err, res)
+	}
+	after, err := st.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	skipped := map[string]bool{}
+	for _, line := range after.Native {
+		if name, rest, ok := strings.Cut(line, ": "); ok && strings.HasPrefix(rest, "skipped: no changed files") {
+			skipped[name] = true
+		}
+	}
+	if !skipped["go"] {
+		t.Fatalf("expected the go analyzer to be skipped on a markdown-only change, got %v", after.Native)
+	}
+	carried := 0
+	for _, line := range status.Native {
+		name, rest, ok := strings.Cut(line, ": ")
+		if !ok || !skipped[name] || strings.HasPrefix(rest, "skipped:") {
+			continue
+		}
+		carried++
+		if !strings.Contains(strings.Join(after.Native, "|"), line) {
+			t.Fatalf("verdict %q lost after markdown-only re-index: %v", line, after.Native)
+		}
+	}
+	if carried == 0 {
+		t.Fatalf("test is vacuous: first verdict had no go analyzer lines: %v", status.Native)
 	}
 }
 
