@@ -1065,3 +1065,23 @@ func TestJavaSameNamedNestedClassesContainOnlyTheirOwnMembers(t *testing.T) {
 		}
 	}
 }
+
+// A Java constructor shares its class's name; with overloads there are
+// several same-file symbols named like the parent, and none of them may be
+// taken for the parent of the others.
+func TestJavaOverloadedConstructorsAttachToTheirClass(t *testing.T) {
+	f := "P.java"
+	syms := []core.SymbolRecord{
+		{ID: "P.java::P", FilePath: f, Language: "java", Kind: core.KindClass, Name: "P", QualifiedName: "P", Span: core.LineRange{Start: 1, End: 20}},
+		{ID: "P.java::P.P#1", FilePath: f, Language: "java", Kind: core.SymbolKind("constructor"), Name: "P", QualifiedName: "P.P", ParentSymbol: "P", Span: core.LineRange{Start: 2, End: 4}},
+		{ID: "P.java::P.P#2", FilePath: f, Language: "java", Kind: core.SymbolKind("constructor"), Name: "P", QualifiedName: "P.P", ParentSymbol: "P", Span: core.LineRange{Start: 5, End: 7}},
+		{ID: "P.java::P.next", FilePath: f, Language: "java", Kind: core.KindMethod, Name: "next", QualifiedName: "P.next", ParentSymbol: "P", Span: core.LineRange{Start: 8, End: 10}},
+	}
+	g := New()
+	g.Replace(syms, 2)
+	for _, child := range []string{"P.java::P.P#1", "P.java::P.P#2", "P.java::P.next"} {
+		if !hasEdge(g, core.EdgeContains, "P.java::P", child) {
+			t.Errorf("class P does not contain %s", child)
+		}
+	}
+}

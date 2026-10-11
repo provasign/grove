@@ -1559,9 +1559,16 @@ func buildDefinesAndImports(symbols []core.SymbolRecord) []core.Edge {
 // listed each implementation three times. A unique candidate is kept as is:
 // Go and Rust methods sit outside their type's span.
 func enclosingWhenAmbiguous(symbol core.SymbolRecord, candidates []*core.SymbolRecord) []*core.SymbolRecord {
+	// Only same-file TYPE declarations compete: a Java constructor shares
+	// its class's name, and must never be taken for its own parent.
+	sameFileType := func(c *core.SymbolRecord) bool {
+		return c.FilePath == symbol.FilePath && c.Name == symbol.ParentSymbol && c.ID != symbol.ID &&
+			(c.Kind == core.KindStruct || c.Kind == core.KindClass || c.Kind == core.KindInterface ||
+				c.Kind == core.KindTrait || c.Kind == core.KindType)
+	}
 	sameFile := 0
 	for _, c := range candidates {
-		if c.FilePath == symbol.FilePath && c.Name == symbol.ParentSymbol {
+		if sameFileType(c) {
 			sameFile++
 		}
 	}
@@ -1570,7 +1577,7 @@ func enclosingWhenAmbiguous(symbol core.SymbolRecord, candidates []*core.SymbolR
 	}
 	var enclosing []*core.SymbolRecord
 	for _, c := range candidates {
-		if c.FilePath == symbol.FilePath && c.Span.Start <= symbol.Span.Start && c.Span.End >= symbol.Span.End {
+		if sameFileType(c) && c.Span.Start <= symbol.Span.Start && c.Span.End >= symbol.Span.End {
 			enclosing = append(enclosing, c)
 		}
 	}
@@ -1587,8 +1594,8 @@ func enclosingWhenAmbiguous(symbol core.SymbolRecord, candidates []*core.SymbolR
 	}
 	out := []*core.SymbolRecord{best}
 	for _, c := range candidates {
-		if c.FilePath != symbol.FilePath {
-			out = append(out, c) // cross-file rules below still apply
+		if !sameFileType(c) {
+			out = append(out, c) // non-type and cross-file candidates: the rules below still apply
 		}
 	}
 	return out
