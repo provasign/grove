@@ -650,10 +650,22 @@ func compilerDeclaredSymbols(req Request, decls []javacDecl) []core.SymbolRecord
 			byFile[s.FilePath] = append(byFile[s.FilePath], s)
 		}
 	}
+	// A parsed symbol covers a declaration when it has the same name and the
+	// spans overlap. Overlap, not containment of javac's start line: javac
+	// and tree-sitter can disagree on line numbering (commons-lang
+	// ClassUtilsOssFuzzTest: NUL and control bytes in a string literal put
+	// javac one line earlier), and a near-miss would declare the method twice.
+	// An anonymous class is named by its position, which the two count
+	// differently (tabs, wide characters), so any parsed anonymous class
+	// starting on the same line covers it.
 	covered := func(d javacDecl) bool {
 		anon := strings.HasPrefix(d.Name, "<anonymous@")
 		for _, s := range byFile[d.File] {
-			if s.Span.Start > d.Start || (s.Span.End > 0 && s.Span.End < d.Start) {
+			end := s.Span.End
+			if end <= 0 {
+				end = s.Span.Start
+			}
+			if s.Span.Start > d.End || end < d.Start {
 				continue
 			}
 			if s.Name == d.Name {

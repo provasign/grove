@@ -104,3 +104,25 @@ func keys(m map[string]core.SymbolRecord) []string {
 	}
 	return out
 }
+
+// A declaration the parser has under the same name, one line off (javac and
+// tree-sitter disagree on line counting around control bytes), is covered,
+// not declared twice.
+func TestCompilerDeclaredSymbolsCoverOverlappingSpans(t *testing.T) {
+	root := t.TempDir()
+	body := "class A {\n  void m() {\n  }\n}\n"
+	if err := os.WriteFile(filepath.Join(root, "A.java"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	req := Request{Root: root, Symbols: []core.SymbolRecord{
+		{ID: "A.java::A@b", FilePath: "A.java", BlobSHA: "b", Language: "java", Kind: core.KindClass, Name: "A", Span: core.LineRange{Start: 1, End: 4}},
+		{ID: "A.java::A.m@b", FilePath: "A.java", BlobSHA: "b", Language: "java", Kind: core.KindMethod, Name: "m", Span: core.LineRange{Start: 3, End: 3}},
+	}}
+	got := compilerDeclaredSymbols(req, []javacDecl{
+		{File: "A.java", Kind: "method", Name: "m", Qualified: "A.m", Parent: "A", Start: 2, End: 3},
+		{File: "A.java", Kind: "method", Name: "n", Qualified: "A.n", Parent: "A", Start: 2, End: 3},
+	})
+	if len(got) != 1 || got[0].Name != "n" {
+		t.Fatalf("want only the undeclared n, got %+v", got)
+	}
+}
