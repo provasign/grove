@@ -254,6 +254,22 @@ public class GroveJavacResolver {
             long ln = dp.getLeaf() instanceof MethodTree ? declLine((MethodTree) dp.getLeaf(), du) : line(dp.getLeaf(), du);
             return new String[]{root.relativize(abs).toString().replace('\\', '/'), name, Long.toString(ln)};
         }
+        // Where the innermost lambda holding the current node starts, as
+        // "line:column" (1-based, characters): grove names a lambda symbol
+        // <lambda@line:column>, so the call is also attributed to it.
+        String lambdaAt() {
+            for (TreePath p = getCurrentPath(); p != null; p = p.getParentPath()) {
+                Tree t = p.getLeaf();
+                if (t instanceof LambdaExpressionTree) {
+                    long pos = trees.getSourcePositions().getStartPosition(cu, t);
+                    if (pos < 0) return null;
+                    long ln = cu.getLineMap().getLineNumber(pos);
+                    return ln + ":" + (pos - cu.getLineMap().getStartPosition(ln) + 1);
+                }
+                if (t instanceof MethodTree || t instanceof ClassTree) return null;
+            }
+            return null;
+        }
         // Whether the current node sits in a lambda body inside its enclosing method.
         boolean inLambda() {
             for (TreePath p = getCurrentPath(); p != null; p = p.getParentPath()) {
@@ -268,7 +284,7 @@ public class GroveJavacResolver {
             if (from == null || to == null) return;
             String json = "{\"from\":" + q(file) + ",\"fromName\":" + q(from[0]) + ",\"fromLine\":" + from[1] +
                 ",\"to\":" + q(to[0]) + ",\"toName\":" + q(to[1]) + ",\"toLine\":" + to[2] +
-                (write == null ? "" : ",\"write\":" + write) + (inLambda() ? ",\"lambda\":true" : "") +
+                (write == null ? "" : ",\"write\":" + write) + (inLambda() ? ",\"lambda\":true" + (lambdaAt() == null ? "" : ",\"lambdaAt\":" + q(lambdaAt())) : "") +
                 (inMethodRef ? ",\"ref\":true" : "") + "}";
             if (!seen.add(json)) return;
             if (out.length() > 0) out.append(',');

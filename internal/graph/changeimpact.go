@@ -1065,7 +1065,7 @@ func (g *CodeGraph) resolveLooseQueryScopedLocked(query, file string) (string, e
 			}
 			matched := true
 			for i := range actual {
-				if !strings.EqualFold(actual[i], queryParams[i]) {
+				if !sameParamType(actual[i], queryParams[i]) {
 					matched = false
 					break
 				}
@@ -1666,6 +1666,25 @@ func signatureCompatible(declParams, candParams []string, wildcards map[string]b
 	return true
 }
 
+// sameParamType compares two parameter type tokens. Case matters: Java's
+// boolean and Boolean (long/Long, double/Double, ...) are different
+// overloads, and comparing case-insensitively answered value(boolean) with
+// the value(Boolean) declaration too. Only C#'s keyword aliases of the same
+// type (string/String, object/Object) compare equal across case.
+func sameParamType(a, b string) bool {
+	if a == b {
+		return true
+	}
+	if !strings.EqualFold(a, b) {
+		return false
+	}
+	switch strings.ToLower(a) {
+	case "string", "object":
+		return true
+	}
+	return false
+}
+
 // filterByParamTypes keeps candidates whose parameter types equal the given
 // list exactly (bare-token comparison).
 func filterByParamTypes(cands []core.SymbolRecord, params []string) []core.SymbolRecord {
@@ -1677,7 +1696,7 @@ func filterByParamTypes(cands []core.SymbolRecord, params []string) []core.Symbo
 		}
 		match := true
 		for i := range params {
-			if !strings.EqualFold(got[i], params[i]) {
+			if !sameParamType(got[i], params[i]) {
 				match = false
 				break
 			}
