@@ -1,0 +1,106 @@
+package native
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/provasign/grove/internal/core"
+)
+
+// gson TypeAdapters.java (2026-10-12): 25 TypeAdapter.write overrides live in
+// anonymous classes assigned to static fields; the parser indexed none, javac
+// attributed all of them, and change_impact reported the family closed at 6
+// of 31. The compiler's declarations are the universe: whatever the parser
+// lacks is added as a compiler-declared symbol, in the parser's naming, and
+// takes part in the inheritance pass like any other symbol.
+func TestJavacAddsDeclarationsTheParserMissed(t *testing.T) {
+	if findJDK() == nil {
+		t.Skip("no JDK 11+ available")
+	}
+	root := t.TempDir()
+	src := `package p;
+
+public class Adapters {
+  public static final Adapter CLASS =
+      new Adapter() {
+        @Override
+        public void write(Out out, Object value) {
+          out.nullValue();
+        }
+      };
+
+  public abstract static class Adapter {
+    public abstract void write(Out out, Object value);
+  }
+
+  public static class Out {
+    public void nullValue() {}
+  }
+}
+`
+	if err := os.MkdirAll(filepath.Join(root, "p"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "p", "Adapters.java"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The parser's view before the astkit fix: the field, but nothing
+	// declared inside its initializer.
+	file, blob := "p/Adapters.java", "blob1"
+	sym := func(kind core.SymbolKind, name, qualified, parent string, start, end int, signature string) core.SymbolRecord {
+		return core.SymbolRecord{ID: file + "::" + qualified + "@" + blob, FilePath: file, BlobSHA: blob, Language: "java",
+			Kind: kind, Name: name, QualifiedName: qualified, ParentSymbol: parent,
+			Span: core.LineRange{Start: start, End: end}, Signature: signature, RawText: signature}
+	}
+	parsed := []core.SymbolRecord{
+		sym(core.KindClass, "Adapters", "Adapters", "", 3, 20, "public class Adapters {"),
+		sym(core.KindField, "CLASS", "Adapters.CLASS", "Adapters", 4, 10, "public static final Adapter CLASS ="),
+		sym(core.KindClass, "Adapter", "Adapters.Adapter", "Adapters", 12, 14, "public abstract static class Adapter {"),
+		sym(core.KindMethod, "write", "Adapters.Adapter.write", "Adapter", 13, 13, "public abstract void write(Out out, Object value);"),
+		sym(core.KindClass, "Out", "Adapters.Out", "Adapters", 16, 18, "public static class Out {"),
+		sym(core.KindMethod, "nullValue", "Adapters.Out.nullValue", "Out", 17, 17, "public void nullValue() {}"),
+	}
+	result := javaAnalyzer{}.Analyze(context.Background(), Request{Root: root, Symbols: parsed, Files: []string{file}})
+	byQN := map[string]core.SymbolRecord{}
+	for _, s := range result.Symbols {
+		byQN[s.QualifiedName] = s
+	}
+	anon, ok := byQN["Adapters.<anonymous@5:7>"]
+	if !ok {
+		t.Fatalf("anonymous class not declared by the compiler; got %v\n%s", keys(byQN), strings.Join(result.Diagnostics, "\n"))
+	}
+	if anon.Kind != core.KindClass || anon.Span.Start != 5 || anon.Span.End != 10 ||
+		!strings.Contains(anon.Signature, "extends Adapter") || anon.ParentSymbol != "Adapters" {
+		t.Fatalf("anonymous class record: %+v", anon)
+	}
+	write, ok := byQN["Adapters.<anonymous@5:7>.write"]
+	if !ok || write.Kind != core.KindMethod || write.ParentSymbol != "<anonymous@5:7>" || write.Span.Start != 6 {
+		t.Fatalf("override inside the anonymous class: %+v (found %v)", write, ok)
+	}
+	for _, s := range result.Symbols {
+		if s.QualifiedName == "Adapters" || s.QualifiedName == "Adapters.Adapter.write" {
+			t.Fatalf("a parsed declaration was declared again: %+v", s)
+		}
+	}
+	// Parser-identical records: RawText is the `new Adapter() {...}` text
+	// (the family pass matches method sets, not an extends header, for
+	// anonymous classes), and the method body text is its own span.
+	if !strings.HasPrefix(anon.RawText, "new Adapter() {") || !strings.Contains(write.RawText, "out.nullValue();") {
+		t.Fatalf("raw text: class %q / method %q", anon.RawText, write.RawText)
+	}
+	joined := strings.Join(result.Diagnostics, "\n")
+	if !strings.Contains(joined, "javac declared 2 symbol(s) in 1 file(s) the parser did not index") {
+		t.Fatalf("diagnostic missing:\n%s", joined)
+	}
+}
+
+func keys(m map[string]core.SymbolRecord) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}

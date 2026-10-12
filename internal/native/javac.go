@@ -487,16 +487,17 @@ func javaPackageOf(data []byte) string {
 }
 
 func javacResolve(ctx context.Context, req Request) ([]core.Edge, []string) {
-	edges, diags, _ := javacResolveScoped(ctx, req)
+	edges, diags, _, _ := javacResolveScoped(ctx, req)
 	return edges, diags
 }
 
 // javacResolveScoped also returns the package directories an incremental run
-// re-attributed (nil for a full run).
-func javacResolveScoped(ctx context.Context, req Request) ([]core.Edge, []string, []string) {
+// re-attributed (nil for a full run) and the compiler-declared symbols the
+// parser lacked.
+func javacResolveScoped(ctx context.Context, req Request) ([]core.Edge, []string, []string, []core.SymbolRecord) {
 	j := findJDK()
 	if j == nil {
-		return nil, []string{"javac resolver skipped: no JDK 11+ found (JAVA_HOME, PATH, java_home, Homebrew openjdk); calls are name-resolved"}, nil
+		return nil, []string{"javac resolver skipped: no JDK 11+ found (JAVA_HOME, PATH, java_home, Homebrew openjdk); calls are name-resolved"}, nil, nil
 	}
 	var files []string
 	for _, f := range req.Files {
@@ -509,7 +510,7 @@ func javacResolveScoped(ctx context.Context, req Request) ([]core.Edge, []string
 		}
 	}
 	if len(files) == 0 {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	units, scopedDirs := javaScope(req, files)
 	if units == nil {
@@ -517,17 +518,17 @@ func javacResolveScoped(ctx context.Context, req Request) ([]core.Edge, []string
 	}
 	tmp, err := os.MkdirTemp("", "grove-javac-")
 	if err != nil {
-		return nil, []string{"javac resolver skipped: " + err.Error()}, nil
+		return nil, []string{"javac resolver skipped: " + err.Error()}, nil, nil
 	}
 	defer os.RemoveAll(tmp)
 	src := filepath.Join(tmp, "GroveJavacResolver.java")
 	cpFile := filepath.Join(tmp, "classpath.txt")
 	cp, cpNote := javacClasspathCached(ctx, j, req.Root, tmp)
 	if err := os.WriteFile(src, []byte(javacResolverSource), 0o600); err != nil {
-		return nil, []string{"javac resolver skipped: " + err.Error()}, nil
+		return nil, []string{"javac resolver skipped: " + err.Error()}, nil, nil
 	}
 	if err := os.WriteFile(cpFile, []byte(cp), 0o600); err != nil {
-		return nil, []string{"javac resolver skipped: " + err.Error()}, nil
+		return nil, []string{"javac resolver skipped: " + err.Error()}, nil, nil
 	}
 	var payload javacPayload
 	batches := javaBatches(req.Root, files)
@@ -550,14 +551,24 @@ func javacResolveScoped(ctx context.Context, req Request) ([]core.Edge, []string
 		}
 		part, err := runJavacResolver(ctx, j, req.Root, tmp, src, cpFile, batchUnits, sourcepath, bi, req.Resident)
 		if err != nil {
-			return nil, []string{err.Error()}, nil
+			return nil, []string{err.Error()}, nil, nil
 		}
 		payload.Files += part.Files
 		payload.Errors += part.Errors
 		payload.Calls = append(payload.Calls, part.Calls...)
 		payload.Members = append(payload.Members, part.Members...)
+		payload.Decls = append(payload.Decls, part.Decls...)
 	}
-	symbols := newSymbolLocator(req.Symbols, map[string]bool{"java": true})
+	// The compiler's declarations are the universe. Whatever the parser did
+	// not index (gson TypeAdapters: 25 adapters in static field initializers,
+	// 2026-10-12) is added as a compiler-declared symbol, so edges land on
+	// it and a "closed" family really is closed.
+	declared := compilerDeclaredSymbols(req, payload.Decls)
+	all := req.Symbols
+	if len(declared) > 0 {
+		all = append(append(make([]core.SymbolRecord, 0, len(req.Symbols)+len(declared)), req.Symbols...), declared...)
+	}
+	symbols := newSymbolLocator(all, map[string]bool{"java": true})
 	var edges []core.Edge
 	// One call edge per (caller, callee); it is lambda-body only when every
 	// call behind it sits in a lambda.
@@ -612,7 +623,131 @@ func javacResolveScoped(ctx context.Context, req Request) ([]core.Edge, []string
 	if scopedDirs != nil {
 		diags = append(diags, "scoped to "+itoa(len(scopedDirs))+" affected package dir(s); other packages' compiler edges carried forward")
 	}
-	return edges, diags, scopedDirs
+	if len(declared) > 0 {
+		files := map[string]bool{}
+		for _, d := range declared {
+			files[d.FilePath] = true
+		}
+		diags = append(diags, "javac declared "+itoa(len(declared))+" symbol(s) in "+itoa(len(files))+" file(s) the parser did not index; added as compiler-declared symbols")
+	}
+	return edges, diags, scopedDirs, declared
+}
+
+// compilerDeclaredSymbols returns a SymbolRecord for every javac declaration
+// that no parsed symbol covers: same file, same name, span containing the
+// declaration's start line (an anonymous class also matches a parsed
+// anonymous class starting on the same line, whatever its column). Records
+// follow the parser's conventions (ID file::qualified@blob, ParentSymbol the
+// parent's last segment, the anonymous class signature carrying its base
+// type) so every downstream pass treats them as ordinary symbols.
+func compilerDeclaredSymbols(req Request, decls []javacDecl) []core.SymbolRecord {
+	if len(decls) == 0 {
+		return nil
+	}
+	byFile := map[string][]core.SymbolRecord{}
+	for _, s := range req.Symbols {
+		if s.Language == "java" {
+			byFile[s.FilePath] = append(byFile[s.FilePath], s)
+		}
+	}
+	covered := func(d javacDecl) bool {
+		anon := strings.HasPrefix(d.Name, "<anonymous@")
+		for _, s := range byFile[d.File] {
+			if s.Span.Start > d.Start || (s.Span.End > 0 && s.Span.End < d.Start) {
+				continue
+			}
+			if s.Name == d.Name {
+				return true
+			}
+			if anon && s.Span.Start == d.Start && strings.HasPrefix(s.Name, "<anonymous@") {
+				return true
+			}
+		}
+		return false
+	}
+	lines := map[string][]string{}
+	fileLines := func(file string) []string {
+		if l, ok := lines[file]; ok {
+			return l
+		}
+		data, err := osReadFile(filepath.Join(req.Root, filepath.FromSlash(file)))
+		if err != nil {
+			lines[file] = nil
+			return nil
+		}
+		lines[file] = strings.Split(string(data), "\n")
+		return lines[file]
+	}
+	var out []core.SymbolRecord
+	seen := map[string]bool{}
+	for _, d := range decls {
+		if d.Start < 1 || d.End < d.Start || covered(d) {
+			continue
+		}
+		parsed := byFile[d.File]
+		if len(parsed) == 0 {
+			continue // the parser produced nothing for this file; no blob to attach to
+		}
+		src := fileLines(d.File)
+		if src == nil || d.End > len(src) {
+			continue
+		}
+		var kind core.SymbolKind
+		switch d.Kind {
+		case "class":
+			kind = core.KindClass
+		case "interface":
+			kind = core.KindInterface
+		case "enum":
+			kind = core.KindEnum
+		case "annotation":
+			kind = core.KindAnnotation
+		case "method":
+			kind = core.KindMethod
+		case "constructor":
+			kind = core.KindConstructor
+		case "field":
+			kind = core.KindField
+		default:
+			continue
+		}
+		id := d.File + "::" + d.Qualified + "@" + parsed[0].BlobSHA
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		// The parser's RawText starts at the node, not at the line start.
+		raw := strings.TrimLeft(strings.Join(src[d.Start-1:d.End], "\n"), " \t")
+		signature := strings.TrimSpace(src[d.Start-1])
+		modifiers := []string{"compiler-declared"}
+		if strings.HasPrefix(d.Name, "<anonymous@") {
+			signature = "class " + d.Name
+			if d.Base != "" {
+				signature += " extends " + d.Base
+			}
+			modifiers = append(modifiers, "anonymous")
+		}
+		parent := d.Parent
+		if i := strings.LastIndex(parent, "."); i >= 0 {
+			parent = parent[i+1:]
+		}
+		out = append(out, core.SymbolRecord{
+			ID: id, FilePath: d.File, BlobSHA: parsed[0].BlobSHA, Language: "java",
+			Kind: kind, Name: d.Name, QualifiedName: d.Qualified, Signature: signature,
+			Span: core.LineRange{Start: d.Start, End: d.End}, RawText: raw,
+			ParentSymbol: parent, Modifiers: modifiers,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].FilePath != out[j].FilePath {
+			return out[i].FilePath < out[j].FilePath
+		}
+		if out[i].Span.Start != out[j].Span.Start {
+			return out[i].Span.Start < out[j].Span.Start
+		}
+		return out[i].QualifiedName < out[j].QualifiedName
+	})
+	return out
 }
 
 type javacRef struct {
@@ -627,11 +762,24 @@ type javacRef struct {
 	Ref      bool   `json:"ref"`
 }
 
+// javacDecl is one declaration javac attributed (see the resolver's "decls").
+type javacDecl struct {
+	File      string `json:"f"`
+	Kind      string `json:"k"`
+	Name      string `json:"n"`
+	Qualified string `json:"q"`
+	Parent    string `json:"p"`
+	Start     int    `json:"s"`
+	End       int    `json:"e"`
+	Base      string `json:"b"`
+}
+
 type javacPayload struct {
-	Files   int        `json:"files"`
-	Errors  int        `json:"errors"`
-	Calls   []javacRef `json:"calls"`
-	Members []javacRef `json:"members"`
+	Files   int         `json:"files"`
+	Errors  int         `json:"errors"`
+	Calls   []javacRef  `json:"calls"`
+	Members []javacRef  `json:"members"`
+	Decls   []javacDecl `json:"decls"`
 }
 
 func runJavacResolver(ctx context.Context, j *jdk, root, tmp, src, cpFile string, units []string, sourcepath string, batch int, resident bool) (javacPayload, error) {

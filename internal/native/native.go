@@ -126,6 +126,12 @@ type Request struct {
 type Result struct {
 	Edges       []core.Edge
 	Diagnostics []string
+	// Symbols are declarations the compiler attributed that the parser did
+	// not index (Java: anonymous classes in field initializers, 2026-10-12).
+	// The indexer stores them beside the parsed symbols so edges can land
+	// on them and completeness claims cover the compiler's universe, not
+	// the parser's.
+	Symbols []core.SymbolRecord
 	// SkippedLanguages lists languages whose analyzers were skipped because
 	// no files of theirs changed; the indexer carries their stored native
 	// edges forward instead of dropping them.
@@ -268,6 +274,7 @@ func AnalyzeChangedFiles(ctx context.Context, root string, symbols []core.Symbol
 			continue
 		}
 		combined.Edges = append(combined.Edges, result.Edges...)
+		combined.Symbols = append(combined.Symbols, result.Symbols...)
 		if full && !timedOut && len(result.Partial) == 0 {
 			combined.Completed = append(combined.Completed, analyzer.Name())
 		}

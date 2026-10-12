@@ -316,13 +316,7 @@ func (s *Store) UpsertFile(ctx context.Context, filePath, blobSHA, language stri
 		return err
 	}
 
-	insertStmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO symbols
-			(id, file_path, blob_sha, language, kind, name, qualified_name, signature,
-			 docstring, span_start, span_end, imports, exports, raw_text, parent_symbol, token_estimate,
-			 modifiers, type_parameters, annotations, call_sites, attr_sites)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`)
+	insertStmt, err := tx.PrepareContext(ctx, insertSymbolSQL)
 	if err != nil {
 		return err
 	}
@@ -337,41 +331,7 @@ func (s *Store) UpsertFile(ctx context.Context, filePath, blobSHA, language stri
 			continue
 		}
 		seen[symbol.ID] = true
-		imports, err := marshalSlice(symbol.Imports)
-		if err != nil {
-			return err
-		}
-		modifiers, err := marshalSlice(symbol.Modifiers)
-		if err != nil {
-			return err
-		}
-		typeParams, err := marshalSlice(symbol.TypeParameters)
-		if err != nil {
-			return err
-		}
-		annotations, err := marshalSlice(symbol.Annotations)
-		if err != nil {
-			return err
-		}
-		callSites, err := json.Marshal(nilToEmpty(symbol.CallSites))
-		if err != nil {
-			return err
-		}
-		attrSites, err := json.Marshal(nilToEmpty(symbol.AttrSites))
-		if err != nil {
-			return err
-		}
-		exports := 0
-		if symbol.Exports {
-			exports = 1
-		}
-		_, err = insertStmt.ExecContext(ctx,
-			symbol.ID, symbol.FilePath, symbol.BlobSHA, symbol.Language, string(symbol.Kind),
-			symbol.Name, symbol.QualifiedName, symbol.Signature, symbol.Docstring,
-			symbol.Span.Start, symbol.Span.End, string(imports), exports,
-			symbol.RawText, symbol.ParentSymbol, symbol.TokenEstimate,
-			string(modifiers), string(typeParams), string(annotations), string(callSites), string(attrSites))
-		if err != nil {
+		if err := execInsertSymbol(ctx, insertStmt, &symbol); err != nil {
 			return err
 		}
 	}
@@ -392,6 +352,78 @@ func (s *Store) UpsertFile(ctx context.Context, filePath, blobSHA, language stri
 	}
 
 	return tx.Commit()
+}
+
+// InsertSymbols adds symbols the native analyzers declared beside the
+// parsed ones (compiler-declared symbols, see native.Result.Symbols). An
+// existing ID is left as it is: a scoped re-attribution reports the same
+// declarations again for files whose parsed symbols did not change.
+func (s *Store) InsertSymbols(ctx context.Context, symbols []core.SymbolRecord) error {
+	if len(symbols) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	stmt, err := tx.PrepareContext(ctx, strings.Replace(insertSymbolSQL, "INSERT INTO", "INSERT OR IGNORE INTO", 1))
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for i := range symbols {
+		if err := execInsertSymbol(ctx, stmt, &symbols[i]); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+const insertSymbolSQL = `
+		INSERT INTO symbols
+			(id, file_path, blob_sha, language, kind, name, qualified_name, signature,
+			 docstring, span_start, span_end, imports, exports, raw_text, parent_symbol, token_estimate,
+			 modifiers, type_parameters, annotations, call_sites, attr_sites)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`
+
+func execInsertSymbol(ctx context.Context, stmt *sql.Stmt, symbol *core.SymbolRecord) error {
+	imports, err := marshalSlice(symbol.Imports)
+	if err != nil {
+		return err
+	}
+	modifiers, err := marshalSlice(symbol.Modifiers)
+	if err != nil {
+		return err
+	}
+	typeParams, err := marshalSlice(symbol.TypeParameters)
+	if err != nil {
+		return err
+	}
+	annotations, err := marshalSlice(symbol.Annotations)
+	if err != nil {
+		return err
+	}
+	callSites, err := json.Marshal(nilToEmpty(symbol.CallSites))
+	if err != nil {
+		return err
+	}
+	attrSites, err := json.Marshal(nilToEmpty(symbol.AttrSites))
+	if err != nil {
+		return err
+	}
+	exports := 0
+	if symbol.Exports {
+		exports = 1
+	}
+	_, err = stmt.ExecContext(ctx,
+		symbol.ID, symbol.FilePath, symbol.BlobSHA, symbol.Language, string(symbol.Kind),
+		symbol.Name, symbol.QualifiedName, symbol.Signature, symbol.Docstring,
+		symbol.Span.Start, symbol.Span.End, string(imports), exports,
+		symbol.RawText, symbol.ParentSymbol, symbol.TokenEstimate,
+		string(modifiers), string(typeParams), string(annotations), string(callSites), string(attrSites))
+	return err
 }
 
 // ReplaceEdges makes the edges table equal to the given set. It diffs
