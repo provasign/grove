@@ -269,28 +269,16 @@ func mergeEdges(base, enriched []core.Edge) []core.Edge {
 		// member itself (owner an interface we saw no anchor for) does not.
 		return set.static
 	}
-	// rust-analyzer analyzes a whole workspace, so in a .rs file it ran on
-	// (the file has native call edges) a call it did not resolve into the
-	// repository went to std or a dependency: a name-narrowed guess from
-	// there is one the compiler rejected (ripgrep: 222 of 222 such guesses
-	// were wrong against rust-analyzer's own truth). Files it did not
-	// analyze keep their guesses.
-	rustAnalyzed := map[string]bool{}
-	for from := range resolved {
-		if file, _, _ := strings.Cut(from, "::"); strings.HasSuffix(file, ".rs") {
-			rustAnalyzed[file] = true
-		}
-	}
 	out := make([]core.Edge, 0, len(ordered))
 	for _, k := range ordered {
 		e := byKey[k]
-		if e.Type == core.EdgeCalls && e.Source != core.EvidenceSourceNative {
-			if superseded(e) {
-				continue
-			}
-			if file, _, _ := strings.Cut(e.From, "::"); rustAnalyzed[file] {
-				continue
-			}
+		// Only a guess the compiler contradicts is dropped. rust-analyzer
+		// analyzes the code active under the default features, so a call in
+		// a #[cfg(...)]-disabled block (tokio's io-uring fs paths: 7 of 9
+		// Handle::try_current callers) has only the parser's resolution;
+		// dropping every guess in an analyzed file lost those callers.
+		if e.Type == core.EdgeCalls && e.Source != core.EvidenceSourceNative && superseded(e) {
+			continue
 		}
 		out = append(out, e)
 	}
