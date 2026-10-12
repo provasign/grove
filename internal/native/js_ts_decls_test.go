@@ -99,6 +99,11 @@ export function use(c: Client) {
 		}
 		return false
 	}
+	for _, e := range res.Edges {
+		if e.From == "main.ts::use@b" && e.To == byQualified["Client.connect"].ID && e.Lines != "18:5" {
+			t.Errorf("use -> Client.connect positions %q, want 18:5", e.Lines)
+		}
+	}
 	if !has("main.ts::use@b", byQualified["Client.connect"].ID) {
 		t.Errorf("use -> Client.connect (ambient member) did not land: %v", res.Edges)
 	}

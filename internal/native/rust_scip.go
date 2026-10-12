@@ -184,6 +184,8 @@ type rustCachedEdge struct {
 	ToKind   string `json:"tk"`
 	ToLine   int    `json:"tl"`
 	Type     string `json:"t"`
+	// Lines: the call positions in the caller's file (Edge.Lines).
+	Lines string `json:"ln,omitempty"`
 }
 
 type rustScipCacheFile struct {
@@ -193,7 +195,7 @@ type rustScipCacheFile struct {
 	Declared []string `json:"declared"`
 }
 
-const rustScipCacheVersion = "2"
+const rustScipCacheVersion = "3"
 
 func rustScipCachePath(root string) string {
 	return filepath.Join(rustAnalyzerTargetDir(root), "grove-edges.json")
@@ -220,7 +222,7 @@ func saveRustScipCache(root string, symbols []core.SymbolRecord, edges []core.Ed
 		file.Edges = append(file.Edges, rustCachedEdge{
 			FromFile: from.FilePath, FromName: from.QualifiedName, FromKind: string(from.Kind), FromLine: from.Span.Start,
 			ToFile: to.FilePath, ToName: to.QualifiedName, ToKind: string(to.Kind), ToLine: to.Span.Start,
-			Type: string(e.Type),
+			Type: string(e.Type), Lines: e.Lines,
 		})
 	}
 	data, err := json.Marshal(file)
@@ -280,7 +282,9 @@ func rustCachedEdges(file *rustScipCacheFile, symbols []core.SymbolRecord) []cor
 		if from == nil || to == nil {
 			continue
 		}
-		edges = append(edges, symbolEdge(*from, *to, core.EdgeType(c.Type), 0.98))
+		e := symbolEdge(*from, *to, core.EdgeType(c.Type), 0.98)
+		e.Lines = c.Lines // positions in the caller's file, valid while it is unchanged
+		edges = append(edges, e)
 	}
 	return edges
 }
@@ -740,8 +744,7 @@ func rustScipPass(req Request, docs []scipDocument, isolatedRoots map[string]boo
 		return -1, false
 	}
 
-	var edges []core.Edge
-	seen := map[string]bool{}
+	pe := newPositionedEdges()
 	for _, doc := range docs {
 		if len(callers[doc.Path]) == 0 {
 			continue
@@ -780,13 +783,9 @@ func rustScipPass(req Request, docs []scipDocument, isolatedRoots map[string]boo
 			default:
 				continue
 			}
-			key := all[from].ID + "\x00" + string(edgeType) + "\x00" + all[to].ID
-			if seen[key] {
-				continue
-			}
-			seen[key] = true
-			edges = append(edges, symbolEdge(all[from], all[to], edgeType, 0.98))
+			// The reference is the called name; SCIP columns are bytes.
+			pe.add(symbolEdge(all[from], all[to], edgeType, 0.98), o.Line+1, charColumn(sourceLine(doc.Path, o.Line), o.Col))
 		}
 	}
-	return declared, edges
+	return declared, pe.finish()
 }

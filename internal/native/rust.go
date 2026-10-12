@@ -120,6 +120,14 @@ func (rustAnalyzer) Analyze(ctx context.Context, req Request) Result {
 			return
 		}
 		cached := rustCachedEdges(record, req.Symbols)
+		// This record predates the edits: positions in an edited file may
+		// have moved, so those edges keep no positions until the next pass.
+		changed := fileSet(req.ChangedFiles)
+		for i := range cached {
+			if file, _, _ := strings.Cut(cached[i].From, "::"); changed[file] {
+				cached[i].Lines = ""
+			}
+		}
 		edges = append(edges, cached...)
 		res.Diagnostics = append(res.Diagnostics, "rust-analyzer edges reused from the last run ("+why+"): "+itoa(len(cached)))
 	}

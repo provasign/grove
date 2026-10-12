@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -86,4 +87,81 @@ func countNativeEdges(edges []core.Edge, edgeType core.EdgeType) int {
 		}
 	}
 	return count
+}
+
+// positionedEdges collects native edges deduplicated by (from, type, to)
+// and, for calls, the positions of every call behind each edge ("line:col"
+// of the called name, Edge.Lines) — the javac pattern, shared by the Go,
+// TypeScript and Rust passes. A later duplicate merges its position instead
+// of being dropped: mergeEdges keeps the first of two equal native edges,
+// so positions must be merged here.
+type positionedEdges struct {
+	edges []core.Edge
+	idx   map[string]int
+	pos   map[int]map[[2]int]bool
+}
+
+func newPositionedEdges() *positionedEdges {
+	return &positionedEdges{idx: map[string]int{}, pos: map[int]map[[2]int]bool{}}
+}
+
+// add records e (once per from/type/to) and, for a call with line > 0, the
+// call's position; col 0 means unknown.
+func (p *positionedEdges) add(e core.Edge, line, col int) {
+	key := e.From + "\x00" + string(e.Type) + "\x00" + e.To
+	i, ok := p.idx[key]
+	if !ok {
+		i = len(p.edges)
+		p.idx[key] = i
+		p.edges = append(p.edges, e)
+	}
+	if e.Type == core.EdgeCalls && line > 0 {
+		if p.pos[i] == nil {
+			p.pos[i] = map[[2]int]bool{}
+		}
+		p.pos[i][[2]int{line, col}] = true
+	}
+}
+
+// finish writes each call edge's positions, ascending, and returns the edges.
+func (p *positionedEdges) finish() []core.Edge {
+	for i, set := range p.pos {
+		list := make([][2]int, 0, len(set))
+		for at := range set {
+			list = append(list, at)
+		}
+		sort.Slice(list, func(a, b int) bool {
+			if list[a][0] != list[b][0] {
+				return list[a][0] < list[b][0]
+			}
+			return list[a][1] < list[b][1]
+		})
+		parts := make([]string, len(list))
+		for j, at := range list {
+			parts[j] = strconv.Itoa(at[0])
+			if at[1] > 0 {
+				parts[j] += ":" + strconv.Itoa(at[1])
+			}
+		}
+		p.edges[i].Lines = strings.Join(parts, ",")
+	}
+	return p.edges
+}
+
+// charColumn converts a 0-based byte offset in a source line to the 1-based
+// column javac and tsc report: UTF-16 code units, so positions from every
+// pass name the same token. 0 when the offset is outside the line.
+func charColumn(line string, byteOff int) int {
+	if byteOff < 0 || byteOff > len(line) {
+		return 0
+	}
+	n := 0
+	for _, r := range line[:byteOff] {
+		if r >= 0x10000 {
+			n += 2
+		} else {
+			n++
+		}
+	}
+	return n + 1
 }
