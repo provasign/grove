@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"google.golang.org/protobuf/encoding/protowire"
 
@@ -114,6 +115,7 @@ check!(r16, |t: Tool| {
 
 fn plain(t: Tool) {
     t.run();
+    r16();
 }
 `)
 	const pkg = "rust-analyzer cargo demo 0.1.0 "
@@ -128,7 +130,7 @@ fn plain(t: Tool) {
 			{rng: []int32{4, 6, 9}, symbol: pkg + "util/impl#[Tool]run()."},
 			{rng: []int32{7, 3, 8}, enclosing: []int32{7, 0, 9, 1}, symbol: pkg + "t/plain().", definition: true},
 			{rng: []int32{8, 6, 9}, symbol: pkg + "util/impl#[Tool]run()."},
-			{rng: []int32{8, 4, 5}, symbol: pkg + "t/r16()."},
+			{rng: []int32{9, 4, 7}, symbol: pkg + "t/r16()."},
 			{rng: []int32{4, 4, 5}, symbol: "local 0"},
 		}},
 	)
@@ -139,11 +141,11 @@ fn plain(t: Tool) {
 	parsed := []core.SymbolRecord{
 		{ID: "src/util.rs::Tool@a", FilePath: "src/util.rs", BlobSHA: "a", Language: "rust", Kind: core.KindStruct, Name: "Tool", QualifiedName: "Tool", Span: core.LineRange{Start: 1, End: 1}},
 		{ID: "src/util.rs::Tool.run@a", FilePath: "src/util.rs", BlobSHA: "a", Language: "rust", Kind: core.KindMethod, Name: "run", QualifiedName: "Tool.run", ParentSymbol: "Tool", Span: core.LineRange{Start: 3, End: 3}},
-		{ID: "tests/t.rs::crate@b", FilePath: "tests/t.rs", BlobSHA: "b", Language: "rust", Kind: core.KindModule, Name: "crate", QualifiedName: "crate", Span: core.LineRange{Start: 1, End: 11}},
-		{ID: "tests/t.rs::plain@b", FilePath: "tests/t.rs", BlobSHA: "b", Language: "rust", Kind: core.KindFunction, Name: "plain", QualifiedName: "plain", Span: core.LineRange{Start: 8, End: 10}},
+		{ID: "tests/t.rs::crate@b", FilePath: "tests/t.rs", BlobSHA: "b", Language: "rust", Kind: core.KindModule, Name: "crate", QualifiedName: "crate", Span: core.LineRange{Start: 1, End: 12}},
+		{ID: "tests/t.rs::plain@b", FilePath: "tests/t.rs", BlobSHA: "b", Language: "rust", Kind: core.KindFunction, Name: "plain", QualifiedName: "plain", Span: core.LineRange{Start: 8, End: 11}},
 	}
 	req := Request{Root: root, Files: []string{"src/util.rs", "tests/t.rs"}, Symbols: parsed}
-	declared, edges := rustScipPass(req, docs)
+	declared, edges := rustScipPass(req, docs, nil)
 	if len(declared) != 1 {
 		t.Fatalf("want only r16 declared (plain and Tool.run are parsed), got %+v", declared)
 	}
@@ -278,4 +280,74 @@ check!(generated, |t: Tool| {
 		}
 	}
 	t.Fatalf("generated -> Tool.run did not land: %v (diagnostics %v)", res.Edges, res.Diagnostics)
+}
+
+// The resident server answers an edit: a call added to an unchanged
+// crate's file lands without a batch pass, and a renamed callee's caller
+// loses its edge.
+func TestRustResidentWorkerEndToEnd(t *testing.T) {
+	bin, _ := rustAnalyzerBin()
+	if bin == "" || !commandExists("cargo") {
+		t.Skip("rust-analyzer or cargo not installed")
+	}
+	t.Setenv("GROVE_RUST_ANALYZER", bin)
+	root := t.TempDir()
+	write := func(rel, body string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(root, rel)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, rel), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("Cargo.toml", "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n")
+	write("src/lib.rs", "pub mod util;\npub fn entry() {\n    util::helper();\n}\n")
+	write("src/util.rs", "pub fn helper() {}\npub fn other() {}\n")
+	sym := func(file, sha, name string, start, end int, sig string) core.SymbolRecord {
+		return core.SymbolRecord{ID: file + "::" + name + "@" + sha, FilePath: file, BlobSHA: sha, Language: "rust", Kind: core.KindFunction, Name: name, QualifiedName: name, Signature: sig, Span: core.LineRange{Start: start, End: end}}
+	}
+	util := []core.SymbolRecord{sym("src/util.rs", "u1", "helper", 1, 1, "pub fn helper() {}"), sym("src/util.rs", "u1", "other", 2, 2, "pub fn other() {}")}
+	lib := []core.SymbolRecord{sym("src/lib.rs", "l1", "entry", 2, 4, "pub fn entry() {")}
+	files := []string{"src/lib.rs", "src/util.rs"}
+	full := (rustAnalyzer{}).Analyze(context.Background(), Request{Root: root, Files: files, Symbols: append(append([]core.SymbolRecord{}, lib...), util...), Resident: true})
+	has := func(res Result, from, to string) bool {
+		for _, e := range res.Edges {
+			if e.From == from && e.To == to && e.Type == core.EdgeCalls {
+				return true
+			}
+		}
+		return false
+	}
+	if !has(full, lib[0].ID, util[0].ID) {
+		t.Fatalf("full pass: entry -> helper missing: %v", full.Diagnostics)
+	}
+	// Edit lib.rs: entry now also calls other.
+	write("src/lib.rs", "pub mod util;\npub fn entry() {\n    util::helper();\n    util::other();\n}\n")
+	lib2 := []core.SymbolRecord{sym("src/lib.rs", "l2", "entry", 2, 5, "pub fn entry() {")}
+	deadline := time.Now().Add(2 * time.Minute)
+	var inc Result
+	for {
+		inc = (rustAnalyzer{}).Analyze(context.Background(), Request{Root: root, Files: files, Symbols: append(append([]core.SymbolRecord{}, lib2...), util...), ChangedFiles: []string{"src/lib.rs"}, PrevChanged: lib, Resident: true})
+		if slices.ContainsFunc(inc.Diagnostics, func(d string) bool { return strings.Contains(d, "resident server") && !strings.Contains(d, "not used") }) || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Second) // the server is still warming up; the run fell back to the batch pass
+	}
+	if !slices.ContainsFunc(inc.Diagnostics, func(d string) bool { return strings.Contains(d, "resident server, 1 edited file") }) {
+		t.Fatalf("edit was not answered by the resident server: %v", inc.Diagnostics)
+	}
+	if !has(inc, lib2[0].ID, util[1].ID) || !has(inc, lib2[0].ID, util[0].ID) {
+		t.Fatalf("edit: entry -> helper/other missing: %v", inc.Edges)
+	}
+	if got := inc.Partial["rust"]; !slices.Equal(got, []string{"src"}) {
+		t.Fatalf("incremental run must report every Rust dir re-analyzed, got %v", got)
+	}
+	// Rename helper in util.rs: entry (unchanged lib.rs) loses its edge.
+	write("src/util.rs", "pub fn helper_renamed() {}\npub fn other() {}\n")
+	util2 := []core.SymbolRecord{sym("src/util.rs", "u2", "helper_renamed", 1, 1, "pub fn helper_renamed() {}"), sym("src/util.rs", "u2", "other", 2, 2, "pub fn other() {}")}
+	ren := (rustAnalyzer{}).Analyze(context.Background(), Request{Root: root, Files: files, Symbols: append(append([]core.SymbolRecord{}, lib2...), util2...), ChangedFiles: []string{"src/util.rs"}, PrevChanged: util, Resident: true})
+	if has(ren, lib2[0].ID, util2[0].ID) || !has(ren, lib2[0].ID, util2[1].ID) {
+		t.Fatalf("rename: want only entry -> other, got %v (%v)", ren.Edges, ren.Diagnostics)
+	}
 }

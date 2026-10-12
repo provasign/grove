@@ -570,7 +570,9 @@ func rustScipParent(symbol string) string {
 
 // rustScipPass turns a decoded index into compiler-declared symbols and the
 // edges made from them.
-func rustScipPass(req Request, docs []scipDocument) ([]core.SymbolRecord, []core.Edge) {
+// isolatedRoots are the root files of test, bench and example targets:
+// separate crates nothing else in the repository can call into.
+func rustScipPass(req Request, docs []scipDocument, isolatedRoots map[string]bool) ([]core.SymbolRecord, []core.Edge) {
 	inScope := fileSet(req.Files)
 	bodies := map[string][]core.SymbolRecord{}
 	enums := map[string][]core.SymbolRecord{}
@@ -684,16 +686,41 @@ func rustScipPass(req Request, docs []scipDocument) ([]core.SymbolRecord, []core
 		}
 		return best
 	}
-	target := map[string]int{}
+	// SCIP names a symbol by package and module path, so every integration
+	// test's (or bench's, example's) root-level helper `fn rt()` gets one
+	// symbol: rust-analyzer's own index cannot tell them apart. A reference
+	// resolves to a definition in its own file first, never to another such
+	// root (a separate crate it cannot reach), else to the only candidate.
+	targets := map[string][]int{}
 	for _, doc := range docs {
 		for _, o := range doc.Occurrences {
 			if !o.Definition || strings.HasPrefix(o.Symbol, "local ") {
 				continue
 			}
-			if i := innermost(byFileName[doc.Path+"\x00"+occName(doc.Path, o)], o.Line+1); i >= 0 {
-				target[o.Symbol] = i
+			if i := innermost(byFileName[doc.Path+"\x00"+occName(doc.Path, o)], o.Line+1); i >= 0 && !slices.Contains(targets[o.Symbol], i) {
+				targets[o.Symbol] = append(targets[o.Symbol], i)
 			}
 		}
+	}
+	resolveTarget := func(symbol, fromFile string) (int, bool) {
+		cands := targets[symbol]
+		if len(cands) == 1 {
+			return cands[0], true
+		}
+		var reachable []int
+		for _, i := range cands {
+			file := all[i].FilePath
+			if file == fromFile {
+				return i, true
+			}
+			if !isolatedRoots[file] {
+				reachable = append(reachable, i)
+			}
+		}
+		if len(reachable) == 1 {
+			return reachable[0], true
+		}
+		return -1, false
 	}
 
 	var edges []core.Edge
@@ -706,7 +733,7 @@ func rustScipPass(req Request, docs []scipDocument) ([]core.SymbolRecord, []core
 			if o.Definition || strings.HasPrefix(o.Symbol, "local ") {
 				continue
 			}
-			to, ok := target[o.Symbol]
+			to, ok := resolveTarget(o.Symbol, doc.Path)
 			if !ok {
 				continue
 			}
@@ -719,8 +746,12 @@ func rustScipPass(req Request, docs []scipDocument) ([]core.SymbolRecord, []core
 			// except where a compiler-declared symbol is involved (no
 			// name-guessed edge may land on one,
 			// graph.dropGuessesIntoCompilerDeclared).
+			// Only a reference that names its target in the source counts:
+			// SCIP also records implicit ones (.await -> Future::poll,
+			// operators, ? -> From::from) that no identifier names, and the
+			// resident server (rust_worker.go) resolves identifiers.
 			from := innermost(callers[doc.Path], o.Line+1)
-			if from < 0 || from == to {
+			if from < 0 || from == to || occName(doc.Path, o) != all[to].Name {
 				continue
 			}
 			var edgeType core.EdgeType

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -39,7 +40,8 @@ type cargoMetadata struct {
 		ID      string `json:"id"`
 		Name    string `json:"name"`
 		Targets []struct {
-			SrcPath string `json:"src_path"`
+			SrcPath string   `json:"src_path"`
+			Kind    []string `json:"kind"`
 		} `json:"targets"`
 		Dependencies []struct {
 			Name string `json:"name"`
@@ -68,12 +70,16 @@ func (rustAnalyzer) Analyze(ctx context.Context, req Request) Result {
 	}
 	pkgTargets := map[string][]string{}
 	pkgByName := map[string]string{}
+	isolatedRoots := map[string]bool{}
 	for _, pkg := range meta.Packages {
 		pkgByName[pkg.Name] = pkg.ID
 		for _, target := range pkg.Targets {
 			rel, ok := relFile(req.Root, target.SrcPath)
 			if ok {
 				pkgTargets[pkg.ID] = append(pkgTargets[pkg.ID], rel)
+				if slices.ContainsFunc(target.Kind, func(k string) bool { return k == "test" || k == "bench" || k == "example" }) {
+					isolatedRoots[rel] = true
+				}
 			}
 		}
 	}
@@ -117,8 +123,21 @@ func (rustAnalyzer) Analyze(ctx context.Context, req Request) Result {
 		edges = append(edges, cached...)
 		res.Diagnostics = append(res.Diagnostics, "rust-analyzer edges reused from the last run ("+why+"): "+itoa(len(cached)))
 	}
-	switch {
-	case rustScipNeeded(req, rustItemMacroFiles(req.Root, req.Files, req.Symbols), record):
+	macroFiles := rustItemMacroFiles(req.Root, req.Files, req.Symbols)
+	if workerEdges, why, ok := rustWorkerUpdate(ctx, req, record, macroFiles); ok {
+		edges = append(edges, workerEdges...)
+		res.Diagnostics = append(res.Diagnostics,
+			"rust-analyzer resolved "+itoa(countNativeEdges(workerEdges, core.EdgeCalls))+" call edge(s) and "+itoa(countNativeEdges(workerEdges, core.EdgeUsesType))+" type use(s) of compiler-declared symbols (resident server, "+itoa(len(req.ChangedFiles))+" edited file(s))")
+		if err := saveRustScipCache(req.Root, req.Symbols, workerEdges); err != nil {
+			res.Diagnostics = append(res.Diagnostics, "rust-analyzer edge record not saved: "+err.Error())
+		}
+		res.Edges = edges
+		return rustPartialAll(req, res)
+	} else if why != "" {
+		res.Diagnostics = append(res.Diagnostics, "rust-analyzer resident server not used: "+why)
+	}
+	if rustScipNeeded(req, macroFiles, record) {
+		rustWorkerWarm(req)
 		if bin, reason := rustAnalyzerBin(); bin == "" {
 			res.Diagnostics = append(res.Diagnostics, "rust-analyzer pass skipped: "+reason)
 			reuse("rust-analyzer unavailable")
@@ -129,7 +148,7 @@ func (rustAnalyzer) Analyze(ctx context.Context, req Request) Result {
 			res.Diagnostics = append(res.Diagnostics, "rust-analyzer scip decode failed: "+err.Error())
 			reuse("this run failed")
 		} else {
-			declared, scipEdges := rustScipPass(req, docs)
+			declared, scipEdges := rustScipPass(req, docs, isolatedRoots)
 			res.Symbols = declared
 			edges = append(edges, scipEdges...)
 			res.Diagnostics = append(res.Diagnostics,
@@ -139,10 +158,30 @@ func (rustAnalyzer) Analyze(ctx context.Context, req Request) Result {
 				res.Diagnostics = append(res.Diagnostics, "rust-analyzer edge record not saved: "+err.Error())
 			}
 		}
-	case rustHasDeclared(req.Symbols):
-		reuse("no edited file needs it")
 	}
 	res.Edges = edges
+	return rustPartialAll(req, res)
+}
+
+// rustPartialAll: an incremental Rust run returns the complete native edge
+// set, so it reports every Rust dir as re-analyzed — otherwise the
+// incremental edge build keeps unchanged callers' previous native call
+// edges verbatim (graph.BuildEdgesDeltaMeta) and an edge rust-analyzer no
+// longer resolves (a renamed callee's caller) would survive.
+func rustPartialAll(req Request, res Result) Result {
+	if len(req.ChangedFiles) == 0 {
+		return res
+	}
+	seen := map[string]bool{}
+	var dirs []string
+	for _, f := range req.Files {
+		if d := packageDir(f); !seen[d] {
+			seen[d] = true
+			dirs = append(dirs, d)
+		}
+	}
+	sort.Strings(dirs)
+	res.Partial = map[string][]string{"rust": dirs}
 	return res
 }
 
