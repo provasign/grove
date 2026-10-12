@@ -640,13 +640,19 @@ func javacResolveScoped(ctx context.Context, req Request) ([]core.Edge, []string
 // follow the parser's conventions (ID file::qualified@blob, ParentSymbol the
 // parent's last segment, the anonymous class signature carrying its base
 // type) so every downstream pass treats them as ordinary symbols.
-func compilerDeclaredSymbols(req Request, decls []javacDecl) []core.SymbolRecord {
+func compilerDeclaredSymbols(req Request, decls []compilerDecl) []core.SymbolRecord {
+	return compilerDeclaredSymbolsFor(req, "java", decls)
+}
+
+// compilerDeclaredSymbolsFor is compilerDeclaredSymbols for any language whose
+// analyzer reports compilerDecls (Java's javac, Go's go/types).
+func compilerDeclaredSymbolsFor(req Request, language string, decls []compilerDecl) []core.SymbolRecord {
 	if len(decls) == 0 {
 		return nil
 	}
 	byFile := map[string][]core.SymbolRecord{}
 	for _, s := range req.Symbols {
-		if s.Language == "java" {
+		if s.Language == language {
 			byFile[s.FilePath] = append(byFile[s.FilePath], s)
 		}
 	}
@@ -658,7 +664,7 @@ func compilerDeclaredSymbols(req Request, decls []javacDecl) []core.SymbolRecord
 	// An anonymous class is named by its position, which the two count
 	// differently (tabs, wide characters), so any parsed anonymous class
 	// starting on the same line covers it.
-	covered := func(d javacDecl) bool {
+	covered := func(d compilerDecl) bool {
 		anon := strings.HasPrefix(d.Name, "<anonymous@")
 		for _, s := range byFile[d.File] {
 			end := s.Span.End
@@ -708,6 +714,10 @@ func compilerDeclaredSymbols(req Request, decls []javacDecl) []core.SymbolRecord
 		switch d.Kind {
 		case "class":
 			kind = core.KindClass
+		case "struct":
+			kind = core.KindStruct
+		case "type":
+			kind = core.KindType
 		case "interface":
 			kind = core.KindInterface
 		case "enum":
@@ -731,7 +741,10 @@ func compilerDeclaredSymbols(req Request, decls []javacDecl) []core.SymbolRecord
 		// The parser's RawText starts at the node, not at the line start.
 		raw := strings.TrimLeft(strings.Join(src[d.Start-1:d.End], "\n"), " \t")
 		signature := strings.TrimSpace(src[d.Start-1])
-		modifiers := []string{"compiler-declared"}
+		if d.Signature != "" {
+			signature = d.Signature
+		}
+		modifiers := append([]string{"compiler-declared"}, d.Modifiers...)
 		if strings.HasPrefix(d.Name, "<anonymous@") {
 			signature = "class " + d.Name
 			if d.Base != "" {
@@ -744,10 +757,10 @@ func compilerDeclaredSymbols(req Request, decls []javacDecl) []core.SymbolRecord
 			parent = parent[i+1:]
 		}
 		out = append(out, core.SymbolRecord{
-			ID: id, FilePath: d.File, BlobSHA: parsed[0].BlobSHA, Language: "java",
+			ID: id, FilePath: d.File, BlobSHA: parsed[0].BlobSHA, Language: language,
 			Kind: kind, Name: d.Name, QualifiedName: d.Qualified, Signature: signature,
 			Span: core.LineRange{Start: d.Start, End: d.End}, RawText: raw,
-			ParentSymbol: parent, Modifiers: modifiers,
+			ParentSymbol: parent, Modifiers: modifiers, Annotations: d.Annotations,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -774,8 +787,9 @@ type javacRef struct {
 	Ref      bool   `json:"ref"`
 }
 
-// javacDecl is one declaration javac attributed (see the resolver's "decls").
-type javacDecl struct {
+// compilerDecl is one declaration a compiler attributed: javac's resolver
+// "decls", or go/types definitions the Go parser did not index (go.go).
+type compilerDecl struct {
 	File      string `json:"f"`
 	Kind      string `json:"k"`
 	Name      string `json:"n"`
@@ -784,14 +798,20 @@ type javacDecl struct {
 	Start     int    `json:"s"`
 	End       int    `json:"e"`
 	Base      string `json:"b"`
+	// Set by in-process analyzers only (Go): the parser-convention signature
+	// when the declaration's first source line is not one, and modifiers and
+	// annotations beyond "compiler-declared".
+	Signature   string   `json:"-"`
+	Modifiers   []string `json:"-"`
+	Annotations []string `json:"-"`
 }
 
 type javacPayload struct {
-	Files   int         `json:"files"`
-	Errors  int         `json:"errors"`
-	Calls   []javacRef  `json:"calls"`
-	Members []javacRef  `json:"members"`
-	Decls   []javacDecl `json:"decls"`
+	Files   int            `json:"files"`
+	Errors  int            `json:"errors"`
+	Calls   []javacRef     `json:"calls"`
+	Members []javacRef     `json:"members"`
+	Decls   []compilerDecl `json:"decls"`
 }
 
 func runJavacResolver(ctx context.Context, j *jdk, root, tmp, src, cpFile string, units []string, sourcepath string, batch int, resident bool) (javacPayload, error) {

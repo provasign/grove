@@ -189,6 +189,37 @@ func TestGoCrossFileMethodContains(t *testing.T) {
 	}
 }
 
+// Only receiver methods attach across files. Fields sit inside their own
+// struct: build-tag variants (syslog.go / syslog_windows.go) and
+// function-local types reuse a name across a package, and each copy took the
+// other's fields (grafana, 2026-10-12).
+func TestGoFieldsContainOnlyInTheirOwnFile(t *testing.T) {
+	g := New()
+	g.Replace([]core.SymbolRecord{
+		{ID: "log/syslog.go::Handler@a", FilePath: "log/syslog.go", Language: "go", Kind: core.KindStruct,
+			Name: "Handler", QualifiedName: "Handler", Span: core.LineRange{Start: 1, End: 3}},
+		{ID: "log/syslog.go::Handler.Tag@a", FilePath: "log/syslog.go", Language: "go", Kind: core.KindField,
+			Name: "Tag", QualifiedName: "Handler.Tag", ParentSymbol: "Handler", Span: core.LineRange{Start: 2, End: 2}},
+		{ID: "log/syslog_windows.go::Handler@b", FilePath: "log/syslog_windows.go", Language: "go", Kind: core.KindStruct,
+			Name: "Handler", QualifiedName: "Handler", Span: core.LineRange{Start: 1, End: 3}},
+		{ID: "log/syslog_windows.go::Handler.logger@b", FilePath: "log/syslog_windows.go", Language: "go", Kind: core.KindField,
+			Name: "logger", QualifiedName: "Handler.logger", ParentSymbol: "Handler", Span: core.LineRange{Start: 2, End: 2}},
+		{ID: "log/handler.go::Handler.Close@c", FilePath: "log/handler.go", Language: "go", Kind: core.KindMethod,
+			Name: "Close", QualifiedName: "Handler.Close", ParentSymbol: "Handler", Span: core.LineRange{Start: 1, End: 1}},
+	}, 3)
+	if !hasEdge(g, core.EdgeContains, "log/syslog.go::Handler@a", "log/syslog.go::Handler.Tag@a") ||
+		!hasEdge(g, core.EdgeContains, "log/syslog_windows.go::Handler@b", "log/syslog_windows.go::Handler.logger@b") {
+		t.Fatal("each Handler must contain its own field")
+	}
+	if hasEdge(g, core.EdgeContains, "log/syslog_windows.go::Handler@b", "log/syslog.go::Handler.Tag@a") ||
+		hasEdge(g, core.EdgeContains, "log/syslog.go::Handler@a", "log/syslog_windows.go::Handler.logger@b") {
+		t.Fatal("a field attached to the other file's same-named type")
+	}
+	if !hasEdge(g, core.EdgeContains, "log/syslog.go::Handler@a", "log/handler.go::Handler.Close@c") {
+		t.Fatal("a receiver method must still attach across files")
+	}
+}
+
 // TS class-body fields (astkit emits no KindField for TS) must be scanned from
 // class source so `this.driver.escape()` resolves through the Driver family.
 func TestTsClassBodyFieldTypes(t *testing.T) {

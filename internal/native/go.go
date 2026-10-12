@@ -183,7 +183,18 @@ func (goAnalyzer) Analyze(ctx context.Context, req Request) Result {
 		}
 	}
 	exports, exportDiag := goExportData(ctx, req.Root, topoKey)
-	semanticEdges, semanticDiagnostics := goSemanticEdges(ctx, req.Root, semFiles, req.Symbols, pkgs, exports)
+	semanticEdges, decls, semanticDiagnostics := goSemanticEdges(ctx, req.Root, semFiles, req.Symbols, pkgs, exports)
+	// go/types attributed every declaration in the checked packages; the ones
+	// the parser does not index (types declared inside function bodies and
+	// their members) become compiler-declared symbols, as javac's do.
+	declared := compilerDeclaredSymbolsFor(req, "go", decls)
+	if len(declared) > 0 {
+		files := map[string]bool{}
+		for _, d := range declared {
+			files[d.FilePath] = true
+		}
+		semanticDiagnostics = append(semanticDiagnostics, "go/types declared "+itoa(len(declared))+" symbol(s) in "+itoa(len(files))+" file(s) the parser did not index; added as compiler-declared symbols")
+	}
 	if exportDiag != "" {
 		semanticDiagnostics = append(semanticDiagnostics, exportDiag)
 	}
@@ -205,6 +216,7 @@ func (goAnalyzer) Analyze(ctx context.Context, req Request) Result {
 		Edges:       edges,
 		Partial:     partial,
 		Diagnostics: append(head, semanticDiagnostics...),
+		Symbols:     declared,
 	}
 }
 
@@ -363,7 +375,7 @@ func newGoSymbolIndex(symbols []core.SymbolRecord) goSymbolIndex {
 		byType:     map[string]core.SymbolRecord{},
 	}
 	for _, symbol := range symbols {
-		if symbol.Language != "go" {
+		if symbol.Language != "go" || goLocalSymbol(symbol) {
 			continue
 		}
 		dir := packageDir(symbol.FilePath)
@@ -386,7 +398,7 @@ func goCallableKey(dir, recv, name string) string {
 	return dir + "\x00" + name
 }
 
-func goSemanticEdges(ctx context.Context, root string, files []string, symbols []core.SymbolRecord, pkgs []goListPackage, exports map[string]string) ([]core.Edge, []string) {
+func goSemanticEdges(ctx context.Context, root string, files []string, symbols []core.SymbolRecord, pkgs []goListPackage, exports map[string]string) ([]core.Edge, []compilerDecl, []string) {
 	symbolIdx := newGoSymbolIndex(symbols)
 	pkgDirsByImport := map[string][]string{}
 	importPathByDir := map[string]string{}
@@ -403,6 +415,7 @@ func goSemanticEdges(ctx context.Context, root string, files []string, symbols [
 	}
 
 	var edges []core.Edge
+	var decls []compilerDecl
 	var diagnostics []string
 	dirs := make([]string, 0, len(filesByDir))
 	for d := range filesByDir {
@@ -438,6 +451,7 @@ func goSemanticEdges(ctx context.Context, root string, files []string, symbols [
 	// the built graph) is identical to the sequential loop.
 	type dirOutcome struct {
 		edges []core.Edge
+		decls []compilerDecl
 		err   error
 	}
 	outcomes := make([]dirOutcome, len(dirs))
@@ -462,8 +476,8 @@ func goSemanticEdges(ctx context.Context, root string, files []string, symbols [
 				if pkgPath == "" {
 					pkgPath = dirs[di]
 				}
-				e, err := goSemanticPackageEdges(root, pkgPath, dirs[di], filesByDir[dirs[di]], symbolIdx, pkgDirsByImport, projectImporter)
-				outcomes[di] = dirOutcome{edges: e, err: err}
+				e, d, err := goSemanticPackageEdges(root, pkgPath, dirs[di], filesByDir[dirs[di]], symbolIdx, pkgDirsByImport, projectImporter)
+				outcomes[di] = dirOutcome{edges: e, decls: d, err: err}
 			}
 		}()
 	}
@@ -478,13 +492,14 @@ func goSemanticEdges(ctx context.Context, root string, files []string, symbols [
 			continue
 		}
 		edges = append(edges, o.edges...)
+		decls = append(decls, o.decls...)
 	}
 	diagnostics = append(diagnostics, "resolved "+itoa(countEdgesOfType(edges, core.EdgeCalls))+" native call edge(s)")
 	diagnostics = append(diagnostics, "resolved "+itoa(countEdgesOfType(edges, core.EdgeUsesType))+" native type-use edge(s)")
-	return edges, diagnostics
+	return edges, decls, diagnostics
 }
 
-func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx goSymbolIndex, pkgDirsByImport map[string][]string, projectImporter types.Importer) ([]core.Edge, error) {
+func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx goSymbolIndex, pkgDirsByImport map[string][]string, projectImporter types.Importer) ([]core.Edge, []compilerDecl, error) {
 	fset := token.NewFileSet()
 	parsed := make([]*ast.File, 0, len(files))
 	for _, file := range files {
@@ -498,7 +513,7 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 			if err == nil {
 				err = fmt.Errorf("%s: no syntax tree", file)
 			}
-			return nil, err
+			return nil, nil, err
 		}
 		parsed = append(parsed, f)
 	}
@@ -513,6 +528,7 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 	}
 	pkg, _ := conf.Check(pkgPath, fset, parsed, info)
 	dispatch := newGoInterfaceDispatch(pkg, root, dir, fset, symbolIdx, pkgDirsByImport)
+	decls, localTypes := goLocalDecls(fset, files, parsed, info)
 
 	var edges []core.Edge
 	seen := map[string]bool{}
@@ -562,6 +578,19 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 						})
 					}
 				case *ast.Ident:
+					if qualified, ok := localTypes[info.Uses[n]]; ok {
+						// A function-local type is declared in this function's
+						// own file: its compiler-declared record shares the
+						// caller's file and blob.
+						add(core.Edge{
+							From:       caller.ID,
+							To:         caller.FilePath + "::" + qualified + "@" + caller.BlobSHA,
+							Type:       core.EdgeUsesType,
+							Confidence: 0.97,
+							Source:     core.EvidenceSourceNative,
+						})
+						return true
+					}
 					if typ, ok := goResolveType(dir, n, info, symbolIdx, pkgDirsByImport, pkg); ok && typ.ID != caller.ID {
 						add(core.Edge{
 							From:       caller.ID,
@@ -577,7 +606,7 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 			return false
 		})
 	}
-	return edges, nil
+	return edges, decls, nil
 }
 
 // goCallerSymbolAt maps a FuncDecl to its symbol by direct key lookup. The
@@ -617,7 +646,9 @@ func goResolveCall(currentDir string, expr ast.Expr, info *types.Info, symbolIdx
 
 func goResolveType(currentDir string, ident *ast.Ident, info *types.Info, symbolIdx goSymbolIndex, pkgDirsByImport map[string][]string, selfPkg *types.Package) (core.SymbolRecord, bool) {
 	obj, ok := info.Uses[ident].(*types.TypeName)
-	if !ok {
+	if !ok || goLocalObject(obj) {
+		// A function-local type is not the package-level type of the same
+		// name; goSemanticPackageEdges links it to its own declaration.
 		return core.SymbolRecord{}, false
 	}
 	dirs := goObjectDirs(currentDir, obj.Pkg(), pkgDirsByImport, selfPkg)
@@ -739,7 +770,7 @@ func newGoNativeIndex(symbols []core.SymbolRecord) *goNativeIndex {
 	}
 	seenFile := map[string]bool{}
 	for _, symbol := range symbols {
-		if symbol.Language != "go" {
+		if symbol.Language != "go" || goLocalSymbol(symbol) {
 			continue
 		}
 		if symbol.Kind == core.KindFunction {
