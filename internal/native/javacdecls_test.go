@@ -126,3 +126,61 @@ func TestCompilerDeclaredSymbolsCoverOverlappingSpans(t *testing.T) {
 		t.Fatalf("want only the undeclared n, got %+v", got)
 	}
 }
+
+// javac reports each call's line, and a call edge carries the lines javac
+// resolved to its target: one caller calling two overloads gets each line
+// under its own overload (gson JsonElementTypeAdapter.write: value(Number)
+// at 145, value(boolean) at 147, value(String) at 149), and a call in a
+// lambda lands on the lambda's edge too.
+func TestJavacCallEdgesCarryTheirLines(t *testing.T) {
+	if findJDK() == nil {
+		t.Skip("no JDK 11+ available")
+	}
+	root := t.TempDir()
+	src := `package p;
+
+public class W {
+  public W value(String s) { return this; }
+  public W value(long n) { return this; }
+  void both() {
+    value("a");
+    value(2L);
+    Runnable r = () -> value("b");
+  }
+}
+`
+	if err := os.MkdirAll(filepath.Join(root, "p"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "p", "W.java"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	file, blob := "p/W.java", "b1"
+	sym := func(kind core.SymbolKind, name, qualified, id string, start, end int, sig string) core.SymbolRecord {
+		return core.SymbolRecord{ID: file + "::" + id + "@" + blob, FilePath: file, BlobSHA: blob, Language: "java",
+			Kind: kind, Name: name, QualifiedName: qualified, ParentSymbol: "W", Span: core.LineRange{Start: start, End: end}, Signature: sig, RawText: sig}
+	}
+	parsed := []core.SymbolRecord{
+		{ID: file + "::W@" + blob, FilePath: file, BlobSHA: blob, Language: "java", Kind: core.KindClass, Name: "W", QualifiedName: "W", Span: core.LineRange{Start: 3, End: 11}},
+		sym(core.KindMethod, "value", "W.value", "W.value", 4, 4, "public W value(String s)"),
+		sym(core.KindMethod, "value", "W.value", "W.value#2", 5, 5, "public W value(long n)"),
+		sym(core.KindMethod, "both", "W.both", "W.both", 6, 10, "void both()"),
+		sym(core.KindFunction, "<lambda@9:18>", "W.<lambda@9:18>", "W.<lambda@9:18>", 9, 9, "() -> value(\"b\")"),
+	}
+	result := javaAnalyzer{}.Analyze(context.Background(), Request{Root: root, Symbols: parsed, Files: []string{file}})
+	got := map[string]string{}
+	for _, e := range result.Edges {
+		if e.Type == core.EdgeCalls && e.Source == core.EvidenceSourceNative {
+			got[strings.TrimPrefix(e.From, file+"::")+" -> "+strings.TrimPrefix(e.To, file+"::")] = e.Lines
+		}
+	}
+	for edge, lines := range map[string]string{
+		"W.both@b1 -> W.value@b1":          "7,9",
+		"W.both@b1 -> W.value#2@b1":        "8",
+		"W.<lambda@9:18>@b1 -> W.value@b1": "9",
+	} {
+		if got[edge] != lines {
+			t.Errorf("%s: lines %q, want %q (all: %v)\n%s", edge, got[edge], lines, got, strings.Join(result.Diagnostics, "\n"))
+		}
+	}
+}

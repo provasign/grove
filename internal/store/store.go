@@ -140,6 +140,7 @@ func (s *Store) runAlterMigrations(ctx context.Context) error {
 		`ALTER TABLE symbols ADD COLUMN call_sites      TEXT NOT NULL DEFAULT '[]'`,
 		`ALTER TABLE edges ADD COLUMN source            TEXT NOT NULL DEFAULT 'unknown'`,
 		`ALTER TABLE edges ADD COLUMN reason            TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE edges ADD COLUMN lines             TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE symbols ADD COLUMN attr_sites      TEXT NOT NULL DEFAULT '[]'`,
 		// Stat cache: the walk skips hashing files whose size+mtime are
 		// unchanged since the last index (-1 = unknown, forces one hash).
@@ -437,20 +438,21 @@ func (s *Store) ReplaceEdges(ctx context.Context, edges []core.Edge) error {
 		confidence float64
 		source     string
 		reason     string
+		lines      string
 	}
 	stored := map[string]edgeMeta{}
-	rows, err := s.db.QueryContext(ctx, `SELECT id, confidence, source, COALESCE(reason, '') FROM edges`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, confidence, source, COALESCE(reason, ''), COALESCE(lines, '') FROM edges`)
 	if err != nil {
 		return err
 	}
 	for rows.Next() {
-		var id, source, reason string
+		var id, source, reason, lines string
 		var conf float64
-		if err := rows.Scan(&id, &conf, &source, &reason); err != nil {
+		if err := rows.Scan(&id, &conf, &source, &reason, &lines); err != nil {
 			rows.Close()
 			return err
 		}
-		stored[id] = edgeMeta{confidence: conf, source: source, reason: reason}
+		stored[id] = edgeMeta{confidence: conf, source: source, reason: reason, lines: lines}
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
@@ -468,7 +470,7 @@ func (s *Store) ReplaceEdges(ctx context.Context, edges []core.Edge) error {
 			continue // duplicate (from, type, to); first one wins
 		}
 		wantIDs[id] = true
-		if meta, ok := stored[id]; ok && meta.confidence == edge.Confidence && meta.source == string(edge.Source) && meta.reason == string(edge.Reason) {
+		if meta, ok := stored[id]; ok && meta.confidence == edge.Confidence && meta.source == string(edge.Source) && meta.reason == string(edge.Reason) && meta.lines == edge.Lines {
 			continue
 		}
 		upserts = append(upserts, edge)
@@ -556,16 +558,16 @@ func (s *Store) ReplaceEdges(ctx context.Context, edges []core.Edge) error {
 		}
 		chunk := upserts[start:end]
 		var sb strings.Builder
-		sb.WriteString(`INSERT INTO edges (id, from_node, to_node, edge_type, confidence, source, reason) VALUES `)
-		args := make([]any, 0, len(chunk)*7)
+		sb.WriteString(`INSERT INTO edges (id, from_node, to_node, edge_type, confidence, source, reason, lines) VALUES `)
+		args := make([]any, 0, len(chunk)*8)
 		for i, edge := range chunk {
 			if i > 0 {
 				sb.WriteString(",")
 			}
-			sb.WriteString("(?,?,?,?,?,?,?)")
-			args = append(args, upsertIDs[start+i], edge.From, edge.To, string(edge.Type), edge.Confidence, string(edge.Source), string(edge.Reason))
+			sb.WriteString("(?,?,?,?,?,?,?,?)")
+			args = append(args, upsertIDs[start+i], edge.From, edge.To, string(edge.Type), edge.Confidence, string(edge.Source), string(edge.Reason), edge.Lines)
 		}
-		sb.WriteString(` ON CONFLICT(id) DO UPDATE SET confidence = excluded.confidence, source = excluded.source, reason = excluded.reason`)
+		sb.WriteString(` ON CONFLICT(id) DO UPDATE SET confidence = excluded.confidence, source = excluded.source, reason = excluded.reason, lines = excluded.lines`)
 		if _, err := tx.ExecContext(ctx, sb.String(), args...); err != nil {
 			return err
 		}
@@ -689,7 +691,7 @@ func (s *Store) SymbolKeysForFile(ctx context.Context, filePath string) ([]core.
 const (
 	sqlDeleteNativeFromFile   = `DELETE FROM edges WHERE from_node >= ? AND from_node < ? AND +source = 'native'`
 	sqlDeleteNativeFromFileID = `DELETE FROM edges WHERE from_node = ? AND +source = 'native'`
-	sqlNativeEdgesInto        = `SELECT from_node, to_node, edge_type, confidence, source, COALESCE(reason, '')
+	sqlNativeEdgesInto        = `SELECT from_node, to_node, edge_type, confidence, source, COALESCE(reason, ''), COALESCE(lines, '')
 		FROM edges
 		WHERE to_node >= ? AND to_node < ? AND +source = 'native'
 		  AND NOT (from_node >= ? AND from_node < ?)`
@@ -710,7 +712,7 @@ func (s *Store) NativeEdgesInto(ctx context.Context, filePath string) ([]core.Ed
 	for rows.Next() {
 		var e core.Edge
 		var typ, source, reason string
-		if err := rows.Scan(&e.From, &e.To, &typ, &e.Confidence, &source, &reason); err != nil {
+		if err := rows.Scan(&e.From, &e.To, &typ, &e.Confidence, &source, &reason, &e.Lines); err != nil {
 			return nil, err
 		}
 		e.Type, e.Source, e.Reason = core.EdgeType(typ), core.EvidenceSource(source), core.EdgeReason(reason)
@@ -837,7 +839,7 @@ func (s *Store) AllEdges(ctx context.Context) ([]core.Edge, error) {
 	// sorted in Go yields the same order (the key is unique and BINARY
 	// collation compares bytes like Go strings).
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT from_node, to_node, edge_type, confidence, COALESCE(source, 'unknown'), COALESCE(reason, '')
+		SELECT from_node, to_node, edge_type, confidence, COALESCE(source, 'unknown'), COALESCE(reason, ''), COALESCE(lines, '')
 		FROM edges
 	`)
 	if err != nil {
@@ -848,7 +850,7 @@ func (s *Store) AllEdges(ctx context.Context) ([]core.Edge, error) {
 	for rows.Next() {
 		var edge core.Edge
 		var typ, source, reason string
-		if err := rows.Scan(&edge.From, &edge.To, &typ, &edge.Confidence, &source, &reason); err != nil {
+		if err := rows.Scan(&edge.From, &edge.To, &typ, &edge.Confidence, &source, &reason, &edge.Lines); err != nil {
 			return nil, err
 		}
 		edge.Type = core.EdgeType(typ)
@@ -946,17 +948,17 @@ func (s *Store) SpliceEdges(ctx context.Context, deleteOwners []string, nativeFi
 		}
 		part := inserts[start:end]
 		var sb strings.Builder
-		sb.WriteString(`INSERT INTO edges (id, from_node, to_node, edge_type, confidence, source, reason) VALUES `)
-		args := make([]any, 0, len(part)*7)
+		sb.WriteString(`INSERT INTO edges (id, from_node, to_node, edge_type, confidence, source, reason, lines) VALUES `)
+		args := make([]any, 0, len(part)*8)
 		for i, edge := range part {
 			if i > 0 {
 				sb.WriteString(",")
 			}
-			sb.WriteString("(?,?,?,?,?,?,?)")
+			sb.WriteString("(?,?,?,?,?,?,?,?)")
 			id := edge.From + "::" + string(edge.Type) + "::" + edge.To
-			args = append(args, id, edge.From, edge.To, string(edge.Type), edge.Confidence, string(edge.Source), string(edge.Reason))
+			args = append(args, id, edge.From, edge.To, string(edge.Type), edge.Confidence, string(edge.Source), string(edge.Reason), edge.Lines)
 		}
-		sb.WriteString(` ON CONFLICT(id) DO UPDATE SET confidence = excluded.confidence, source = excluded.source, reason = excluded.reason`)
+		sb.WriteString(` ON CONFLICT(id) DO UPDATE SET confidence = excluded.confidence, source = excluded.source, reason = excluded.reason, lines = excluded.lines`)
 		if _, err := tx.ExecContext(ctx, sb.String(), args...); err != nil {
 			return err
 		}
@@ -1038,7 +1040,7 @@ func FingerprintEdges(edges []core.Edge) EdgeFingerprint {
 // materializing every row. The query order matches FingerprintEdges.
 func (s *Store) EdgeFingerprint(ctx context.Context) (EdgeFingerprint, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT from_node, to_node, edge_type, confidence, COALESCE(source, 'unknown'), COALESCE(reason, '')
+		SELECT from_node, to_node, edge_type, confidence, COALESCE(source, 'unknown'), COALESCE(reason, ''), COALESCE(lines, '')
 		FROM edges
 		ORDER BY from_node, edge_type, to_node
 	`)
@@ -1052,7 +1054,7 @@ func (s *Store) EdgeFingerprint(ctx context.Context) (EdgeFingerprint, error) {
 	for rows.Next() {
 		var edge core.Edge
 		var typ, source, reason string
-		if err := rows.Scan(&edge.From, &edge.To, &typ, &edge.Confidence, &source, &reason); err != nil {
+		if err := rows.Scan(&edge.From, &edge.To, &typ, &edge.Confidence, &source, &reason, &edge.Lines); err != nil {
 			return EdgeFingerprint{}, err
 		}
 		edge.Type = core.EdgeType(typ)
@@ -1072,7 +1074,7 @@ func (s *Store) EdgeFingerprint(ctx context.Context) (EdgeFingerprint, error) {
 func writeEdgeFingerprint(h hash.Hash, edge core.Edge) {
 	id := edge.From + "::" + string(edge.Type) + "::" + edge.To
 	var word [8]byte
-	for _, value := range []string{id, string(edge.Source), string(edge.Reason)} {
+	for _, value := range []string{id, string(edge.Source), string(edge.Reason), edge.Lines} {
 		binary.BigEndian.PutUint64(word[:], uint64(len(value)))
 		_, _ = h.Write(word[:])
 		_, _ = h.Write([]byte(value))
@@ -1089,7 +1091,7 @@ func writeEdgeFingerprint(h hash.Hash, edge core.Edge) {
 func (s *Store) EdgesBySource(ctx context.Context, source string) ([]core.Edge, error) {
 	nEdges := s.countRows(ctx, `SELECT COUNT(*) FROM edges WHERE source = ?`, source) // before the cursor: see AllSymbols
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT from_node, to_node, edge_type, confidence, COALESCE(source, 'unknown'), COALESCE(reason, '')
+		SELECT from_node, to_node, edge_type, confidence, COALESCE(source, 'unknown'), COALESCE(reason, ''), COALESCE(lines, '')
 		FROM edges
 		WHERE source = ?
 		ORDER BY from_node, edge_type, to_node
@@ -1102,7 +1104,7 @@ func (s *Store) EdgesBySource(ctx context.Context, source string) ([]core.Edge, 
 	for rows.Next() {
 		var edge core.Edge
 		var typ, src, reason string
-		if err := rows.Scan(&edge.From, &edge.To, &typ, &edge.Confidence, &src, &reason); err != nil {
+		if err := rows.Scan(&edge.From, &edge.To, &typ, &edge.Confidence, &src, &reason, &edge.Lines); err != nil {
 			return nil, err
 		}
 		edge.Type = core.EdgeType(typ)

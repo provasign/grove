@@ -528,6 +528,9 @@ type ChangeImpactResult struct {
 	// caller with any resolved edge into the set is certain.
 	HasHeuristicRefs   bool
 	NameMatchedCallers []string
+	// CallerLines: per caller ID, the lines where a compiler resolved its
+	// calls into the change set (javac). Absent for callers without them.
+	CallerLines map[string][]int
 
 	// Data-member anchors only (fields, properties, constants, variables):
 	// MemberKind is non-empty, Accesses are the confirmed read/write/init/
@@ -634,6 +637,7 @@ func (e *Engine) ChangeImpactScoped(ctx context.Context, query, file string) (Ch
 		CallerCoverage:     raw.CallerCoverage,
 		HasHeuristicRefs:   raw.HasHeuristicRefs,
 		NameMatchedCallers: raw.NameMatchedCallers,
+		CallerLines:        raw.CallerLines,
 		MemberKind:         raw.MemberKind,
 		Accesses:           raw.Accesses,
 		AmbiguousAccesses:  raw.AmbiguousAccesses,

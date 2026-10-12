@@ -96,6 +96,10 @@ type Edge struct {
 	Type       EdgeType       `json:"type"`
 	Confidence float64        `json:"confidence"`
 	Source     EvidenceSource `json:"source,omitempty"`
+	// Lines: the caller's call lines a compiler resolved to this target,
+	// comma-separated and ascending ("127,140"). Only native call edges set
+	// it (javac); a string keeps Edge comparable.
+	Lines string `json:"lines,omitempty"`
 	// Reason is the resolver mechanism that produced the edge — the "why".
 	// Source names the extraction layer (astkit/heuristic/regex/native);
 	// Reason names how the candidate set was resolved. Coarse today; the

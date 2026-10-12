@@ -72,6 +72,11 @@ type ChangeImpactResult struct {
 	// mostly compiler-verified answer "heuristic" (hono Router.match: 13 of
 	// 14 callers compiler-resolved).
 	NameMatchedCallers []string
+	// CallerLines maps a caller's ID to the lines where a compiler resolved
+	// its calls into the change set (javac): each call site, not just the
+	// calling function, so an overload migration reads which line calls
+	// which overload. Callers without compiler lines are absent.
+	CallerLines map[string][]int
 
 	// Data-member anchors (fields, properties, constants, variables) only —
 	// see memberimpact.go. MemberKind is non-empty exactly for those.
@@ -104,6 +109,39 @@ func (c callerEvidence) note(e core.Edge) {
 	} else if _, ok := c[e.From]; !ok {
 		c[e.From] = false
 	}
+}
+
+// callerLines collects, per caller, the call lines compiler edges carry.
+type callerLines map[string]map[int]bool
+
+func (c callerLines) note(e core.Edge) {
+	if e.Type != core.EdgeCalls || e.Lines == "" {
+		return
+	}
+	for _, part := range strings.Split(e.Lines, ",") {
+		if n, err := strconv.Atoi(part); err == nil && n > 0 {
+			if c[e.From] == nil {
+				c[e.From] = map[int]bool{}
+			}
+			c[e.From][n] = true
+		}
+	}
+}
+
+func (c callerLines) sorted() map[string][]int {
+	if len(c) == 0 {
+		return nil
+	}
+	out := make(map[string][]int, len(c))
+	for id, set := range c {
+		lines := make([]int, 0, len(set))
+		for n := range set {
+			lines = append(lines, n)
+		}
+		sort.Ints(lines)
+		out[id] = lines
+	}
+	return out
 }
 
 // nameMatched returns the callers with no certain edge, sorted.
@@ -511,6 +549,7 @@ func (g *CodeGraph) changeImpactScoped(query, file string) (*ChangeImpactResult,
 	}
 	callerSeen := make(map[string]bool)
 	evidence := callerEvidence{}
+	callLines := callerLines{}
 	var callers []core.SymbolRecord
 	for id := range memberIDs {
 		for _, ei := range g.inbound[id] {
@@ -525,6 +564,7 @@ func (g *CodeGraph) changeImpactScoped(query, file string) (*ChangeImpactResult,
 			}
 			if !memberIDs[edge.From] {
 				evidence.note(edge)
+				callLines.note(edge)
 			}
 			if memberIDs[edge.From] || callerSeen[edge.From] {
 				continue
@@ -575,6 +615,7 @@ func (g *CodeGraph) changeImpactScoped(query, file string) (*ChangeImpactResult,
 		Completeness:       completeness,
 		HasHeuristicRefs:   len(evidence.nameMatched()) > 0,
 		NameMatchedCallers: evidence.nameMatched(),
+		CallerLines:        callLines.sorted(),
 	}, nil
 }
 
@@ -726,6 +767,7 @@ func (g *CodeGraph) externalRootedImpact(query, typeName, methodName string, que
 	}
 	callerSeen := make(map[string]bool)
 	evidence := callerEvidence{}
+	callLines := callerLines{}
 	var callers []core.SymbolRecord
 	for id := range memberIDs {
 		for _, ei := range g.inbound[id] {
@@ -735,6 +777,7 @@ func (g *CodeGraph) externalRootedImpact(query, typeName, methodName string, que
 			}
 			if !memberIDs[edge.From] {
 				evidence.note(edge)
+				callLines.note(edge)
 			}
 			if memberIDs[edge.From] || callerSeen[edge.From] {
 				continue
@@ -757,6 +800,7 @@ func (g *CodeGraph) externalRootedImpact(query, typeName, methodName string, que
 		Completeness:       "project-local",
 		HasHeuristicRefs:   len(evidence.nameMatched()) > 0,
 		NameMatchedCallers: evidence.nameMatched(),
+		CallerLines:        callLines.sorted(),
 	}, nil
 }
 
@@ -1154,6 +1198,7 @@ func (g *CodeGraph) freeFunctionImpactLocked(query, file string) *ChangeImpactRe
 		}
 	}
 	evidence := callerEvidence{}
+	callLines := callerLines{}
 	seen := map[string]bool{}
 	var callers []core.SymbolRecord
 	for id := range declIDs {
@@ -1165,6 +1210,7 @@ func (g *CodeGraph) freeFunctionImpactLocked(query, file string) *ChangeImpactRe
 				continue
 			}
 			evidence.note(edge)
+			callLines.note(edge)
 			if seen[edge.From] {
 				continue
 			}
@@ -1183,6 +1229,7 @@ func (g *CodeGraph) freeFunctionImpactLocked(query, file string) *ChangeImpactRe
 		Completeness:       "callers-only",
 		HasHeuristicRefs:   len(evidence.nameMatched()) > 0,
 		NameMatchedCallers: evidence.nameMatched(),
+		CallerLines:        callLines.sorted(),
 		ReExports:          g.jsReExportsLocked(decls),
 	}
 }
