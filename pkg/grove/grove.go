@@ -99,8 +99,7 @@ type Config struct {
 	MinEdgeConfidence *float64
 	// DeferNative, when non-nil, overrides whether a resident engine answers
 	// edits from the parse and runs the compiler pass in the background
-	// (default: on for resident engines, off for OneShot; GROVE_DEFER_NATIVE=0
-	// turns it off).
+	// (default off; GROVE_DEFER_NATIVE=1 turns it on; never for OneShot).
 	DeferNative *bool
 	// OneShot marks an engine that indexes once and exits (a CLI command).
 	// It keeps no resident analyzer workers, starts no background warm-up,
@@ -356,7 +355,11 @@ func (e *Engine) Index(ctx context.Context, dir string) (IndexResult, error) {
 }
 
 // deferNative reports whether edits are answered from the parse with the
-// compiler pass in the background (see Config.DeferNative).
+// compiler pass in the background (see Config.DeferNative). Off by default:
+// measured on jackson-databind (2026-10-12), javac is ~0.7s of a ~1.7s edit
+// and the rest (edge construction, store write) is paid twice when the pass
+// is deferred, so a compiler-backed answer arrives ~0.8s LATER than with the
+// synchronous pass; only a provisional answer arrives sooner (~1.05s).
 func (e *Engine) deferNative() bool {
 	if e.cfg.OneShot {
 		return false
@@ -364,7 +367,7 @@ func (e *Engine) deferNative() bool {
 	if e.cfg.DeferNative != nil {
 		return *e.cfg.DeferNative
 	}
-	return os.Getenv("GROVE_DEFER_NATIVE") != "0"
+	return os.Getenv("GROVE_DEFER_NATIVE") == "1"
 }
 
 // NativePending lists the files whose compiler analysis is still pending,
