@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -396,7 +397,38 @@ func BuildEdgesWithProgress(symbols []core.SymbolRecord, report ProgressFunc) []
 	decoEdges := buildDecoratorEdges(idx, symbols, callEdges)
 	edges = append(edges, decoEdges...)
 	tick("decorators")
-	return edges
+	return dropGuessesIntoCompilerDeclared(symbols, edges)
+}
+
+// dropGuessesIntoCompilerDeclared removes name-guessed reference edges
+// (calls, uses-type, reads, writes) into compiler-declared symbols. Such a
+// symbol exists because a compiler declared it, and the same compiler resolved
+// the references to it; a guess by name only adds the unrelated callers of
+// every same-named method (typeorm: nine getConnectionManager().get(...)
+// callers and a Map.get became callers of the container's anonymous get,
+// 2026-10-12). Structural edges (contains, extends, implements, overrides)
+// come from the symbol's own declaration and stay.
+func dropGuessesIntoCompilerDeclared(symbols []core.SymbolRecord, edges []core.Edge) []core.Edge {
+	declared := map[string]bool{}
+	for i := range symbols {
+		if slices.Contains(symbols[i].Modifiers, "compiler-declared") {
+			declared[symbols[i].ID] = true
+		}
+	}
+	if len(declared) == 0 {
+		return edges
+	}
+	out := edges[:0]
+	for _, e := range edges {
+		if declared[e.To] && e.Source != core.EvidenceSourceNative {
+			switch e.Type {
+			case core.EdgeCalls, core.EdgeUsesType, core.EdgeReads, core.EdgeWrites:
+				continue
+			}
+		}
+		out = append(out, e)
+	}
+	return out
 }
 
 // edgeTimer prints per-builder durations to stderr when GROVE_TIMING=1.

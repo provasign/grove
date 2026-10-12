@@ -118,7 +118,7 @@ func TestCompilerDeclaredSymbolsCoverOverlappingSpans(t *testing.T) {
 		{ID: "A.java::A@b", FilePath: "A.java", BlobSHA: "b", Language: "java", Kind: core.KindClass, Name: "A", Span: core.LineRange{Start: 1, End: 4}},
 		{ID: "A.java::A.m@b", FilePath: "A.java", BlobSHA: "b", Language: "java", Kind: core.KindMethod, Name: "m", Span: core.LineRange{Start: 3, End: 3}},
 	}}
-	got := compilerDeclaredSymbols(req, []javacDecl{
+	got := compilerDeclaredSymbols(req, []compilerDecl{
 		{File: "A.java", Kind: "method", Name: "m", Qualified: "A.m", Parent: "A", Start: 2, End: 3},
 		{File: "A.java", Kind: "method", Name: "n", Qualified: "A.n", Parent: "A", Start: 2, End: 3},
 	})

@@ -1621,8 +1621,13 @@ func buildContains(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
 				// Go receiver methods attach to their type across files:
 				// `func (s *T) M()` may live in any file of T's package.
 				// Same directory ≈ same package (Go enforces one package
-				// per directory).
+				// per directory). Only receiver methods: a field or an
+				// interface method ("declaration") sits inside its type, and
+				// function-local types reuse names across a package (grafana
+				// pkg/api: one local testCase per test, each collecting every
+				// other one's fields, 2026-10-12).
 				sameGoPackage := symbol.Language == "go" && parent.Language == "go" &&
+					symbol.Kind == core.KindMethod && !slices.Contains(symbol.Annotations, "declaration") &&
 					path.Dir(parent.FilePath) == path.Dir(symbol.FilePath)
 				sameRustCrate := symbol.Language == "rust" && parent.Language == "rust" &&
 					idx.rustCrateOfFile[symbol.FilePath] != "" &&

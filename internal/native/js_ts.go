@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -198,9 +199,13 @@ func (jsTSAnalyzer) Analyze(ctx context.Context, req Request) Result {
 		}
 	}
 	if out == nil {
-		cmd := exec.CommandContext(ctx, "node", "-e", tsScript)
+		scriptEnv, err := tsScriptEnv()
+		if err != nil {
+			return Result{Diagnostics: []string{"typescript resolver script: " + err.Error()}}
+		}
+		cmd := exec.CommandContext(ctx, "node", "-e", tsScriptLoader)
 		cmd.Dir = dir
-		env := []string{"GROVE_FILES=" + string(filesJSON), "GROVE_ROOT=" + req.Root}
+		env := []string{scriptEnv, "GROVE_FILES=" + string(filesJSON), "GROVE_ROOT=" + req.Root}
 		if changed := tsChangedFiles(req); changed != nil {
 			if b, err := jsonMarshal(changed); err == nil {
 				env = append(env, "GROVE_CHANGED="+string(b))
@@ -261,13 +266,22 @@ func (jsTSAnalyzer) Analyze(ctx context.Context, req Request) Result {
 			ToLine   int    `json:"toLine"`
 			Write    bool   `json:"write"`
 		} `json:"members"`
+		Decls []compilerDecl `json:"decls"`
 	}
 	if err := unmarshalJSON(tsPayload(out), &payload); err != nil {
 		return Result{Diagnostics: []string{"typescript resolver JSON decode failed: " + err.Error() +
 			": stdout starts " + strconv.Quote(clip(stdoutText, 160)) + "; stderr " + strconv.Quote(clip(stderrText, 160))}}
 	}
 	fileScope := fileSet(req.Files)
-	symbols := newSymbolLocator(req.Symbols, map[string]bool{"javascript": true, "typescript": true, "tsx": true})
+	// The compiler's declarations the parser lacks become compiler-declared
+	// symbols (as javac's and go/types'), and calls the checker resolved to
+	// them land on them.
+	declared := tsCompilerDeclaredSymbols(req, payload.Decls)
+	located := req.Symbols
+	if len(declared) > 0 {
+		located = append(append(make([]core.SymbolRecord, 0, len(req.Symbols)+len(declared)), req.Symbols...), declared...)
+	}
+	symbols := newSymbolLocator(located, map[string]bool{"javascript": true, "typescript": true, "tsx": true})
 	edges := make([]core.Edge, 0, len(payload.Edges)+len(payload.Calls)+len(payload.Types))
 	for _, edge := range payload.Edges {
 		from := strings.TrimSpace(edge.From)
@@ -317,6 +331,14 @@ func (jsTSAnalyzer) Analyze(ctx context.Context, req Request) Result {
 			"resolved " + itoa(len(payload.Members)) + " native member-reference candidate(s)",
 		}, payload.ConfigErrors...),
 	}
+	if len(declared) > 0 {
+		res.Symbols = declared
+		files := map[string]bool{}
+		for _, d := range declared {
+			files[d.FilePath] = true
+		}
+		res.Diagnostics = append(res.Diagnostics, "typescript declared "+itoa(len(declared))+" symbol(s) in "+itoa(len(files))+" file(s) the parser did not index; added as compiler-declared symbols")
+	}
 	if workerNote != "" {
 		res.Diagnostics = append(res.Diagnostics, workerNote)
 	} else if req.Resident && tsWorkerEnabled() && !tsWorkerOverCap(req.Root) {
@@ -330,6 +352,44 @@ func (jsTSAnalyzer) Analyze(ctx context.Context, req Request) Result {
 		}
 	}
 	return res
+}
+
+// tsCompilerDeclaredSymbols turns the resolver's decls into compiler-declared
+// symbols, each in the language the parser gave its file (a .js file's
+// symbols are javascript, a .tsx file's tsx).
+func tsCompilerDeclaredSymbols(req Request, decls []compilerDecl) []core.SymbolRecord {
+	if len(decls) == 0 {
+		return nil
+	}
+	langOf := map[string]string{}
+	for _, s := range req.Symbols {
+		switch s.Language {
+		case "javascript", "typescript", "tsx":
+			if _, ok := langOf[s.FilePath]; !ok {
+				langOf[s.FilePath] = s.Language
+			}
+		}
+	}
+	byLang := map[string][]compilerDecl{}
+	for _, d := range decls {
+		if lang := langOf[d.File]; lang != "" {
+			byLang[lang] = append(byLang[lang], d)
+		}
+	}
+	var out []core.SymbolRecord
+	for _, lang := range []string{"javascript", "tsx", "typescript"} {
+		out = append(out, compilerDeclaredSymbolsFor(req, lang, byLang[lang])...)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].FilePath != out[j].FilePath {
+			return out[i].FilePath < out[j].FilePath
+		}
+		if out[i].Span.Start != out[j].Span.Start {
+			return out[i].Span.Start < out[j].Span.Start
+		}
+		return out[i].QualifiedName < out[j].QualifiedName
+	})
+	return out
 }
 
 // tsChangedFiles returns the changed JS/TS files of an incremental run, or nil
@@ -490,6 +550,7 @@ const edges = [];
 const calls = [];
 const types = [];
 const members = [];
+const decls = [];
 const memberKeys = new Set();
 const edgeKeys = new Set();
 const callKeys = new Set();
@@ -717,6 +778,86 @@ function currentName(sf, stack) {
   // that as the file's <top-level> symbol, spanning the whole file.
   return {name: '<top-level>', line: 1};
 }
+// collectDecls reports the declarations of a file the compiler parsed, in
+// Grove's naming, for compiler-declared symbols (the Go side drops every one
+// the parser already indexed): class expressions and their members (an
+// unnamed one is <anonymous@line:col>, as javac's), declarations nested in
+// function bodies, and the bodyless members of an ambient 'declare class'.
+// typeorm (2026-10-12): 'new (class implements ContainerInterface { get() })()'
+// left ContainerInterface.get's one implementation out of every index.
+// Overload signatures and object-literal methods are skipped, as the parser
+// skips them.
+function collectDecls(sf) {
+  const file = rel(sf.fileName);
+  const pos = p => sf.getLineAndCharacterOfPosition(p);
+  const line = p => pos(p).line + 1;
+  const ident = n => n && (ts.isIdentifier(n) || ts.isPrivateIdentifier(n)) ? n.text : '';
+  const overload = (n, siblings) => !n.body && (siblings || []).some(m => m !== n && m.kind === n.kind && m.body &&
+    (ts.isConstructorDeclaration(n) || ident(m.name) === ident(n.name)));
+  const join = (scope, name) => scope ? scope + '.' + name : name;
+  function emit(n, kind, name, scope, parent, local, extra) {
+    const d = {f: file, k: kind, n: name, q: join(scope, name), p: parent, s: line(n.getStart(sf)), e: line(n.end)};
+    if (local) d.mods = ['local'];
+    decls.push(Object.assign(d, extra || {}));
+  }
+  function heritage(n) {
+    return (n.heritageClauses || []).map(h => (h.token === ts.SyntaxKind.ExtendsKeyword ? 'extends ' : 'implements ') +
+      h.types.map(t => t.expression.getText(sf)).join(', ')).join(' ');
+  }
+  function classLike(n, scope, parent, local) {
+    let name = ident(n.name), extra;
+    if (!name) {
+      const at = pos(n.getStart(sf));
+      name = '<anonymous@' + (at.line + 1) + ':' + (at.character + 1) + '>';
+      extra = {mods: local ? ['local', 'anonymous'] : ['anonymous']};
+    }
+    const h = heritage(n);
+    extra = Object.assign(extra || {}, {sig: 'class ' + name + (h ? ' ' + h : '')});
+    emit(n, 'class', name, scope, parent, local, extra);
+    const q = join(scope, name);
+    for (const m of n.members) {
+      if ((ts.isMethodDeclaration(m) || ts.isConstructorDeclaration(m)) && overload(m, n.members)) continue;
+      let mname = '', kind = 'method';
+      if (ts.isConstructorDeclaration(m)) { mname = 'constructor'; kind = 'constructor'; }
+      else if (ts.isMethodDeclaration(m) || ts.isGetAccessor(m) || ts.isSetAccessor(m)) mname = ident(m.name);
+      else if (ts.isPropertyDeclaration(m)) { mname = ident(m.name); kind = 'field'; }
+      if (!mname) { walk(m, q, name, local); continue; }
+      emit(m, kind, mname, q, name, local);
+      walk(m, join(q, mname), mname, local || !!m.body);
+    }
+  }
+  function walk(n, scope, parent, local) {
+    ts.forEachChild(n, c => {
+      if (ts.isClassDeclaration(c) || ts.isClassExpression(c)) return classLike(c, scope, parent, local);
+      if (ts.isInterfaceDeclaration(c)) {
+        emit(c, 'interface', c.name.text, scope, parent, local);
+        const q = join(scope, c.name.text);
+        for (const m of c.members) {
+          const mname = ident(m.name);
+          if (!mname) continue;
+          if (ts.isMethodSignature(m)) emit(m, 'method', mname, q, c.name.text, local, {ann: ['declaration']});
+          else if (ts.isPropertySignature(m)) emit(m, 'field', mname, q, c.name.text, local);
+        }
+        return;
+      }
+      if (ts.isEnumDeclaration(c)) return emit(c, 'enum', c.name.text, scope, parent, local);
+      if (ts.isTypeAliasDeclaration(c)) return emit(c, 'type', c.name.text, scope, parent, local);
+      if (ts.isFunctionDeclaration(c) && c.name) {
+        if (overload(c, c.parent.statements)) return;
+        emit(c, 'function', c.name.text, scope, parent, local);
+        return walk(c, join(scope, c.name.text), c.name.text, local || !!c.body);
+      }
+      if (ts.isModuleDeclaration(c) && ts.isIdentifier(c.name)) return walk(c, join(scope, c.name.text), c.name.text, local);
+      if (ts.isVariableDeclaration(c) && ts.isIdentifier(c.name) && c.initializer &&
+          (ts.isArrowFunction(c.initializer) || ts.isFunctionExpression(c.initializer))) {
+        return walk(c, join(scope, c.name.text), c.name.text, true);
+      }
+      if (ts.isFunctionLike(c) && c.body) return walk(c, scope, parent, true);
+      walk(c, scope, parent, local);
+    });
+  }
+  walk(sf, '', '', false);
+}
 function visit(checker, options, host, sf, node, stack) {
 	if (ts.isCallExpression(node) && node.arguments.length > 0 && ts.isStringLiteralLike(node.arguments[0])) {
 	  const expr = node.expression;
@@ -899,6 +1040,7 @@ for (const project of configs) {
     if (sf.isDeclarationFile || !input.has(path.resolve(sf.fileName)) || !inVisitScope(sf.fileName)) continue;
     loadedFiles.add(path.resolve(sf.fileName));
     visit(checker, parsed.options, host, sf, sf, []);
+    collectDecls(sf);
   }
   timing.visitMs += Date.now() - began;
 }
@@ -940,12 +1082,13 @@ if (uncovered.length > 0) {
       loadedFiles.add(abs);
       inferredFiles++;
       visit(checker, options, host, sf, sf, []);
+      collectDecls(sf);
     }
   }
 }
 return {files: loadedFiles.size, configs: configs.length, solutionConfigs, inferredFiles, timing, narrowed,
   scopedDirs: visitDirs === null ? null : [...visitDirs],
-  configErrors, edges, calls, types, members};
+  configErrors, edges, calls, types, members, decls};
 }
 if (process.env.GROVE_TS_WORKER === '1') {
   const rl = require('readline').createInterface({input: process.stdin, crlfDelay: Infinity});

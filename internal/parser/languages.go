@@ -32,7 +32,10 @@ var securityExtensions = map[string]bool{
 // blind to binary upgrades and serves stale symbols indefinitely.
 // 2026-10-12.1: javac compiler-declared symbols (native.Result.Symbols) and
 // astkit's Java field-initializer / initializer-block declarations.
-const ExtractorVersion = "2026-10-12.1"
+// 2026-10-12.2: go/types compiler-declared symbols (function-local types and
+// their fields and interface methods) and TypeScript ones (class-expression
+// members, functions nested in function bodies, ambient class members).
+const ExtractorVersion = "2026-10-12.2"
 
 // DetectLanguage returns the Grove language tag for a file path.
 // Returns "" for unsupported or security-excluded files.

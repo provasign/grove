@@ -280,7 +280,7 @@ func BuildEdgesDeltaMeta(prevEdges []core.Edge, prevSymbols, symbols []core.Symb
 	for id := range postOwners {
 		metaOwners[id] = true
 	}
-	return edges, buildDeltaMeta(symbols, metaOwners, changedFiles, nativeAnalyzedDirs)
+	return dropGuessesIntoCompilerDeclared(symbols, edges), buildDeltaMeta(symbols, metaOwners, changedFiles, nativeAnalyzedDirs)
 }
 
 // previousImplicitSuperKeys returns the "from\x00to" keys the implicit super
