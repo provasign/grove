@@ -733,6 +733,12 @@ func compilerDeclaredSymbolsFor(req Request, language string, decls []compilerDe
 			kind = core.KindConstructor
 		case "field":
 			kind = core.KindField
+		case "trait":
+			kind = core.KindTrait
+		case "const":
+			kind = core.KindConst
+		case "variable":
+			kind = core.KindVariable
 		default:
 			continue
 		}

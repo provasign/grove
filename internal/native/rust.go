@@ -6,7 +6,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
+	"time"
 
 	"github.com/provasign/grove/internal/core"
 )
@@ -16,6 +18,11 @@ type rustAnalyzer struct{}
 func (rustAnalyzer) Name() string { return "rust" }
 
 func (rustAnalyzer) Languages() []string { return []string{"rust"} }
+
+// Budget: an edit to a file holding macro-generated items re-runs
+// rust-analyzer over the whole workspace (tokio: ~11s), well past the
+// default incremental budget; a pass killed there would drop those items.
+func (rustAnalyzer) Budget(int) time.Duration { return 3 * time.Minute }
 
 func (rustAnalyzer) Available(_ context.Context, root string) Availability {
 	if !anyFile(root, "Cargo.toml") {
@@ -92,8 +99,7 @@ func (rustAnalyzer) Analyze(ctx context.Context, req Request) Result {
 	importCount := len(edges)
 	semanticEdges := rustSemanticEdges(req.Symbols, req.Files)
 	edges = append(edges, semanticEdges...)
-	return Result{
-		Edges: edges,
+	res := Result{
 		Diagnostics: []string{
 			"cargo metadata resolved " + itoa(len(meta.Packages)) + " package(s)",
 			"resolved " + itoa(importCount) + " native import edge(s)",
@@ -102,6 +108,42 @@ func (rustAnalyzer) Analyze(ctx context.Context, req Request) Result {
 			"resolved " + itoa(countNativeEdges(semanticEdges, core.EdgeImplements)) + " native implements edge(s)",
 		},
 	}
+	record := readRustScipCache(req.Root)
+	reuse := func(why string) {
+		if record == nil || len(req.ChangedFiles) == 0 {
+			return
+		}
+		cached := rustCachedEdges(record, req.Symbols)
+		edges = append(edges, cached...)
+		res.Diagnostics = append(res.Diagnostics, "rust-analyzer edges reused from the last run ("+why+"): "+itoa(len(cached)))
+	}
+	switch {
+	case rustScipNeeded(req, rustItemMacroFiles(req.Root, req.Files, req.Symbols), record):
+		if bin, reason := rustAnalyzerBin(); bin == "" {
+			res.Diagnostics = append(res.Diagnostics, "rust-analyzer pass skipped: "+reason)
+			reuse("rust-analyzer unavailable")
+		} else if raw, err := runRustAnalyzerScip(ctx, bin, req.Root); err != nil {
+			res.Diagnostics = append(res.Diagnostics, "rust-analyzer scip failed: "+err.Error())
+			reuse("this run failed")
+		} else if docs, err := decodeScip(raw); err != nil {
+			res.Diagnostics = append(res.Diagnostics, "rust-analyzer scip decode failed: "+err.Error())
+			reuse("this run failed")
+		} else {
+			declared, scipEdges := rustScipPass(req, docs)
+			res.Symbols = declared
+			edges = append(edges, scipEdges...)
+			res.Diagnostics = append(res.Diagnostics,
+				"rust-analyzer declared "+itoa(len(declared))+" symbol(s) the parser did not index (macro-generated items)",
+				"rust-analyzer resolved "+itoa(len(scipEdges))+" edge(s) from compiler-declared symbols")
+			if err := saveRustScipCache(req.Root, append(append([]core.SymbolRecord(nil), req.Symbols...), declared...), scipEdges); err != nil {
+				res.Diagnostics = append(res.Diagnostics, "rust-analyzer edge record not saved: "+err.Error())
+			}
+		}
+	case rustHasDeclared(req.Symbols):
+		reuse("no edited file needs it")
+	}
+	res.Edges = edges
+	return res
 }
 
 func rustModuleEdges(root string, files []string) []core.Edge {
@@ -163,7 +205,10 @@ func rustSemanticEdges(symbols []core.SymbolRecord, files []string) []core.Edge 
 	methodsByType := map[string][]core.SymbolRecord{}
 	moduleFiles := rustModuleFileIndex(files)
 	for _, symbol := range symbols {
-		if symbol.Language == "rust" {
+		// Edges to or from compiler-declared symbols are rust-analyzer's
+		// (rust_scip.go); a fresh pass declares them after this one runs, so
+		// matching them here would differ between cold and incremental runs.
+		if symbol.Language == "rust" && !slices.Contains(symbol.Modifiers, "compiler-declared") {
 			byFile[symbol.FilePath] = append(byFile[symbol.FilePath], symbol)
 			if typeKind(symbol.Kind) {
 				typesByName[symbol.Name] = append(typesByName[symbol.Name], symbol)
@@ -187,6 +232,12 @@ func rustSemanticEdges(symbols []core.SymbolRecord, files []string) []core.Edge 
 	// masked text.
 	masked := make([]string, len(symbols))
 	for i, symbol := range symbols {
+		// Compiler-declared symbols (rust_scip.go) carry rust-analyzer's own
+		// edges; text matching over their macro invocation would add guesses
+		// on incremental runs only (a fresh pass declares them after this).
+		if slices.Contains(symbol.Modifiers, "compiler-declared") {
+			continue
+		}
 		if symbol.Language == "rust" && symbol.RawText != "" {
 			masked[i] = maskCode("rust", symbol.RawText)
 			for _, ref := range rustImplRefs(masked[i]) {
@@ -199,7 +250,7 @@ func rustSemanticEdges(symbols []core.SymbolRecord, files []string) []core.Edge 
 		}
 	}
 	for i, caller := range symbols {
-		if caller.Language != "rust" || caller.RawText == "" || !callableKind(caller.Kind) {
+		if caller.Language != "rust" || caller.RawText == "" || !callableKind(caller.Kind) || masked[i] == "" {
 			continue
 		}
 		body := masked[i]
