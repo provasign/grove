@@ -4,10 +4,15 @@
 //   java GroveJavacResolver.java <root> <files-list> <classpath-file> [<sourcepath-file>]
 // files-list: one repo-relative .java path per line. classpath-file: a
 // File.pathSeparator-joined classpath (may be empty). Prints one JSON object:
-//   {"files":N,"errors":N,"calls":[...],"members":[...]}
-// Each entry: from/fromName/fromLine (enclosing method or class, its start
-// line), to/toName/toLine (the declaration), and for members "write".
-// Only declarations inside <root> are reported.
+//   {"files":N,"errors":N,"calls":[...],"members":[...],"decls":[...]}
+// Each call/member entry: from/fromName/fromLine (enclosing method or class,
+// its start line), to/toName/toLine (the declaration), and for members
+// "write". Only declarations inside <root> are reported.
+// decls: every type, method, constructor and field declaration javac
+// attributed, with the parser's naming (anonymous classes as
+// <anonymous@line:col>), so grove can add the ones its parser missed:
+//   {"f":file,"k":kind,"n":name,"q":qualified,"p":parentQualified,
+//    "s":startLine,"e":endLine,"b":baseTypeOfAnonymousClass}
 import com.sun.source.tree.*;
 import com.sun.source.util.*;
 import javax.lang.model.element.*;
@@ -20,6 +25,7 @@ import java.util.*;
 public class GroveJavacResolver {
     static final StringBuilder calls = new StringBuilder();
     static final StringBuilder members = new StringBuilder();
+    static final StringBuilder decls = new StringBuilder();
     static final Set<String> seen = new HashSet<>();
     static int nCalls = 0, nMembers = 0;
 
@@ -34,7 +40,7 @@ public class GroveJavacResolver {
             while ((line = in.readLine()) != null) {
                 String result;
                 try {
-                    calls.setLength(0); members.setLength(0); seen.clear(); nCalls = 0; nMembers = 0;
+                    calls.setLength(0); members.setLength(0); decls.setLength(0); seen.clear(); nCalls = 0; nMembers = 0;
                     result = run(line.split("\t", -1));
                 } catch (Throwable e) {
                     result = "{\"error\":" + q(String.valueOf(e)) + "}";
@@ -97,7 +103,7 @@ public class GroveJavacResolver {
         int errors = 0;
         for (Diagnostic<?> d : diags.getDiagnostics()) if (d.getKind() == Diagnostic.Kind.ERROR) errors++;
         return "{\"files\":" + unitCount + ",\"errors\":" + errors +
-            ",\"calls\":[" + calls + "],\"members\":[" + members + "]}";
+            ",\"calls\":[" + calls + "],\"members\":[" + members + "],\"decls\":[" + decls + "]}";
     }
 
     static String q(String s) {
@@ -119,6 +125,96 @@ public class GroveJavacResolver {
         long line(Tree t, CompilationUnitTree unit) {
             long pos = trees.getSourcePositions().getStartPosition(unit, t);
             return pos < 0 ? -1 : unit.getLineMap().getLineNumber(pos);
+        }
+        long endLine(Tree t, CompilationUnitTree unit) {
+            long pos = trees.getSourcePositions().getEndPosition(unit, t);
+            return pos < 0 ? -1 : unit.getLineMap().getLineNumber(pos);
+        }
+        // Column in characters from the line start (the parser's anonymous
+        // class names are <anonymous@line:col>, col 1-based, no tab expansion).
+        long column(Tree t, CompilationUnitTree unit) {
+            long pos = trees.getSourcePositions().getStartPosition(unit, t);
+            if (pos < 0) return -1;
+            long ln = unit.getLineMap().getLineNumber(pos);
+            return pos - unit.getLineMap().getStartPosition(ln) + 1;
+        }
+        // Qualified names of the enclosing types, innermost last, in the
+        // parser's form: Outer.Inner.<anonymous@l:c>.
+        final Deque<String> owners = new ArrayDeque<>();
+        void decl(String kind, String name, String qualified, String parent, long start, long end, String base) {
+            if (start < 0 || end < 0) return;
+            StringBuilder json = new StringBuilder("{\"f\":").append(q(file)).append(",\"k\":").append(q(kind))
+                .append(",\"n\":").append(q(name)).append(",\"q\":").append(q(qualified))
+                .append(",\"p\":").append(q(parent)).append(",\"s\":").append(start).append(",\"e\":").append(end);
+            if (base != null && !base.isEmpty()) json.append(",\"b\":").append(q(base));
+            json.append('}');
+            if (decls.length() > 0) decls.append(',');
+            decls.append(json);
+        }
+        @Override public Void visitClass(ClassTree t, Void v) {
+            String parent = owners.isEmpty() ? "" : owners.peekLast();
+            String name = t.getSimpleName().toString();
+            String kind;
+            switch (t.getKind()) {
+                case INTERFACE: kind = "interface"; break;
+                case ENUM: kind = "enum"; break;
+                case ANNOTATION_TYPE: kind = "annotation"; break;
+                default: kind = "class";
+            }
+            long start = line(t, cu), end = endLine(t, cu);
+            String base = null;
+            if (name.isEmpty() && t.getKind() == Tree.Kind.ENUM) {
+                // An enum constant body: the parser attributes its methods
+                // to the enum itself and declares no class for the body.
+                owners.addLast(parent);
+                try { return super.visitClass(t, v); } finally { owners.removeLast(); }
+            }
+            if (name.isEmpty()) {
+                // Anonymous: named and spanned by its `new T(...) {` expression.
+                TreePath pp = getCurrentPath().getParentPath();
+                Tree creation = pp == null ? null : pp.getLeaf();
+                if (creation instanceof NewClassTree) {
+                    name = "<anonymous@" + line(creation, cu) + ":" + column(creation, cu) + ">";
+                    start = line(creation, cu); end = endLine(creation, cu);
+                    base = ((NewClassTree) creation).getIdentifier().toString();
+                } else {
+                    name = "<anonymous@" + start + ":" + column(t, cu) + ">";
+                }
+            }
+            String qualified = parent.isEmpty() ? name : parent + "." + name;
+            decl(kind, name, qualified, parent, start, end, base);
+            owners.addLast(qualified);
+            try { return super.visitClass(t, v); } finally { owners.removeLast(); }
+        }
+        @Override public Void visitMethod(MethodTree t, Void v) {
+            if (!owners.isEmpty()) {
+                String parent = owners.peekLast();
+                boolean ctor = t.getName().contentEquals("<init>");
+                String name = ctor ? simple(parent) : t.getName().toString();
+                if (!(ctor && t.getBody() != null && t.getBody().getStatements().isEmpty() && line(t, cu) == line(t.getBody(), cu) && t.getParameters().isEmpty() && isDefaultCtor(t)))
+                    decl(ctor ? "constructor" : "method", name, parent + "." + name, parent, line(t, cu), endLine(t, cu), null);
+            }
+            return super.visitMethod(t, v);
+        }
+        // javac synthesizes a default constructor with no source position
+        // of its own (it shares the class's); the parser has no such symbol.
+        boolean isDefaultCtor(MethodTree t) {
+            long pos = trees.getSourcePositions().getStartPosition(cu, t);
+            TreePath cp = getCurrentPath().getParentPath();
+            return cp != null && cp.getLeaf() instanceof ClassTree && pos == trees.getSourcePositions().getStartPosition(cu, cp.getLeaf());
+        }
+        @Override public Void visitVariable(VariableTree t, Void v) {
+            TreePath pp = getCurrentPath().getParentPath();
+            if (!owners.isEmpty() && pp != null && pp.getLeaf() instanceof ClassTree) {
+                String parent = owners.peekLast();
+                String name = t.getName().toString();
+                decl("field", name, parent + "." + name, parent, line(t, cu), endLine(t, cu), null);
+            }
+            return super.visitVariable(t, v);
+        }
+        static String simple(String qualified) {
+            int i = qualified.lastIndexOf('.');
+            return i < 0 ? qualified : qualified.substring(i + 1);
         }
         // A line inside the method's own span whatever the extractor counts as
         // its start (annotations, modifiers): the body's first line, else the

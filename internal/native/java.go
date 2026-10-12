@@ -40,7 +40,13 @@ func (javaAnalyzer) Analyze(ctx context.Context, req Request) Result {
 	// reference and field access -- overloads included. An incremental run
 	// attributes only the affected packages; the text pass below follows the
 	// same scope so every other package's stored edges carry forward whole.
-	javacEdges, javacDiags, scopedDirs := javacResolveScoped(ctx, req)
+	javacEdges, javacDiags, scopedDirs, declared := javacResolveScoped(ctx, req)
+	semanticSymbols := req.Symbols
+	if len(declared) > 0 {
+		// Compiler-declared symbols take part in the text passes too: an
+		// anonymous adapter's `extends TypeAdapter` is its family edge.
+		semanticSymbols = append(append(make([]core.SymbolRecord, 0, len(req.Symbols)+len(declared)), req.Symbols...), declared...)
+	}
 	var inScope func(file string) bool
 	if scopedDirs != nil {
 		dirs := map[string]bool{}
@@ -49,7 +55,7 @@ func (javaAnalyzer) Analyze(ctx context.Context, req Request) Result {
 		}
 		inScope = func(file string) bool { return dirs[packageDir(file)] }
 	}
-	edges := javaSemanticEdgesIn(req.Symbols, inScope)
+	edges := javaSemanticEdgesIn(semanticSymbols, inScope)
 	edges = append(edges, javacEdges...)
 	diags = append(diags, javacDiags...)
 	diags = append(diags,
@@ -59,7 +65,7 @@ func (javaAnalyzer) Analyze(ctx context.Context, req Request) Result {
 		"resolved "+itoa(countNativeEdges(edges, core.EdgeExtends))+" native extends edge(s)",
 		"resolved "+itoa(countNativeEdges(edges, core.EdgeImplements))+" native implements edge(s)",
 	)
-	res := Result{Edges: edges, Diagnostics: diags}
+	res := Result{Edges: edges, Diagnostics: diags, Symbols: declared}
 	if scopedDirs != nil {
 		res.Partial = map[string][]string{"java": scopedDirs}
 	}

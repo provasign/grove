@@ -142,12 +142,12 @@ func TestJavacResidentWorkerMatchesOneShot(t *testing.T) {
 		return out
 	}
 	ctx := context.Background()
-	oneShot, diags, _ := javacResolveScoped(ctx, Request{Root: root, Files: rel, Symbols: symbols})
+	oneShot, diags, _, _ := javacResolveScoped(ctx, Request{Root: root, Files: rel, Symbols: symbols})
 	if len(oneShot) == 0 {
 		t.Skipf("javac resolver produced no edges: %v", diags)
 	}
 	for i := 0; i < 2; i++ {
-		resident, rdiags, _ := javacResolveScoped(ctx, Request{Root: root, Files: rel, Symbols: symbols, Resident: true})
+		resident, rdiags, _, _ := javacResolveScoped(ctx, Request{Root: root, Files: rel, Symbols: symbols, Resident: true})
 		if a, b := edgeSet(oneShot), edgeSet(resident); !slices.Equal(a, b) {
 			t.Fatalf("call %d: resident javac differs from one-shot:\n one-shot %v\n resident %v\n diags %v", i, a, b, rdiags)
 		}

@@ -760,6 +760,16 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 		}
 	}
 	result.Native = append(result.Native, nativeResult.Diagnostics...)
+	if len(nativeResult.Symbols) > 0 {
+		// Compiler-declared symbols (native.Result.Symbols) join the parsed
+		// ones in the store and in this run's symbol set, in store order, so
+		// edge construction, the baseline and later queries all see them.
+		if err := i.store.InsertSymbols(ctx, nativeResult.Symbols); err != nil {
+			return nil, result, err
+		}
+		symbols = append(symbols, nativeResult.Symbols...)
+		sort.Slice(symbols, func(a, b int) bool { return store.SymbolStoreLess(&symbols[a], &symbols[b]) })
+	}
 	// The analyzers ran: their verdict is what this database's native
 	// edges reflect from now on (a no-change re-index returns above and
 	// leaves the stored verdict alone). An analyzer skipped with its edges

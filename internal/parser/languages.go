@@ -30,7 +30,9 @@ var securityExtensions = map[string]bool{
 // detector fixes, synthesized records): the indexer re-extracts every file
 // when the stored stamp differs, because the blobSHA cache is otherwise
 // blind to binary upgrades and serves stale symbols indefinitely.
-const ExtractorVersion = "2026-10-10.1"
+// 2026-10-12.1: javac compiler-declared symbols (native.Result.Symbols) and
+// astkit's Java field-initializer / initializer-block declarations.
+const ExtractorVersion = "2026-10-12.1"
 
 // DetectLanguage returns the Grove language tag for a file path.
 // Returns "" for unsupported or security-excluded files.
