@@ -528,9 +528,10 @@ type ChangeImpactResult struct {
 	// caller with any resolved edge into the set is certain.
 	HasHeuristicRefs   bool
 	NameMatchedCallers []string
-	// CallerLines: per caller ID, the lines where a compiler resolved its
-	// calls into the change set (javac). Absent for callers without them.
-	CallerLines map[string][]int
+	// CallerLines: per caller ID, the positions ("line:col" of the called
+	// name) where a compiler resolved its calls into the change set
+	// (javac). Absent for callers without them.
+	CallerLines map[string][]string
 
 	// Data-member anchors only (fields, properties, constants, variables):
 	// MemberKind is non-empty, Accesses are the confirmed read/write/init/

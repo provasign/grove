@@ -72,11 +72,12 @@ type ChangeImpactResult struct {
 	// mostly compiler-verified answer "heuristic" (hono Router.match: 13 of
 	// 14 callers compiler-resolved).
 	NameMatchedCallers []string
-	// CallerLines maps a caller's ID to the lines where a compiler resolved
-	// its calls into the change set (javac): each call site, not just the
-	// calling function, so an overload migration reads which line calls
-	// which overload. Callers without compiler lines are absent.
-	CallerLines map[string][]int
+	// CallerLines maps a caller's ID to the positions ("line:col" of the
+	// called name) where a compiler resolved its calls into the change set
+	// (javac): each call, not just the calling function, so an overload
+	// migration reads which token calls which overload. Callers without
+	// compiler positions are absent.
+	CallerLines map[string][]string
 
 	// Data-member anchors (fields, properties, constants, variables) only —
 	// see memberimpact.go. MemberKind is non-empty exactly for those.
@@ -111,37 +112,56 @@ func (c callerEvidence) note(e core.Edge) {
 	}
 }
 
-// callerLines collects, per caller, the call lines compiler edges carry.
-type callerLines map[string]map[int]bool
+// callerLines collects, per caller, the call positions ("line:col")
+// compiler edges carry.
+type callerLines map[string]map[string]bool
 
 func (c callerLines) note(e core.Edge) {
 	if e.Type != core.EdgeCalls || e.Lines == "" {
 		return
 	}
 	for _, part := range strings.Split(e.Lines, ",") {
-		if n, err := strconv.Atoi(part); err == nil && n > 0 {
-			if c[e.From] == nil {
-				c[e.From] = map[int]bool{}
-			}
-			c[e.From][n] = true
+		if part == "" {
+			continue
 		}
+		if c[e.From] == nil {
+			c[e.From] = map[string]bool{}
+		}
+		c[e.From][part] = true
 	}
 }
 
-func (c callerLines) sorted() map[string][]int {
+func (c callerLines) sorted() map[string][]string {
 	if len(c) == 0 {
 		return nil
 	}
-	out := make(map[string][]int, len(c))
+	out := make(map[string][]string, len(c))
 	for id, set := range c {
-		lines := make([]int, 0, len(set))
-		for n := range set {
-			lines = append(lines, n)
+		pos := make([]string, 0, len(set))
+		for p := range set {
+			pos = append(pos, p)
 		}
-		sort.Ints(lines)
-		out[id] = lines
+		sort.Slice(pos, func(a, b int) bool { return positionLess(pos[a], pos[b]) })
+		out[id] = pos
 	}
 	return out
+}
+
+// positionLess orders "line" / "line:col" positions numerically.
+func positionLess(a, b string) bool {
+	la, ca := splitPosition(a)
+	lb, cb := splitPosition(b)
+	if la != lb {
+		return la < lb
+	}
+	return ca < cb
+}
+
+func splitPosition(p string) (int, int) {
+	l, c, _ := strings.Cut(p, ":")
+	line, _ := strconv.Atoi(l)
+	col, _ := strconv.Atoi(c)
+	return line, col
 }
 
 // nameMatched returns the callers with no certain edge, sorted.
