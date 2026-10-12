@@ -31,7 +31,11 @@ func TestDeferredSpliceCheckHealsBeforeNextIndex(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	eng, err := Open(ctx, Config{RepoRoot: root})
+	// Synchronous compiler pass: this test sequences the deferred splice
+	// check against the next foreground index, and a background compiler
+	// pass (Config.DeferNative) would run the check in between.
+	off := false
+	eng, err := Open(ctx, Config{RepoRoot: root, DeferNative: &off})
 	if err != nil {
 		t.Fatal(err)
 	}

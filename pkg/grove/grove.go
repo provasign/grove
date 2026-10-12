@@ -97,6 +97,11 @@ type Config struct {
 	// edge-confidence floor: edges below it are dropped from the graph and
 	// the store. See index.Options.MinConfidence.
 	MinEdgeConfidence *float64
+	// DeferNative, when non-nil, overrides whether a resident engine answers
+	// edits from the parse and runs the compiler pass in the background
+	// (default: on for resident engines, off for OneShot; GROVE_DEFER_NATIVE=0
+	// turns it off).
+	DeferNative *bool
 	// OneShot marks an engine that indexes once and exits (a CLI command).
 	// It keeps no resident analyzer workers, starts no background warm-up,
 	// and verifies its store write before returning. With no resident graph
@@ -139,6 +144,16 @@ type Engine struct {
 	// a query still in flight keeps the database locked (Windows:
 	// SQLITE_BUSY for the next opener).
 	bg sync.WaitGroup
+
+	// Deferred compiler pass (DeferNative): files whose compiler analysis
+	// is pending, and the background loop draining them. pendMu guards all
+	// four; the loop takes indexMu for each pass.
+	pendMu        sync.Mutex
+	pending       map[string]bool
+	nativeBusy    bool
+	nativeDone    chan struct{}
+	nativeErr     string
+	closingNative bool
 
 	mu    sync.RWMutex
 	graph *graph.CodeGraph
@@ -204,6 +219,9 @@ func (e *Engine) Close() error {
 	if e.store == nil {
 		return nil
 	}
+	e.pendMu.Lock()
+	e.closingNative = true
+	e.pendMu.Unlock()
 	e.indexMu.Lock()
 	e.runPendingCheck(context.Background())
 	if e.warmCancel != nil {
@@ -300,8 +318,164 @@ func (e *Engine) Index(ctx context.Context, dir string) (IndexResult, error) {
 	if dir == "" {
 		dir = e.root
 	}
+	deferNative := e.deferNative()
+	if deferNative {
+		e.pendMu.Lock()
+		busy := e.nativeBusy
+		e.pendMu.Unlock()
+		if busy {
+			// A compiler pass holds the index lock. Answer "fresh" without
+			// waiting for it when nothing changed since the last run; a
+			// real change waits for the pass, then indexes (never cancels
+			// it: a pass stopped between its symbol and edge writes would
+			// leave the store out of step).
+			if changed, err := e.idx.HasChanges(ctx, dir); err == nil && !changed {
+				return e.pendingNoopResult(ctx), nil
+			}
+		}
+	}
 	e.indexMu.Lock()
-	defer e.indexMu.Unlock()
+	res, err := e.indexLocked(ctx, dir, false, func(o *index.Options) { o.DeferNative = deferNative })
+	e.indexMu.Unlock()
+	if err != nil {
+		return res, err
+	}
+	if deferNative {
+		e.pendMu.Lock()
+		for _, f := range res.NativePending {
+			if e.pending == nil {
+				e.pending = map[string]bool{}
+			}
+			e.pending[f] = true
+		}
+		e.pendMu.Unlock()
+		e.startNativePass()
+	}
+	res.NativePending = e.NativePending()
+	return res, nil
+}
+
+// deferNative reports whether edits are answered from the parse with the
+// compiler pass in the background (see Config.DeferNative).
+func (e *Engine) deferNative() bool {
+	if e.cfg.OneShot {
+		return false
+	}
+	if e.cfg.DeferNative != nil {
+		return *e.cfg.DeferNative
+	}
+	return os.Getenv("GROVE_DEFER_NATIVE") != "0"
+}
+
+// NativePending lists the files whose compiler analysis is still pending,
+// sorted. Empty when the graph is fully compiler-backed (or no compiler ran).
+func (e *Engine) NativePending() []string {
+	e.pendMu.Lock()
+	defer e.pendMu.Unlock()
+	out := make([]string, 0, len(e.pending))
+	for f := range e.pending {
+		out = append(out, f)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// WaitNative waits up to d for the pending compiler pass to finish. It
+// reports whether nothing is pending when it returns.
+func (e *Engine) WaitNative(ctx context.Context, d time.Duration) bool {
+	e.pendMu.Lock()
+	done, busy, empty := e.nativeDone, e.nativeBusy, len(e.pending) == 0
+	e.pendMu.Unlock()
+	if !busy || done == nil {
+		return empty
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+	case <-ctx.Done():
+	}
+	e.pendMu.Lock()
+	defer e.pendMu.Unlock()
+	return len(e.pending) == 0
+}
+
+// startNativePass starts the background loop that re-analyzes pending files
+// with the compiler, one pass per snapshot, until nothing is pending. A
+// file added while a pass runs is picked up by the next iteration; the
+// exit check and the busy flag change under pendMu, so none is stranded.
+func (e *Engine) startNativePass() {
+	e.pendMu.Lock()
+	if e.nativeBusy || len(e.pending) == 0 || e.closingNative {
+		e.pendMu.Unlock()
+		return
+	}
+	e.nativeBusy = true
+	e.nativeDone = make(chan struct{})
+	done := e.nativeDone
+	e.pendMu.Unlock()
+	e.bg.Add(1)
+	go func() {
+		defer e.bg.Done()
+		for {
+			e.pendMu.Lock()
+			files := make([]string, 0, len(e.pending))
+			for f := range e.pending {
+				files = append(files, f)
+			}
+			if len(files) == 0 || e.closingNative {
+				e.nativeBusy = false
+				close(done)
+				e.pendMu.Unlock()
+				return
+			}
+			e.pendMu.Unlock()
+			sort.Strings(files)
+			e.indexMu.Lock()
+			res, err := e.indexLocked(context.Background(), e.root, true, func(o *index.Options) { o.ReextractFiles = files })
+			e.indexMu.Unlock()
+			e.pendMu.Lock()
+			if err != nil {
+				// Pending stays; the next Index restarts the loop.
+				e.nativeErr = err.Error()
+				e.nativeBusy = false
+				close(done)
+				e.pendMu.Unlock()
+				return
+			}
+			e.nativeErr = ""
+			still := map[string]bool{}
+			for _, f := range res.NativePending {
+				still[f] = true
+			}
+			for _, f := range files {
+				if !still[f] {
+					delete(e.pending, f)
+				}
+			}
+			e.pendMu.Unlock()
+		}
+	}()
+}
+
+// pendingNoopResult is the answer to an Index call that found nothing new
+// while the compiler pass runs: counts from the store, the pending files.
+func (e *Engine) pendingNoopResult(ctx context.Context) IndexResult {
+	res := IndexResult{Root: e.root, NativePending: e.NativePending()}
+	if st, err := e.store.Status(ctx); err == nil {
+		res.SymbolCount, res.EdgeCount = st.SymbolCount, st.EdgeCount
+	}
+	res.Native = append(res.Native, fmt.Sprintf(
+		"skipped: no file changes since last index; compiler pass running for %d file(s)", len(res.NativePending)))
+	return res
+}
+
+// indexLocked is one index run under indexMu; adjust sets per-run options.
+// A background run (the deferred compiler pass) leaves the previous run's
+// splice note for the next caller-visible result instead of reporting it on
+// a result nobody reads.
+func (e *Engine) indexLocked(ctx context.Context, dir string, background bool, adjust func(*index.Options)) (IndexResult, error) {
 	e.runPendingCheck(ctx)
 	// SkipNoopGraph: a no-change index returns a nil graph instead of
 	// reloading all stored symbols+edges. If a resident graph exists it is
@@ -309,6 +483,9 @@ func (e *Engine) Index(ctx context.Context, dir string) (IndexResult, error) {
 	// exists yet, the first query rehydrates lazily via currentGraph.
 	resident := !e.cfg.OneShot
 	opts := index.Options{SkipNoopGraph: true, Force: e.force, Vacuum: e.cfg.VacuumAfterIndex, DeferSpliceCheck: resident, Resident: resident}
+	if adjust != nil {
+		adjust(&opts)
+	}
 	if e.cfg.MinEdgeConfidence != nil {
 		opts.MinConfidence, opts.MinConfidenceSet = *e.cfg.MinEdgeConfidence, true
 	}
@@ -341,7 +518,7 @@ func (e *Engine) Index(ctx context.Context, dir string) (IndexResult, error) {
 		}
 	}
 	cg, result, err := e.idx.IndexWithOptions(ctx, dir, opts)
-	if e.spliceNote != "" {
+	if e.spliceNote != "" && !background {
 		result.Native = append(result.Native, "previous run: "+e.spliceNote)
 		e.spliceNote = ""
 	}

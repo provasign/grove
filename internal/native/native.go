@@ -542,3 +542,26 @@ func decodeJSON[T any](data []byte) (T, error) {
 	err := json.Unmarshal(data, &out)
 	return out, err
 }
+
+// DeferrableLanguages returns the languages whose native analysis an
+// incremental run may defer: an enabled analyzer touches them, and it has
+// completed a full pass before (completed, by analyzer name), so stored
+// compiler edges exist to carry until the deferred pass runs. A language no
+// analyzer covers is not listed: there is nothing to defer.
+func DeferrableLanguages(cfg Config, changed, completed map[string]bool) map[string]bool {
+	out := map[string]bool{}
+	if !cfg.Enabled {
+		return out
+	}
+	for _, analyzer := range PriorityAnalyzers() {
+		if !analyzerEnabled(analyzer, cfg) || !completed[analyzer.Name()] || !touchesLanguages(analyzer, changed) {
+			continue
+		}
+		for _, lang := range analyzer.Languages() {
+			if changed[lang] {
+				out[lang] = true
+			}
+		}
+	}
+	return out
+}

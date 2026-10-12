@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 )
 
 const goInterfaceImpactSource = `package coverage
@@ -149,6 +150,11 @@ func TestGoInterfaceImpactIncrementalRemovesStaleDispatch(t *testing.T) {
 			}
 			if _, err := eng.Index(ctx, ""); err != nil {
 				t.Fatal(err)
+			}
+			// The compiler pass for the edit may run in the background
+			// (Config.DeferNative); the compiler-backed answer follows it.
+			if !eng.WaitNative(ctx, 2*time.Minute) {
+				t.Fatalf("compiler pass did not drain: %v", eng.NativePending())
 			}
 			after, err := eng.ChangeImpactScoped(ctx, "writer.CloseNotify", "writer.go")
 			if err != nil {

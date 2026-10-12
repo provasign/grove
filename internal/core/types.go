@@ -163,6 +163,10 @@ type IndexResult struct {
 	EdgeCount    int      `json:"edgeCount"`
 	Errors       []string `json:"errors,omitempty"`
 	Native       []string `json:"native,omitempty"`
+	// NativePending lists changed files whose compiler analysis was deferred
+	// (index.Options.DeferNative): their edges are parse-derived until a
+	// later run re-analyzes them.
+	NativePending []string `json:"nativePending,omitempty"`
 }
 
 type IsolatedChangeRegion struct {

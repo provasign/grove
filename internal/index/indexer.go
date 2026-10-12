@@ -83,6 +83,18 @@ type Options struct {
 	// processes and caches between runs (see native.Config.Resident).
 	Resident bool
 
+	// DeferNative skips the native (compiler) analyzers of the languages an
+	// incremental run changed: the graph is built from the parse and the
+	// stored compiler edges (re-pointed to the new symbols), and the changed
+	// files come back in IndexResult.NativePending for a later run with
+	// ReextractFiles. A cold or forced run, or an analyzer that never
+	// completed a full pass, is never deferred.
+	DeferNative bool
+	// ReextractFiles are extracted again even when their bytes are unchanged
+	// (the deferred compiler pass for IndexResult.NativePending). They count
+	// as changed for native analysis and edge construction.
+	ReextractFiles []string
+
 	// PrevBaseline, when PrevEdges is nil, loads the previous state from the
 	// store. It is called only when the walk found changed files and before
 	// they are persisted (afterwards the store no longer holds the previous
@@ -376,18 +388,9 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 	// before walking, so they are neither indexed nor left to grow.
 	native.CleanupLegacyCaches(root)
 	currentFiles := map[string]bool{}
-	ignore := newIgnoreMatcher(root)
 
 	// Phase 1 (serial): walk the tree, apply ignore/sensitivity rules, and
 	// collect the files whose content hash changed since the last index.
-	type parseTask struct {
-		absPath string
-		relPath string
-		blobSHA string
-		size    int64
-		mtime   int64
-	}
-	var tasks []parseTask
 	fileMeta, err := i.store.AllFileMeta(ctx)
 	if err != nil {
 		return nil, result, err
@@ -404,108 +407,21 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 		return nil, result, err
 	}
 	forceExtract := opts.Force || storedExtractor != parser.ExtractorVersion || storedResolver != graph.ResolverVersion
-	statRefresh := map[string][2]int64{} // touched but content-identical
-	var walkFailed []string              // relPaths whose subtree could not be read this run
-	err = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			// A failed subtree contributes nothing to currentFiles, so the
-			// prune pass below would silently delete its stored records. An
-			// unreadable root aborts the whole run (a nonexistent root must
-			// never empty an existing index); a failed sub-path is recorded so
-			// its stored files are shielded from pruning.
-			if path == root {
-				return walkErr
-			}
-			result.Errors = append(result.Errors, walkErr.Error())
-			if rel, relErr := filepath.Rel(root, path); relErr == nil {
-				walkFailed = append(walkFailed, filepath.ToSlash(rel))
-			}
-			return nil
-		}
-		relPath, err := filepath.Rel(root, path)
-		if err != nil {
-			relPath = path
-		}
-		relPath = filepath.ToSlash(relPath)
-
-		if entry.IsDir() {
-			if path != root && (shouldSkipDirName(entry.Name()) ||
-				ignore.Ignored(relPath, true)) {
-				return filepath.SkipDir
-			}
-			// Nested ignore files apply from this directory downward;
-			// WalkDir visits parents first, so deeper rules land later and
-			// override (gitignore last-match-wins).
-			if path != root {
-				ignore.LoadDir(path, relPath)
-			}
-			return nil
-		}
-		if isSensitivePath(relPath) || ignore.Ignored(relPath, false) {
-			return nil
-		}
-		// A symlinked FILE entry inside root can point anywhere; WalkDir
-		// already refuses to descend into a symlinked DIRECTORY (its
-		// DirEntry.IsDir() is false for a symlink even when the target is a
-		// dir, so it falls through to this file branch and typically fails
-		// parser.Supported below) — but a symlinked file whose target has a
-		// recognized extension would otherwise have its content read,
-		// parsed, and exposed under the in-repo symlink name even though
-		// the real bytes live outside the indexed tree. Reject any entry
-		// whose resolved target escapes root before it is ever parsed.
-		if entry.Type()&os.ModeSymlink != 0 {
-			resolved, e := filepath.EvalSymlinks(path)
-			if e != nil {
-				return nil
-			}
-			if r, e := filepath.Rel(root, resolved); e != nil || r == ".." || strings.HasPrefix(r, ".."+string(filepath.Separator)) {
-				return nil
-			}
-		}
-		if !parser.SupportedFile(path) {
-			return nil
-		}
-
-		result.FilesSeen++
-		currentFiles[relPath] = true
-
-		// Stat cache: size+mtime match means the content is unchanged —
-		// skip reading and hashing 1.4GB of sources on every rescan.
-		// os.Stat (not entry.Info) so symlinked sources stat the TARGET;
-		// the link's own stat never changes when the target is edited.
-		// --force bypasses the shortcut: it is the recovery path for
-		// mtime-preserving writers (rsync -t, tar, build caches).
-		info, statErr := os.Stat(path)
-		meta, found := fileMeta[relPath]
-		if !forceExtract && statErr == nil && found &&
-			meta.Size == info.Size() && meta.Mtime == info.ModTime().UnixNano() {
-			result.FilesSkipped++
-			return nil
-		}
-		blobSHA, err := parser.FileBlobSHA(path)
-		if err != nil {
-			result.Errors = append(result.Errors, fmt.Sprintf("%s: %v", relPath, err))
-			return nil
-		}
-		var size, mtime int64 = -1, -1
-		if statErr == nil {
-			size, mtime = info.Size(), info.ModTime().UnixNano()
-		}
-		if !forceExtract && found && meta.BlobSHA == blobSHA {
-			// Touched (or first run after the stat-cache migration) but
-			// content-identical: refresh the stat so the next walk skips it.
-			// forceExtract bypasses this too — force means force, and a
-			// changed extractor stamp must re-extract identical bytes.
-			result.FilesSkipped++
-			statRefresh[relPath] = [2]int64{size, mtime}
-			return nil
-		}
-		tasks = append(tasks, parseTask{absPath: path, relPath: relPath, blobSHA: blobSHA, size: size, mtime: mtime})
-		return nil
-	})
+	reextract := make(map[string]bool, len(opts.ReextractFiles))
+	for _, f := range opts.ReextractFiles {
+		reextract[filepath.ToSlash(f)] = true
+	}
+	scan, err := scanTree(root, fileMeta, forceExtract, reextract)
 	if err != nil {
 		return nil, result, err
 	}
+	tasks, statRefresh, walkFailed := scan.tasks, scan.statRefresh, scan.walkFailed
+	for f := range scan.currentFiles {
+		currentFiles[f] = true
+	}
+	result.FilesSeen += scan.filesSeen
+	result.FilesSkipped += scan.filesSkipped
+	result.Errors = append(result.Errors, scan.errors...)
 	if err := i.store.UpdateFileStats(ctx, statRefresh); err != nil {
 		return nil, result, err
 	}
@@ -745,7 +661,40 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 			nativeCfg.RunToCompletion[a.Name()] = true
 		}
 	}
-	nativeResult := native.AnalyzeChangedFiles(ctx, root, symbols, nativeCfg, scope, changedRel, allFiles)
+	var nativeResult native.Result
+	deferred := map[string]bool{}
+	if opts.DeferNative && scope != nil {
+		deferred = native.DeferrableLanguages(nativeCfg, changedLanguages, completed)
+	}
+	if len(deferred) > 0 {
+		// Deferred compiler pass: the changed languages' analyzers are
+		// skipped, so their stored edges are carried (re-pointed to the new
+		// symbols below) and the changed files are reported pending. Other
+		// changed languages, if any, still run now.
+		rest := map[string]bool{}
+		for lang := range changedLanguages {
+			if !deferred[lang] {
+				rest[lang] = true
+			}
+		}
+		if len(rest) > 0 {
+			nativeResult = native.AnalyzeChangedFiles(ctx, root, symbols, nativeCfg, rest, changedRel, allFiles)
+		}
+		for lang := range deferred {
+			nativeResult.SkippedLanguages = append(nativeResult.SkippedLanguages, lang)
+		}
+		sort.Strings(nativeResult.SkippedLanguages)
+		for _, f := range changedRel {
+			if deferred[parser.DetectLanguage(f)] {
+				result.NativePending = append(result.NativePending, f)
+			}
+		}
+		sort.Strings(result.NativePending)
+		nativeResult.Diagnostics = append(nativeResult.Diagnostics, fmt.Sprintf(
+			"native: compiler analysis deferred for %d changed file(s); stored compiler edges carried until the deferred pass", len(result.NativePending)))
+	} else {
+		nativeResult = native.AnalyzeChangedFiles(ctx, root, symbols, nativeCfg, scope, changedRel, allFiles)
+	}
 	if len(nativeResult.Completed) > 0 {
 		for _, n := range nativeResult.Completed {
 			completed[n] = true
@@ -1147,4 +1096,186 @@ func carryForwardVerdict(ctx context.Context, st *store.Store, current []string)
 		merged = append(merged, line)
 	}
 	return merged
+}
+
+// parseTask is one file the walk found new or changed.
+type parseTask struct {
+	absPath string
+	relPath string
+	blobSHA string
+	size    int64
+	mtime   int64
+}
+
+// treeScan is what one walk of the tree found: the files to (re)extract, the
+// set of files present, content-identical files whose stat must be
+// refreshed, and subtrees that could not be read.
+type treeScan struct {
+	tasks        []parseTask
+	currentFiles map[string]bool
+	statRefresh  map[string][2]int64
+	walkFailed   []string
+	filesSeen    int
+	filesSkipped int
+	errors       []string
+}
+
+// scanTree walks root applying the ignore and sensitivity rules and
+// compares every supported file with the stored stat/blob cache. It reads
+// the tree and fileMeta only; it writes nothing, so it is safe beside a
+// running index (HasChanges uses it without the index lock). reextract
+// names files to extract again even when their bytes are unchanged (a
+// deferred compiler pass, see Options.ReextractFiles).
+func scanTree(root string, fileMeta map[string]store.FileMeta, forceExtract bool, reextract map[string]bool) (treeScan, error) {
+	s := treeScan{currentFiles: map[string]bool{}, statRefresh: map[string][2]int64{}}
+	ignore := newIgnoreMatcher(root)
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			// A failed subtree contributes nothing to currentFiles, so the
+			// prune pass below would silently delete its stored records. An
+			// unreadable root aborts the whole run (a nonexistent root must
+			// never empty an existing index); a failed sub-path is recorded so
+			// its stored files are shielded from pruning.
+			if path == root {
+				return walkErr
+			}
+			s.errors = append(s.errors, walkErr.Error())
+			if rel, relErr := filepath.Rel(root, path); relErr == nil {
+				s.walkFailed = append(s.walkFailed, filepath.ToSlash(rel))
+			}
+			return nil
+		}
+		relPath, err := filepath.Rel(root, path)
+		if err != nil {
+			relPath = path
+		}
+		relPath = filepath.ToSlash(relPath)
+
+		if entry.IsDir() {
+			if path != root && (shouldSkipDirName(entry.Name()) ||
+				ignore.Ignored(relPath, true)) {
+				return filepath.SkipDir
+			}
+			// Nested ignore files apply from this directory downward;
+			// WalkDir visits parents first, so deeper rules land later and
+			// override (gitignore last-match-wins).
+			if path != root {
+				ignore.LoadDir(path, relPath)
+			}
+			return nil
+		}
+		if isSensitivePath(relPath) || ignore.Ignored(relPath, false) {
+			return nil
+		}
+		// A symlinked FILE entry inside root can point anywhere; WalkDir
+		// already refuses to descend into a symlinked DIRECTORY (its
+		// DirEntry.IsDir() is false for a symlink even when the target is a
+		// dir, so it falls through to this file branch and typically fails
+		// parser.Supported below) — but a symlinked file whose target has a
+		// recognized extension would otherwise have its content read,
+		// parsed, and exposed under the in-repo symlink name even though
+		// the real bytes live outside the indexed tree. Reject any entry
+		// whose resolved target escapes root before it is ever parsed.
+		if entry.Type()&os.ModeSymlink != 0 {
+			resolved, e := filepath.EvalSymlinks(path)
+			if e != nil {
+				return nil
+			}
+			if r, e := filepath.Rel(root, resolved); e != nil || r == ".." || strings.HasPrefix(r, ".."+string(filepath.Separator)) {
+				return nil
+			}
+		}
+		if !parser.SupportedFile(path) {
+			return nil
+		}
+
+		s.filesSeen++
+		s.currentFiles[relPath] = true
+
+		// Stat cache: size+mtime match means the content is unchanged —
+		// skip reading and hashing 1.4GB of sources on every rescan.
+		// os.Stat (not entry.Info) so symlinked sources stat the TARGET;
+		// the link's own stat never changes when the target is edited.
+		// --force bypasses the shortcut: it is the recovery path for
+		// mtime-preserving writers (rsync -t, tar, build caches).
+		info, statErr := os.Stat(path)
+		meta, found := fileMeta[relPath]
+		if !forceExtract && !reextract[relPath] && statErr == nil && found &&
+			meta.Size == info.Size() && meta.Mtime == info.ModTime().UnixNano() {
+			s.filesSkipped++
+			return nil
+		}
+		blobSHA, err := parser.FileBlobSHA(path)
+		if err != nil {
+			s.errors = append(s.errors, fmt.Sprintf("%s: %v", relPath, err))
+			return nil
+		}
+		var size, mtime int64 = -1, -1
+		if statErr == nil {
+			size, mtime = info.Size(), info.ModTime().UnixNano()
+		}
+		if !forceExtract && !reextract[relPath] && found && meta.BlobSHA == blobSHA {
+			// Touched (or first run after the stat-cache migration) but
+			// content-identical: refresh the stat so the next walk skips it.
+			// forceExtract bypasses this too — force means force, and a
+			// changed extractor stamp must re-extract identical bytes.
+			s.filesSkipped++
+			s.statRefresh[relPath] = [2]int64{size, mtime}
+			return nil
+		}
+		s.tasks = append(s.tasks, parseTask{absPath: path, relPath: relPath, blobSHA: blobSHA, size: size, mtime: mtime})
+		return nil
+	})
+	return s, err
+}
+
+// HasChanges reports whether an index run of root would find work: a new,
+// changed or removed file, or an extractor/resolver stamp that forces
+// re-extraction. It applies the same walk (scanTree), stamp and prune rules
+// as a run and writes nothing, so a resident engine can answer "still fresh"
+// while a deferred compiler pass holds the index lock.
+func (i *Indexer) HasChanges(ctx context.Context, root string) (bool, error) {
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return false, err
+	}
+	if resolved, err2 := filepath.EvalSymlinks(absRoot); err2 == nil {
+		absRoot = resolved
+	}
+	storedExtractor, _, err := i.store.GetMeta(ctx, "extractor-version")
+	if err != nil {
+		return false, err
+	}
+	storedResolver, _, err := i.store.GetMeta(ctx, "resolver-version")
+	if err != nil {
+		return false, err
+	}
+	if storedExtractor != parser.ExtractorVersion || storedResolver != graph.ResolverVersion {
+		return true, nil
+	}
+	fileMeta, err := i.store.AllFileMeta(ctx)
+	if err != nil {
+		return false, err
+	}
+	scan, err := scanTree(absRoot, fileMeta, false, nil)
+	if err != nil {
+		return false, err
+	}
+	if len(scan.tasks) > 0 {
+		return true, nil
+	}
+	current := scan.currentFiles
+	for relPath := range fileMeta {
+		for _, failed := range scan.walkFailed {
+			if relPath == failed || strings.HasPrefix(relPath, failed+"/") {
+				current[relPath] = true
+				break
+			}
+		}
+	}
+	pruned, err := i.store.FilesNotIn(ctx, current)
+	if err != nil {
+		return false, err
+	}
+	return len(pruned) > 0, nil
 }
