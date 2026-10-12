@@ -287,12 +287,27 @@ public class GroveJavacResolver {
             // A chained call split across lines (writer(out)\n    .value(x))
             // starts on the receiver's line; the method's name ends on the
             // line an edit of the call touches.
+            // The position is the method name's own start (line:column,
+            // 1-based characters), so an edit can replace exactly that token
+            // even when two overloads are called on one line.
             Tree leaf = getCurrentPath().getLeaf();
-            long at = write != null ? -1
-                : leaf instanceof MethodInvocationTree ? endLine(((MethodInvocationTree) leaf).getMethodSelect(), cu)
-                : line(leaf, cu);
+            long at = -1, col = -1;
+            if (write == null) {
+                long pos = trees.getSourcePositions().getStartPosition(cu, leaf);
+                if (leaf instanceof MethodInvocationTree) {
+                    Tree sel = ((MethodInvocationTree) leaf).getMethodSelect();
+                    String name = sel instanceof MemberSelectTree ? ((MemberSelectTree) sel).getIdentifier().toString()
+                        : sel instanceof IdentifierTree ? ((IdentifierTree) sel).getName().toString() : null;
+                    long end = trees.getSourcePositions().getEndPosition(cu, sel);
+                    if (name != null && end >= name.length()) pos = end - name.length();
+                }
+                if (pos >= 0) {
+                    at = cu.getLineMap().getLineNumber(pos);
+                    col = pos - cu.getLineMap().getStartPosition(at) + 1;
+                }
+            }
             String json = "{\"from\":" + q(file) + ",\"fromName\":" + q(from[0]) + ",\"fromLine\":" + from[1] +
-                (at > 0 ? ",\"line\":" + at : "") +
+                (at > 0 ? ",\"line\":" + at + ",\"col\":" + col : "") +
                 ",\"to\":" + q(to[0]) + ",\"toName\":" + q(to[1]) + ",\"toLine\":" + to[2] +
                 (write == null ? "" : ",\"write\":" + write) + (inLambda() ? ",\"lambda\":true" + (lambdaAt() == null ? "" : ",\"lambdaAt\":" + q(lambdaAt())) : "") +
                 (inMethodRef ? ",\"ref\":true" : "") + "}";

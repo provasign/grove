@@ -177,9 +177,9 @@ public class W {
 		}
 	}
 	for edge, lines := range map[string]string{
-		"W.both@b1 -> W.value@b1":          "7,9",
-		"W.both@b1 -> W.value#2@b1":        "8,11",
-		"W.<lambda@9:18>@b1 -> W.value@b1": "9",
+		"W.both@b1 -> W.value@b1":          "7:5,9:24",
+		"W.both@b1 -> W.value#2@b1":        "8:5,11:10",
+		"W.<lambda@9:18>@b1 -> W.value@b1": "9:24",
 	} {
 		if got[edge] != lines {
 			t.Errorf("%s: lines %q, want %q (all: %v)\n%s", edge, got[edge], lines, got, strings.Join(result.Diagnostics, "\n"))
