@@ -575,11 +575,32 @@ func javacResolveScoped(ctx context.Context, req Request) ([]core.Edge, []string
 	// call behind it sits in a lambda.
 	type pair struct{ from, to string }
 	callIdx := map[pair]int{}
+	// The parser indexes a lambda as its own symbol (<lambda@line:col>) and
+	// guesses edges from its call sites; javac attributes the same calls to
+	// the enclosing method. A call in a lambda also gets a native edge from
+	// the lambda, so the compiler's resolution supersedes those guesses
+	// (gson: () -> jsonWriter.value(true) was listed under all seven
+	// value overloads).
+	lambdas := map[string]core.SymbolRecord{}
+	for _, sym := range all {
+		if sym.Language == "java" && strings.HasPrefix(sym.Name, "<lambda@") {
+			lambdas[sym.FilePath+"\x00"+sym.Name] = sym
+		}
+	}
 	for _, c := range payload.Calls {
 		from, okFrom := symbols.at(c.From, c.FromName, c.FromLine)
 		to, okTo := symbols.at(c.To, c.ToName, c.ToLine)
 		if !okFrom || !okTo || from.ID == to.ID {
 			continue
+		}
+		if c.Lambda && c.LambdaAt != "" {
+			if lam, ok := lambdas[from.FilePath+"\x00<lambda@"+c.LambdaAt+">"]; ok && lam.ID != to.ID {
+				if _, dup := callIdx[pair{lam.ID, to.ID}]; !dup {
+					le := symbolEdge(lam, to, core.EdgeCalls, 0.99)
+					callIdx[pair{lam.ID, to.ID}] = len(edges)
+					edges = append(edges, le)
+				}
+			}
 		}
 		k := pair{from.ID, to.ID}
 		reason := core.EdgeReason("")
@@ -797,6 +818,9 @@ type javacRef struct {
 	ToLine   int    `json:"toLine"`
 	Write    bool   `json:"write"`
 	Lambda   bool   `json:"lambda"`
+	// LambdaAt: where the innermost lambda holding the call starts
+	// ("line:column"); grove's parser names that lambda <lambda@line:column>.
+	LambdaAt string `json:"lambdaAt"`
 	Ref      bool   `json:"ref"`
 }
 

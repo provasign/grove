@@ -212,7 +212,12 @@ func mergeEdges(base, enriched []core.Edge) []core.Edge {
 	//   - the checker named no concrete target at all.
 	type calleeSet struct {
 		quals, ifaceOwners map[string]bool
-		static             bool // a direct, non-dispatch concrete resolution
+		// files holds, per resolved qualified name, the files of the
+		// targets: a same-named declaration in another file is a build-tag
+		// twin (kept); one in the same file is an overload the checker did
+		// not pick (gson value(1) -> value(long), not value(float)).
+		files  map[string]map[string]bool
+		static bool // a direct, non-dispatch concrete resolution
 	}
 	resolved := map[string]map[string]*calleeSet{} // caller -> callee name -> native targets
 	implements := map[string]map[string]bool{}     // type qual -> interface quals
@@ -237,11 +242,16 @@ func mergeEdges(base, enriched []core.Edge) []core.Edge {
 		name := calleeNameOf(e.To)
 		set := byName[name]
 		if set == nil {
-			set = &calleeSet{quals: map[string]bool{}, ifaceOwners: map[string]bool{}}
+			set = &calleeSet{quals: map[string]bool{}, ifaceOwners: map[string]bool{}, files: map[string]map[string]bool{}}
 			byName[name] = set
 		}
 		qual, anchor := symbolQual(e.To)
 		set.quals[qual] = true
+		if set.files[qual] == nil {
+			set.files[qual] = map[string]bool{}
+		}
+		toFile, _, _ := strings.Cut(e.To, "::")
+		set.files[qual][toFile] = true
 		if anchor {
 			set.ifaceOwners[qualOwner(qual)] = true
 		} else if e.Reason != core.ReasonMethodSet {
@@ -255,7 +265,8 @@ func mergeEdges(base, enriched []core.Edge) []core.Edge {
 		}
 		qual := calleeQualOf(e.To)
 		if set.quals[qual] {
-			return false
+			toFile, _, _ := strings.Cut(e.To, "::")
+			return set.files[qual][toFile] // same file: an overload the checker did not pick
 		}
 		if len(set.ifaceOwners) > 0 {
 			for iface := range set.ifaceOwners {
@@ -320,6 +331,14 @@ func symbolQual(id string) (qual string, anchor bool) {
 	owner, member, anchor := strings.Cut(rest, "#")
 	if at := strings.LastIndexByte(owner, '@'); at >= 0 {
 		owner = owner[:at]
+	}
+	// "T.value@sha#2" is the second same-named declaration (an overload),
+	// not an interface-dispatch anchor "T@sha#Name": a member name never
+	// starts with a digit. Read as an anchor it named the callee "2", so a
+	// name-guessed call to JsonTreeWriter.value(boolean) survived javac
+	// resolving the same call to JsonWriter.value(String).
+	if anchor && member != "" && member[0] >= '0' && member[0] <= '9' {
+		return owner, false
 	}
 	if anchor {
 		return owner + "." + member, true
