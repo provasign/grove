@@ -282,7 +282,11 @@ public class GroveJavacResolver {
         void emit(StringBuilder out, Element target, Boolean write) {
             String[] from = enclosing(), to = declared(target);
             if (from == null || to == null) return;
+            // The call expression's own line: grove keeps, per compiler call
+            // edge, the lines javac resolved to that target.
+            long at = write == null ? line(getCurrentPath().getLeaf(), cu) : -1;
             String json = "{\"from\":" + q(file) + ",\"fromName\":" + q(from[0]) + ",\"fromLine\":" + from[1] +
+                (at > 0 ? ",\"line\":" + at : "") +
                 ",\"to\":" + q(to[0]) + ",\"toName\":" + q(to[1]) + ",\"toLine\":" + to[2] +
                 (write == null ? "" : ",\"write\":" + write) + (inLambda() ? ",\"lambda\":true" + (lambdaAt() == null ? "" : ",\"lambdaAt\":" + q(lambdaAt())) : "") +
                 (inMethodRef ? ",\"ref\":true" : "") + "}";

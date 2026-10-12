@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -587,6 +588,16 @@ func javacResolveScoped(ctx context.Context, req Request) ([]core.Edge, []string
 			lambdas[sym.FilePath+"\x00"+sym.Name] = sym
 		}
 	}
+	callLines := map[int]map[int]bool{} // edge index -> call lines
+	addLine := func(i, line int) {
+		if line <= 0 {
+			return
+		}
+		if callLines[i] == nil {
+			callLines[i] = map[int]bool{}
+		}
+		callLines[i][line] = true
+	}
 	for _, c := range payload.Calls {
 		from, okFrom := symbols.at(c.From, c.FromName, c.FromLine)
 		to, okTo := symbols.at(c.To, c.ToName, c.ToLine)
@@ -595,9 +606,12 @@ func javacResolveScoped(ctx context.Context, req Request) ([]core.Edge, []string
 		}
 		if c.Lambda && c.LambdaAt != "" {
 			if lam, ok := lambdas[from.FilePath+"\x00<lambda@"+c.LambdaAt+">"]; ok && lam.ID != to.ID {
-				if _, dup := callIdx[pair{lam.ID, to.ID}]; !dup {
+				if i, dup := callIdx[pair{lam.ID, to.ID}]; dup {
+					addLine(i, c.Line)
+				} else {
 					le := symbolEdge(lam, to, core.EdgeCalls, 0.99)
 					callIdx[pair{lam.ID, to.ID}] = len(edges)
+					addLine(len(edges), c.Line)
 					edges = append(edges, le)
 				}
 			}
@@ -614,12 +628,26 @@ func javacResolveScoped(ctx context.Context, req Request) ([]core.Edge, []string
 			if reason == "" {
 				edges[i].Reason = "" // a plain call outranks lambda/ref forms
 			}
+			addLine(i, c.Line)
 			continue
 		}
 		e := symbolEdge(from, to, core.EdgeCalls, 0.99)
 		e.Reason = reason
 		callIdx[k] = len(edges)
+		addLine(len(edges), c.Line)
 		edges = append(edges, e)
+	}
+	for i, set := range callLines {
+		lines := make([]int, 0, len(set))
+		for l := range set {
+			lines = append(lines, l)
+		}
+		sort.Ints(lines)
+		parts := make([]string, len(lines))
+		for j, l := range lines {
+			parts[j] = strconv.Itoa(l)
+		}
+		edges[i].Lines = strings.Join(parts, ",")
 	}
 	for _, m := range payload.Members {
 		from, okFrom := symbols.at(m.From, m.FromName, m.FromLine)
@@ -821,7 +849,9 @@ type javacRef struct {
 	// LambdaAt: where the innermost lambda holding the call starts
 	// ("line:column"); grove's parser names that lambda <lambda@line:column>.
 	LambdaAt string `json:"lambdaAt"`
-	Ref      bool   `json:"ref"`
+	// Line: the call expression's line (calls only).
+	Line int  `json:"line"`
+	Ref  bool `json:"ref"`
 }
 
 // compilerDecl is one declaration a compiler attributed: javac's resolver
