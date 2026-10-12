@@ -177,6 +177,15 @@ func (g *CodeGraph) memberAnchorLocked(query, file string) (*memberAnchor, error
 			owned = append(owned, s)
 		}
 	}
+	// A bare name that is both a module-level variable and a member of some
+	// type is ambiguous unless a file says which: the module-level one won
+	// silently, so `request` answered for a benchmark script's variable
+	// instead of Hono.request (1,105 sites) or FetchEvent.request
+	// (2026-10-12). Scoped to a file, the module-level declaration there is
+	// the one meant (members are addressable as Type.member).
+	if len(moduleLevel) > 0 && len(owned) > 0 && file == "" {
+		return nil, mixedBareMemberError(query, q, moduleLevel, owned)
+	}
 	if len(moduleLevel) > 0 {
 		return g.ownerlessAnchorLocked(q, q, moduleLevel)
 	}
@@ -488,4 +497,44 @@ func memberLanguages(lang string) []string {
 		return []string{"typescript", "tsx", "javascript"}
 	}
 	return []string{lang}
+}
+
+// mixedBareMemberError lists every candidate of a bare data-member name that
+// is declared both at module level and inside types: one line per
+// module-level scope (retry with the name and its file) and one per owning
+// type (retry with Type.member), each with a sample location.
+func mixedBareMemberError(query, member string, moduleLevel, owned []core.SymbolRecord) error {
+	type line struct{ label, loc string }
+	var lines []line
+	seen := map[string]bool{}
+	add := func(label string, s core.SymbolRecord) {
+		key := label + "\x00" + s.FilePath
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		lines = append(lines, line{label, fmt.Sprintf("%s:%d", s.FilePath, s.Span.Start)})
+	}
+	for _, s := range moduleLevel {
+		add(member, s)
+	}
+	for _, s := range owned {
+		add(s.ParentSymbol+"."+member, s)
+	}
+	sort.Slice(lines, func(i, j int) bool {
+		if lines[i].label != lines[j].label {
+			return lines[i].label < lines[j].label
+		}
+		return lines[i].loc < lines[j].loc
+	})
+	var b strings.Builder
+	for i, l := range lines {
+		if i >= maxLooseCandidates {
+			fmt.Fprintf(&b, "\n  … and %d more", len(lines)-maxLooseCandidates)
+			break
+		}
+		fmt.Fprintf(&b, "\n  %s  (%s)", l.label, l.loc)
+	}
+	return fmt.Errorf("change-impact: %q is ambiguous — %d candidates:%s\nre-run with one of these (a module-level name with its file, a member as Type.member)",
+		query, len(lines), b.String())
 }
