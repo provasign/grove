@@ -43,7 +43,6 @@ func TestDeferredCompilerPassConvergesToColdIndex(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer eng.Close()
 	if _, err := eng.Index(ctx, ""); err != nil { // cold: synchronous compiler pass
 		t.Fatal(err)
 	}
@@ -120,6 +119,26 @@ func TestDeferredCompilerPassConvergesToColdIndex(t *testing.T) {
 	if g, w := edges(gotEdges), edges(wantEdges); !equalStrings(g, w) {
 		t.Fatalf("edges differ from a cold index:\n got %d %v\nwant %d %v", len(g), g, len(w), w)
 	}
+	// The store must hold the same thing: a new engine rehydrates from it.
+	if err := eng.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(ctx, Config{RepoRoot: root, OneShot: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	storedSyms, storedEdges, err := reopened.SnapshotGraph(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g, w := ids(storedSyms), ids(wantSyms); !equalStrings(g, w) {
+		t.Fatalf("stored symbols differ from a cold index:\n got %v\nwant %v", g, w)
+	}
+	if g, w := edges(storedEdges), edges(wantEdges); !equalStrings(g, w) {
+		t.Fatalf("stored edges differ from a cold index:\n got %d %v\nwant %d %v", len(g), g, len(w), w)
+	}
+	eng = reopened
 	// And the anonymous override is in Adapter.write's family.
 	r, err := eng.ChangeImpact(ctx, "Adapter.write")
 	if err != nil {

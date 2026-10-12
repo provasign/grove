@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/provasign/grove/internal/store"
 )
@@ -123,6 +124,11 @@ func TestIncrementalIndexMatchesFullRebuild(t *testing.T) {
 			if !marked {
 				t.Fatalf("incremental path not taken; diagnostics: %v", res.Native)
 			}
+		}
+		// The compiler pass for the edit may run in the background
+		// (Config.DeferNative); compare the state it converges to.
+		if !eng.WaitNative(ctx, 2*time.Minute) {
+			t.Fatalf("compiler pass did not drain: %v", eng.NativePending())
 		}
 		queries = rawQueries(t, eng)
 		return storedEdgeDump(t, root)
