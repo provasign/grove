@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -290,6 +291,9 @@ func TestRustResidentWorkerEndToEnd(t *testing.T) {
 	if bin == "" || !commandExists("cargo") {
 		t.Skip("rust-analyzer or cargo not installed")
 	}
+	if out, err := exec.Command(bin, "--version").CombinedOutput(); err != nil {
+		t.Skipf("rust-analyzer not runnable: %s", strings.TrimSpace(string(out)))
+	}
 	t.Setenv("GROVE_RUST_ANALYZER", bin)
 	root := t.TempDir()
 	write := func(rel, body string) {
@@ -349,5 +353,24 @@ func TestRustResidentWorkerEndToEnd(t *testing.T) {
 	ren := (rustAnalyzer{}).Analyze(context.Background(), Request{Root: root, Files: files, Symbols: append(append([]core.SymbolRecord{}, lib2...), util2...), ChangedFiles: []string{"src/util.rs"}, PrevChanged: util, Resident: true})
 	if has(ren, lib2[0].ID, util2[0].ID) || !has(ren, lib2[0].ID, util2[1].ID) {
 		t.Fatalf("rename: want only entry -> other, got %v (%v)", ren.Edges, ren.Diagnostics)
+	}
+}
+
+// rustup's proxy without the component exits with "Unknown binary": it is
+// not an installed rust-analyzer.
+func TestRustAnalyzerBinSkipsBrokenProxy(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script stand-in")
+	}
+	dir := t.TempDir()
+	proxy := filepath.Join(dir, "rust-analyzer")
+	if err := os.WriteFile(proxy, []byte("#!/bin/sh\necho \"error: Unknown binary 'rust-analyzer'\" >&2\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GROVE_RUST_ANALYZER", "")
+	t.Setenv("PATH", dir)
+	t.Setenv("HOME", t.TempDir())
+	if bin, reason := rustAnalyzerBin(); bin != "" || !strings.Contains(reason, "not found") {
+		t.Fatalf("broken proxy accepted: %q %q", bin, reason)
 	}
 }

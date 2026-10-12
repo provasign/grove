@@ -14,6 +14,8 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"google.golang.org/protobuf/encoding/protowire"
 
@@ -40,8 +42,12 @@ import (
 // reuses the edits of the last run (rustScipCache) instead of paying for a
 // whole-workspace analysis (tokio: ~11s) on every save.
 
-// rustAnalyzerBin locates rust-analyzer: $GROVE_RUST_ANALYZER (a path, or
-// 0/false/off to disable the pass), PATH, then ~/.cargo/bin.
+// rustAnalyzerBin locates a runnable rust-analyzer: $GROVE_RUST_ANALYZER (a
+// path, or 0/false/off to disable the pass), PATH, ~/.cargo/bin, then the
+// server the VS Code extension (and its forks) bundles. rustup installs a
+// rust-analyzer proxy even without the component ("Unknown binary
+// 'rust-analyzer' in official toolchain"), so each candidate must answer
+// --version.
 func rustAnalyzerBin() (string, string) {
 	if value := strings.TrimSpace(os.Getenv("GROVE_RUST_ANALYZER")); value != "" {
 		if isFalse(value) {
@@ -49,32 +55,43 @@ func rustAnalyzerBin() (string, string) {
 		}
 		return value, ""
 	}
-	if path, err := exec.LookPath("rust-analyzer"); err == nil {
-		return path, ""
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", "rust-analyzer not found"
-	}
 	exe := "rust-analyzer"
 	if runtime.GOOS == "windows" {
 		exe += ".exe"
 	}
-	if path := filepath.Join(home, ".cargo", "bin", exe); fileExists(path) {
-		return path, ""
+	var candidates []string
+	if path, err := exec.LookPath("rust-analyzer"); err == nil {
+		candidates = append(candidates, path)
 	}
-	// The VS Code extension (and its forks) ships its own server binary
-	// rather than putting one on PATH; take the newest installed version.
-	for _, editor := range []string{".vscode", ".vscode-insiders", ".cursor", ".windsurf"} {
-		matches, _ := filepath.Glob(filepath.Join(home, editor, "extensions", "rust-lang.rust-analyzer-*", "server", exe))
-		sort.Strings(matches)
-		for i := len(matches) - 1; i >= 0; i-- {
-			if fileExists(matches[i]) {
-				return matches[i], ""
-			}
+	if home, err := os.UserHomeDir(); err == nil {
+		candidates = append(candidates, filepath.Join(home, ".cargo", "bin", exe))
+		for _, editor := range []string{".vscode", ".vscode-insiders", ".cursor", ".windsurf"} {
+			matches, _ := filepath.Glob(filepath.Join(home, editor, "extensions", "rust-lang.rust-analyzer-*", "server", exe))
+			sort.Sort(sort.Reverse(sort.StringSlice(matches))) // newest version first
+			candidates = append(candidates, matches...)
+		}
+	}
+	for _, path := range candidates {
+		if fileExists(path) && rustAnalyzerRuns(path) {
+			return path, ""
 		}
 	}
 	return "", "rust-analyzer not found (PATH, ~/.cargo/bin, editor extensions)"
+}
+
+var rustAnalyzerRunnable sync.Map // path -> bool
+
+// rustAnalyzerRuns reports whether path answers --version (memoized: the
+// check runs once per binary per process).
+func rustAnalyzerRuns(path string) bool {
+	if ok, seen := rustAnalyzerRunnable.Load(path); seen {
+		return ok.(bool)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ok := exec.CommandContext(ctx, path, "--version").Run() == nil
+	rustAnalyzerRunnable.Store(path, ok)
+	return ok
 }
 
 func fileExists(path string) bool {
