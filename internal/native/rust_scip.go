@@ -14,6 +14,8 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
 	"google.golang.org/protobuf/encoding/protowire"
 
@@ -40,8 +42,12 @@ import (
 // reuses the edits of the last run (rustScipCache) instead of paying for a
 // whole-workspace analysis (tokio: ~11s) on every save.
 
-// rustAnalyzerBin locates rust-analyzer: $GROVE_RUST_ANALYZER (a path, or
-// 0/false/off to disable the pass), PATH, then ~/.cargo/bin.
+// rustAnalyzerBin locates a runnable rust-analyzer: $GROVE_RUST_ANALYZER (a
+// path, or 0/false/off to disable the pass), PATH, ~/.cargo/bin, then the
+// server the VS Code extension (and its forks) bundles. rustup installs a
+// rust-analyzer proxy even without the component ("Unknown binary
+// 'rust-analyzer' in official toolchain"), so each candidate must answer
+// --version.
 func rustAnalyzerBin() (string, string) {
 	if value := strings.TrimSpace(os.Getenv("GROVE_RUST_ANALYZER")); value != "" {
 		if isFalse(value) {
@@ -49,32 +55,43 @@ func rustAnalyzerBin() (string, string) {
 		}
 		return value, ""
 	}
-	if path, err := exec.LookPath("rust-analyzer"); err == nil {
-		return path, ""
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", "rust-analyzer not found"
-	}
 	exe := "rust-analyzer"
 	if runtime.GOOS == "windows" {
 		exe += ".exe"
 	}
-	if path := filepath.Join(home, ".cargo", "bin", exe); fileExists(path) {
-		return path, ""
+	var candidates []string
+	if path, err := exec.LookPath("rust-analyzer"); err == nil {
+		candidates = append(candidates, path)
 	}
-	// The VS Code extension (and its forks) ships its own server binary
-	// rather than putting one on PATH; take the newest installed version.
-	for _, editor := range []string{".vscode", ".vscode-insiders", ".cursor", ".windsurf"} {
-		matches, _ := filepath.Glob(filepath.Join(home, editor, "extensions", "rust-lang.rust-analyzer-*", "server", exe))
-		sort.Strings(matches)
-		for i := len(matches) - 1; i >= 0; i-- {
-			if fileExists(matches[i]) {
-				return matches[i], ""
-			}
+	if home, err := os.UserHomeDir(); err == nil {
+		candidates = append(candidates, filepath.Join(home, ".cargo", "bin", exe))
+		for _, editor := range []string{".vscode", ".vscode-insiders", ".cursor", ".windsurf"} {
+			matches, _ := filepath.Glob(filepath.Join(home, editor, "extensions", "rust-lang.rust-analyzer-*", "server", exe))
+			sort.Sort(sort.Reverse(sort.StringSlice(matches))) // newest version first
+			candidates = append(candidates, matches...)
+		}
+	}
+	for _, path := range candidates {
+		if fileExists(path) && rustAnalyzerRuns(path) {
+			return path, ""
 		}
 	}
 	return "", "rust-analyzer not found (PATH, ~/.cargo/bin, editor extensions)"
+}
+
+var rustAnalyzerRunnable sync.Map // path -> bool
+
+// rustAnalyzerRuns reports whether path answers --version (memoized: the
+// check runs once per binary per process).
+func rustAnalyzerRuns(path string) bool {
+	if ok, seen := rustAnalyzerRunnable.Load(path); seen {
+		return ok.(bool)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ok := exec.CommandContext(ctx, path, "--version").Run() == nil
+	rustAnalyzerRunnable.Store(path, ok)
+	return ok
 }
 
 func fileExists(path string) bool {
@@ -126,31 +143,12 @@ func rustItemMacroFiles(root string, files []string, symbols []core.SymbolRecord
 	return out
 }
 
-// rustScipNeeded decides whether this run invokes rust-analyzer: a full
-// pass where any item-level macro exists, an incremental one where an
-// edited file held compiler-declared symbols (record.Declared), made one of
-// the recorded edges, or invokes a macro with arguments at item level. Any
-// other edit reuses the last run's edges (rustScipCache). Known gap until
-// the next pass: a reference newly added to a file that made none.
+// rustScipNeeded decides whether this run invokes rust-analyzer. Its call
+// edges are the Rust call graph wherever it is installed, so a full pass
+// always runs it; an incremental run re-runs it unless the resident worker
+// can update the edited files (rust_worker.go).
 func rustScipNeeded(req Request, macroFiles map[string]string, record *rustScipCacheFile) bool {
-	if len(req.ChangedFiles) == 0 {
-		return len(macroFiles) > 0
-	}
-	if record == nil {
-		return rustHasDeclared(req.Symbols) || len(macroFiles) > 0 && rustChangedHasMacro(req.ChangedFiles, macroFiles)
-	}
-	// A reused edge from an edited file could name a reference the edit
-	// removed, so those files re-run the pass too.
-	sources := map[string]bool{}
-	for _, e := range record.Edges {
-		sources[e.FromFile] = true
-	}
-	for _, file := range req.ChangedFiles {
-		if slices.Contains(record.Declared, file) || sources[file] || strings.ContainsAny(macroFiles[file], "([") {
-			return true
-		}
-	}
-	return false
+	return len(req.Files) > 0
 }
 
 func rustChangedHasMacro(changed []string, macroFiles map[string]string) bool {
@@ -254,8 +252,7 @@ func readRustScipCache(root string) *rustScipCacheFile {
 }
 
 // rustCachedEdges re-resolves a run's recorded edges against the current
-// symbols. An endpoint that no longer exists drops its edge; one end must
-// still be a compiler-declared symbol.
+// symbols. An endpoint that no longer exists drops its edge.
 func rustCachedEdges(file *rustScipCacheFile, symbols []core.SymbolRecord) []core.Edge {
 	byName := map[string][]*core.SymbolRecord{}
 	for i := range symbols {
@@ -280,7 +277,7 @@ func rustCachedEdges(file *rustScipCacheFile, symbols []core.SymbolRecord) []cor
 	for _, c := range file.Edges {
 		from := find(c.FromFile, c.FromName, c.FromKind, c.FromLine)
 		to := find(c.ToFile, c.ToName, c.ToKind, c.ToLine)
-		if from == nil || to == nil || !slices.Contains(from.Modifiers, "compiler-declared") && !slices.Contains(to.Modifiers, "compiler-declared") {
+		if from == nil || to == nil {
 			continue
 		}
 		edges = append(edges, symbolEdge(*from, *to, core.EdgeType(c.Type), 0.98))
@@ -590,7 +587,9 @@ func rustScipParent(symbol string) string {
 
 // rustScipPass turns a decoded index into compiler-declared symbols and the
 // edges made from them.
-func rustScipPass(req Request, docs []scipDocument) ([]core.SymbolRecord, []core.Edge) {
+// isolatedRoots are the root files of test, bench and example targets:
+// separate crates nothing else in the repository can call into.
+func rustScipPass(req Request, docs []scipDocument, isolatedRoots map[string]bool) ([]core.SymbolRecord, []core.Edge) {
 	inScope := fileSet(req.Files)
 	bodies := map[string][]core.SymbolRecord{}
 	enums := map[string][]core.SymbolRecord{}
@@ -704,16 +703,41 @@ func rustScipPass(req Request, docs []scipDocument) ([]core.SymbolRecord, []core
 		}
 		return best
 	}
-	target := map[string]int{}
+	// SCIP names a symbol by package and module path, so every integration
+	// test's (or bench's, example's) root-level helper `fn rt()` gets one
+	// symbol: rust-analyzer's own index cannot tell them apart. A reference
+	// resolves to a definition in its own file first, never to another such
+	// root (a separate crate it cannot reach), else to the only candidate.
+	targets := map[string][]int{}
 	for _, doc := range docs {
 		for _, o := range doc.Occurrences {
 			if !o.Definition || strings.HasPrefix(o.Symbol, "local ") {
 				continue
 			}
-			if i := innermost(byFileName[doc.Path+"\x00"+occName(doc.Path, o)], o.Line+1); i >= 0 {
-				target[o.Symbol] = i
+			if i := innermost(byFileName[doc.Path+"\x00"+occName(doc.Path, o)], o.Line+1); i >= 0 && !slices.Contains(targets[o.Symbol], i) {
+				targets[o.Symbol] = append(targets[o.Symbol], i)
 			}
 		}
+	}
+	resolveTarget := func(symbol, fromFile string) (int, bool) {
+		cands := targets[symbol]
+		if len(cands) == 1 {
+			return cands[0], true
+		}
+		var reachable []int
+		for _, i := range cands {
+			file := all[i].FilePath
+			if file == fromFile {
+				return i, true
+			}
+			if !isolatedRoots[file] {
+				reachable = append(reachable, i)
+			}
+		}
+		if len(reachable) == 1 {
+			return reachable[0], true
+		}
+		return -1, false
 	}
 
 	var edges []core.Edge
@@ -726,23 +750,32 @@ func rustScipPass(req Request, docs []scipDocument) ([]core.SymbolRecord, []core
 			if o.Definition || strings.HasPrefix(o.Symbol, "local ") {
 				continue
 			}
-			to, ok := target[o.Symbol]
+			to, ok := resolveTarget(o.Symbol, doc.Path)
 			if !ok {
 				continue
 			}
-			// An edge is rust-analyzer's when either end is a declaration
-			// only it can see: calls made inside a generated item, and uses
-			// of a generated item anywhere (no name-guessed edge may land on
-			// one, graph.dropGuessesIntoCompilerDeclared).
+			// Every resolved reference to a function is a call edge from the
+			// innermost declaration holding it (calls, method calls through
+			// inference, and functions passed as values — the same "may
+			// affect" altitude as the go/types and javac passes); the graph
+			// treats these as authoritative for .rs callers
+			// (graph.compilerResolvedNode). Type uses stay the parser's
+			// except where a compiler-declared symbol is involved (no
+			// name-guessed edge may land on one,
+			// graph.dropGuessesIntoCompilerDeclared).
+			// Only a reference that names its target in the source counts:
+			// SCIP also records implicit ones (.await -> Future::poll,
+			// operators, ? -> From::from) that no identifier names, and the
+			// resident server (rust_worker.go) resolves identifiers.
 			from := innermost(callers[doc.Path], o.Line+1)
-			if from < 0 || from == to || !isDeclared[from] && !isDeclared[to] {
+			if from < 0 || from == to || occName(doc.Path, o) != all[to].Name {
 				continue
 			}
 			var edgeType core.EdgeType
 			switch {
-			case callableKind(all[to].Kind):
+			case callableKind(all[to].Kind) && (callableKind(all[from].Kind) || isDeclared[from]):
 				edgeType = core.EdgeCalls
-			case typeKind(all[to].Kind):
+			case typeKind(all[to].Kind) && (isDeclared[from] || isDeclared[to]):
 				edgeType = core.EdgeUsesType
 			default:
 				continue

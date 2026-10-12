@@ -269,11 +269,28 @@ func mergeEdges(base, enriched []core.Edge) []core.Edge {
 		// member itself (owner an interface we saw no anchor for) does not.
 		return set.static
 	}
+	// rust-analyzer analyzes a whole workspace, so in a .rs file it ran on
+	// (the file has native call edges) a call it did not resolve into the
+	// repository went to std or a dependency: a name-narrowed guess from
+	// there is one the compiler rejected (ripgrep: 222 of 222 such guesses
+	// were wrong against rust-analyzer's own truth). Files it did not
+	// analyze keep their guesses.
+	rustAnalyzed := map[string]bool{}
+	for from := range resolved {
+		if file, _, _ := strings.Cut(from, "::"); strings.HasSuffix(file, ".rs") {
+			rustAnalyzed[file] = true
+		}
+	}
 	out := make([]core.Edge, 0, len(ordered))
 	for _, k := range ordered {
 		e := byKey[k]
-		if e.Type == core.EdgeCalls && e.Source != core.EvidenceSourceNative && superseded(e) {
-			continue
+		if e.Type == core.EdgeCalls && e.Source != core.EvidenceSourceNative {
+			if superseded(e) {
+				continue
+			}
+			if file, _, _ := strings.Cut(e.From, "::"); rustAnalyzed[file] {
+				continue
+			}
 		}
 		out = append(out, e)
 	}
@@ -296,10 +313,12 @@ func calleeQualOf(id string) string {
 }
 
 // compilerResolvedNode: callers whose native call edges come from a real
-// compiler (go/types, javac), so a native resolution is authoritative.
+// compiler (go/types, javac, rust-analyzer), so a native resolution is
+// authoritative. Rust callers have native call edges only where
+// rust-analyzer ran; elsewhere nothing is superseded.
 func compilerResolvedNode(id string) bool {
 	file, _, _ := strings.Cut(id, "::")
-	return strings.HasSuffix(file, ".go") || strings.HasSuffix(file, ".java")
+	return strings.HasSuffix(file, ".go") || strings.HasSuffix(file, ".java") || strings.HasSuffix(file, ".rs")
 }
 
 // symbolQual splits a symbol ID into its qualified name and whether it is a
