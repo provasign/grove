@@ -75,9 +75,13 @@ func residentWorkerFor(key, root, marker string, start func() *exec.Cmd) *reside
 // working directory too (untrusted mode runs node from a neutral directory).
 func tsWorkerFor(root, dir string) *residentWorker {
 	return residentWorkerFor("ts\x00"+root+"\x00"+dir, root, tsPayloadSentinel, func() *exec.Cmd {
-		cmd := exec.Command("node", "-e", tsScript)
+		scriptEnv, err := tsScriptEnv()
+		if err != nil {
+			scriptEnv = "GROVE_TS_SCRIPT=" // the loader fails and the caller runs one-shot
+		}
+		cmd := exec.Command("node", "-e", tsScriptLoader)
 		cmd.Dir = dir
-		cmd.Env = appendEnv("GROVE_TS_WORKER=1")
+		cmd.Env = appendEnv(scriptEnv, "GROVE_TS_WORKER=1")
 		return cmd
 	})
 }

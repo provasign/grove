@@ -199,9 +199,13 @@ func (jsTSAnalyzer) Analyze(ctx context.Context, req Request) Result {
 		}
 	}
 	if out == nil {
-		cmd := exec.CommandContext(ctx, "node", "-e", tsScript)
+		scriptEnv, err := tsScriptEnv()
+		if err != nil {
+			return Result{Diagnostics: []string{"typescript resolver script: " + err.Error()}}
+		}
+		cmd := exec.CommandContext(ctx, "node", "-e", tsScriptLoader)
 		cmd.Dir = dir
-		env := []string{"GROVE_FILES=" + string(filesJSON), "GROVE_ROOT=" + req.Root}
+		env := []string{scriptEnv, "GROVE_FILES=" + string(filesJSON), "GROVE_ROOT=" + req.Root}
 		if changed := tsChangedFiles(req); changed != nil {
 			if b, err := jsonMarshal(changed); err == nil {
 				env = append(env, "GROVE_CHANGED="+string(b))
