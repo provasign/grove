@@ -146,6 +146,8 @@ public class W {
     value("a");
     value(2L);
     Runnable r = () -> value("b");
+    this
+        .value(3L);
   }
 }
 `
@@ -161,10 +163,10 @@ public class W {
 			Kind: kind, Name: name, QualifiedName: qualified, ParentSymbol: "W", Span: core.LineRange{Start: start, End: end}, Signature: sig, RawText: sig}
 	}
 	parsed := []core.SymbolRecord{
-		{ID: file + "::W@" + blob, FilePath: file, BlobSHA: blob, Language: "java", Kind: core.KindClass, Name: "W", QualifiedName: "W", Span: core.LineRange{Start: 3, End: 11}},
+		{ID: file + "::W@" + blob, FilePath: file, BlobSHA: blob, Language: "java", Kind: core.KindClass, Name: "W", QualifiedName: "W", Span: core.LineRange{Start: 3, End: 13}},
 		sym(core.KindMethod, "value", "W.value", "W.value", 4, 4, "public W value(String s)"),
 		sym(core.KindMethod, "value", "W.value", "W.value#2", 5, 5, "public W value(long n)"),
-		sym(core.KindMethod, "both", "W.both", "W.both", 6, 10, "void both()"),
+		sym(core.KindMethod, "both", "W.both", "W.both", 6, 12, "void both()"),
 		sym(core.KindFunction, "<lambda@9:18>", "W.<lambda@9:18>", "W.<lambda@9:18>", 9, 9, "() -> value(\"b\")"),
 	}
 	result := javaAnalyzer{}.Analyze(context.Background(), Request{Root: root, Symbols: parsed, Files: []string{file}})
@@ -176,7 +178,7 @@ public class W {
 	}
 	for edge, lines := range map[string]string{
 		"W.both@b1 -> W.value@b1":          "7,9",
-		"W.both@b1 -> W.value#2@b1":        "8",
+		"W.both@b1 -> W.value#2@b1":        "8,11",
 		"W.<lambda@9:18>@b1 -> W.value@b1": "9",
 	} {
 		if got[edge] != lines {

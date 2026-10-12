@@ -284,7 +284,13 @@ public class GroveJavacResolver {
             if (from == null || to == null) return;
             // The call expression's own line: grove keeps, per compiler call
             // edge, the lines javac resolved to that target.
-            long at = write == null ? line(getCurrentPath().getLeaf(), cu) : -1;
+            // A chained call split across lines (writer(out)\n    .value(x))
+            // starts on the receiver's line; the method's name ends on the
+            // line an edit of the call touches.
+            Tree leaf = getCurrentPath().getLeaf();
+            long at = write != null ? -1
+                : leaf instanceof MethodInvocationTree ? endLine(((MethodInvocationTree) leaf).getMethodSelect(), cu)
+                : line(leaf, cu);
             String json = "{\"from\":" + q(file) + ",\"fromName\":" + q(from[0]) + ",\"fromLine\":" + from[1] +
                 (at > 0 ? ",\"line\":" + at : "") +
                 ",\"to\":" + q(to[0]) + ",\"toName\":" + q(to[1]) + ",\"toLine\":" + to[2] +
