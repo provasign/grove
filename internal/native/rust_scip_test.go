@@ -162,6 +162,9 @@ fn plain(t: Tool) {
 	}
 	for _, e := range edges {
 		key := e.From + " " + string(e.Type) + " " + e.To
+		if key == "tests/t.rs::plain@b calls src/util.rs::Tool.run@a" && e.Lines != "9:7" {
+			t.Errorf("plain -> Tool.run positions %q, want 9:7 (line 9, the called name)", e.Lines)
+		}
 		if !want[key] {
 			t.Errorf("unexpected edge %s", key)
 		}
@@ -343,6 +346,11 @@ func TestRustResidentWorkerEndToEnd(t *testing.T) {
 	}
 	if !has(inc, lib2[0].ID, util[1].ID) || !has(inc, lib2[0].ID, util[0].ID) {
 		t.Fatalf("edit: entry -> helper/other missing: %v", inc.Edges)
+	}
+	for _, e := range inc.Edges {
+		if e.From == lib2[0].ID && e.To == util[1].ID && e.Type == core.EdgeCalls && e.Lines != "4:11" {
+			t.Errorf("resident server: entry -> other positions %q, want 4:11", e.Lines)
+		}
 	}
 	if got := inc.Partial["rust"]; !slices.Equal(got, []string{"src"}) {
 		t.Fatalf("incremental run must report every Rust dir re-analyzed, got %v", got)

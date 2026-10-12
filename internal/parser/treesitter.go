@@ -682,7 +682,7 @@ func projectCallSites(in []astkit.CallSite) []core.CallSite {
 	}
 	out := make([]core.CallSite, len(in))
 	for i, c := range in {
-		out[i] = core.CallSite{Callee: c.Callee, Line: c.Line, Argc: c.Argc, Args: c.Args, Generic: c.Generic, Write: c.Write, ReferenceOnly: c.ReferenceOnly}
+		out[i] = core.CallSite{Callee: c.Callee, Line: c.Line, Col: c.Col, Argc: c.Argc, Args: c.Args, Generic: c.Generic, Write: c.Write, ReferenceOnly: c.ReferenceOnly}
 	}
 	return out
 }

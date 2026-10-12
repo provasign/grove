@@ -40,7 +40,8 @@ var securityExtensions = map[string]bool{
 // 2026-10-12.4: every Rust call edge from rust-analyzer where it runs.
 // 2026-10-12.5: javac call edges carry their call lines (Edge.Lines).
 // 2026-10-12.6: those positions are line:col of the called name.
-const ExtractorVersion = "2026-10-12.6"
+// 2026-10-12.7: Go, TypeScript and Rust call edges carry positions too.
+const ExtractorVersion = "2026-10-12.7"
 
 // DetectLanguage returns the Grove language tag for a file path.
 // Returns "" for unsupported or security-excluded files.

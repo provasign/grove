@@ -530,16 +530,9 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 	dispatch := newGoInterfaceDispatch(pkg, root, dir, fset, symbolIdx, pkgDirsByImport)
 	decls, localTypes := goLocalDecls(fset, files, parsed, info)
 
-	var edges []core.Edge
-	seen := map[string]bool{}
-	add := func(edge core.Edge) {
-		key := edge.From + "\x00" + string(edge.Type) + "\x00" + edge.To
-		if seen[key] {
-			return
-		}
-		seen[key] = true
-		edges = append(edges, edge)
-	}
+	pe := newPositionedEdges()
+	add := func(edge core.Edge) { pe.add(edge, 0, 0) }
+	lines := goLineReader(fset)
 	for _, edge := range dispatch.contractEdges() {
 		add(edge)
 	}
@@ -558,18 +551,22 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 			ast.Inspect(fn.Body, func(inner ast.Node) bool {
 				switch n := inner.(type) {
 				case *ast.CallExpr:
+					// The called name's position: an edit list names that
+					// token (javac/tsc do the same).
+					line, col := lines(goCalledName(n.Fun))
+					call := func(e core.Edge) { pe.add(e, line, col) }
 					if anchor, ok := dispatch.interfaceAnchor(n.Fun, info); ok {
-						add(core.Edge{From: caller.ID, To: anchor, Type: core.EdgeCalls,
+						call(core.Edge{From: caller.ID, To: anchor, Type: core.EdgeCalls,
 							Confidence: 0.99, Source: core.EvidenceSourceNative, Reason: core.ReasonMethodSet})
 					}
 					for _, callee := range dispatch.targets(n.Fun, info) {
 						if callee.ID != caller.ID {
-							add(core.Edge{From: caller.ID, To: callee.ID, Type: core.EdgeCalls,
+							call(core.Edge{From: caller.ID, To: callee.ID, Type: core.EdgeCalls,
 								Confidence: 0.99, Source: core.EvidenceSourceNative, Reason: core.ReasonMethodSet})
 						}
 					}
 					if callee, ok := goResolveCall(dir, n.Fun, info, symbolIdx, pkgDirsByImport, pkg); ok && callee.ID != caller.ID {
-						add(core.Edge{
+						call(core.Edge{
 							From:       caller.ID,
 							To:         callee.ID,
 							Type:       core.EdgeCalls,
@@ -606,7 +603,47 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 			return false
 		})
 	}
-	return edges, decls, nil
+	return pe.finish(), decls, nil
+}
+
+// goCalledName is the identifier a call names: f(), x.M(), pkg.F[T]().
+func goCalledName(fun ast.Expr) token.Pos {
+	switch f := fun.(type) {
+	case *ast.Ident:
+		return f.Pos()
+	case *ast.SelectorExpr:
+		return f.Sel.Pos()
+	case *ast.IndexExpr:
+		return goCalledName(f.X)
+	case *ast.IndexListExpr:
+		return goCalledName(f.X)
+	case *ast.ParenExpr:
+		return goCalledName(f.X)
+	}
+	return token.NoPos
+}
+
+// goLineReader turns a position into its 1-based line and character
+// column (UTF-16 units, as javac and tsc count), reading each file once.
+func goLineReader(fset *token.FileSet) func(token.Pos) (int, int) {
+	files := map[string][]string{}
+	return func(pos token.Pos) (int, int) {
+		if !pos.IsValid() {
+			return 0, 0
+		}
+		at := fset.Position(pos)
+		src, ok := files[at.Filename]
+		if !ok {
+			if data, err := osReadFile(at.Filename); err == nil {
+				src = strings.Split(string(data), "\n")
+			}
+			files[at.Filename] = src
+		}
+		if at.Line < 1 || at.Line > len(src) {
+			return at.Line, 0
+		}
+		return at.Line, charColumn(src[at.Line-1], at.Column-1)
+	}
 }
 
 // goCallerSymbolAt maps a FuncDecl to its symbol by direct key lookup. The

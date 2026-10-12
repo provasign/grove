@@ -365,6 +365,7 @@ func (w *rustLSP) sync(files []string) error {
 type rustRef struct {
 	file string
 	line int // 1-based
+	col  int // 1-based UTF-16 column of the reference (0 = unknown)
 	to   rustDefSite
 }
 
@@ -466,7 +467,7 @@ func (w *rustLSP) fileRefs(ctx context.Context, file string) ([]rustRef, error) 
 			if def.file == "" || def.file == file && def.line == sites[i].line+1 && def.end == def.line {
 				continue // outside the repository, or the declaration itself
 			}
-			out = append(out, rustRef{file: file, line: sites[i].line + 1, to: def})
+			out = append(out, rustRef{file: file, line: sites[i].line + 1, col: sites[i].char + 1, to: def})
 		}
 	}
 	return out, nil
@@ -709,15 +710,8 @@ func rustWorkerUpdate(ctx context.Context, req Request, record *rustScipCacheFil
 	}
 
 	resolver := newRustEdgeResolver(symbols)
-	var edges []core.Edge
-	seen := map[string]bool{}
-	add := func(e core.Edge) {
-		key := e.From + "\x00" + string(e.Type) + "\x00" + e.To
-		if !seen[key] {
-			seen[key] = true
-			edges = append(edges, e)
-		}
-	}
+	pe := newPositionedEdges()
+	add := func(e core.Edge) { pe.add(e, 0, 0) } // kept edges carry their own Lines
 	// Kept: the record's edges from files the edit does not affect,
 	// re-resolved by name (an edited file's declarations get new IDs).
 	kept := &rustScipCacheFile{Version: record.Version, Declared: record.Declared}
@@ -731,10 +725,10 @@ func rustWorkerUpdate(ctx context.Context, req Request, record *rustScipCacheFil
 	}
 	for _, r := range refs {
 		if e, ok := resolver.edge(r.file, r.line, resolver.target(r.to)); ok {
-			add(e)
+			pe.add(e, r.line, r.col)
 		}
 	}
-	return edges, "", true
+	return pe.finish(), "", true
 }
 
 // rustWorkerMaxFiles bounds the files one edit may re-resolve through the

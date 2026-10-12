@@ -248,6 +248,8 @@ func (jsTSAnalyzer) Analyze(ctx context.Context, req Request) Result {
 			To       string `json:"to"`
 			ToName   string `json:"toName"`
 			ToLine   int    `json:"toLine"`
+			Line     int    `json:"line"`
+			Col      int    `json:"col"`
 		} `json:"calls"`
 		Types []struct {
 			From     string `json:"from"`
@@ -291,13 +293,15 @@ func (jsTSAnalyzer) Analyze(ctx context.Context, req Request) Result {
 		}
 		edges = append(edges, nativeImportEdge(from, to, 0.97))
 	}
+	calls := newPositionedEdges()
 	for _, edge := range payload.Calls {
 		from, okFrom := symbols.atOrTopLevel(edge.From, edge.FromName, edge.FromLine)
 		to, okTo := symbols.at(edge.To, edge.ToName, edge.ToLine)
 		if okFrom && okTo && from.ID != to.ID {
-			edges = append(edges, symbolEdge(from, to, core.EdgeCalls, 0.98))
+			calls.add(symbolEdge(from, to, core.EdgeCalls, 0.98), edge.Line, edge.Col)
 		}
 	}
+	edges = append(edges, calls.finish()...)
 	for _, edge := range payload.Types {
 		from, okFrom := symbols.atOrTopLevel(edge.From, edge.FromName, edge.FromLine)
 		to, okTo := symbols.at(edge.To, edge.ToName, edge.ToLine)
@@ -873,6 +877,13 @@ function visit(checker, options, host, sf, node, stack) {
     const target = declInfo(checker, checker.getSymbolAtLocation(expr));
     if (target) {
       const call = {from: rel(sf.fileName), fromName, fromLine, to: target.file, toName: target.name, toLine: target.line};
+      // The called name's position (1-based line, UTF-16 column), only when
+      // the callee is a name: a computed callee's start is not the token.
+      if (ts.isIdentifier(expr) || ts.isPrivateIdentifier(expr)) {
+        const at = sf.getLineAndCharacterOfPosition(expr.getStart(sf));
+        call.line = at.line + 1;
+        call.col = at.character + 1;
+      }
       const key = JSON.stringify(call);
       if (!callKeys.has(key)) { callKeys.add(key); calls.push(call); }
     }
