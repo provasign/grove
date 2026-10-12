@@ -126,31 +126,12 @@ func rustItemMacroFiles(root string, files []string, symbols []core.SymbolRecord
 	return out
 }
 
-// rustScipNeeded decides whether this run invokes rust-analyzer: a full
-// pass where any item-level macro exists, an incremental one where an
-// edited file held compiler-declared symbols (record.Declared), made one of
-// the recorded edges, or invokes a macro with arguments at item level. Any
-// other edit reuses the last run's edges (rustScipCache). Known gap until
-// the next pass: a reference newly added to a file that made none.
+// rustScipNeeded decides whether this run invokes rust-analyzer. Its call
+// edges are the Rust call graph wherever it is installed, so a full pass
+// always runs it; an incremental run re-runs it unless the resident worker
+// can update the edited files (rust_worker.go).
 func rustScipNeeded(req Request, macroFiles map[string]string, record *rustScipCacheFile) bool {
-	if len(req.ChangedFiles) == 0 {
-		return len(macroFiles) > 0
-	}
-	if record == nil {
-		return rustHasDeclared(req.Symbols) || len(macroFiles) > 0 && rustChangedHasMacro(req.ChangedFiles, macroFiles)
-	}
-	// A reused edge from an edited file could name a reference the edit
-	// removed, so those files re-run the pass too.
-	sources := map[string]bool{}
-	for _, e := range record.Edges {
-		sources[e.FromFile] = true
-	}
-	for _, file := range req.ChangedFiles {
-		if slices.Contains(record.Declared, file) || sources[file] || strings.ContainsAny(macroFiles[file], "([") {
-			return true
-		}
-	}
-	return false
+	return len(req.Files) > 0
 }
 
 func rustChangedHasMacro(changed []string, macroFiles map[string]string) bool {
@@ -254,8 +235,7 @@ func readRustScipCache(root string) *rustScipCacheFile {
 }
 
 // rustCachedEdges re-resolves a run's recorded edges against the current
-// symbols. An endpoint that no longer exists drops its edge; one end must
-// still be a compiler-declared symbol.
+// symbols. An endpoint that no longer exists drops its edge.
 func rustCachedEdges(file *rustScipCacheFile, symbols []core.SymbolRecord) []core.Edge {
 	byName := map[string][]*core.SymbolRecord{}
 	for i := range symbols {
@@ -280,7 +260,7 @@ func rustCachedEdges(file *rustScipCacheFile, symbols []core.SymbolRecord) []cor
 	for _, c := range file.Edges {
 		from := find(c.FromFile, c.FromName, c.FromKind, c.FromLine)
 		to := find(c.ToFile, c.ToName, c.ToKind, c.ToLine)
-		if from == nil || to == nil || !slices.Contains(from.Modifiers, "compiler-declared") && !slices.Contains(to.Modifiers, "compiler-declared") {
+		if from == nil || to == nil {
 			continue
 		}
 		edges = append(edges, symbolEdge(*from, *to, core.EdgeType(c.Type), 0.98))
@@ -730,19 +710,24 @@ func rustScipPass(req Request, docs []scipDocument) ([]core.SymbolRecord, []core
 			if !ok {
 				continue
 			}
-			// An edge is rust-analyzer's when either end is a declaration
-			// only it can see: calls made inside a generated item, and uses
-			// of a generated item anywhere (no name-guessed edge may land on
-			// one, graph.dropGuessesIntoCompilerDeclared).
+			// Every resolved reference to a function is a call edge from the
+			// innermost declaration holding it (calls, method calls through
+			// inference, and functions passed as values — the same "may
+			// affect" altitude as the go/types and javac passes); the graph
+			// treats these as authoritative for .rs callers
+			// (graph.compilerResolvedNode). Type uses stay the parser's
+			// except where a compiler-declared symbol is involved (no
+			// name-guessed edge may land on one,
+			// graph.dropGuessesIntoCompilerDeclared).
 			from := innermost(callers[doc.Path], o.Line+1)
-			if from < 0 || from == to || !isDeclared[from] && !isDeclared[to] {
+			if from < 0 || from == to {
 				continue
 			}
 			var edgeType core.EdgeType
 			switch {
-			case callableKind(all[to].Kind):
+			case callableKind(all[to].Kind) && (callableKind(all[from].Kind) || isDeclared[from]):
 				edgeType = core.EdgeCalls
-			case typeKind(all[to].Kind):
+			case typeKind(all[to].Kind) && (isDeclared[from] || isDeclared[to]):
 				edgeType = core.EdgeUsesType
 			default:
 				continue

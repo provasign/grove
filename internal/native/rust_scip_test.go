@@ -152,14 +152,15 @@ fn plain(t: Tool) {
 		t.Fatalf("r16 record: %+v", r16)
 	}
 	want := map[string]bool{
-		r16.ID + " calls src/util.rs::Tool.run@a": true,
-		r16.ID + " uses-type src/util.rs::Tool@a": true,
-		"tests/t.rs::plain@b calls " + r16.ID:     true,
+		r16.ID + " calls src/util.rs::Tool.run@a":           true,
+		r16.ID + " uses-type src/util.rs::Tool@a":           true,
+		"tests/t.rs::plain@b calls " + r16.ID:               true,
+		"tests/t.rs::plain@b calls src/util.rs::Tool.run@a": true,
 	}
 	for _, e := range edges {
 		key := e.From + " " + string(e.Type) + " " + e.To
 		if !want[key] {
-			t.Errorf("unexpected edge %s (plain -> Tool.run belongs to the parser's resolution)", key)
+			t.Errorf("unexpected edge %s", key)
 		}
 		delete(want, key)
 	}
@@ -169,28 +170,11 @@ fn plain(t: Tool) {
 }
 
 func TestRustScipNeeded(t *testing.T) {
-	record := &rustScipCacheFile{Declared: []string{"tests/t.rs"}}
-	for _, tc := range []struct {
-		name    string
-		changed []string
-		macros  map[string]string
-		record  *rustScipCacheFile
-		symbols []core.SymbolRecord
-		want    bool
-	}{
-		{name: "full pass, item-level macro", macros: map[string]string{"src/a.rs": "{"}, want: true},
-		{name: "full pass, no item-level macro", macros: map[string]string{}},
-		{name: "edit to a file holding compiler-declared symbols", changed: []string{"tests/t.rs"}, macros: map[string]string{}, record: record, want: true},
-		{name: "edit adding a macro with arguments", changed: []string{"tests/new.rs"}, macros: map[string]string{"tests/new.rs": "("}, record: record, want: true},
-		{name: "edit to a wrapper the parser reads", changed: []string{"src/a.rs"}, macros: map[string]string{"src/a.rs": "{"}, record: record},
-		{name: "plain edit beside them", changed: []string{"tests/util.rs"}, macros: map[string]string{"tests/t.rs": "("}, record: record},
-		{name: "edit to a file using a generated item", changed: []string{"src/use.rs"}, macros: map[string]string{}, record: &rustScipCacheFile{Edges: []rustCachedEdge{{FromFile: "src/use.rs"}}}, want: true},
-		{name: "no record of the last run's edges", changed: []string{"tests/util.rs"}, macros: map[string]string{"tests/t.rs": "("}, symbols: []core.SymbolRecord{{FilePath: "tests/t.rs", Language: "rust", Modifiers: []string{"compiler-declared"}}}, want: true},
-		{name: "no record and nothing to keep", changed: []string{"tests/util.rs"}, macros: map[string]string{"tests/t.rs": "("}},
-	} {
-		if got := rustScipNeeded(Request{ChangedFiles: tc.changed, Symbols: tc.symbols}, tc.macros, tc.record); got != tc.want {
-			t.Errorf("%s: run=%v, want %v", tc.name, got, tc.want)
-		}
+	if !rustScipNeeded(Request{Files: []string{"src/lib.rs"}}, nil, nil) {
+		t.Error("a Rust repo runs rust-analyzer")
+	}
+	if rustScipNeeded(Request{}, nil, nil) {
+		t.Error("no Rust files, no pass")
 	}
 }
 

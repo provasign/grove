@@ -134,7 +134,7 @@ func (rustAnalyzer) Analyze(ctx context.Context, req Request) Result {
 			edges = append(edges, scipEdges...)
 			res.Diagnostics = append(res.Diagnostics,
 				"rust-analyzer declared "+itoa(len(declared))+" symbol(s) the parser did not index (macro-generated items)",
-				"rust-analyzer resolved "+itoa(len(scipEdges))+" edge(s) from compiler-declared symbols")
+				"rust-analyzer resolved "+itoa(countNativeEdges(scipEdges, core.EdgeCalls))+" call edge(s) and "+itoa(countNativeEdges(scipEdges, core.EdgeUsesType))+" type use(s) of compiler-declared symbols")
 			if err := saveRustScipCache(req.Root, append(append([]core.SymbolRecord(nil), req.Symbols...), declared...), scipEdges); err != nil {
 				res.Diagnostics = append(res.Diagnostics, "rust-analyzer edge record not saved: "+err.Error())
 			}
