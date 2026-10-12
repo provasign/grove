@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -714,6 +715,8 @@ func compilerDeclaredSymbolsFor(req Request, language string, decls []compilerDe
 		switch d.Kind {
 		case "class":
 			kind = core.KindClass
+		case "function":
+			kind = core.KindFunction
 		case "struct":
 			kind = core.KindStruct
 		case "type":
@@ -746,11 +749,15 @@ func compilerDeclaredSymbolsFor(req Request, language string, decls []compilerDe
 		}
 		modifiers := append([]string{"compiler-declared"}, d.Modifiers...)
 		if strings.HasPrefix(d.Name, "<anonymous@") {
-			signature = "class " + d.Name
-			if d.Base != "" {
-				signature += " extends " + d.Base
+			if d.Signature == "" {
+				signature = "class " + d.Name
+				if d.Base != "" {
+					signature += " extends " + d.Base
+				}
 			}
-			modifiers = append(modifiers, "anonymous")
+			if !slices.Contains(modifiers, "anonymous") {
+				modifiers = append(modifiers, "anonymous")
+			}
 		}
 		parent := d.Parent
 		if i := strings.LastIndex(parent, "."); i >= 0 {
@@ -798,12 +805,12 @@ type compilerDecl struct {
 	Start     int    `json:"s"`
 	End       int    `json:"e"`
 	Base      string `json:"b"`
-	// Set by in-process analyzers only (Go): the parser-convention signature
-	// when the declaration's first source line is not one, and modifiers and
+	// Optional (Go, TypeScript): the parser-convention signature when the
+	// declaration's first source line is not one, and modifiers and
 	// annotations beyond "compiler-declared".
-	Signature   string   `json:"-"`
-	Modifiers   []string `json:"-"`
-	Annotations []string `json:"-"`
+	Signature   string   `json:"sig,omitempty"`
+	Modifiers   []string `json:"mods,omitempty"`
+	Annotations []string `json:"ann,omitempty"`
 }
 
 type javacPayload struct {
