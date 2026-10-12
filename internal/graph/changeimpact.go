@@ -1096,6 +1096,17 @@ func (g *CodeGraph) resolveLooseQueryScopedLocked(query, file string) (string, e
 	if len(order) == 1 {
 		return order[0], nil
 	}
+	// A bare name scoped to a file names the top-level function of that
+	// name there: a member of the same name is addressable as Type.method,
+	// a package-level function has no other spelling. Without this, chi's
+	// URLParam (func, context.go) and Context.URLParam (method, same file)
+	// stayed ambiguous under the very retry the ambiguity suggested, and
+	// the function and its 24 callers were unreachable (2026-10-12).
+	if file != "" && !hasParamList && strings.IndexByte(head, '.') < 0 {
+		if _, ok := canonical[head]; ok {
+			return head, nil
+		}
+	}
 	sort.Strings(order)
 	return "", fmt.Errorf("change-impact: %q is ambiguous — %d candidates:%s\nre-run with one of these",
 		query, len(order), formatCandidates(order, canonical))
