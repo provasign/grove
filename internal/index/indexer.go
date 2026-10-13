@@ -335,7 +335,18 @@ func (i *Indexer) Index(ctx context.Context, root string) (*graph.CodeGraph, cor
 func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Options) (*graph.CodeGraph, core.IndexResult, error) {
 	prog := newIndexProgress(i.store)
 	cg, result, err := i.indexWithOptions(ctx, root, opts, prog)
-	if err == nil && opts.Vacuum {
+	// SQLite keeps freed pages: after a full re-extract (an upgrade that
+	// changes the stored format) the file stays at its old size, mostly
+	// partly empty. Compact automatically when over a quarter of the file
+	// and over 64MB is free space (django upgrade 2026-10-13: 27% free,
+	// VACUUM 3.5s after a 22s rebuild, 593MB -> 420MB).
+	autoVacuum := false
+	if err == nil && !opts.Vacuum {
+		if frac, size := i.store.FreeFraction(ctx); frac > 0.25 && frac*float64(size) > 64<<20 {
+			autoVacuum = true
+		}
+	}
+	if err == nil && (opts.Vacuum || autoVacuum) {
 		prog.phase("vacuum", "")
 		if verr := i.store.Vacuum(ctx); verr != nil {
 			result.Native = append(result.Native, "vacuum failed: "+verr.Error())
@@ -430,7 +441,7 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 
 		if entry.IsDir() {
 			if path != root && (shouldSkipDirName(entry.Name()) ||
-				ignore.Ignored(relPath, true)) {
+				ignore.Ignored(relPath, true) || isPythonEnvDir(path, entry.Name())) {
 				return filepath.SkipDir
 			}
 			// Nested ignore files apply from this directory downward;
