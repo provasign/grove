@@ -36,11 +36,11 @@ func TestPurgeTestsEdgesRunsOnceAndDropsItsIndex(t *testing.T) {
 
 	// ...and the index the delta carry path actually reads must exist.
 	if err := st.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_edge_source'`).Scan(&n); err != nil {
+		`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_gedge_source'`).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 	if n != 1 {
-		t.Error("idx_edge_source missing — EdgesBySource falls back to a full-table scan")
+		t.Error("idx_gedge_source missing — EdgesBySource falls back to a full-table scan")
 	}
 }
 
@@ -52,8 +52,8 @@ func TestPurgeTestsEdgesStillPurgesLegacyRows(t *testing.T) {
 
 	// Simulate a legacy database: a persisted tests edge, marker cleared.
 	if _, err := st.db.ExecContext(ctx,
-		`INSERT INTO edges (id, from_node, to_node, edge_type, confidence, source, reason)
-		 VALUES ('x','a.go::A@s','b.go::B@s','tests',1.0,'heuristic','')`); err != nil {
+		`INSERT INTO graph_edges (from_node, to_node, edge_type, confidence, source, reason)
+		 VALUES ('a.go::A@s','b.go::B@s','tests',1.0,'heuristic','')`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.db.ExecContext(ctx, `DELETE FROM meta WHERE key = ?`, purgeTestsEdgesKey); err != nil {
