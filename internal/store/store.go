@@ -19,6 +19,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/provasign/grove/internal/core"
+	"github.com/provasign/grove/internal/parser"
 )
 
 type Store struct {
@@ -138,9 +139,6 @@ func (s *Store) runAlterMigrations(ctx context.Context) error {
 		`ALTER TABLE symbols ADD COLUMN type_parameters TEXT NOT NULL DEFAULT '[]'`,
 		`ALTER TABLE symbols ADD COLUMN annotations     TEXT NOT NULL DEFAULT '[]'`,
 		`ALTER TABLE symbols ADD COLUMN call_sites      TEXT NOT NULL DEFAULT '[]'`,
-		`ALTER TABLE edges ADD COLUMN source            TEXT NOT NULL DEFAULT 'unknown'`,
-		`ALTER TABLE edges ADD COLUMN reason            TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE edges ADD COLUMN lines             TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE symbols ADD COLUMN attr_sites      TEXT NOT NULL DEFAULT '[]'`,
 		// Stat cache: the walk skips hashing files whose size+mtime are
 		// unchanged since the last index (-1 = unknown, forces one hash).
@@ -166,6 +164,9 @@ func (s *Store) runAlterMigrations(ctx context.Context) error {
 			}
 		}
 	}
+	if err := s.migrateLegacyEdges(ctx); err != nil {
+		return err
+	}
 	// Heuristic tests edges were removed from the graph entirely; purge rows
 	// written by earlier versions so stored counts and splice invariants
 	// stay consistent. (The GROVE_MATERIALIZED_TESTS rollback flag is gone —
@@ -179,17 +180,74 @@ func (s *Store) runAlterMigrations(ctx context.Context) error {
 	if done, err := s.migrationDone(ctx, purgeTestsEdgesKey); err != nil {
 		return err
 	} else if !done {
-		if _, err := s.db.ExecContext(ctx, `DELETE FROM edges WHERE edge_type = 'tests'`); err != nil {
+		if _, err := s.db.ExecContext(ctx, `DELETE FROM graph_edges WHERE edge_type = 'tests'`); err != nil {
 			return fmt.Errorf("migration (purge tests edges): %w", err)
 		}
 		if err := s.markMigrationDone(ctx, purgeTestsEdgesKey); err != nil {
 			return err
 		}
 	}
-	// Drop AFTER the purge above, which is its last user on a legacy database.
-	if _, err := s.db.ExecContext(ctx, `DROP INDEX IF EXISTS idx_edge_type`); err != nil {
-		return fmt.Errorf("migration (drop idx_edge_type): %w", err)
+	return nil
+}
+
+// legacyEdgesStamp is the extractor stamp of the last release that stored
+// edges in the old "edges" table; a database at exactly this stamp holds
+// otherwise-current data, so converting its edges in place is a complete
+// upgrade and needs no re-extract.
+const legacyEdgesStamp = "2026-10-13.1"
+
+// migrateLegacyEdges moves rows from the pre-2026-10-13 "edges" table (TEXT
+// id column) into graph_edges, then drops it. Every column but the derived
+// id is copied, so the edge set is unchanged. When the database was current
+// apart from this layout, the extractor stamp is advanced so the next index
+// does not re-extract; any other stamp is left alone and the indexer's
+// usual stamp check decides.
+func (s *Store) migrateLegacyEdges(ctx context.Context) error {
+	var n int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'edges'`).Scan(&n); err != nil || n == 0 {
+		return err
 	}
+	// Columns very old databases lack, so the copy below can name them.
+	for _, stmt := range []string{
+		`ALTER TABLE edges ADD COLUMN source TEXT NOT NULL DEFAULT 'unknown'`,
+		`ALTER TABLE edges ADD COLUMN reason TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE edges ADD COLUMN lines  TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := s.db.ExecContext(ctx, stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+			return fmt.Errorf("migration %q: %w", stmt, err)
+		}
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `
+		INSERT OR IGNORE INTO graph_edges (from_node, to_node, edge_type, confidence, source, reason, lines)
+		SELECT from_node, to_node, edge_type, confidence, COALESCE(source, 'unknown'), COALESCE(reason, ''), COALESCE(lines, '')
+		FROM edges`); err != nil {
+		return fmt.Errorf("migration (copy edges): %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE edges`); err != nil {
+		return fmt.Errorf("migration (drop edges): %w", err)
+	}
+	var stamp string
+	_ = tx.QueryRowContext(ctx, `SELECT value FROM meta WHERE key = 'extractor-version'`).Scan(&stamp)
+	if stamp == legacyEdgesStamp {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE meta SET value = ? WHERE key = 'extractor-version'`, parser.ExtractorVersion); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	// The dropped table's pages stay in the file as free space; give them
+	// back once. Best effort: another connection holding the database makes
+	// VACUUM fail with "busy", and the indexer's free-space check compacts
+	// later instead.
+	_, _ = s.db.ExecContext(ctx, `VACUUM`)
 	return nil
 }
 
@@ -487,19 +545,20 @@ func (s *Store) ReplaceEdges(ctx context.Context, edges []core.Edge) error {
 		reason     string
 		lines      string
 	}
-	stored := map[string]edgeMeta{}
-	rows, err := s.db.QueryContext(ctx, `SELECT id, confidence, source, COALESCE(reason, ''), COALESCE(lines, '') FROM edges`)
+	stored := map[edgeKey]edgeMeta{}
+	rows, err := s.db.QueryContext(ctx, `SELECT from_node, edge_type, to_node, confidence, source, COALESCE(reason, ''), COALESCE(lines, '') FROM graph_edges`)
 	if err != nil {
 		return err
 	}
 	for rows.Next() {
-		var id, source, reason, lines string
+		var k edgeKey
+		var source, reason, lines string
 		var conf float64
-		if err := rows.Scan(&id, &conf, &source, &reason, &lines); err != nil {
+		if err := rows.Scan(&k.from, &k.typ, &k.to, &conf, &source, &reason, &lines); err != nil {
 			rows.Close()
 			return err
 		}
-		stored[id] = edgeMeta{confidence: conf, source: source, reason: reason, lines: lines}
+		stored[k] = edgeMeta{confidence: conf, source: source, reason: reason, lines: lines}
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
@@ -508,25 +567,23 @@ func (s *Store) ReplaceEdges(ctx context.Context, edges []core.Edge) error {
 
 	tick("load-stored-ids")
 
-	wantIDs := make(map[string]bool, len(edges))
+	wantIDs := make(map[edgeKey]bool, len(edges))
 	var upserts []core.Edge
-	var upsertIDs []string
 	for _, edge := range edges {
-		id := edge.From + "::" + string(edge.Type) + "::" + edge.To
-		if wantIDs[id] {
+		k := edgeKey{from: edge.From, typ: string(edge.Type), to: edge.To}
+		if wantIDs[k] {
 			continue // duplicate (from, type, to); first one wins
 		}
-		wantIDs[id] = true
-		if meta, ok := stored[id]; ok && meta.confidence == edge.Confidence && meta.source == string(edge.Source) && meta.reason == string(edge.Reason) && meta.lines == edge.Lines {
+		wantIDs[k] = true
+		if meta, ok := stored[k]; ok && meta.confidence == edge.Confidence && meta.source == string(edge.Source) && meta.reason == string(edge.Reason) && meta.lines == edge.Lines {
 			continue
 		}
 		upserts = append(upserts, edge)
-		upsertIDs = append(upsertIDs, id)
 	}
-	var deletes []string
-	for id := range stored {
-		if !wantIDs[id] {
-			deletes = append(deletes, id)
+	var deletes []edgeKey
+	for k := range stored {
+		if !wantIDs[k] {
+			deletes = append(deletes, k)
 		}
 	}
 	tick("diff")
@@ -544,27 +601,15 @@ func (s *Store) ReplaceEdges(ctx context.Context, edges []core.Edge) error {
 	// concurrent writer.
 	bulk := len(upserts) > 200_000
 	if bulk {
-		// Insert in primary-key order: random-order TEXT-key insertion lands
-		// on random b-tree pages (the PK index cannot be dropped); sorted
-		// insertion is append-like and keeps the hot page set tiny.
-		order := make([]int, len(upserts))
-		for i := range order {
-			order[i] = i
-		}
-		sort.Slice(order, func(a, b int) bool { return upsertIDs[order[a]] < upsertIDs[order[b]] })
-		sortedUpserts := make([]core.Edge, len(upserts))
-		sortedIDs := make([]string, len(upserts))
-		for i, idx := range order {
-			sortedUpserts[i] = upserts[idx]
-			sortedIDs[i] = upsertIDs[idx]
-		}
-		upserts, upsertIDs = sortedUpserts, sortedIDs
+		// Insert in unique-key order: random-order TEXT-key insertion lands
+		// on random b-tree pages (the unique index cannot be dropped);
+		// sorted insertion is append-like and keeps the hot page set tiny.
+		sort.Slice(upserts, func(a, b int) bool { return edgeKeyLess(&upserts[a], &upserts[b]) })
 		for _, p := range []string{
 			`PRAGMA cache_size=-262144`, // 256MB
 			`PRAGMA wal_autocheckpoint=0`,
-			`DROP INDEX IF EXISTS idx_edge_from`,
-			`DROP INDEX IF EXISTS idx_edge_to`,
-			`DROP INDEX IF EXISTS idx_edge_source`,
+			`DROP INDEX IF EXISTS idx_gedge_to`,
+			`DROP INDEX IF EXISTS idx_gedge_source`,
 		} {
 			if _, err := s.db.ExecContext(ctx, p); err != nil {
 				return err
@@ -579,45 +624,23 @@ func (s *Store) ReplaceEdges(ctx context.Context, edges []core.Edge) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	const deleteChunk = 500
-	for start := 0; start < len(deletes); start += deleteChunk {
-		end := start + deleteChunk
-		if end > len(deletes) {
-			end = len(deletes)
-		}
-		chunk := deletes[start:end]
-		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(chunk)), ",")
-		args := make([]any, len(chunk))
-		for i, id := range chunk {
-			args[i] = id
-		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM edges WHERE id IN (`+placeholders+`)`, args...); err != nil {
+	if len(deletes) > 0 {
+		del, err := tx.PrepareContext(ctx, `DELETE FROM graph_edges WHERE from_node = ? AND edge_type = ? AND to_node = ?`)
+		if err != nil {
 			return err
 		}
+		for _, k := range deletes {
+			if _, err := del.ExecContext(ctx, k.from, k.typ, k.to); err != nil {
+				del.Close()
+				return err
+			}
+		}
+		del.Close()
 	}
 
 	tick("deletes")
-	const insertChunk = 342 // 7 columns × 342 = 2394 parameters per statement
-	for start := 0; start < len(upserts); start += insertChunk {
-		end := start + insertChunk
-		if end > len(upserts) {
-			end = len(upserts)
-		}
-		chunk := upserts[start:end]
-		var sb strings.Builder
-		sb.WriteString(`INSERT INTO edges (id, from_node, to_node, edge_type, confidence, source, reason, lines) VALUES `)
-		args := make([]any, 0, len(chunk)*8)
-		for i, edge := range chunk {
-			if i > 0 {
-				sb.WriteString(",")
-			}
-			sb.WriteString("(?,?,?,?,?,?,?,?)")
-			args = append(args, upsertIDs[start+i], edge.From, edge.To, string(edge.Type), edge.Confidence, string(edge.Source), string(edge.Reason), edge.Lines)
-		}
-		sb.WriteString(` ON CONFLICT(id) DO UPDATE SET confidence = excluded.confidence, source = excluded.source, reason = excluded.reason, lines = excluded.lines`)
-		if _, err := tx.ExecContext(ctx, sb.String(), args...); err != nil {
-			return err
-		}
+	if err := upsertEdges(ctx, tx, upserts); err != nil {
+		return err
 	}
 	tick("inserts")
 	if err := tx.Commit(); err != nil {
@@ -628,9 +651,8 @@ func (s *Store) ReplaceEdges(ctx context.Context, edges []core.Edge) error {
 		// Rebuild what the bulk path dropped, restore steady-state pragmas,
 		// and truncate the WAL the disabled autocheckpoint let grow.
 		for _, p := range []string{
-			`CREATE INDEX IF NOT EXISTS idx_edge_from   ON edges(from_node)`,
-			`CREATE INDEX IF NOT EXISTS idx_edge_to     ON edges(to_node)`,
-			`CREATE INDEX IF NOT EXISTS idx_edge_source ON edges(source)`,
+			`CREATE INDEX IF NOT EXISTS idx_gedge_to     ON graph_edges(to_node)`,
+			`CREATE INDEX IF NOT EXISTS idx_gedge_source ON graph_edges(source)`,
 			`PRAGMA wal_autocheckpoint=1000`,
 			`PRAGMA wal_checkpoint(TRUNCATE)`,
 			`PRAGMA cache_size=-2000`,
@@ -639,6 +661,49 @@ func (s *Store) ReplaceEdges(ctx context.Context, edges []core.Edge) error {
 				return err
 			}
 			tick("bulk-restore:" + firstWords(p))
+		}
+	}
+	return nil
+}
+
+// edgeKey identifies a stored edge: graph_edges' unique key.
+type edgeKey struct{ from, typ, to string }
+
+// edgeKeyLess orders edges by graph_edges' unique key (from, type, to) —
+// also AllEdges' order.
+func edgeKeyLess(a, b *core.Edge) bool {
+	if a.From != b.From {
+		return a.From < b.From
+	}
+	if a.Type != b.Type {
+		return a.Type < b.Type
+	}
+	return a.To < b.To
+}
+
+// upsertEdges writes edges in multi-row statements; an existing (from, type,
+// to) row takes the incoming metadata.
+func upsertEdges(ctx context.Context, tx *sql.Tx, edges []core.Edge) error {
+	const insertChunk = 342 // 7 columns × 342 = 2394 parameters per statement
+	for start := 0; start < len(edges); start += insertChunk {
+		end := start + insertChunk
+		if end > len(edges) {
+			end = len(edges)
+		}
+		chunk := edges[start:end]
+		var sb strings.Builder
+		sb.WriteString(`INSERT INTO graph_edges (from_node, to_node, edge_type, confidence, source, reason, lines) VALUES `)
+		args := make([]any, 0, len(chunk)*7)
+		for i, edge := range chunk {
+			if i > 0 {
+				sb.WriteString(",")
+			}
+			sb.WriteString("(?,?,?,?,?,?,?)")
+			args = append(args, edge.From, edge.To, string(edge.Type), edge.Confidence, string(edge.Source), string(edge.Reason), edge.Lines)
+		}
+		sb.WriteString(` ON CONFLICT(from_node, edge_type, to_node) DO UPDATE SET confidence = excluded.confidence, source = excluded.source, reason = excluded.reason, lines = excluded.lines`)
+		if _, err := tx.ExecContext(ctx, sb.String(), args...); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -733,13 +798,13 @@ func (s *Store) SymbolKeysForFile(ctx context.Context, filePath string) ([]core.
 
 // Native-edge range queries. "+source" keeps SQLite on the from_node /
 // to_node range index: with a plain source = 'native' it chose
-// idx_edge_source and scanned every native edge once per file (guava: 172k
+// the source index and scanned every native edge once per file (guava: 172k
 // rows x 216 files x 2 per edit, 25s). spliceplan_test pins the plans.
 const (
-	sqlDeleteNativeFromFile   = `DELETE FROM edges WHERE from_node >= ? AND from_node < ? AND +source = 'native'`
-	sqlDeleteNativeFromFileID = `DELETE FROM edges WHERE from_node = ? AND +source = 'native'`
+	sqlDeleteNativeFromFile   = `DELETE FROM graph_edges WHERE from_node >= ? AND from_node < ? AND +source = 'native'`
+	sqlDeleteNativeFromFileID = `DELETE FROM graph_edges WHERE from_node = ? AND +source = 'native'`
 	sqlNativeEdgesInto        = `SELECT from_node, to_node, edge_type, confidence, source, COALESCE(reason, ''), COALESCE(lines, '')
-		FROM edges
+		FROM graph_edges
 		WHERE to_node >= ? AND to_node < ? AND +source = 'native'
 		  AND NOT (from_node >= ? AND from_node < ?)`
 )
@@ -787,7 +852,7 @@ func (s *Store) AllSymbols(ctx context.Context) ([]core.SymbolRecord, error) {
 // EdgeCountBySource returns the number of stored edges with the given
 // evidence source.
 func (s *Store) EdgeCountBySource(ctx context.Context, source string) int {
-	return s.countRows(ctx, `SELECT COUNT(*) FROM edges WHERE source = ?`, source)
+	return s.countRows(ctx, `SELECT COUNT(*) FROM graph_edges WHERE source = ?`, source)
 }
 
 // SymbolCount returns COUNT(*) of the symbols table.
@@ -949,14 +1014,14 @@ func (s *Store) fillFileImports(ctx context.Context, symbols []core.SymbolRecord
 }
 
 func (s *Store) AllEdges(ctx context.Context) ([]core.Edge, error) {
-	nEdges := s.countRows(ctx, `SELECT COUNT(*) FROM edges`) // before the cursor: see AllSymbols
+	nEdges := s.countRows(ctx, `SELECT COUNT(*) FROM graph_edges`) // before the cursor: see AllSymbols
 	// No ORDER BY: SQLite answered it with an index scan plus a temp B-tree
 	// sort, the bulk of a session's first-query hydration. A table scan
 	// sorted in Go yields the same order (the key is unique and BINARY
 	// collation compares bytes like Go strings).
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT from_node, to_node, edge_type, confidence, COALESCE(source, 'unknown'), COALESCE(reason, ''), COALESCE(lines, '')
-		FROM edges
+		FROM graph_edges
 	`)
 	if err != nil {
 		return nil, err
@@ -977,16 +1042,7 @@ func (s *Store) AllEdges(ctx context.Context) ([]core.Edge, error) {
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	sort.Slice(edges, func(i, j int) bool {
-		a, b := &edges[i], &edges[j]
-		if a.From != b.From {
-			return a.From < b.From
-		}
-		if a.Type != b.Type {
-			return a.Type < b.Type
-		}
-		return a.To < b.To
-	})
+	sort.Slice(edges, func(i, j int) bool { return edgeKeyLess(&edges[i], &edges[j]) })
 	return edges, nil
 }
 
@@ -1031,7 +1087,7 @@ func (s *Store) SpliceEdges(ctx context.Context, deleteOwners []string, nativeFi
 		for i, id := range part {
 			args[i] = id
 		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM edges WHERE from_node IN (`+ph+`)`, args...); err != nil {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM graph_edges WHERE from_node IN (`+ph+`)`, args...); err != nil {
 			return err
 		}
 	}
@@ -1056,28 +1112,8 @@ func (s *Store) SpliceEdges(ctx context.Context, deleteOwners []string, nativeFi
 	// difference — moved on. That divergence is silent by construction.
 	inserts = dedupeWriteSet(inserts)
 
-	const insertChunk = 342
-	for start := 0; start < len(inserts); start += insertChunk {
-		end := start + insertChunk
-		if end > len(inserts) {
-			end = len(inserts)
-		}
-		part := inserts[start:end]
-		var sb strings.Builder
-		sb.WriteString(`INSERT INTO edges (id, from_node, to_node, edge_type, confidence, source, reason, lines) VALUES `)
-		args := make([]any, 0, len(part)*8)
-		for i, edge := range part {
-			if i > 0 {
-				sb.WriteString(",")
-			}
-			sb.WriteString("(?,?,?,?,?,?,?,?)")
-			id := edge.From + "::" + string(edge.Type) + "::" + edge.To
-			args = append(args, id, edge.From, edge.To, string(edge.Type), edge.Confidence, string(edge.Source), string(edge.Reason), edge.Lines)
-		}
-		sb.WriteString(` ON CONFLICT(id) DO UPDATE SET confidence = excluded.confidence, source = excluded.source, reason = excluded.reason, lines = excluded.lines`)
-		if _, err := tx.ExecContext(ctx, sb.String(), args...); err != nil {
-			return err
-		}
+	if err := upsertEdges(ctx, tx, inserts); err != nil {
+		return err
 	}
 	return tx.Commit()
 }
@@ -1125,7 +1161,7 @@ func (s *Store) countRows(ctx context.Context, query string, args ...any) int {
 // invariant check.
 func (s *Store) EdgeCount(ctx context.Context) (int, error) {
 	var n int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM edges`).Scan(&n)
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM graph_edges`).Scan(&n)
 	return n, err
 }
 
@@ -1157,7 +1193,7 @@ func FingerprintEdges(edges []core.Edge) EdgeFingerprint {
 func (s *Store) EdgeFingerprint(ctx context.Context) (EdgeFingerprint, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT from_node, to_node, edge_type, confidence, COALESCE(source, 'unknown'), COALESCE(reason, ''), COALESCE(lines, '')
-		FROM edges
+		FROM graph_edges
 		ORDER BY from_node, edge_type, to_node
 	`)
 	if err != nil {
@@ -1205,10 +1241,10 @@ func writeEdgeFingerprint(h hash.Hash, edge core.Edge) {
 // this avoids materializing millions of rows the caller would discard (the
 // delta carry path keeps only native edges — ~1/6 of the table).
 func (s *Store) EdgesBySource(ctx context.Context, source string) ([]core.Edge, error) {
-	nEdges := s.countRows(ctx, `SELECT COUNT(*) FROM edges WHERE source = ?`, source) // before the cursor: see AllSymbols
+	nEdges := s.countRows(ctx, `SELECT COUNT(*) FROM graph_edges WHERE source = ?`, source) // before the cursor: see AllSymbols
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT from_node, to_node, edge_type, confidence, COALESCE(source, 'unknown'), COALESCE(reason, ''), COALESCE(lines, '')
-		FROM edges
+		FROM graph_edges
 		WHERE source = ?
 		ORDER BY from_node, edge_type, to_node
 	`, source)
@@ -1262,7 +1298,7 @@ func (s *Store) Status(ctx context.Context) (core.Status, error) {
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM symbols`).Scan(&status.SymbolCount); err != nil {
 		return status, err
 	}
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM edges`).Scan(&status.EdgeCount); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM graph_edges`).Scan(&status.EdgeCount); err != nil {
 		return status, err
 	}
 	// Run state the indexer records as it goes (see index.indexProgress):
@@ -1355,7 +1391,7 @@ func (s *Store) ReleaseLocks(ctx context.Context, intentID string) (int64, error
 // from/to indexes (and ESCAPE disables the prefix optimization anyway), so
 // every per-file delete scanned the whole edge table — 16s per changed file
 // on a 6.3M-edge monorepo. Ranges compare raw bytes, so no wildcard escaping
-// is needed, and each statement provably uses idx_edge_from / idx_edge_to.
+// is needed, and each statement provably uses the from_node (unique) / to_node index.
 // The prefix "path::" ends in ':' (0x3A), so "path:;" (';' == ':'+1) is its
 // exclusive upper bound. Three statements rather than one OR'd statement so
 // each gets its index; DELETE is idempotent per row, so the split is
@@ -1364,13 +1400,13 @@ func deleteFileEdges(ctx context.Context, tx *sql.Tx, filePath string) error {
 	fileNode := "file:" + filePath
 	lo := filePath + "::"
 	hi := filePath + ":;"
-	if _, err := tx.ExecContext(ctx, `DELETE FROM edges WHERE from_node = ?`, fileNode); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM graph_edges WHERE from_node = ?`, fileNode); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM edges WHERE from_node >= ? AND from_node < ?`, lo, hi); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM graph_edges WHERE from_node >= ? AND from_node < ?`, lo, hi); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM edges WHERE to_node >= ? AND to_node < ?`, lo, hi); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM graph_edges WHERE to_node >= ? AND to_node < ?`, lo, hi); err != nil {
 		return err
 	}
 	return nil
@@ -1446,23 +1482,33 @@ CREATE INDEX IF NOT EXISTS idx_sym_lang      ON symbols(language);
 CREATE INDEX IF NOT EXISTS idx_sym_qualified ON symbols(qualified_name);
 CREATE INDEX IF NOT EXISTS idx_sym_parent    ON symbols(parent_symbol);
 
-CREATE TABLE IF NOT EXISTS edges (
-    id         TEXT PRIMARY KEY,
+-- graph_edges (was: edges). An edge is identified by (from_node,
+-- edge_type, to_node); the old TEXT id column was exactly
+-- from||'::'||type||'::'||to (checked over 3.4M edges in 8 repos,
+-- 2026-10-13), stored once in the row and again in its PRIMARY KEY index.
+-- Dropping it took django's index 427MB -> 316MB. The unique index leads
+-- with from_node, so it also serves every from_node lookup and range
+-- (no separate idx_edge_from). The table was renamed so an older binary
+-- never reads this layout as its own: it finds no "edges" table, creates
+-- an empty one, and its stamp mismatch makes it rebuild.
+CREATE TABLE IF NOT EXISTS graph_edges (
     from_node  TEXT NOT NULL,
     to_node    TEXT NOT NULL,
     edge_type  TEXT NOT NULL,
     confidence REAL NOT NULL DEFAULT 1.0,
-    source     TEXT NOT NULL DEFAULT 'unknown'
+    source     TEXT NOT NULL DEFAULT 'unknown',
+    reason     TEXT NOT NULL DEFAULT '',
+    lines      TEXT NOT NULL DEFAULT '',
+    UNIQUE (from_node, edge_type, to_node)
 );
 
-CREATE INDEX IF NOT EXISTS idx_edge_from   ON edges(from_node);
-CREATE INDEX IF NOT EXISTS idx_edge_to     ON edges(to_node);
+CREATE INDEX IF NOT EXISTS idx_gedge_to     ON graph_edges(to_node);
 -- edges(source): EdgesBySource('native') is the delta carry path's read, and
 -- native rows are ~5% of the table (30k of 612k on guava) — without this it
 -- scanned all 612k to return 30k. Measured 1.3-3.2s -> 0.8-1.0s, for a 0.9s
 -- build. No index on edge_type: 7 distinct values over 600k rows, and its one
 -- caller (the legacy tests-edge purge) now runs once per database.
-CREATE INDEX IF NOT EXISTS idx_edge_source ON edges(source);
+CREATE INDEX IF NOT EXISTS idx_gedge_source ON graph_edges(source);
 
 CREATE TABLE IF NOT EXISTS icr_locks (
     lock_key    TEXT PRIMARY KEY,

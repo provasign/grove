@@ -65,7 +65,7 @@ func TestDeferredSpliceCheckHealsBeforeNextIndex(t *testing.T) {
 	}
 	db, err := sql.Open("sqlite", filepath.Join(root, ".grove", "grove.db"))
 	if err == nil {
-		_, err = db.ExecContext(ctx, `DELETE FROM edges WHERE rowid IN (SELECT rowid FROM edges LIMIT 1)`)
+		_, err = db.ExecContext(ctx, `DELETE FROM graph_edges WHERE rowid IN (SELECT rowid FROM graph_edges LIMIT 1)`)
 		db.Close()
 	}
 	if err != nil {

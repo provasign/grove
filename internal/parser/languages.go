@@ -44,7 +44,11 @@ var securityExtensions = map[string]bool{
 // 2026-10-13.1: a file's import list is stored once on its file_index row
 // (store.fileImportsMarker); older binaries must re-extract, not read the
 // marker as "no imports". Python environments (venv, conda) are skipped.
-const ExtractorVersion = "2026-10-13.1"
+// 2026-10-13.2: edges live in graph_edges keyed (from, type, to), without
+// the derived TEXT id. store.migrateLegacyEdges converts a 2026-10-13.1
+// database in place and advances its stamp; older binaries see the new
+// stamp and rebuild instead of reading an empty "edges" table.
+const ExtractorVersion = "2026-10-13.2"
 
 // DetectLanguage returns the Grove language tag for a file path.
 // Returns "" for unsupported or security-excluded files.

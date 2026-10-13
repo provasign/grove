@@ -14,8 +14,8 @@ func seedEdges(t *testing.T, st *Store, edges [][2]string) {
 	t.Helper()
 	for _, e := range edges {
 		if _, err := st.db.Exec(
-			`INSERT INTO edges (id, from_node, to_node, edge_type, confidence, source) VALUES (?, ?, ?, 'calls', 1.0, 'astkit')`,
-			e[0]+"::"+e[1], e[0], e[1],
+			`INSERT INTO graph_edges (from_node, to_node, edge_type, confidence, source) VALUES (?, ?, 'calls', 1.0, 'astkit')`,
+			e[0], e[1],
 		); err != nil {
 			t.Fatalf("seed edge %v: %v", e, err)
 		}
@@ -24,7 +24,7 @@ func seedEdges(t *testing.T, st *Store, edges [][2]string) {
 
 func edgeNodes(t *testing.T, st *Store) []string {
 	t.Helper()
-	rows, err := st.db.Query(`SELECT from_node || ' -> ' || to_node FROM edges ORDER BY id`)
+	rows, err := st.db.Query(`SELECT from_node || ' -> ' || to_node FROM graph_edges ORDER BY from_node, edge_type, to_node`)
 	if err != nil {
 		t.Fatalf("query edges: %v", err)
 	}
@@ -122,7 +122,7 @@ func TestDeleteFilesNotInUsesSamePrefixSemantics(t *testing.T) {
 }
 
 // TestDeleteFileEdgesUsesIndexes pins the point of the rewrite: every DELETE
-// must be served by idx_edge_from / idx_edge_to, never a full table scan.
+// must be served by the from_node (unique) / to_node index, never a full table scan.
 func TestDeleteFileEdgesUsesIndexes(t *testing.T) {
 	st := openStore(t)
 	plans := []struct {
@@ -130,9 +130,9 @@ func TestDeleteFileEdgesUsesIndexes(t *testing.T) {
 		args      []any
 		wantIndex string
 	}{
-		{`DELETE FROM edges WHERE from_node = ?`, []any{"file:x.go"}, "idx_edge_from"},
-		{`DELETE FROM edges WHERE from_node >= ? AND from_node < ?`, []any{"x.go::", "x.go:;"}, "idx_edge_from"},
-		{`DELETE FROM edges WHERE to_node >= ? AND to_node < ?`, []any{"x.go::", "x.go:;"}, "idx_edge_to"},
+		{`DELETE FROM graph_edges WHERE from_node = ?`, []any{"file:x.go"}, "sqlite_autoindex_graph_edges_1"},
+		{`DELETE FROM graph_edges WHERE from_node >= ? AND from_node < ?`, []any{"x.go::", "x.go:;"}, "sqlite_autoindex_graph_edges_1"},
+		{`DELETE FROM graph_edges WHERE to_node >= ? AND to_node < ?`, []any{"x.go::", "x.go:;"}, "idx_gedge_to"},
 	}
 	for _, p := range plans {
 		rows, err := st.db.Query("EXPLAIN QUERY PLAN "+p.sql, p.args...)

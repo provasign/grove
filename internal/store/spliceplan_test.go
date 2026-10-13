@@ -8,7 +8,7 @@ import (
 
 // The per-file native deletes in SpliceEdges (and NativeEdgesInto) must use
 // the from_node / to_node range index. With a plain source = 'native' SQLite
-// chose idx_edge_source and scanned every native edge once per file: 25s of
+// chose the source index and scanned every native edge once per file: 25s of
 // a 31s guava edit. A query edit that loses the "+source" guard regresses
 // this silently, so pin the plans.
 func TestNativeEdgeRangeQueriesUseNodeIndexes(t *testing.T) {
@@ -19,9 +19,9 @@ func TestNativeEdgeRangeQueriesUseNodeIndexes(t *testing.T) {
 	defer st.Close()
 	ctx := context.Background()
 	plans := map[string]string{
-		sqlDeleteNativeFromFile:   "idx_edge_from",
-		sqlDeleteNativeFromFileID: "idx_edge_from",
-		sqlNativeEdgesInto:        "idx_edge_to",
+		sqlDeleteNativeFromFile:   "sqlite_autoindex_graph_edges_1",
+		sqlDeleteNativeFromFileID: "sqlite_autoindex_graph_edges_1",
+		sqlNativeEdgesInto:        "idx_gedge_to",
 	}
 	for q, want := range plans {
 		rows, err := st.db.QueryContext(ctx, "EXPLAIN QUERY PLAN "+q, "a::", "a:;", "a::", "a:;")
