@@ -146,6 +146,8 @@ func (s *Store) runAlterMigrations(ctx context.Context) error {
 		// unchanged since the last index (-1 = unknown, forces one hash).
 		"ALTER TABLE file_index ADD COLUMN file_size  INTEGER NOT NULL DEFAULT -1",
 		"ALTER TABLE file_index ADD COLUMN file_mtime INTEGER NOT NULL DEFAULT -1",
+		// One copy of a file's import list (see fileImportsMarker).
+		`ALTER TABLE file_index ADD COLUMN imports TEXT NOT NULL DEFAULT '[]'`,
 		// The FTS5 mirror was never queried by any retrieval path (search
 		// runs in-memory over the graph), yet its sync triggers doubled the
 		// cost of every symbol write and the table duplicated symbol text
@@ -323,6 +325,11 @@ func (s *Store) UpsertFile(ctx context.Context, filePath, blobSHA, language stri
 	}
 	defer insertStmt.Close()
 
+	fileImports, err := commonImports(symbols)
+	if err != nil {
+		return err
+	}
+
 	// Defensive: collapse duplicate IDs within a single file. Some Tree-sitter
 	// walkers can revisit a node (e.g. a class declared on the same line as a
 	// nested definition), and the symbols table has a PRIMARY KEY on id.
@@ -332,22 +339,23 @@ func (s *Store) UpsertFile(ctx context.Context, filePath, blobSHA, language stri
 			continue
 		}
 		seen[symbol.ID] = true
-		if err := execInsertSymbol(ctx, insertStmt, &symbol); err != nil {
+		if err := execInsertSymbolWith(ctx, insertStmt, &symbol, fileImports); err != nil {
 			return err
 		}
 	}
 
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO file_index (file_path, blob_sha, language, symbol_count, indexed_at, file_size, file_mtime)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO file_index (file_path, blob_sha, language, symbol_count, indexed_at, file_size, file_mtime, imports)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(file_path) DO UPDATE SET
 			blob_sha     = excluded.blob_sha,
 			language     = excluded.language,
 			symbol_count = excluded.symbol_count,
 			indexed_at   = excluded.indexed_at,
 			file_size    = excluded.file_size,
-			file_mtime   = excluded.file_mtime
-	`, filePath, blobSHA, language, len(symbols), time.Now().UTC().Format(time.RFC3339), size, mtime)
+			file_mtime   = excluded.file_mtime,
+			imports      = excluded.imports
+	`, filePath, blobSHA, language, len(symbols), time.Now().UTC().Format(time.RFC3339), size, mtime, fileImports)
 	if err != nil {
 		return err
 	}
@@ -389,10 +397,49 @@ const insertSymbolSQL = `
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
+// fileImportsMarker stands in a symbol's imports column for "the import
+// list stored once on this file's file_index row". Every symbol of a file
+// carries the file's whole import list, so storing it per symbol was 135MB
+// of django's 593MB index (60,720 copies of 2,160 lists, measured
+// 2026-10-13). The marker is not JSON on purpose: a reader that does not
+// know it gets no imports rather than wrong ones.
+const fileImportsMarker = "@file"
+
+// commonImports is the JSON import list most symbols of a file carry ("[]"
+// when none do): the one stored on the file_index row.
+func commonImports(symbols []core.SymbolRecord) (string, error) {
+	counts := map[string]int{}
+	best, bestN := "[]", 0
+	for i := range symbols {
+		if len(symbols[i].Imports) == 0 {
+			continue
+		}
+		b, err := marshalSlice(symbols[i].Imports)
+		if err != nil {
+			return "", err
+		}
+		k := string(b)
+		counts[k]++
+		if counts[k] > bestN || (counts[k] == bestN && k < best) {
+			best, bestN = k, counts[k]
+		}
+	}
+	return best, nil
+}
+
 func execInsertSymbol(ctx context.Context, stmt *sql.Stmt, symbol *core.SymbolRecord) error {
+	return execInsertSymbolWith(ctx, stmt, symbol, "")
+}
+
+// execInsertSymbolWith writes symbol; when its imports equal fileImports (a
+// non-empty list stored on the file row), the column holds the marker.
+func execInsertSymbolWith(ctx context.Context, stmt *sql.Stmt, symbol *core.SymbolRecord, fileImports string) error {
 	imports, err := marshalSlice(symbol.Imports)
 	if err != nil {
 		return err
+	}
+	if fileImports != "" && fileImports != "[]" && string(imports) == fileImports {
+		imports = []byte(fileImportsMarker)
 	}
 	modifiers, err := marshalSlice(symbol.Modifiers)
 	if err != nil {
@@ -804,6 +851,7 @@ func (s *Store) querySymbols(ctx context.Context, capHint int, tail string, args
 	defer rows.Close()
 
 	symbols := make([]core.SymbolRecord, 0, capHint)
+	var fromFile []int // symbols whose imports live on the file row
 	for rows.Next() {
 		var symbol core.SymbolRecord
 		var kind, importsJSON, modifiersJSON, typeParamsJSON, annotationsJSON, callSitesJSON, attrSitesJSON string
@@ -819,7 +867,11 @@ func (s *Store) querySymbols(ctx context.Context, capHint int, tail string, args
 		); err != nil {
 			return nil, err
 		}
-		_ = json.Unmarshal([]byte(importsJSON), &symbol.Imports)
+		if importsJSON == fileImportsMarker {
+			fromFile = append(fromFile, len(symbols))
+		} else {
+			_ = json.Unmarshal([]byte(importsJSON), &symbol.Imports)
+		}
 		_ = json.Unmarshal([]byte(modifiersJSON), &symbol.Modifiers)
 		_ = json.Unmarshal([]byte(typeParamsJSON), &symbol.TypeParameters)
 		_ = json.Unmarshal([]byte(annotationsJSON), &symbol.Annotations)
@@ -829,7 +881,71 @@ func (s *Store) querySymbols(ctx context.Context, capHint int, tail string, args
 		symbol.Exports = exports == 1
 		symbols = append(symbols, symbol)
 	}
-	return symbols, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(fromFile) > 0 {
+		if err := s.fillFileImports(ctx, symbols, fromFile); err != nil {
+			return nil, err
+		}
+	}
+	return symbols, nil
+}
+
+// fillFileImports sets Imports on symbols[idx...] from their files'
+// file_index rows. Symbols of one file share one decoded slice, as they
+// shared one list when parsed.
+func (s *Store) fillFileImports(ctx context.Context, symbols []core.SymbolRecord, idx []int) error {
+	var files []string
+	seen := map[string]bool{}
+	for _, i := range idx {
+		if f := symbols[i].FilePath; !seen[f] {
+			seen[f] = true
+			files = append(files, f)
+		}
+	}
+	byFile := make(map[string][]string, len(files))
+	scan := func(rows *sql.Rows) error {
+		defer rows.Close()
+		for rows.Next() {
+			var f, js string
+			if err := rows.Scan(&f, &js); err != nil {
+				return err
+			}
+			var list []string
+			_ = json.Unmarshal([]byte(js), &list)
+			byFile[f] = list
+		}
+		return rows.Err()
+	}
+	// Most callers load a large share of the files (AllSymbols): one scan
+	// beats thousands of bound parameters.
+	if len(files) > 400 {
+		rows, err := s.db.QueryContext(ctx, `SELECT file_path, imports FROM file_index`)
+		if err != nil {
+			return err
+		}
+		if err := scan(rows); err != nil {
+			return err
+		}
+	} else {
+		args := make([]any, len(files))
+		for i, f := range files {
+			args[i] = f
+		}
+		rows, err := s.db.QueryContext(ctx,
+			`SELECT file_path, imports FROM file_index WHERE file_path IN (?`+strings.Repeat(",?", len(files)-1)+`)`, args...)
+		if err != nil {
+			return err
+		}
+		if err := scan(rows); err != nil {
+			return err
+		}
+	}
+	for _, i := range idx {
+		symbols[i].Imports = byFile[symbols[i].FilePath]
+	}
+	return nil
 }
 
 func (s *Store) AllEdges(ctx context.Context) ([]core.Edge, error) {
@@ -1118,6 +1234,18 @@ func (s *Store) EdgesBySource(ctx context.Context, source string) ([]core.Edge, 
 // Vacuum rebuilds the database file, returning the pages a re-index's
 // deleted rows and the bulk edge load's dropped indexes left free. It
 // needs free disk for a full copy and cannot run inside a transaction.
+// FreeFraction is the share of the database file that is free pages, and
+// the file's size in bytes.
+func (s *Store) FreeFraction(ctx context.Context) (float64, int64) {
+	var free, pages, size int64
+	if s.db.QueryRowContext(ctx, `PRAGMA freelist_count`).Scan(&free) != nil ||
+		s.db.QueryRowContext(ctx, `PRAGMA page_count`).Scan(&pages) != nil ||
+		s.db.QueryRowContext(ctx, `PRAGMA page_size`).Scan(&size) != nil || pages == 0 {
+		return 0, 0
+	}
+	return float64(free) / float64(pages), pages * size
+}
+
 func (s *Store) Vacuum(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
 		return err
@@ -1283,7 +1411,8 @@ CREATE TABLE IF NOT EXISTS file_index (
     blob_sha     TEXT NOT NULL,
     language     TEXT NOT NULL,
     symbol_count INTEGER NOT NULL DEFAULT 0,
-    indexed_at   TEXT NOT NULL
+    indexed_at   TEXT NOT NULL,
+    imports      TEXT NOT NULL DEFAULT '[]'
 );
 
 CREATE TABLE IF NOT EXISTS symbols (

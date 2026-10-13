@@ -199,3 +199,36 @@ func TestIsSensitivePath_PrivateKeysAndCredStores(t *testing.T) {
 		}
 	}
 }
+
+// Installed Python environments are third-party code under any directory
+// name and are often not gitignored (2026-10-13: a 1GB index).
+func TestIndex_SkipsPythonEnvironments(t *testing.T) {
+	idx, cleanup := newIdx(t)
+	defer cleanup()
+
+	root := t.TempDir()
+	files := map[string]string{
+		"app.py":                                "def keep():\n    pass\n",
+		"env/pyvenv.cfg":                        "home = /usr/bin\n",
+		"env/lib/python3.12/site-packages/x.py": "def dep():\n    pass\n",
+		"conda/conda-meta/history":              "\n",
+		"conda/lib/y.py":                        "def dep2():\n    pass\n",
+		"vendored/site-packages/z.py":           "def dep3():\n    pass\n",
+	}
+	for name, body := range files {
+		p := filepath.Join(root, name)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, res, err := idx.Index(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.FilesUpdated != 1 {
+		t.Fatalf("FilesUpdated = %d, want 1 (only app.py)", res.FilesUpdated)
+	}
+}

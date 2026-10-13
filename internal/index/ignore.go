@@ -180,6 +180,24 @@ func globMatch(pattern, value string) bool {
 	return err == nil && ok
 }
 
+// isPythonEnvDir reports whether dir is an installed Python environment: a
+// venv/virtualenv (pyvenv.cfg at its root), a conda env (conda-meta/), or a
+// site-packages tree. These hold third-party code under any name ("venv",
+// "env", ".env-py311") and are often not gitignored; indexing one roughly
+// doubled a Python project's database (2026-10-13 report: 1GB index).
+func isPythonEnvDir(dir, name string) bool {
+	if name == "site-packages" {
+		return true
+	}
+	if _, err := os.Stat(filepath.Join(dir, "pyvenv.cfg")); err == nil {
+		return true
+	}
+	if fi, err := os.Stat(filepath.Join(dir, "conda-meta")); err == nil && fi.IsDir() {
+		return true
+	}
+	return false
+}
+
 func shouldSkipDirName(name string) bool {
 	switch name {
 	case ".git", ".grove", ".cache", ".venv", ".tox", ".next", ".idea",
