@@ -1215,3 +1215,23 @@ func TestResolverEdgesCarryTheirCallPositions(t *testing.T) {
 		t.Errorf("Request.get_data lines = %q, want 5:9 (all: %v)", got, lines)
 	}
 }
+
+// A base class named through an import alias resolves to the imported class:
+// flask's `class Blueprint(SansioBlueprint)` had no supertype, so its
+// inherited route() could not be reached (2026-10-14).
+func TestPyAliasedBaseClassResolves(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "pkg/sansio/blueprints.py::Blueprint@1", FilePath: "pkg/sansio/blueprints.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindClass, Name: "Blueprint", QualifiedName: "Blueprint", Signature: "class Blueprint:", RawText: "class Blueprint:\n    pass\n"},
+		{ID: "pkg/blueprints.py::Blueprint@4", FilePath: "pkg/blueprints.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindClass, Name: "Blueprint", QualifiedName: "Blueprint", Signature: "class Blueprint(SansioBlueprint):",
+			RawText: "class Blueprint(SansioBlueprint):\n    pass\n",
+			Imports: []string{".sansio.blueprints", ".sansio.blueprints#Blueprint", "@python-binding:1:SansioBlueprint=.sansio.blueprints#Blueprint"}},
+	}
+	for _, e := range BuildEdges(syms) {
+		if e.Type == core.EdgeExtends && e.From == "pkg/blueprints.py::Blueprint@4" && e.To == "pkg/sansio/blueprints.py::Blueprint@1" {
+			return
+		}
+	}
+	t.Fatal("Blueprint(SansioBlueprint) must extend the sansio Blueprint")
+}

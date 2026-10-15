@@ -1798,6 +1798,10 @@ func buildExtendsImplements(idx *edgeIndex, symbols []core.SymbolRecord) []core.
 				continue
 			}
 			for _, base := range pythonClassBases(&symbol) {
+				if aliased := pyAliasedBaseEdges(idx, symbol, base); len(aliased) > 0 {
+					edges = append(edges, aliased...)
+					continue
+				}
 				edges = append(edges, resolveTypeEdges(idx, symbol, base, core.EdgeExtends, 0.85)...)
 			}
 		case "rust":
@@ -4876,4 +4880,31 @@ func sameOverloadSet(cands []*core.SymbolRecord) bool {
 		}
 	}
 	return true
+}
+
+// pyAliasedBaseEdges resolves a base class named through an import alias
+// (`from .sansio.blueprints import Blueprint as SansioBlueprint`, then
+// `class Blueprint(SansioBlueprint)`): no class is named SansioBlueprint, so
+// the name search found nothing and flask's Blueprint had no supertype.
+func pyAliasedBaseEdges(idx *edgeIndex, symbol core.SymbolRecord, base string) []core.Edge {
+	if strings.Contains(base, ".") {
+		return nil
+	}
+	module, member, visible, _ := idx.pyImportBinding(&symbol, base)
+	if !visible || member == "" || member == base {
+		return nil
+	}
+	files := map[string]bool{}
+	for _, f := range idx.pyModuleFiles(symbol.FilePath, module) {
+		files[f] = true
+	}
+	var out []core.Edge
+	for _, target := range idx.byName[strings.ToLower(member)] {
+		if target.Name != member || target.Kind != core.KindClass || target.ID == symbol.ID || !files[target.FilePath] {
+			continue
+		}
+		out = append(out, core.Edge{From: symbol.ID, To: target.ID, Type: core.EdgeExtends,
+			Confidence: 0.85, Source: core.EvidenceSourceHeuristic, Reason: core.ReasonTypeRef})
+	}
+	return out
 }
