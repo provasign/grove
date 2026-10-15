@@ -631,3 +631,16 @@ func TestCHeaderStaticCallsAndParameterShadowing(t *testing.T) {
 		t.Errorf("main reaches %d run_tests copies, want 20", runs)
 	}
 }
+
+// Python: `(ctx := _cv.get(None))` with `_cv: ContextVar[Ctx]` types ctx.
+func TestPythonContextVarWalrus(t *testing.T) {
+	got, _, _ := callEdges(t, map[string]string{
+		"pkg/__init__.py": "",
+		"pkg/ctx.py":      "class Ctx:\n    def push(self):\n        return 1\n\n\nclass Other:\n    def push(self):\n        return 2\n",
+		"pkg/globals.py":  "from contextvars import ContextVar\nfrom .ctx import Ctx\n\n_cv: ContextVar[Ctx] = ContextVar(\"x\")\n",
+		"pkg/helpers.py": "from .globals import _cv\n\n\ndef stream():\n    if (ctx := _cv.get(None)) is not None:\n        ctx.push()\n",
+	})
+	if !got["stream→Ctx.push"] || got["stream→Other.push"] {
+		t.Errorf("ctx from ContextVar[Ctx].get not typed: %v", got)
+	}
+}

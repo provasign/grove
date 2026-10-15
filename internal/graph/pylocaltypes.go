@@ -36,6 +36,7 @@ var (
 	pyClassRefRe = regexp.MustCompile(`(?m)^\s+(\w+)\s*=\s*(?:\w+\.)?([A-Z]\w*)\s*$`)
 	// x = [await] [self.|mod.]func(...) — typed through func's return
 	// annotation (ctx = self.app_context() → AppContext)
+	pyWalrusCallRe = regexp.MustCompile(`\(\s*(\w+)\s*:=\s*(?:await\s+)?(?:((?:\w+\.)*\w+)\.)?([a-z_]\w*)\(`)
 	pyCallAssignRe = regexp.MustCompile(`(?m)^\s*(\w+)\s*=\s*(?:await\s+)?(?:((?:\w+\.)*\w+)\.)?([a-z_]\w*)\(`)
 	// with [async] item[, item]: — parenthesized items may span lines, and
 	// the suite may begin on the same line after the colon.
@@ -742,7 +743,10 @@ func pyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 				aliased[m[1]] = true
 			}
 		}
-		for _, m := range pyCallAssignRe.FindAllStringSubmatch(body, -1) {
+		callAssigns := pyCallAssignRe.FindAllStringSubmatch(body, -1)
+		// `if (ctx := _cv_app.get(None)) is not None:` assigns too.
+		callAssigns = append(callAssigns, pyWalrusCallRe.FindAllStringSubmatch(body, -1)...)
+		for _, m := range callAssigns {
 			if _, done := out[m[1]]; done {
 				continue // annotation / constructor evidence wins
 			}
@@ -751,6 +755,15 @@ func pyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 				// ContextVar, not anything indexed — its `get` is not the
 				// repo's `get`. Only an own-object chain, a typed local, or
 				// a bare call is typed.
+				if _, typed := out[q]; !typed && m[3] == "get" {
+					// ctx = _cv_app.get(None) with `_cv_app: ContextVar[AppContext]`
+					// at module level: the value the ContextVar holds (flask
+					// helpers, oracle review 2026-10-15).
+					if t := pyContextVarType(idx, symbol, q); t != "" {
+						out[m[1]] = t
+						continue
+					}
+				}
 				if _, typed := out[q]; !typed {
 					// req = wrappers.Request.from_values(...): a factory
 					// called on an indexed class is typed through its own
@@ -2089,6 +2102,43 @@ func pyChainType(idx *edgeIndex, symbol *core.SymbolRecord, localTypes map[strin
 		typ = strings.TrimPrefix(attrs[seg], "class:")
 	}
 	return typ
+}
+
+var pyContextVarRe = regexp.MustCompile(`:\s*(?:contextvars\.)?ContextVar\[\s*["']?([\w.]+)["']?\s*\]`)
+
+// pyContextVarType returns T for a module-level variable named name
+// annotated `ContextVar[T]` (the caller's own module first, else the one
+// such variable in the repository), when T is indexed.
+func pyContextVarType(idx *edgeIndex, symbol *core.SymbolRecord, name string) string {
+	var found []*core.SymbolRecord
+	for _, cand := range namedSymbols(idx, name) {
+		if cand.Language != "python" || cand.ParentSymbol != "" || cand.Kind != core.KindVariable {
+			continue
+		}
+		if cand.FilePath == symbol.FilePath {
+			found = []*core.SymbolRecord{cand}
+			break
+		}
+		found = append(found, cand)
+	}
+	if len(found) != 1 {
+		return ""
+	}
+	m := pyContextVarRe.FindStringSubmatch(found[0].Signature)
+	if m == nil {
+		m = pyContextVarRe.FindStringSubmatch(firstLine(found[0].RawText))
+	}
+	if m == nil {
+		return ""
+	}
+	t := m[1]
+	if i := strings.LastIndexByte(t, '.'); i >= 0 {
+		t = t[i+1:]
+	}
+	if !typeSymbolExists(idx, t) {
+		return ""
+	}
+	return t
 }
 
 // pyUniformMethodReturn types `x = recv.method(...)` when recv is an untyped
