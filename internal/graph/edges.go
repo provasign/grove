@@ -2337,6 +2337,9 @@ func resolveCallees(idx *edgeIndex, symbol *core.SymbolRecord, calleeName string
 		if _, ok := scope[cand.FilePath]; !ok {
 			continue
 		}
+		if hasModifier(cand, "local") && tsFamilyLang(cand.Language) && !idx.jsLocalVisible(symbol, cand) {
+			continue
+		}
 		if cand.FilePath == symbol.FilePath {
 			sameFile = append(sameFile, cand)
 		} else {
@@ -2854,6 +2857,16 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				continue
 			}
 			localDefinition := qualifier == "" && symbol.Name != "<top-level>" && declaresLocalFunction(&symbol, codeBody(), calleeName)
+			if localDefinition && tsFamilyLang(symbol.Language) {
+				// A nested `function run(i)` is indexed as a local symbol:
+				// the bare call binds the innermost one in scope.
+				if local := idx.jsLexicalLocal(&symbol, calleeName); local != nil {
+					if local.ID != symbol.ID {
+						addEdge(symbol.ID, local.ID, 0.95, core.EvidenceSourceASTKit, core.ReasonASTNarrowed)
+					}
+					continue
+				}
+			}
 			if localDefinition && (symbol.Language != "python" || len(pythonLexicalChild(idx, &symbol, calleeName)) == 0) {
 				// A function declared inside the caller's own body
 				// (`function run(i)` nested in Socket.run, a nested `def`)
@@ -5638,4 +5651,45 @@ func goProducerReturnType(idx *edgeIndex, producer string) string {
 		typ = t
 	}
 	return typ
+}
+
+// jsLocalVisible reports whether a JS/TS function declared inside another
+// function (astkit marks it "local") is in scope for caller: only code
+// within the declaring function's span sees it. A file's many nested
+// `function next()` helpers are never one another's, nor another file's.
+func (idx *edgeIndex) jsLocalVisible(caller, local *core.SymbolRecord) bool {
+	if caller.FilePath != local.FilePath {
+		return false
+	}
+	var encl *core.SymbolRecord
+	for _, s := range idx.byFile[local.FilePath] {
+		if s.ID == local.ID || s.Name == "<top-level>" || !graphCallableSymbol(s) {
+			continue
+		}
+		if s.Span.Start <= local.Span.Start && s.Span.End >= local.Span.End &&
+			(s.Span.Start != local.Span.Start || s.Span.End != local.Span.End) {
+			if encl == nil || s.Span.End-s.Span.Start < encl.Span.End-encl.Span.Start {
+				encl = s
+			}
+		}
+	}
+	if encl == nil {
+		return true // declared in an anonymous callback of the file's top-level code
+	}
+	return caller.Span.Start >= encl.Span.Start && caller.Span.End <= encl.Span.End
+}
+
+// jsLexicalLocal is the innermost JS/TS local function named name visible
+// from caller (declared in caller's body or an enclosing function's), or nil.
+func (idx *edgeIndex) jsLexicalLocal(caller *core.SymbolRecord, name string) *core.SymbolRecord {
+	var best *core.SymbolRecord
+	for _, s := range idx.byFile[caller.FilePath] {
+		if s.Name != name || !hasModifier(s, "local") || !tsFamilyLang(s.Language) || !idx.jsLocalVisible(caller, s) {
+			continue
+		}
+		if best == nil || s.Span.Start > best.Span.Start {
+			best = s // declared deeper or later in the scope chain
+		}
+	}
+	return best
 }
