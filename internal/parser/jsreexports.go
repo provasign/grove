@@ -63,13 +63,14 @@ func JSExportIndex(root string) (map[string][]core.JSExportSpecifier, int) {
 func scanJSExports(root string, prefilter []byte, name string) (map[string][]core.JSExportSpecifier, int) {
 	out := map[string][]core.JSExportSpecifier{}
 	skipped := 0
+	skipDirs := NewDirSkipper(root)
 	_ = filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
 		if err != nil {
 			skipped++
 			return nil
 		}
 		if info.IsDir() {
-			if p != root && refSkipDir(info.Name()) {
+			if p != root && skipDirs.Skip(relOf(root, p), info.Name()) {
 				return filepath.SkipDir
 			}
 			return nil

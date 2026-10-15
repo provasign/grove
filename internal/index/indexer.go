@@ -388,6 +388,7 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 	native.CleanupLegacyCaches(root)
 	currentFiles := map[string]bool{}
 	ignore := newIgnoreMatcher(root)
+	skipDirs := parser.NewDirSkipper(root)
 
 	// Phase 1 (serial): walk the tree, apply ignore/sensitivity rules, and
 	// collect the files whose content hash changed since the last index.
@@ -440,7 +441,7 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 		relPath = filepath.ToSlash(relPath)
 
 		if entry.IsDir() {
-			if path != root && (shouldSkipDirName(entry.Name()) ||
+			if path != root && (skipDirs.Skip(relPath, entry.Name()) ||
 				ignore.Ignored(relPath, true) || isPythonEnvDir(path, entry.Name())) {
 				return filepath.SkipDir
 			}

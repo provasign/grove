@@ -127,13 +127,13 @@ func (e *Engine) Walk(root string) ([]core.SymbolRecord, int, error) {
 	var symbols []core.SymbolRecord
 	filesIndexed := 0
 
+	skipDirs := NewDirSkipper(root)
 	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
 		if entry.IsDir() {
-			name := entry.Name()
-			if name == ".git" || name == ".grove" || name == "node_modules" || name == "vendor" || name == "dist" || name == "bin" {
+			if path != root && skipDirs.Skip(relOf(root, path), entry.Name()) {
 				return filepath.SkipDir
 			}
 			return nil
