@@ -498,3 +498,25 @@ func TestPythonSelfAttributes(t *testing.T) {
 		t.Error("self.name bound to an unrelated class's property")
 	}
 }
+
+// TS/JS call-result receivers: a library producer's result reaches none of
+// our methods unless it returns an element (Map.get); our annotated
+// producer picks its return type's method (oracle review 2026-10-15).
+func TestTSCallResultReceivers(t *testing.T) {
+	got, _, _ := callEdges(t, map[string]string{
+		"a.ts": "export class Op {\n  to(r: string): Op { return this; }\n}\nexport class Other {\n  to(r: string): void {}\n  filter(): void {}\n}\n" +
+			"export class Ns {\n  createChild(n: string): void {}\n}\n" +
+			"export class S {\n  parents: Map<string, Ns> = new Map();\n  newOp(): Op { return new Op(); }\n" +
+			"  a(): void { this.newOp().to(\"room\"); }\n  b(xs: number[]): void { xs.map(x => x).filter(); }\n" +
+			"  c(): void { this.parents.get(\"k\")!.createChild(\"n\"); }\n}\n",
+	})
+	if got["S.a→Other.to"] || !got["S.a→Op.to"] {
+		t.Errorf("newOp().to not narrowed by the producer's return type: %v", got)
+	}
+	if got["S.b→Other.filter"] {
+		t.Error("a library result's method bound to ours")
+	}
+	if !got["S.c→Ns.createChild"] {
+		t.Errorf("map.get(k)!.createChild lost its target: %v", got)
+	}
+}

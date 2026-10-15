@@ -51,7 +51,9 @@ var securityExtensions = map[string]bool{
 // 2026-10-16.1: a call on its own declaration's line takes the call's column, not the
 // declaration name's (astkit fillCallColumns); javac and go/types record calls
 // resolved to libraries or to the caller itself (core.EdgeResolvedCalls).
-const ExtractorVersion = "2026-10-16.1"
+// 2026-10-16.2: JS/TS receivers behind `!` or parentheses are kept; an
+// unnamed receiver (`a[i].m()`) is "<expr>", not a bare call.
+const ExtractorVersion = "2026-10-16.2"
 
 // DetectLanguage returns the Grove language tag for a file path.
 // Returns "" for unsupported or security-excluded files.

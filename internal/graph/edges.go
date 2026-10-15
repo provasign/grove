@@ -375,6 +375,54 @@ func pyHierarchyKnown(idx *edgeIndex, cls, dir string) bool {
 	return true
 }
 
+// tsElementProducers are library methods returning an element of their
+// receiver (Map.get, Array.find), whose type may be one of ours.
+var tsElementProducers = map[string]bool{
+	"get": true, "find": true, "findLast": true, "at": true, "pop": true, "shift": true,
+	"deref": true, "next": true, "item": true, "peek": true, "first": true, "last": true,
+}
+
+// tsProducerReturnTypes returns the declared return types (bare names) of
+// the TS/JS functions and methods named producer, and whether any exists. An
+// unannotated producer yields no types: nothing to narrow by.
+func tsProducerReturnTypes(idx *edgeIndex, producer string) ([]string, bool) {
+	exists := false
+	seen := map[string]bool{}
+	var out []string
+	for _, f := range idx.byName[strings.ToLower(producer)] {
+		if f.Name != producer || !tsFamilyLang(f.Language) {
+			continue
+		}
+		switch f.Kind {
+		case core.KindMethod, core.KindFunction, core.KindField, core.KindVariable:
+		default:
+			continue
+		}
+		exists = true
+		ret := tsDeclaredReturnType(f.Signature)
+		if ret == "" || ret == tsAnonymousType || ret == "this" || ret == "void" || ret == "any" || ret == "unknown" {
+			return nil, true
+		}
+		if j := strings.LastIndexByte(ret, '.'); j >= 0 {
+			ret = ret[j+1:]
+		}
+		if !seen[ret] {
+			seen[ret] = true
+			out = append(out, ret)
+		}
+	}
+	return out, exists
+}
+
+func allTypesIndexed(idx *edgeIndex, types []string) bool {
+	for _, t := range types {
+		if !typeSymbolExists(idx, t) {
+			return false
+		}
+	}
+	return true
+}
+
 // pyIsSubclass reports whether cls inherits from base (within four levels).
 func pyIsSubclass(idx *edgeIndex, cls, base, dir string) bool {
 	level := []string{cls}
@@ -2913,14 +2961,15 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				}
 				cands = compatible
 			}
-			rustExprReceiver := symbol.Language == "rust" && qualifier == "<expr>"
-			if rustExprReceiver {
+			exprReceiver := qualifier == "<expr>"
+			if exprReceiver {
 				// A method on an expression astkit could not name (`(a +
-				// b).m()`, `xs[i].m()`): an untyped receiver, resolved by name
-				// like one, but never a bare call.
+				// b).m()`, `xs[i].m()`, `this.clients[id].close()`): an
+				// untyped receiver, resolved by name like one, but never a
+				// bare call.
 				qualifier = ""
 			}
-			if symbol.Language == "rust" && qualifier == "" && !rustExprReceiver && !strings.HasSuffix(cs.Callee, "!") {
+			if symbol.Language == "rust" && qualifier == "" && !exprReceiver && !strings.HasSuffix(cs.Callee, "!") {
 				// A bare Rust call never reaches a method (that takes self.
 				// or Type::): `matched(m)` calling a closure parameter bound
 				// to every method named matched (ripgrep printer, 11 edges).
@@ -3090,7 +3139,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					cands = reachable
 				}
 			}
-			if qualifier == "" && len(cands) > 0 && (symbol.Language == "javascript" || symbol.Language == "typescript" || symbol.Language == "tsx") {
+			if qualifier == "" && !exprReceiver && len(cands) > 0 && (symbol.Language == "javascript" || symbol.Language == "typescript" || symbol.Language == "tsx") {
 				// A bare call in JS/TS never reaches a class member: methods
 				// need a receiver. socket.io's `run()` (a local arrow) and
 				// express's `send(req, path, opts)` (the send module) were
@@ -3380,6 +3429,27 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				typ := strings.TrimSuffix(qualifier, "()")
 				if typeSymbolExists(idx, typ) {
 					cands = typeOrInheritedMethodTargets(idx, &symbol, typ, calleeName, cands)
+				} else if rets, exists := tsProducerReturnTypes(idx, typ); !exists {
+					// No function or method of ours by that name: a library
+					// call's result (arr.map(...).filter, JSON.parse(...).x)
+					// (oracle review 2026-10-15: socket.io fan-out) — unless
+					// the library method returns an element it holds
+					// (map.get(k)!.createChild()), which may be ours.
+					if !tsElementProducers[typ] {
+						cands = nil
+					}
+				} else if len(rets) > 0 {
+					// this.newBroadcastOperator().to(room): the producer's
+					// declared return type picks the method.
+					var byType []*core.SymbolRecord
+					for _, ret := range rets {
+						if typeSymbolExists(idx, ret) {
+							byType = append(byType, typeOrInheritedMethodTargets(idx, &symbol, ret, calleeName, cands)...)
+						}
+					}
+					if len(byType) > 0 || allTypesIndexed(idx, rets) {
+						cands = byType
+					}
 				}
 			}
 			if (symbol.Language == "csharp" || symbol.Language == "php" ||
