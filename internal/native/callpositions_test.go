@@ -23,7 +23,7 @@ func TestGoCallEdgesCarryTheirPositions(t *testing.T) {
 		{ID: "main.go::W.Value@b", FilePath: "main.go", BlobSHA: "b", Language: "go", Kind: core.KindMethod, Name: "Value", QualifiedName: "W.Value", ParentSymbol: "W", Span: core.LineRange{Start: 5, End: 5}},
 		{ID: "main.go::use@b", FilePath: "main.go", BlobSHA: "b", Language: "go", Kind: core.KindFunction, Name: "use", QualifiedName: "use", Span: core.LineRange{Start: 7, End: 10}},
 	}
-	edges, _, _ := goSemanticEdges(context.Background(), root, []string{"main.go"}, parsed, nil, nil)
+	edges, _, _ := goSemanticEdges(context.Background(), root, []string{"main.go"}, parsed, nil, goDeps{})
 	for _, e := range edges {
 		if e.Type == core.EdgeCalls && e.From == "main.go::use@b" && e.To == "main.go::W.Value@b" {
 			// line 8: "\tw.Value(1)" -> col 4; line 9: "\t_ = \"é\"; w.Value(2)" -> col 13 (é is one unit)

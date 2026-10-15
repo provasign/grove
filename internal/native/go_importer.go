@@ -34,13 +34,16 @@ type goProjectImporter struct {
 // alone looks packages up GOPATH-style and never finds a module dependency, so
 // every project package importing one was type-checked partially even with
 // the module cache fully populated.
-func newGoProjectImporter(packages []goListPackage, exports map[string]string) *goProjectImporter {
+func newGoProjectImporter(packages []goListPackage, deps goDeps) *goProjectImporter {
 	var fallback types.Importer = importer.Default()
+	exports := deps.exports
 	if len(exports) > 0 {
 		fallback = exportDataImporter{exports: exports, fallback: fallback,
 			gc: importer.ForCompiler(token.NewFileSet(), "gc", func(path string) (io.ReadCloser, error) {
 				return os.Open(exports[path])
 			})}
+	} else if deps.source != nil {
+		fallback = deps.source
 	}
 	p := &goProjectImporter{
 		packages: map[string]goListPackage{}, loaded: map[string]*types.Package{},
@@ -169,3 +172,94 @@ func (e exportDataImporter) Import(path string) (*types.Package, error) {
 	}
 	return e.fallback.Import(path)
 }
+
+// goDeps is how dependency packages (standard library, modules) get their
+// types: compiler export data from `go list -export`, or, when that would
+// first have to compile the whole build graph (a cold build cache: grafana
+// ~29 min), type-checking their source with function bodies ignored.
+type goDeps struct {
+	exports map[string]string
+	source  types.Importer
+}
+
+// goDepPackage is one dependency's source, as `go list -deps -json` lists it.
+type goDepPackage struct {
+	ImportPath string
+	Dir        string
+	GoFiles    []string
+	CgoFiles   []string
+	ImportMap  map[string]string
+}
+
+// goSourceImporter type-checks dependency packages from source, declarations
+// only (IgnoreFuncBodies), the way gopls does for packages it has no export
+// data for: no compilation, no codegen. cgo is faked (FakeImportC): C.x is
+// untyped, everything else is checked. Imports go through ImportMap
+// (vendored paths). Not safe for concurrent use; the project importer calls
+// its fallback under a mutex.
+type goSourceImporter struct {
+	fset    *token.FileSet
+	pkgs    map[string]goDepPackage
+	loaded  map[string]*types.Package
+	loading map[string]bool
+}
+
+func newGoSourceImporter(pkgs []goDepPackage) *goSourceImporter {
+	g := &goSourceImporter{fset: token.NewFileSet(), pkgs: map[string]goDepPackage{},
+		loaded: map[string]*types.Package{}, loading: map[string]bool{}}
+	for _, p := range pkgs {
+		g.pkgs[p.ImportPath] = p
+	}
+	return g
+}
+
+func (g *goSourceImporter) Import(path string) (*types.Package, error) {
+	return g.importFrom(path, "")
+}
+
+func (g *goSourceImporter) importFrom(path, from string) (*types.Package, error) {
+	if path == "unsafe" {
+		return types.Unsafe, nil
+	}
+	if from != "" {
+		if mapped := g.pkgs[from].ImportMap[path]; mapped != "" {
+			path = mapped
+		}
+	}
+	if pkg, ok := g.loaded[path]; ok {
+		return pkg, nil
+	}
+	info, ok := g.pkgs[path]
+	if !ok {
+		return nil, fmt.Errorf("go source importer: %s not in the dependency listing", path)
+	}
+	if g.loading[path] {
+		return nil, fmt.Errorf("go source importer: import cycle through %s", path)
+	}
+	g.loading[path] = true
+	defer delete(g.loading, path)
+	var files []*ast.File
+	for _, name := range append(append([]string(nil), info.GoFiles...), info.CgoFiles...) {
+		f, err := parser.ParseFile(g.fset, filepath.Join(info.Dir, name), nil, parser.SkipObjectResolution)
+		if err != nil && f == nil {
+			continue
+		}
+		files = append(files, f)
+	}
+	conf := types.Config{
+		Importer:         importerFunc(func(p string) (*types.Package, error) { return g.importFrom(p, path) }),
+		IgnoreFuncBodies: true,
+		FakeImportC:      true,
+		Error:            func(error) {},
+	}
+	pkg, _ := conf.Check(path, g.fset, files, nil)
+	if pkg == nil {
+		return nil, fmt.Errorf("go source importer: %s did not type-check", path)
+	}
+	g.loaded[path] = pkg
+	return pkg, nil
+}
+
+type importerFunc func(string) (*types.Package, error)
+
+func (f importerFunc) Import(path string) (*types.Package, error) { return f(path) }

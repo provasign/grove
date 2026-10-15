@@ -1,8 +1,10 @@
 package native
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/build"
@@ -15,6 +17,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"crypto/sha256"
 	"encoding/hex"
@@ -182,8 +185,8 @@ func (goAnalyzer) Analyze(ctx context.Context, req Request) Result {
 			scopeDiag = []string{"scoped to " + itoa(len(dirs)) + " affected package dir(s); other packages' native edges carried forward"}
 		}
 	}
-	exports, exportDiag := goExportData(ctx, req.Root, topoKey)
-	semanticEdges, decls, semanticDiagnostics := goSemanticEdges(ctx, req.Root, semFiles, req.Symbols, pkgs, exports)
+	deps, exportDiag := goExportData(ctx, req.Root, topoKey)
+	semanticEdges, decls, semanticDiagnostics := goSemanticEdges(ctx, req.Root, semFiles, req.Symbols, pkgs, deps)
 	// go/types attributed every declaration in the checked packages; the ones
 	// the parser does not index (types declared inside function bodies and
 	// their members) become compiler-declared symbols, as javac's do.
@@ -398,7 +401,7 @@ func goCallableKey(dir, recv, name string) string {
 	return dir + "\x00" + name
 }
 
-func goSemanticEdges(ctx context.Context, root string, files []string, symbols []core.SymbolRecord, pkgs []goListPackage, exports map[string]string) ([]core.Edge, []compilerDecl, []string) {
+func goSemanticEdges(ctx context.Context, root string, files []string, symbols []core.SymbolRecord, pkgs []goListPackage, deps goDeps) ([]core.Edge, []compilerDecl, []string) {
 	symbolIdx := newGoSymbolIndex(symbols)
 	pkgDirsByImport := map[string][]string{}
 	importPathByDir := map[string]string{}
@@ -422,7 +425,7 @@ func goSemanticEdges(ctx context.Context, root string, files []string, symbols [
 		dirs = append(dirs, d)
 	}
 	sort.Strings(dirs)
-	projectImporter := newGoProjectImporter(pkgs, exports)
+	projectImporter := newGoProjectImporter(pkgs, deps)
 	var analyzedImports []string
 	interfacePackages := map[string]bool{}
 	for _, dir := range dirs {
@@ -1176,7 +1179,7 @@ func saveGoListCache(path, key string, output []byte) {
 // GOCACHE afterwards. -e keeps going past packages that do not build (a
 // dependency missing from the module cache, a project package mid-edit);
 // those simply have no export data and are reported by the type checker.
-func goExportData(ctx context.Context, root, topoKey string) (map[string]string, string) {
+func goExportData(ctx context.Context, root, topoKey string) (goDeps, string) {
 	cachePath := filepath.Join(root, ".grove", "goexport-cache.json")
 	for attempt := 0; attempt < 2; attempt++ {
 		out, hit := []byte(nil), false
@@ -1184,18 +1187,21 @@ func goExportData(ctx context.Context, root, topoKey string) (map[string]string,
 			out, hit = loadGoListCache(cachePath, topoKey)
 		}
 		if !hit {
-			cmd := exec.CommandContext(ctx, "go", "list", "-e", "-deps", "-export", "-json=ImportPath,Export", "./...")
-			cmd.Dir = root
-			cmd.Env = goAnalyzerEnv(root)
-			var stderr strings.Builder
-			cmd.Stderr = &stderr
 			var err error
-			if out, err = cmd.Output(); err != nil {
-				diag := "go list -export failed: " + err.Error()
-				if detail := strings.TrimSpace(stderr.String()); detail != "" {
-					diag += ": " + clip(detail, 300)
+			var timedOut bool
+			out, timedOut, err = goListExportBounded(ctx, root, topoKey, cachePath)
+			if timedOut {
+				// A cold build cache: compiling the whole build graph can
+				// take many minutes. Type the dependencies from source this
+				// time; the listing keeps compiling in the background and is
+				// cached for the next index.
+				if src := goSourceDeps(ctx, root); src != nil {
+					return goDeps{source: src}, "go list -export still compiling dependencies (cold build cache); this index typed them from source"
 				}
-				return nil, diag
+				return goDeps{}, "go list -export still compiling dependencies (cold build cache) and the dependency listing failed"
+			}
+			if err != nil {
+				return goDeps{}, err.Error()
 			}
 		}
 		exports := map[string]string{}
@@ -1207,7 +1213,7 @@ func goExportData(ctx context.Context, root, topoKey string) (map[string]string,
 				if err == io.EOF {
 					break
 				}
-				return nil, "go list -export JSON decode failed: " + err.Error()
+				return goDeps{}, "go list -export JSON decode failed: " + err.Error()
 			}
 			if pkg.Export == "" {
 				continue
@@ -1224,7 +1230,79 @@ func goExportData(ctx context.Context, root, topoKey string) (map[string]string,
 		if !hit {
 			saveGoListCache(cachePath, topoKey, out)
 		}
-		return exports, ""
+		return goDeps{exports: exports}, ""
 	}
-	return nil, ""
+	return goDeps{}, ""
+}
+
+// goExportTimeout bounds the wait for `go list -export`: with a warm build
+// cache it returns in about a minute on grafana, cold it compiles everything
+// (~29 min). GROVE_GO_EXPORT_TIMEOUT (a Go duration) overrides it.
+func goExportTimeout() time.Duration {
+	if v := os.Getenv("GROVE_GO_EXPORT_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return 2 * time.Minute
+}
+
+// goListExportBounded runs `go list -export`, waiting at most
+// goExportTimeout. Past it, the command keeps running in the background and
+// saves its listing to the cache when it finishes (until ctx ends).
+func goListExportBounded(ctx context.Context, root, topoKey, cachePath string) ([]byte, bool, error) {
+	cmd := exec.CommandContext(ctx, "go", "list", "-e", "-deps", "-export", "-json=ImportPath,Export", "./...")
+	cmd.Dir = root
+	cmd.Env = goAnalyzerEnv(root)
+	var stdout bytes.Buffer
+	var stderr strings.Builder
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Start(); err != nil {
+		return nil, false, fmt.Errorf("go list -export failed: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			diag := "go list -export failed: " + err.Error()
+			if detail := strings.TrimSpace(stderr.String()); detail != "" {
+				diag += ": " + clip(detail, 300)
+			}
+			return nil, false, errors.New(diag)
+		}
+		return stdout.Bytes(), false, nil
+	case <-time.After(goExportTimeout()):
+		go func() {
+			if err := <-done; err == nil {
+				saveGoListCache(cachePath, topoKey, stdout.Bytes())
+			}
+		}()
+		return nil, true, nil
+	}
+}
+
+// goSourceDeps lists the dependency packages' source (`go list -deps`
+// without -export compiles nothing) for goSourceImporter.
+func goSourceDeps(ctx context.Context, root string) types.Importer {
+	cmd := exec.CommandContext(ctx, "go", "list", "-e", "-deps", "-json=ImportPath,Dir,GoFiles,CgoFiles,ImportMap", "./...")
+	cmd.Dir = root
+	cmd.Env = goAnalyzerEnv(root)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+	var pkgs []goDepPackage
+	dec := json.NewDecoder(bytesReader(out))
+	for {
+		var p goDepPackage
+		if err := dec.Decode(&p); err != nil {
+			break
+		}
+		pkgs = append(pkgs, p)
+	}
+	if len(pkgs) == 0 {
+		return nil
+	}
+	return newGoSourceImporter(pkgs)
 }
