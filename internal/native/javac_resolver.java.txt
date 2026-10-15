@@ -28,6 +28,20 @@ public class GroveJavacResolver {
     static final StringBuilder decls = new StringBuilder();
     static final Set<String> seen = new HashSet<>();
     static int nCalls = 0, nMembers = 0;
+    static final Set<String> projectSources = new HashSet<>();
+    static final List<Path> sourceRoots = new ArrayList<>();
+    // Whether a type is declared by a project source file (by its top-level
+    // type's package path), whatever the compiler loaded it from.
+    static boolean projectType(Element e) {
+        Element top = null;
+        for (Element x = e; x != null; x = x.getEnclosingElement())
+            if (x instanceof TypeElement) top = x;
+        if (!(top instanceof TypeElement)) return false;
+        String rel = ((TypeElement) top).getQualifiedName().toString().replace('.', '/') + ".java";
+        for (String f : projectSources) if (f.equals(rel) || f.endsWith("/" + rel)) return true;
+        for (Path r : sourceRoots) if (Files.exists(r.resolve(rel))) return true;
+        return false;
+    }
 
     public static void main(String[] args) throws Exception {
         if (args.length > 0 && args[0].equals("--serve")) {
@@ -61,6 +75,12 @@ public class GroveJavacResolver {
         // listed files and reads other project classes from these roots as
         // their declarations are needed.
         String sp = args.length > 3 ? new String(Files.readAllBytes(Paths.get(args[3])), StandardCharsets.UTF_8).trim() : "";
+        // Where the project's sources live, to tell an external target from a
+        // compiled copy of a project class (a stale jar on the classpath).
+        projectSources.clear();
+        for (String r : rel) { if (!r.isBlank()) projectSources.add(r.trim().replace('\\', '/')); }
+        sourceRoots.clear();
+        for (String d : sp.split(File.pathSeparator)) { if (!d.isBlank()) sourceRoots.add(Paths.get(d)); }
         JavaCompiler javac = ToolProvider.getSystemJavaCompiler();
         DiagnosticCollector<JavaFileObject> diags = new DiagnosticCollector<>();
         StandardJavaFileManager fm = javac.getStandardFileManager(diags, null, StandardCharsets.UTF_8);
@@ -237,6 +257,51 @@ public class GroveJavacResolver {
             }
             return null;
         }
+        // The callers a call is attributed to. Code in an instance field
+        // initializer or instance initializer block runs inside every
+        // constructor that does not delegate with this(...) — javac copies
+        // it there — so it belongs to those constructors (commons-lang:
+        // new AtomicInitializer() calls getNoInit() through a field
+        // initializer). With no explicit constructor, or for static
+        // initializers, the class itself.
+        List<String[]> callers() {
+            TreePath member = null;
+            for (TreePath p = getCurrentPath(); p != null; p = p.getParentPath()) {
+                Tree t = p.getLeaf();
+                if (t instanceof MethodTree) break;
+                if (t instanceof ClassTree) {
+                    if (member != null && isInstanceInit(member.getLeaf())) {
+                        List<String[]> ctors = new ArrayList<>();
+                        ClassTree c = (ClassTree) t;
+                        for (Tree m : c.getMembers()) {
+                            if (!(m instanceof MethodTree)) continue;
+                            MethodTree mt = (MethodTree) m;
+                            if (!mt.getName().contentEquals("<init>") || mt.getBody() == null || delegatesToThis(mt)) continue;
+                            if (trees.getSourcePositions().getStartPosition(cu, mt) == trees.getSourcePositions().getStartPosition(cu, c)) continue; // synthesized default
+                            ctors.add(new String[]{c.getSimpleName().toString(), Long.toString(declLine(mt, cu))});
+                        }
+                        if (!ctors.isEmpty()) return ctors;
+                    }
+                    break;
+                }
+                member = p;
+            }
+            String[] one = enclosing();
+            return one == null ? Collections.emptyList() : Collections.singletonList(one);
+        }
+        boolean isInstanceInit(Tree m) {
+            if (m instanceof VariableTree) return !((VariableTree) m).getModifiers().getFlags().contains(Modifier.STATIC);
+            if (m instanceof BlockTree) return !((BlockTree) m).isStatic();
+            return false;
+        }
+        boolean delegatesToThis(MethodTree m) {
+            List<? extends StatementTree> st = m.getBody().getStatements();
+            if (st.isEmpty() || !(st.get(0) instanceof ExpressionStatementTree)) return false;
+            ExpressionTree e = ((ExpressionStatementTree) st.get(0)).getExpression();
+            if (!(e instanceof MethodInvocationTree)) return false;
+            ExpressionTree sel = ((MethodInvocationTree) e).getMethodSelect();
+            return sel instanceof IdentifierTree && ((IdentifierTree) sel).getName().contentEquals("this");
+        }
         String enclosingClassName(TreePath p) {
             for (TreePath q = p; q != null; q = q.getParentPath())
                 if (q.getLeaf() instanceof ClassTree) return ((ClassTree) q.getLeaf()).getSimpleName().toString();
@@ -280,7 +345,10 @@ public class GroveJavacResolver {
             return false;
         }
         void emit(StringBuilder out, Element target, Boolean write) {
-            String[] from = enclosing(), to = declared(target);
+            for (String[] from : callers()) emitFrom(out, target, write, from);
+        }
+        void emitFrom(StringBuilder out, Element target, Boolean write, String[] from) {
+            String[] to = declared(target);
             // A call to a method declared outside the project (the JDK, a
             // dependency) is still reported, as "ext", so grove can drop a
             // name-based guess at the same position.
@@ -311,7 +379,8 @@ public class GroveJavacResolver {
             }
             String target_ = to != null ? ",\"to\":" + q(to[0]) + ",\"toName\":" + q(to[1]) + ",\"toLine\":" + to[2]
                 : ",\"ext\":" + q(target.getKind() == ElementKind.CONSTRUCTOR ? target.getEnclosingElement().getSimpleName().toString() : target.getSimpleName().toString())
-                  + ",\"extOwner\":" + q(target.getEnclosingElement().getSimpleName().toString());
+                  + ",\"extOwner\":" + q(target.getEnclosingElement().getSimpleName().toString())
+                  + (projectType(target.getEnclosingElement()) ? ",\"extProject\":true" : "");
             if (to == null && at <= 0) return;
             String json = "{\"from\":" + q(file) + ",\"fromName\":" + q(from[0]) + ",\"fromLine\":" + from[1] +
                 (at > 0 ? ",\"line\":" + at + ",\"col\":" + col : "") +

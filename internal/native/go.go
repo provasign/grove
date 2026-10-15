@@ -736,7 +736,7 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 		out = append(out, e)
 	}
 	out = append(out, ifaceCalls.edgesOf(core.EdgeExternalIfaceCall)...)
-	return append(out, dedupeEdges(fieldStores)...), decls, pkg, nil
+	return append(out, groupFieldStores(fieldStores)...), decls, pkg, nil
 }
 
 // goExternalIfaceCallKey names a call through a library interface's method
@@ -846,19 +846,6 @@ func goFuncValueSymbol(dir string, expr ast.Expr, info *types.Info, symbolIdx go
 		return core.SymbolRecord{}, false
 	}
 	return goSymbolForFunc(dir, fn, symbolIdx, pkgDirsByImport, selfPkg)
-}
-
-func dedupeEdges(edges []core.Edge) []core.Edge {
-	seen := map[string]bool{}
-	out := edges[:0]
-	for _, e := range edges {
-		k := e.From + "\x00" + e.To + "\x00" + e.Lines
-		if !seen[k] {
-			seen[k] = true
-			out = append(out, e)
-		}
-	}
-	return out
 }
 
 // goExternalContracts records, on each method of the package's own types,
@@ -1882,4 +1869,37 @@ func containsString(list []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// groupFieldStores merges the stores of one function by one caller into a
+// single record listing every slot (comma-separated): the graph keeps one
+// edge per (from, to, type), so separate records for two slots lost one.
+func groupFieldStores(stores []core.Edge) []core.Edge {
+	type pair struct{ from, to string }
+	keys := map[pair][]string{}
+	var order []pair
+	first := map[pair]core.Edge{}
+	for _, e := range stores {
+		p := pair{e.From, e.To}
+		if _, ok := keys[p]; !ok {
+			order = append(order, p)
+			first[p] = e
+		}
+		keys[p] = append(keys[p], e.Lines)
+	}
+	out := make([]core.Edge, 0, len(order))
+	for _, p := range order {
+		e := first[p]
+		ks := keys[p]
+		sort.Strings(ks)
+		uniq := ks[:0]
+		for i, k := range ks {
+			if i == 0 || k != ks[i-1] {
+				uniq = append(uniq, k)
+			}
+		}
+		e.Lines = strings.Join(uniq, ",")
+		out = append(out, e)
+	}
+	return out
 }

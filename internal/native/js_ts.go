@@ -1029,9 +1029,22 @@ function relDir(r) { const i = r.lastIndexOf('/'); return i >= 0 ? r.slice(0, i)
 const changedRel = req.changed || null;
 let visitDirs = null;
 if (Array.isArray(changedRel) && changedRel.length > 0) {
-  const changedSet = new Set(changedRel);
-  const dirs = new Set(changedRel.map(relDir));
-  for (const e of edges) if (changedSet.has(e.to)) dirs.add(relDir(e.from));
+  // Importers transitively: a type reaches a file through a barrel's
+  // re-export (test/index.ts imports ../lib, which re-exports the edited
+  // in-memory-adapter.ts) or a value an intermediate module hands on.
+  const importersOf = new Map();
+  for (const e of edges) {
+    if (!importersOf.has(e.to)) importersOf.set(e.to, []);
+    importersOf.get(e.to).push(e.from);
+  }
+  const reached = new Set(changedRel);
+  const queue = [...changedRel];
+  while (queue.length > 0) {
+    for (const from of importersOf.get(queue.pop()) || []) {
+      if (!reached.has(from)) { reached.add(from); queue.push(from); }
+    }
+  }
+  const dirs = new Set([...reached].map(relDir));
   const inScope = inputFiles.filter(f => dirs.has(relDir(f))).length;
   if (2 * inScope <= inputFiles.length) visitDirs = dirs;
 }

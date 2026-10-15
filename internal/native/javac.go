@@ -630,14 +630,11 @@ func javacResolveScoped(ctx context.Context, req Request) ([]core.Edge, []string
 	// A call javac resolved to the JDK or a dependency, or to the caller
 	// itself, has no edge to carry that fact; it is recorded so a
 	// name-based guess at the same position is dropped (core.EdgeResolvedCalls).
-	// A target type the project also declares is not trusted as external:
-	// a stale compiled copy of a project class on the classpath reads as one.
-	projectTypes := map[string]bool{}
-	for _, sym := range all {
-		if sym.Language == "java" && (sym.Kind == core.KindClass || sym.Kind == core.KindInterface || sym.Kind == core.KindEnum || sym.Kind == core.KindType || sym.Kind == core.KindStruct) {
-			projectTypes[sym.Name] = true
-		}
-	}
+	// A target whose type has a project source file is not trusted as
+	// external (javacRef.ExtProject): a stale compiled copy of a project
+	// class on the classpath reads as one. By qualified name: the JDK's
+	// java.io.ByteArrayOutputStream is external although commons-io
+	// declares its own ByteArrayOutputStream.
 	marks := resolvedMarks{}
 	mark := func(from core.SymbolRecord, name string, c javacRef) {
 		marks.add(from.ID, name, c.Line, c.Col)
@@ -650,7 +647,7 @@ func javacResolveScoped(ctx context.Context, req Request) ([]core.Edge, []string
 	for _, c := range payload.Calls {
 		from, okFrom := symbols.at(c.From, c.FromName, c.FromLine)
 		if c.Ext != "" {
-			if okFrom && !projectTypes[c.ExtOwner] {
+			if okFrom && !c.ExtProject {
 				mark(from, c.Ext, c)
 			}
 			continue
@@ -925,6 +922,9 @@ type javacRef struct {
 	// ExtOwner the type declaring it.
 	Ext      string `json:"ext"`
 	ExtOwner string `json:"extOwner"`
+	// ExtProject: the external target's type has a source file in the
+	// project (a stale compiled copy was loaded): not trusted as external.
+	ExtProject bool `json:"extProject"`
 }
 
 // compilerDecl is one declaration a compiler attributed: javac's resolver

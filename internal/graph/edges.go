@@ -2484,6 +2484,16 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 
 // resolveCallEdges resolves one caller's outgoing call/property edges.
 func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSatisfaction) []core.Edge {
+	edges := resolveSymbolCallEdges(idx, symbol, sat)
+	if symbol.Language == "python" {
+		// Function values flowing through this symbol (pyvalueflow.go),
+		// whether or not it has call sites of its own.
+		edges = append(edges, pyValueFlowMarkers(idx, &symbol)...)
+	}
+	return edges
+}
+
+func resolveSymbolCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSatisfaction) []core.Edge {
 	if symbol.Language == "cobol" || symbol.Language == "jcl" {
 		// Mainframe semantics live in their own resolver; the machinery
 		// below never sees these symbols.
@@ -2562,6 +2572,16 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			}
 			cands := resolvePropertyTargets(idx, &symbol, name, scope, as.Write)
 			cands = narrowByReceiver(cands, &symbol, qualifier, attrSelfVars)
+			if symbol.Language == "python" && qualifier != "" {
+				if t := pyIsinstanceAt(idx, &symbol, as.Line, qualifier); t != "" {
+					narrowedTypes := make(map[string]string, len(attrLocalTypes)+1)
+					for k, v := range attrLocalTypes {
+						narrowedTypes[k] = v
+					}
+					narrowedTypes[qualifier] = t
+					attrLocalTypes = narrowedTypes
+				}
+			}
 			if _, isSelf := attrSelfVars[qualifier]; !isSelf && qualifier != "" {
 				// ctx.request with ctx typed AppContext reads that class's
 				// property (or an ancestor's), not every `request` property
@@ -2573,13 +2593,25 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					pool = resolvePropertyTargets(idx, &symbol, name, nil, as.Write)
 				}
 				if kept, dispatch, decided := narrowByLocalType(idx, nil, &symbol, attrLocalTypes, qualifier, name, pool, scope); decided {
-					cands = append(kept, dispatch...)
+					// The type pass may widen to every callable of the name;
+					// an attribute read runs only a property (self.json.dumps
+					// is a bound-method reference, no call).
+					cands = cands[:0:0]
+					for _, c := range append(kept, dispatch...) {
+						if propertyAnnotationMatches(c, as.Write) {
+							cands = append(cands, c)
+						}
+					}
 				}
 			}
 			if _, isSelf := attrSelfVars[qualifier]; isSelf && classLanguage(symbol.Language) && len(filterByParent(cands, symbol.ParentSymbol)) == 0 {
 				if inherited := inheritedTargets(idx, &symbol, name, true); len(inherited) > 0 {
 					cands = inherited
-				} else if symbol.Language == "python" && symbol.ParentSymbol != "" && pyHierarchyKnown(idx, symbol.ParentSymbol, dirOf(symbol.FilePath)) {
+				} else if symbol.Language == "python" && symbol.ParentSymbol != "" &&
+					(pyHierarchyKnown(idx, symbol.ParentSymbol, dirOf(symbol.FilePath)) || pyTypeHasMember(idx, symbol.ParentSymbol, name, dirOf(symbol.FilePath))) {
+					// (The class declaring the attribute as data — Blueprint's
+					// self.name — settles it even when a same-named class
+					// elsewhere leaves the hierarchy ambiguous.)
 					// Neither the class nor an ancestor declares it: a plain
 					// instance attribute, or a subclass's property (self may
 					// be a subclass instance) — never an unrelated class's
@@ -2753,6 +2785,18 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				continue
 			}
 			localTypes = tsLocalTypesAt(baseLocalTypes, cs.Callee, cs.Line-symbol.Span.Start)
+			if symbol.Language == "python" {
+				if q, _, ok := strings.Cut(cs.Callee, "."); ok {
+					if t := pyIsinstanceAt(idx, &symbol, cs.Line, q); t != "" {
+						narrowedTypes := make(map[string]string, len(localTypes)+1)
+						for k, v := range localTypes {
+							narrowedTypes[k] = v
+						}
+						narrowedTypes[q] = t
+						localTypes = narrowedTypes
+					}
+				}
+			}
 			callPos = ""
 			if cs.Line > 0 {
 				callPos = strconv.Itoa(cs.Line)
@@ -2793,6 +2837,12 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					}
 				}
 			}
+			if symbol.Language == "csharp" && len(cs.Args) == 0 && cs.Argc > 0 {
+				// Arguments astkit could not type are still arguments: an
+				// empty list would read as a zero-argument call (new
+				// JArray(\n ...) bound JArray()).
+				cs.Args = make([]string, cs.Argc)
+			}
 			calleeName := cs.Callee
 			// Split receiver prefix (e.g. "user.save" → qualifier "user",
 			// name "save"); chains keep only the last segment ("a.b.Get" → "b").
@@ -2822,14 +2872,14 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			if symbol.Language == "swift" && calleeName == "init" && symbol.ParentSymbol != "" {
 				switch qualifier {
 				case "self":
-					ctors, _ := swiftNarrowCall(constructorTargets(idx, symbol.ParentSymbol, scope), cs, &symbol)
+					ctors, _ := swiftNarrowCall(idx, constructorTargets(idx, symbol.ParentSymbol, scope), cs, &symbol, localTypes)
 					for _, ctor := range ctors {
 						addEdge(symbol.ID, ctor.ID, 0.9, core.EvidenceSourceASTKit, core.ReasonASTNarrowed)
 					}
 					continue
 				case "super":
 					for _, base := range constructorBaseClasses(idx, "swift", symbol.ParentSymbol, dirOf(symbol.FilePath)) {
-						ctors, _ := swiftNarrowCall(constructorTargets(idx, base, scope), cs, &symbol)
+						ctors, _ := swiftNarrowCall(idx, constructorTargets(idx, base, scope), cs, &symbol, localTypes)
 						for _, ctor := range ctors {
 							addEdge(symbol.ID, ctor.ID, 0.85, core.EvidenceSourceHeuristic, core.ReasonInheritance)
 						}
@@ -2989,7 +3039,11 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					if allCtors {
 						cands = ctors
 					}
+					qualifiedType := allCtors && csQualifiedTypeAt(&symbol, cs, calleeName)
 					switch {
+					case qualifiedType:
+						// `new Outer.Inner(..)`: the source names the type
+						// fully; simple-name lookup does not apply.
 					case allCtors && csImplicitConstructorShadows(idx, &symbol, calleeName, cands):
 						if traceCalls {
 							fmt.Fprintf(os.Stderr, "grove-trace %s: callee=%q dropped: implicit constructor of a namespace-visible class shadows %d\n", symbol.QualifiedName, cs.Callee, len(cands))
@@ -3005,7 +3059,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 						}
 					default:
 						before := len(cands)
-						if cands = csNarrowBareCall(idx, &symbol, cands); len(cands) == 0 {
+						if cands = csNarrowBareCall(idx, &symbol, cands, cs); len(cands) == 0 {
 							if traceCalls {
 								fmt.Fprintf(os.Stderr, "grove-trace %s: callee=%q dropped: bare call, none of %d candidates on the own type chain\n", symbol.QualifiedName, cs.Callee, before)
 							}
@@ -3118,6 +3172,11 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				}
 				cands = compatible
 			}
+			if symbol.Language == "csharp" && qualifier == "this" && csOwnChainDelegate(idx, &symbol, calleeName, cands) {
+				// this.PropertyChanging(this, e): invoking the class's own
+				// event or delegate field, no method of ours.
+				continue
+			}
 			exprReceiver := qualifier == "<expr>"
 			if exprReceiver {
 				// A method on an expression astkit could not name (`(a +
@@ -3125,6 +3184,21 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// untyped receiver, resolved by name like one, but never a
 				// bare call.
 				qualifier = ""
+				if symbol.Language == "csharp" {
+					// C#: nothing types the receiver, so of our methods only
+					// an extension method in scope can be the target
+					// (o["results"].Children<JObject>()).
+					var ext []*core.SymbolRecord
+					for _, c := range cands {
+						if csIsExtensionMethod(c) && idx.csExtensionVisible(&symbol, c) {
+							ext = append(ext, c)
+						}
+					}
+					if len(ext) == 0 {
+						continue
+					}
+					cands = ext
+				}
 			}
 			if symbol.Language == "rust" && qualifier == "" && !exprReceiver && !strings.HasSuffix(cs.Callee, "!") {
 				// A bare Rust call never reaches a method (that takes self.
@@ -3175,7 +3249,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// routinely share an arity and a value shape while
 				// differing only in label. Arity is the fallback.
 				var decided bool
-				if cands, decided = swiftNarrowCall(cands, cs, &symbol); decided && len(cands) == 0 {
+				if cands, decided = swiftNarrowCall(idx, cands, cs, &symbol, localTypes); decided && len(cands) == 0 {
 					continue
 				}
 			} else if symbol.Language == "kotlin" {
@@ -4117,6 +4191,22 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// behavior until type evidence pins the overload set down.
 				narrowed = nil
 			}
+			if symbol.Language == "csharp" && len(narrowed) > 0 {
+				// Whatever chose them, a member the argument count cannot
+				// bind is not the target: new JsonPosition() is the
+				// struct's implicit constructor, not JsonPosition(type).
+				argc := cs.Argc
+				if argc < len(cs.Args) {
+					argc = len(cs.Args)
+				}
+				var fit []*core.SymbolRecord
+				for _, c := range narrowed {
+					if csArityFits(c, argc, false) || csIsExtensionMethod(c) && csArityFits(c, argc, true) {
+						fit = append(fit, c)
+					}
+				}
+				narrowed = fit
+			}
 			if symbol.Language == "java" && len(narrowed) > 4 && sameOverloadSet(narrowed) {
 				// javac binds exactly one of these; when neither arity nor
 				// argument types could tell StrBuilder's fourteen one-arg
@@ -4206,7 +4296,15 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					ctors = phpNarrowNewByNamespace(idx, &symbol, cs, ctorName, ctors)
 				}
 				if symbol.Language == "csharp" {
-					ctors = filterByArgc(ctors, cs.Argc)
+					// astkit's C# argument count is exact, zero included:
+					// new JsonPosition() binds no JsonPosition(type).
+					var fit []*core.SymbolRecord
+					for _, c := range ctors {
+						if csArityApplicable(c, cs.Argc) {
+							fit = append(fit, c)
+						}
+					}
+					ctors = fit
 					if len(ctors) > 1 {
 						if csArgTypeCache == nil {
 							csArgTypeCache = csharpArgTypes(idx, &symbol)
@@ -4347,6 +4445,16 @@ func callerSelfQualifiers(symbol *core.SymbolRecord) map[string]struct{} {
 	if symbol.Language == "go" && symbol.Kind == core.KindMethod {
 		if v := goReceiverVar(symbol.Signature); v != "" {
 			out[v] = struct{}{}
+		}
+	}
+	if symbol.Language == "python" && symbol.Kind == core.KindFunction {
+		// A function (not a method) whose own parameter is annotated
+		// `self: Scaffold` (flask's setupmethod wrapper) has a typed
+		// variable named self, not a receiver of some class of its own.
+		for name, ann := range pyFlowParamAnnotations(symbol) {
+			if (name == "self" || name == "cls") && ann != "" {
+				delete(out, name)
+			}
 		}
 	}
 	return out

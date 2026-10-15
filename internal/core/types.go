@@ -120,12 +120,17 @@ const (
 	// with the EdgeExternalContract records of the project's methods that
 	// fulfil that interface into dispatch call edges.
 	EdgeExternalIfaceCall EdgeType = "external-iface-call"
+	// EdgeFuncSlotFlow records, on a symbol (From == To), slots that receive
+	// another slot's function values: Lines "dst<-src,...", with the
+	// function-field keys (a Python `self.get_converter = get_converter`
+	// links the attribute slot to the parameter slot).
+	EdgeFuncSlotFlow EdgeType = "func-slot-flow"
 )
 
 // IsMarkerEdge reports the stored per-symbol records that are not graph edges.
 func IsMarkerEdge(t EdgeType) bool {
 	return t == EdgeResolvedCalls || t == EdgeExternalContract || t == EdgeFuncFieldCall || t == EdgeFuncFieldStore ||
-		t == EdgeExternalIfaceCall
+		t == EdgeExternalIfaceCall || t == EdgeFuncSlotFlow
 }
 
 type Edge struct {

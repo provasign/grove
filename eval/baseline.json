@@ -8,8 +8,8 @@
  },
  "flask": {
   "commit": "36e4a824",
-  "precision": 0.8924,
-  "recall": 0.7557,
+  "precision": 0.8962,
+  "recall": 0.7867,
   "tolerance": 0.005,
   "minUniverse": 0.97
  },
@@ -23,14 +23,14 @@
  "express": {
   "commit": "dae209ae",
   "precision": 0.8846,
-  "recall": 1,
+  "recall": 1.0,
   "tolerance": 0.02,
   "minUniverse": 0.88
  },
  "commons-lang": {
   "commit": "44298fe",
   "precision": 1.0,
-  "recall": 0.997,
+  "recall": 1.0,
   "minUniverse": 0.96,
   "tolerance": 0.005
  },
@@ -43,8 +43,8 @@
  },
  "newtonsoft": {
   "commit": "0a2e291",
-  "precision": 0.951,
-  "recall": 0.9764,
+  "precision": 0.9709,
+  "recall": 0.9774,
   "tolerance": 0.005,
   "minUniverse": 0.99
  },
@@ -64,21 +64,21 @@
  },
  "SwiftyJSON": {
   "commit": "3d25441",
-  "precision": 0.9355,
-  "recall": 1,
+  "precision": 1.0,
+  "recall": 1.0,
   "tolerance": 0.005,
   "minUniverse": 0.99
  },
  "turtle": {
   "commit": "3cfc963",
-  "precision": 1,
+  "precision": 1.0,
   "recall": 1.0,
   "tolerance": 0.02,
   "minUniverse": 0.75
  },
  "json-framework": {
   "commit": "93e4ca5",
-  "precision": 1,
+  "precision": 1.0,
   "recall": 1.0,
   "tolerance": 0.02,
   "minUniverse": 0.97
@@ -92,8 +92,8 @@
  },
  "commons-io": {
   "commit": "8ad9867d",
-  "precision": 0.9983,
-  "recall": 0.996,
+  "precision": 1.0,
+  "recall": 1.0,
   "tolerance": 0.005,
   "minUniverse": 0.93
  },
@@ -114,13 +114,13 @@
  "p-queue": {
   "commit": "180ab9e",
   "precision": 0.9592,
-  "recall": 1,
+  "recall": 1.0,
   "tolerance": 0.02,
   "minUniverse": 0.99
  },
  "Files": {
   "commit": "e85f2b4",
-  "precision": 0.989,
+  "precision": 1.0,
   "recall": 1.0,
   "tolerance": 0.02,
   "minUniverse": 0.95

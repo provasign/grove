@@ -100,3 +100,48 @@ public class p.C {
 		t.Fatalf("static initializer invokes misattributed: %+v", methods)
 	}
 }
+
+// A public class extending a package-private one gets javac access bridges
+// (ACC_BRIDGE) for the inherited public methods, and calls from other
+// packages link to them; the truth names the real declaration, and a
+// bridge is never a caller.
+func TestJavaCallTruthFollowsAccessBridges(t *testing.T) {
+	if _, err := exec.LookPath(jdkTool("javac")); err != nil {
+		t.Skip("no JDK")
+	}
+	if err := exec.Command(jdkTool("javac"), "-version").Run(); err != nil {
+		t.Skip("no working javac")
+	}
+	root := t.TempDir()
+	src := filepath.Join(root, "src", "main", "java")
+	files := map[string]string{
+		"p/Stream.java": "package p;\npublic class Stream {\n" +
+			"  abstract static class AbstractBuilder<T extends AbstractBuilder<T>> {\n" +
+			"    public T setMaxCount(long n) { return null; }\n  }\n" +
+			"  public static class Builder extends AbstractBuilder<Builder> {\n    public Builder() {}\n  }\n}\n",
+		"q/User.java": "package q;\npublic class User {\n  void use() {\n    new p.Stream.Builder().setMaxCount(3);\n  }\n}\n",
+	}
+	for n, body := range files {
+		path := filepath.Join(src, n)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, edges, err := JavaCallTruth(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, e := range edges {
+		got[e.Caller.Name+"→"+e.Callee.Name] = true
+		if e.Caller.Name == "Builder.setMaxCount" {
+			t.Errorf("a bridge is reported as a caller: %v", e)
+		}
+	}
+	if !got["User.use→AbstractBuilder.setMaxCount"] {
+		t.Errorf("missing User.use→AbstractBuilder.setMaxCount; edges=%v", got)
+	}
+}

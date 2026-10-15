@@ -657,6 +657,16 @@ func pyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 				}
 				continue
 			}
+			if n := strings.TrimSpace(name); strings.HasPrefix(n, "**") || strings.HasPrefix(n, "*") && len(n) > 1 {
+				// The annotation types the values; the parameter itself is
+				// the dict (**kw) or tuple (*args) holding them.
+				kind := "extern:tuple"
+				if strings.HasPrefix(n, "**") {
+					kind = "extern:dict"
+				}
+				out[strings.TrimLeft(n, "*")] = kind
+				continue
+			}
 			name = strings.TrimSpace(strings.TrimLeft(name, "*"))
 			if eq := strings.Index(ann, "="); eq >= 0 {
 				ann = ann[:eq]
@@ -733,6 +743,61 @@ func pyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 			}
 			if t := pyIterableElementType(idx, symbol, m[2] != "", m[3]); t != "" {
 				out[m[1]] = t
+			}
+		}
+		// app = ctx.app: a local copied from an attribute chain has the
+		// chain's type (ctx: AppContext, AppContext.app: Flask).
+		for _, m := range pyChainAliasRe.FindAllStringSubmatch(body, -1) {
+			if _, typed := out[m[1]]; typed || m[2] == "self" || m[2] == "cls" {
+				continue
+			}
+			if _, base := out[m[2]]; !base {
+				continue
+			}
+			if t := pyChainType(idx, symbol, out, callerSelfQualifiers(symbol), m[2]+"."+m[3]); t != "" {
+				out[m[1]] = t
+			}
+		}
+		// self.record(lambda s: s.add_url_rule(...)): record's parameter is
+		// a Callable[[BlueprintSetupState], None] (here through the alias
+		// DeferredSetupFunction), so the lambda's s is a BlueprintSetupState.
+		for _, m := range pyLambdaArgRe.FindAllStringSubmatch(body, -1) {
+			if _, typed := out[m[3]]; typed {
+				continue
+			}
+			if t := pyLambdaParamType(idx, symbol, m[1] != "", m[2]); t != "" {
+				out[m[3]] = t
+			}
+		}
+		// handler_map = self.error_handler_spec[name][c]: each subscript
+		// peels one container level off the attribute's annotation
+		// (dict[K, dict[int, ...]] -> dict -> the runtime's dict).
+		for _, m := range pySubscriptAssignRe.FindAllStringSubmatch(body, -1) {
+			if _, typed := out[m[1]]; typed {
+				continue
+			}
+			ann := pySelfAttrAnnotation(idx, symbol, m[2])
+			for depth := strings.Count(m[3], "["); depth > 0 && ann != ""; depth-- {
+				ann = pySubscriptElement(ann)
+			}
+			if ann != "" {
+				if t := pyComponentType(idx, symbol, ann); t != "" {
+					out[m[1]] = t
+				}
+			}
+		}
+		// for srcobj, loader in self._iter_loaders(t): with the method
+		// annotated Generator[tuple[Scaffold, BaseLoader], None, None],
+		// srcobj is a Scaffold and loader jinja's BaseLoader (external).
+		for _, m := range pyForTupleRe.FindAllStringSubmatch(body, -1) {
+			names := strings.Split(m[1], ",")
+			elems := pyLoopElementTypes(idx, symbol, m[2] != "", m[3], m[4] != "", len(names))
+			for i, n := range names {
+				n = strings.TrimSpace(n)
+				if _, typed := out[n]; typed || n == "_" || i >= len(elems) || elems[i] == "" {
+					continue
+				}
+				out[n] = elems[i]
 			}
 		}
 		selfVars := callerSelfQualifiers(symbol)
@@ -856,9 +921,72 @@ func pyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 			}
 		}
 	}
-	delete(out, "self")
+	// ctx = app_ctx._get_current_object(): a receiver typed only by a module
+	// global above, its method's result typed through the receiver's
+	// bases — a type variable takes the argument the base list binds it
+	// to (AppContextProxy(ProxyMixin[AppContext], AppContext) makes
+	// ProxyMixin[T]._get_current_object() -> T an AppContext).
+	if symbol.RawText != "" {
+		for _, m := range pyCallAssignRe.FindAllStringSubmatch(maskCode(symbol.Language, symbol.RawText), -1) {
+			q := m[2]
+			if _, done := out[m[1]]; done || q == "" || strings.Contains(q, ".") {
+				continue
+			}
+			recv := strings.TrimPrefix(out[q], "class:")
+			if recv == "" || strings.HasPrefix(recv, "extern:") {
+				continue
+			}
+			if t := pyGenericMethodResult(idx, recv, m[3], dirOf(symbol.FilePath)); t != "" {
+				out[m[1]] = t
+			}
+		}
+	}
+	if symbol.Kind != core.KindFunction || pyFlowParamAnnotations(symbol)["self"] == "" {
+		delete(out, "self") // the receiver, not a typed variable (see callerSelfQualifiers)
+	}
 	delete(out, "_")
 	return out
+}
+
+// pyGenericMethodResult types recv.method(): the method's return
+// annotation found on recv's MRO; a type variable resolves through recv's
+// own base list (`Owner[Arg]` for the class declaring the method).
+func pyGenericMethodResult(idx *edgeIndex, recv, method, preferDir string) string {
+	for _, cn := range pyMRO(idx, recv, preferDir) {
+		for _, f := range idx.byName[strings.ToLower(method)] {
+			if f.Name != method || f.ParentSymbol != cn || f.Language != "python" {
+				continue
+			}
+			ret := strings.Trim(strings.TrimSpace(pyReturnAnnotation(f)), `"'`)
+			if ret == "" {
+				return ""
+			}
+			if i := strings.LastIndexByte(ret, '.'); i >= 0 {
+				ret = ret[i+1:]
+			}
+			if len(ret) > 2 || !isPlainIdent(ret) {
+				if pyResolveClass(idx, ret, preferDir) != nil {
+					return ret
+				}
+				return ""
+			}
+			// A type variable: Owner[Arg] in the receiver's declaration.
+			cls := pyResolveClass(idx, recv, preferDir)
+			if cls == nil {
+				return ""
+			}
+			header := firstLine(maskCode("python", cls.RawText))
+			re := localFnRes.get(`\b` + regexp.QuoteMeta(cn) + `\[\s*([A-Za-z_][\w.]*)\s*\]`)
+			if mm := re.FindStringSubmatch(header); mm != nil {
+				arg := mm[1][strings.LastIndexByte(mm[1], '.')+1:]
+				if pyResolveClass(idx, arg, preferDir) != nil {
+					return arg
+				}
+			}
+			return ""
+		}
+	}
+	return ""
 }
 
 // pyClassAttrTypes collects attribute types declared on one class — body
@@ -1289,6 +1417,15 @@ func pyImportedDirectBaseTargets(idx *edgeIndex, symbol *core.SymbolRecord, cand
 // (multi-line signatures make the first-line Signature unusable) and
 // reduces it to one indexable class name, or "".
 func pyReturnType(s *core.SymbolRecord) string {
+	if t := pyReturnAnnotation(s); t != "" {
+		return pyBareType(t)
+	}
+	return ""
+}
+
+// pyReturnAnnotation is a def's full return annotation text
+// ("t.Iterator[tuple[Scaffold, BaseLoader]]"), "" when there is none.
+func pyReturnAnnotation(s *core.SymbolRecord) string {
 	raw := s.RawText
 	i := strings.Index(raw, "def ")
 	if i < 0 {
@@ -1339,7 +1476,7 @@ func pyReturnType(s *core.SymbolRecord) string {
 	if arrow < 0 {
 		return ""
 	}
-	return pyBareType(head[arrow+2:])
+	return strings.TrimSpace(head[arrow+2:])
 }
 
 // pyCallResultType types the result of calling `name` from symbol's body:
@@ -2482,4 +2619,330 @@ func pyIterableElementType(idx *edgeIndex, symbol *core.SymbolRecord, self bool,
 		}
 	}
 	return ""
+}
+
+// for a, b in <self.>name(...) / <self.>name:
+var pyForTupleRe = regexp.MustCompile(`(?m)^\s*(?:async\s+)?for\s+\(?\s*([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)\s*\)?\s+in\s+(self\.)?([A-Za-z_]\w*)\s*(\()?`)
+
+// pyLoopElementTypes types the n loop targets of `for ... in <iterable>`
+// from the iterable's annotation: a called function's or method's return
+// annotation, or a parameter's / self attribute's. The element of
+// Iterator/Iterable/Generator/list/set/Sequence[...] is unpacked when it
+// is a tuple[...]. A component the project does not declare is
+// "extern:Name": its methods are never ours.
+func pyLoopElementTypes(idx *edgeIndex, symbol *core.SymbolRecord, self bool, name string, call bool, n int) []string {
+	ann := ""
+	switch {
+	case call && self && symbol.ParentSymbol != "":
+		for _, cn := range pyMRO(idx, symbol.ParentSymbol, dirOf(symbol.FilePath)) {
+			for _, f := range idx.byName[strings.ToLower(name)] {
+				if f.Name == name && f.ParentSymbol == cn && f.Language == "python" {
+					ann = pyReturnAnnotation(f)
+				}
+			}
+			if ann != "" {
+				break
+			}
+		}
+	case call:
+		for _, f := range idx.byName[strings.ToLower(name)] {
+			if f.Name == name && f.Language == "python" && f.Kind == core.KindFunction && f.ParentSymbol == "" {
+				if r := pyReturnAnnotation(f); r != "" {
+					if ann != "" && ann != r {
+						return nil
+					}
+					ann = r
+				}
+			}
+		}
+	case !self:
+		ann = pyFlowParamAnnotations(symbol)[name]
+	}
+	if ann == "" {
+		return nil
+	}
+	elem := pyContainerElement(ann)
+	if elem == "" {
+		return nil
+	}
+	parts := []string{elem}
+	if head, args, ok := pyGenericParts(elem); ok && (head == "tuple" || head == "Tuple") {
+		parts = splitTopLevel(args, ',')
+	}
+	if len(parts) != n {
+		return nil
+	}
+	out := make([]string, n)
+	for i, p := range parts {
+		out[i] = pyComponentType(idx, symbol, p)
+	}
+	return out
+}
+
+// pyGenericParts splits "Head[args]" (prefixes t./typing./collections.abc.
+// dropped) into its head and argument text.
+func pyGenericParts(t string) (string, string, bool) {
+	t = strings.TrimSpace(t)
+	for _, p := range []string{"t.", "typing.", "collections.abc.", "cabc."} {
+		t = strings.TrimPrefix(t, p)
+	}
+	i := strings.IndexByte(t, '[')
+	if i <= 0 || !strings.HasSuffix(t, "]") {
+		return t, "", false
+	}
+	args := strings.TrimSpace(t[i+1 : len(t)-1])
+	args = strings.TrimSpace(strings.TrimSuffix(args, ",")) // a trailing comma in a wrapped annotation
+	return t[:i], args, true
+}
+
+// pyContainerElement is the element type an annotated iterable yields.
+func pyContainerElement(ann string) string {
+	head, args, ok := pyGenericParts(ann)
+	if !ok {
+		return ""
+	}
+	switch head {
+	case "Iterator", "Iterable", "Generator", "AsyncIterator", "AsyncIterable", "AsyncGenerator",
+		"list", "List", "set", "Set", "frozenset", "Sequence", "MutableSequence", "Collection", "deque":
+		parts := splitTopLevel(args, ',')
+		if len(parts) == 0 {
+			return ""
+		}
+		return strings.TrimSpace(parts[0])
+	}
+	return ""
+}
+
+// pyComponentType maps an annotation component to a receiver type: an
+// indexed class, else the runtime's (extern:Name) for a builtin or a type
+// the project does not declare; "" when unclear (a type variable, a union).
+func pyComponentType(idx *edgeIndex, symbol *core.SymbolRecord, t string) string {
+	t = strings.Trim(strings.TrimSpace(t), `"'`)
+	if t == "" || strings.ContainsAny(t, "|[") {
+		if b := pyBuiltinAnnotation(t); b != "" {
+			return "extern:" + b
+		}
+		return ""
+	}
+	if i := strings.LastIndexByte(t, '.'); i >= 0 {
+		t = t[i+1:]
+	}
+	if len(t) <= 1 || t == "Any" || t == "object" {
+		return "" // a type variable, anything, or a malformed "mod." component
+	}
+	if pyResolveClass(idx, t, dirOf(symbol.FilePath)) != nil {
+		return t
+	}
+	if b := pyBuiltinAnnotation(t); b != "" {
+		return "extern:" + b
+	}
+	if t[0] >= 'A' && t[0] <= 'Z' {
+		return "extern:" + t
+	}
+	return ""
+}
+
+var pySubscriptAssignRe = regexp.MustCompile(`(?m)^\s*([A-Za-z_]\w*)\s*=\s*self\.([A-Za-z_]\w*)((?:\[[^\]\n]*\])+)\s*$`)
+
+// pySelfAttrAnnotation finds the annotation of self.name in the caller's
+// class or its bases: `self.name: T` in a method, or `name: T` in the class
+// body. "" when unannotated.
+func pySelfAttrAnnotation(idx *edgeIndex, symbol *core.SymbolRecord, name string) string {
+	if symbol.ParentSymbol == "" {
+		return ""
+	}
+	selfAnn := localFnRes.get(`self\.` + regexp.QuoteMeta(name) + `\s*:\s*([^=\n]+?)\s*(?:=|\n)`)
+	classAnn := localFnRes.get(`(?m)^\s*` + regexp.QuoteMeta(name) + `\s*:\s*([^=\n]+?)\s*(?:=|$)`)
+	for _, cn := range pyMRO(idx, symbol.ParentSymbol, dirOf(symbol.FilePath)) {
+		cls := pyResolveClass(idx, cn, dirOf(symbol.FilePath))
+		if cls == nil {
+			continue
+		}
+		text := maskCode("python", cls.RawText)
+		// Annotations span lines (dict[\n ... ]): join them first.
+		text = strings.Join(pyLogicalLines(strings.Split(text, "\n")), "\n")
+		if m := selfAnn.FindStringSubmatch(text + "\n"); m != nil {
+			return strings.TrimSpace(m[1])
+		}
+		if m := classAnn.FindStringSubmatch(text); m != nil {
+			return strings.TrimSpace(m[1])
+		}
+	}
+	return ""
+}
+
+// pySubscriptElement is the type a subscript of an annotated container
+// yields: dict[K, V] -> V, list[T] -> T, Mapping[K, V] -> V.
+func pySubscriptElement(ann string) string {
+	head, args, ok := pyGenericParts(ann)
+	if !ok {
+		return ""
+	}
+	parts := splitTopLevel(args, ',')
+	switch head {
+	case "dict", "Dict", "Mapping", "MutableMapping", "defaultdict", "DefaultDict", "OrderedDict":
+		if len(parts) == 2 {
+			return strings.TrimSpace(parts[1])
+		}
+	case "list", "List", "Sequence", "MutableSequence", "tuple", "Tuple":
+		if len(parts) >= 1 {
+			return strings.TrimSpace(parts[0])
+		}
+	}
+	return ""
+}
+
+var pyLambdaArgRe = regexp.MustCompile(`(self\.)?([A-Za-z_]\w*)\(\s*lambda\s+([A-Za-z_]\w*)\s*[:,]`)
+
+// pyLambdaParamType types the first parameter of a lambda passed as the
+// first argument of name(...) / self.name(...): the first argument type of
+// the callee parameter's Callable[[A, ...], R] annotation, resolving one
+// module-level alias (X = t.Callable[[A], R]).
+func pyLambdaParamType(idx *edgeIndex, symbol *core.SymbolRecord, self bool, name string) string {
+	var callee *core.SymbolRecord
+	if self && symbol.ParentSymbol != "" {
+		for _, cn := range pyMRO(idx, symbol.ParentSymbol, dirOf(symbol.FilePath)) {
+			for _, f := range idx.byName[strings.ToLower(name)] {
+				if f.Name == name && f.ParentSymbol == cn && f.Language == "python" {
+					callee = f
+				}
+			}
+			if callee != nil {
+				break
+			}
+		}
+	} else if !self {
+		for _, f := range idx.byName[strings.ToLower(name)] {
+			if f.Name == name && f.Language == "python" && f.Kind == core.KindFunction && f.ParentSymbol == "" {
+				if callee != nil {
+					return ""
+				}
+				callee = f
+			}
+		}
+	}
+	if callee == nil {
+		return ""
+	}
+	params := pyFlowParamNames(callee)
+	if len(params) > 0 && (params[0] == "self" || params[0] == "cls") {
+		params = params[1:]
+	}
+	if len(params) == 0 {
+		return ""
+	}
+	ann := pyFlowParamAnnotations(callee)[params[0]]
+	if head, _, ok := pyGenericParts(ann); !ok || head != "Callable" {
+		// One alias hop: DeferredSetupFunction = t.Callable[[...], None].
+		alias := strings.TrimSpace(ann)
+		if i := strings.LastIndexByte(alias, '.'); i >= 0 {
+			alias = alias[i+1:]
+		}
+		ann = ""
+		for _, v := range idx.byName[strings.ToLower(alias)] {
+			if v.Name == alias && v.Language == "python" && v.Kind == core.KindVariable {
+				if _, rhs, ok := strings.Cut(v.RawText, "="); ok {
+					ann = strings.TrimSpace(rhs)
+				}
+			}
+		}
+	}
+	head, args, ok := pyGenericParts(ann)
+	if !ok || head != "Callable" {
+		return ""
+	}
+	parts := splitTopLevel(args, ',')
+	if len(parts) == 0 {
+		return ""
+	}
+	first := strings.TrimSpace(parts[0])
+	if !strings.HasPrefix(first, "[") || !strings.HasSuffix(first, "]") {
+		return ""
+	}
+	inner := splitTopLevel(first[1:len(first)-1], ',')
+	if len(inner) == 0 {
+		return ""
+	}
+	return pyComponentType(idx, symbol, inner[0])
+}
+
+var pyChainAliasRe = regexp.MustCompile(`(?m)^\s*([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\.([A-Za-z_]\w*)\s*$`)
+
+var pyIsinstanceRe = regexp.MustCompile(`^(\s*)(?:if|elif)\s+isinstance\(\s*([A-Za-z_]\w*)\s*,\s*([A-Za-z_][\w.]*)\s*\)\s*:`)
+
+// pyIsinstanceAt is the class an `if/elif isinstance(name, C):` block
+// narrows name to at the given line (innermost such block), or "".
+// debughelpers: srcobj.name inside `elif isinstance(srcobj, Blueprint):`
+// is a Blueprint's attribute, not App's property.
+func pyIsinstanceAt(idx *edgeIndex, symbol *core.SymbolRecord, line int, name string) string {
+	if symbol.RawText == "" || name == "" || !strings.Contains(symbol.RawText, "isinstance(") {
+		return ""
+	}
+	lines := strings.Split(maskCode("python", symbol.RawText), "\n")
+	at := line - symbol.Span.Start
+	if at <= 0 || at >= len(lines) {
+		return ""
+	}
+	indentOf := func(l string) int { return len(l) - len(strings.TrimLeft(l, " \t")) }
+	target := indentOf(lines[at])
+	for i := at - 1; i >= 0; i-- {
+		l := lines[i]
+		if strings.TrimSpace(l) == "" {
+			continue
+		}
+		ind := indentOf(l)
+		if ind >= target {
+			continue
+		}
+		// A header enclosing the line.
+		if m := pyIsinstanceRe.FindStringSubmatch(l); m != nil && m[2] == name {
+			cls := m[3][strings.LastIndexByte(m[3], '.')+1:]
+			if pyResolveClass(idx, cls, dirOf(symbol.FilePath)) != nil {
+				return cls
+			}
+			return ""
+		}
+		target = ind
+		if ind == 0 {
+			break
+		}
+	}
+	return ""
+}
+
+// pyBaseExceptionMembers are the methods BaseException itself defines.
+var pyBaseExceptionMembers = map[string]bool{"with_traceback": true, "add_note": true}
+
+// pyExceptionSubclassMembers: a receiver annotated BaseException or
+// Exception (click's Result.exception) that calls a method neither defines
+// holds one of our subclasses that does — result.exception.format_message()
+// is ClickException's. Nil otherwise.
+func pyExceptionSubclassMembers(idx *edgeIndex, caller *core.SymbolRecord, base, name string, cands []*core.SymbolRecord) []*core.SymbolRecord {
+	if base != "BaseException" && base != "Exception" || pyBaseExceptionMembers[name] || strings.HasPrefix(name, "__") {
+		return nil
+	}
+	var out []*core.SymbolRecord
+	for _, c := range cands {
+		if c.Language != "python" || c.ParentSymbol == "" || c.Name != name {
+			continue
+		}
+		for _, b := range pyMRO(idx, c.ParentSymbol, dirOf(c.FilePath)) {
+			// A runtime exception class (Exception, ValueError, ...) we do
+			// not declare: every one is a BaseException.
+			if pyRuntimeException(b) && !typeSymbolExists(idx, b) && (base == "BaseException" || b != "BaseException") {
+				out = append(out, c)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// pyRuntimeException reports a builtin exception class name.
+func pyRuntimeException(name string) bool {
+	switch name {
+	case "BaseException", "Exception", "KeyboardInterrupt", "SystemExit", "GeneratorExit", "StopIteration", "StopAsyncIteration":
+		return true
+	}
+	return strings.HasSuffix(name, "Error") || strings.HasSuffix(name, "Warning")
 }

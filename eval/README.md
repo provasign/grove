@@ -122,6 +122,16 @@ corpora of each language:
   commons-lang and commons-io). Both snapshots were re-pinned with the
   corrected oracle: commons-lang R 0.9808 -> 0.9970, commons-io
   0.9829 -> 0.9960 on an unchanged Grove build.
+- **Access and erasure bridges** (2026-10-17). javac adds ACC_BRIDGE methods
+  to a public class for public methods it inherits from a package-private
+  superclass (commons-io's `BoundedInputStream.Builder` over
+  `AbstractBuilder.setMaxCount`), and calls link to them. The oracle took a
+  bridge for a declaration at the class's line: the real target looked like a
+  false positive and the bridge appeared as a caller. Bridges now resolve to
+  the method they delegate to and are never callers. Both Java snapshots were
+  re-pinned: on the same Grove build commons-io P 0.9983 -> 1.0000,
+  commons-lang unchanged at 1.0000 (its bridge edges were outside the matched
+  universe); matched universes rose to 99.3% / 99.6%.
 - **Implicit super-constructor calls** (Java, C#): a constructor with no
   `super(...)`/`this(...)` calls the superclass's parameterless constructor,
   which javac emits and the oracle records — 89 of commons-io's misses. The
@@ -562,6 +572,26 @@ compiles and the tests' net46 target does not — target-dependent, and the
 same edges are true for library-internal callers; and constructor/overload
 sets whose arguments the extractor cannot type (`new JValue(x)`,
 `WriteValue(v)`, `SerializeObject(x, converter)`).
+
+2026-10-17 (truth re-pinned, P 0.9709 / R 0.9774). The oracle now records
+what Roslyn binds but the old snapshot skipped: a constructor with no
+initializer calls the base's parameterless constructor, `: this(..)` /
+`: base(..)` initializers, target-typed `new(..)`, and query-clause calls
+(`from x in xs where ..` → `Where`, `Cast`, `OrderBy`). Resolver side: a
+receiver astkit cannot name is `<expr>` and reaches only visible extension
+methods; a bare call never reaches one and must fit by argument count
+(`Equals(a, b)` is `object.Equals`); a member no argument count can bind is
+dropped (`new S()` is a struct's implicit constructor); `.Value` /
+`.GetValueOrDefault()` unwrap a nullable argument; arrays convert by
+covariance and an array for a `params` slot applies the normal form; nested
+types are visible by simple name only inside their outer type; runtime
+instance methods (`List<T>.AddRange`, `string.EndsWith`) beat same-named
+extensions; `this.Event(..)` invokes the event. Documented oracle limit:
+the snapshot compiles `LinqBridge.cs` (no `HAVE_LINQ`) against .NET 8
+references, where `Func<,>` is ambiguous with `System.Func` (130 CS0104
+errors), so every lambda call there fails overload resolution and has no
+edge (~120 of the remaining false edges, Roslyn's own candidate set
+contains grove's target).
 
 Day-one progression (0.2632 → 0.6813), each step measured:
 

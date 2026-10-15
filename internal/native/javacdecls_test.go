@@ -186,3 +186,97 @@ public class W {
 		}
 	}
 }
+
+// An instance field initializer runs inside every constructor that does
+// not delegate with this(...) (javac copies it there), so its calls belong
+// to those constructors; a call javac resolved to a JDK type that shares a
+// simple name with a project type (java.io.ByteArrayOutputStream beside the
+// project's own ByteArrayOutputStream) is still recorded as external.
+func TestJavacFieldInitializersAndSameNamedJDKTypes(t *testing.T) {
+	if findJDK() == nil {
+		t.Skip("no JDK 11+ available")
+	}
+	root := t.TempDir()
+	files := map[string]string{
+		"p/Init.java": `package p;
+
+public class Init {
+  private final Object ref = noInit();
+  public Init() {
+    this(1);
+  }
+  private Init(int n) {
+  }
+  public Init(String s) {
+  }
+  private Object noInit() { return null; }
+}
+`,
+		"p/ByteArrayOutputStream.java": `package p;
+
+public class ByteArrayOutputStream {
+  public void writeTo(Object out) {}
+}
+`,
+		"p/Use.java": `package p;
+
+public class Use {
+  void copy(java.io.ByteArrayOutputStream out) throws java.io.IOException {
+    out.writeTo(null);
+  }
+}
+`,
+	}
+	for name, body := range files {
+		path := filepath.Join(root, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	blob := "b1"
+	sym := func(file string, kind core.SymbolKind, name, parent, id string, start, end int, sig string) core.SymbolRecord {
+		return core.SymbolRecord{ID: file + "::" + id + "@" + blob, FilePath: file, BlobSHA: blob, Language: "java",
+			Kind: kind, Name: name, QualifiedName: id, ParentSymbol: parent, Span: core.LineRange{Start: start, End: end}, Signature: sig, RawText: sig}
+	}
+	parsed := []core.SymbolRecord{
+		sym("p/Init.java", core.KindClass, "Init", "", "Init", 3, 13, "public class Init {"),
+		sym("p/Init.java", core.KindField, "ref", "Init", "Init.ref", 4, 4, "private final Object ref = noInit();"),
+		sym("p/Init.java", core.KindConstructor, "Init", "Init", "Init.Init", 5, 7, "public Init()"),
+		sym("p/Init.java", core.KindConstructor, "Init", "Init", "Init.Init#2", 8, 9, "private Init(int n)"),
+		sym("p/Init.java", core.KindConstructor, "Init", "Init", "Init.Init#3", 10, 11, "public Init(String s)"),
+		sym("p/Init.java", core.KindMethod, "noInit", "Init", "Init.noInit", 12, 12, "private Object noInit()"),
+		sym("p/ByteArrayOutputStream.java", core.KindClass, "ByteArrayOutputStream", "", "ByteArrayOutputStream", 3, 5, "public class ByteArrayOutputStream {"),
+		sym("p/ByteArrayOutputStream.java", core.KindMethod, "writeTo", "ByteArrayOutputStream", "ByteArrayOutputStream.writeTo", 4, 4, "public void writeTo(Object out)"),
+		sym("p/Use.java", core.KindClass, "Use", "", "Use", 3, 7, "public class Use {"),
+		sym("p/Use.java", core.KindMethod, "copy", "Use", "Use.copy", 4, 6, "void copy(java.io.ByteArrayOutputStream out)"),
+	}
+	result := javaAnalyzer{}.Analyze(context.Background(), Request{Root: root, Symbols: parsed,
+		Files: []string{"p/Init.java", "p/ByteArrayOutputStream.java", "p/Use.java"}})
+	calls := map[string]bool{}
+	marked := ""
+	for _, e := range result.Edges {
+		if e.Type == core.EdgeCalls && e.Source == core.EvidenceSourceNative {
+			calls[e.From+" -> "+e.To] = true
+		}
+		if e.Type == core.EdgeResolvedCalls && e.From == "p/Use.java::Use.copy@b1" {
+			marked = e.Lines
+		}
+	}
+	noInit := "p/Init.java::Init.noInit@b1"
+	for _, from := range []string{"p/Init.java::Init.Init#2@b1", "p/Init.java::Init.Init#3@b1"} {
+		if !calls[from+" -> "+noInit] {
+			t.Errorf("%s runs the field initializer: missing call to noInit (all %v)\n%s", from, calls, strings.Join(result.Diagnostics, "\n"))
+		}
+	}
+	for _, from := range []string{"p/Init.java::Init.Init@b1", "p/Init.java::Init@b1"} {
+		if calls[from+" -> "+noInit] {
+			t.Errorf("%s does not run the field initializer itself", from)
+		}
+	}
+	if !strings.Contains(marked, "writeTo@5:") {
+		t.Errorf("out.writeTo on a java.io.ByteArrayOutputStream must be recorded as external, got %q", marked)
+	}
+}

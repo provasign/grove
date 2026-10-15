@@ -553,6 +553,13 @@ func narrowByLocalType(idx *edgeIndex, sat *interfaceSatisfaction, caller *core.
 	// A variable holding a class still narrows method calls to that class
 	// (classmethods, attribute access through the class object).
 	typ = strings.TrimPrefix(typ, "class:")
+	if caller != nil && caller.Language == "python" {
+		if base := strings.TrimPrefix(typ, "extern:"); (base == "BaseException" || base == "Exception") && !typeSymbolExists(idx, base) {
+			// The runtime's exception base: a method it lacks is one of
+			// our subclasses' (pyExceptionSubclassMembers).
+			return pyExceptionSubclassMembers(idx, caller, base, calleeName, cands), nil, true
+		}
+	}
 	if strings.HasPrefix(typ, "extern:") {
 		// `private _xhr: any` — nothing of ours runs through it.
 		return nil, nil, true
