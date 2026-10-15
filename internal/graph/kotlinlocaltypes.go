@@ -529,3 +529,178 @@ func kotlinBareType(t string) string {
 	}
 	return t
 }
+
+// ktReceiverScope is the source range of a lambda with receiver typ.
+type ktReceiverScope struct {
+	typ                          string
+	startLine, startCol, endLine int
+	endCol                       int
+}
+
+// kotlinReceiverFnTypeRe reads a receiver function type parameter:
+// `script: ShellScript.() -> String`.
+var kotlinReceiverFnTypeRe = regexp.MustCompile(`:\s*(?:suspend\s+)?([A-Z]\w*)(?:<[^>]*>)?\.\(`)
+
+// kotlinReceiverScopes finds the lambdas with receiver in caller: the
+// trailing lambda of a call whose callee's last parameter is a receiver
+// function type `T.() -> R`, and the stdlib scope functions x.apply { },
+// x.run { }, with(x) { } whose receiver is x. Each scope's range comes from
+// brace matching in the caller's masked source.
+func kotlinReceiverScopes(idx *edgeIndex, caller *core.SymbolRecord, localTypes map[string]string) []ktReceiverScope {
+	if caller.RawText == "" {
+		return nil
+	}
+	code := maskCode("kotlin", caller.RawText)
+	lines := strings.Split(code, "\n")
+	var out []ktReceiverScope
+	for _, cs := range caller.CallSites {
+		name, qual := cs.Callee, ""
+		if i := strings.LastIndexByte(name, '.'); i >= 0 {
+			qual, name = name[:i], name[i+1:]
+		}
+		typ := ""
+		switch {
+		case (name == "apply" || name == "run") && qual != "":
+			typ = localTypes[qual]
+			if typ == "" {
+				typ = kotlinFieldType(idx, caller.ParentSymbol, qual)
+			}
+		case name == "with" && qual == "" && len(cs.Args) > 0:
+			typ = localTypes[cs.Args[0]]
+		default:
+			for _, f := range idx.byName[strings.ToLower(name)] {
+				if f.Name != name || f.Language != "kotlin" || !graphCallableSymbol(f) {
+					continue
+				}
+				params := tsDeclParams("kotlin", f.Signature)
+				groups := splitParams("kotlin", params)
+				if len(groups) == 0 {
+					continue
+				}
+				m := kotlinReceiverFnTypeRe.FindStringSubmatch(groups[len(groups)-1])
+				if m == nil {
+					continue
+				}
+				if typ != "" && typ != m[1] {
+					typ = ""
+					break
+				}
+				typ = m[1]
+			}
+		}
+		typ = strings.TrimPrefix(strings.TrimSuffix(typ, "?"), "class:")
+		if typ == "" || cs.Line <= 0 || cs.Col <= 0 {
+			continue
+		}
+		li := cs.Line - caller.Span.Start
+		if li < 0 || li >= len(lines) {
+			continue
+		}
+		// From the called name: past a balanced argument list, the next
+		// non-blank character must open the lambda.
+		l, c := li, cs.Col-1+len(name)
+		next := func() (byte, bool) {
+			for l < len(lines) {
+				if c < len(lines[l]) {
+					return lines[l][c], true
+				}
+				l++
+				c = 0
+			}
+			return 0, false
+		}
+		skipBlank := func() {
+			for {
+				b, ok := next()
+				if !ok || (b != ' ' && b != '\t' && b != '\r') {
+					return
+				}
+				c++
+			}
+		}
+		skipBlank()
+		if b, ok := next(); ok && b == '(' {
+			depth := 0
+			for {
+				b, ok := next()
+				if !ok {
+					break
+				}
+				c++
+				if b == '(' {
+					depth++
+				} else if b == ')' {
+					depth--
+					if depth == 0 {
+						break
+					}
+				}
+			}
+			skipBlank()
+		}
+		if b, ok := next(); !ok || b != '{' {
+			continue
+		}
+		sl, sc := l, c
+		depth := 0
+		for {
+			b, ok := next()
+			if !ok {
+				break
+			}
+			if b == '{' {
+				depth++
+			} else if b == '}' {
+				depth--
+				if depth == 0 {
+					out = append(out, ktReceiverScope{typ: typ, startLine: sl + caller.Span.Start, startCol: sc + 1,
+						endLine: l + caller.Span.Start, endCol: c + 1})
+					break
+				}
+			}
+			c++
+		}
+	}
+	return out
+}
+
+// kotlinReceiverAt is the receiver type of the innermost receiver lambda
+// containing line:col, or "".
+func kotlinReceiverAt(scopes []ktReceiverScope, line, col int) string {
+	best := -1
+	after := func(l1, c1, l2, c2 int) bool { return l1 > l2 || l1 == l2 && c1 > c2 }
+	for i, s := range scopes {
+		if !after(line, col, s.startLine, s.startCol) || after(line, col, s.endLine, s.endCol) {
+			continue
+		}
+		if best < 0 || after(s.startLine, s.startCol, scopes[best].startLine, scopes[best].startCol) {
+			best = i
+		}
+	}
+	if best < 0 {
+		return ""
+	}
+	return scopes[best].typ
+}
+
+// kotlinTypeMembers keeps the candidates declared by typ or its bases
+// (nearest first) and the extension functions on typ.
+func kotlinTypeMembers(idx *edgeIndex, cands []*core.SymbolRecord, typ, preferDir string) []*core.SymbolRecord {
+	classes := []string{typ}
+	seen := map[string]bool{}
+	for level := 0; level < 5 && len(classes) > 0; level++ {
+		var next []string
+		for _, cls := range classes {
+			if seen[cls] {
+				continue
+			}
+			seen[cls] = true
+			if found := filterByParent(cands, cls); len(found) > 0 {
+				return found
+			}
+			next = append(next, baseClassesFor(idx, "kotlin", cls, preferDir)...)
+		}
+		classes = next
+	}
+	return kotlinExtensionCandidates(cands, typ)
+}

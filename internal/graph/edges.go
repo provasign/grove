@@ -2681,6 +2681,8 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			return *maskedBody
 		}
 		var ktShapeCache map[string]string
+		var ktReceiverScopes []ktReceiverScope
+		ktScopesDone := false
 		javaTypesFor := func(cands []*core.SymbolRecord, cs core.CallSite) map[string]string {
 			if javaArgTypeCache == nil {
 				javaArgTypeCache = javaArgTypes(idx, &symbol)
@@ -3268,7 +3270,24 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				}
 				cands = byType
 			}
+			ktLambdaReceiver := false
 			if symbol.Language == "kotlin" && qualifier == "" && len(cands) > 0 {
+				// Inside a lambda with receiver (`shellRun { command(...) }`
+				// where shellRun takes `script: ShellScript.() -> String`,
+				// or x.apply { }, x.run { }, with(x) { }), the lambda's
+				// receiver is the innermost implicit receiver.
+				if !ktScopesDone {
+					ktReceiverScopes = kotlinReceiverScopes(idx, &symbol, localTypes)
+					ktScopesDone = true
+				}
+				if t := kotlinReceiverAt(ktReceiverScopes, cs.Line, cs.Col); t != "" {
+					if members := kotlinTypeMembers(idx, cands, t, dirOf(symbol.FilePath)); len(members) > 0 {
+						cands = members
+						ktLambdaReceiver = true
+					}
+				}
+			}
+			if symbol.Language == "kotlin" && qualifier == "" && len(cands) > 0 && !ktLambdaReceiver {
 				// A bare call resolves against the implicit receivers in
 				// scope: the enclosing class and, in an extension
 				// function, its receiver type. Outside both — a top-level
