@@ -2818,6 +2818,35 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				}
 				cands = compatible
 			}
+			if symbol.Language == "rust" && qualifier == "" && !strings.HasSuffix(cs.Callee, "!") {
+				// A bare Rust call never reaches a method (that takes self.
+				// or Type::): `matched(m)` calling a closure parameter bound
+				// to every method named matched (ripgrep printer, 11 edges).
+				var free []*core.SymbolRecord
+				for _, c := range cands {
+					if c.Kind == core.KindFunction || c.Kind == core.KindConstructor && c.ParentSymbol == "" {
+						free = append(free, c)
+					}
+				}
+				cands = free
+			}
+			if symbol.Language == "rust" && (qualifier == "<str>" || qualifier == "<slice>") {
+				// A string literal or range-index receiver (astkit marks
+				// them): a std str/slice method, unless the repository
+				// implements the method on those types.
+				var onStd []*core.SymbolRecord
+				for _, c := range cands {
+					p := c.ParentSymbol
+					if qualifier == "<str>" && (p == "str" || p == "String") ||
+						qualifier == "<slice>" && (strings.HasPrefix(p, "[") || p == "Vec") {
+						onStd = append(onStd, c)
+					}
+				}
+				cands = onStd
+				if len(cands) == 0 {
+					continue
+				}
+			}
 			if symbol.Language == "swift" && qualifier == "" && len(cands) == 0 {
 				// `throw LocationError(path:..)` where `typealias
 				// LocationError = FilesError<LocationErrorReason>`: the
@@ -3669,7 +3698,10 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			// "cls(...)" constructs the caller's own class, and a variable
 			// holding a class (null_session_class = NullSession) constructs
 			// the held class.
-			if len(narrowed) == 0 && !capped {
+			// Rust has no constructors: `JSON(x)` / `Printer::JSON(x)` builds
+			// a tuple struct or enum variant and runs no `new` (ripgrep: 12
+			// such literals bound to unrelated `new` functions).
+			if len(narrowed) == 0 && !capped && symbol.Language != "rust" {
 				ctorName := calleeName
 				if held, ok := localTypes[calleeName]; ok && strings.HasPrefix(held, "class:") {
 					ctorName = strings.TrimPrefix(held, "class:")

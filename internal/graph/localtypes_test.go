@@ -1445,3 +1445,33 @@ func TestGoCallResultReceiverUsesProducerType(t *testing.T) {
 		t.Fatalf("NewB().Send() must bind to B.Send only: %v", got)
 	}
 }
+
+// Rust: a bare call reaches free functions only (a closure parameter
+// `matched(m)` is no method), a string-literal receiver reaches no in-repo
+// method, and a tuple-struct literal `JSON(x)` runs no `new`.
+func TestRustBareCallsLiteralReceiversAndTupleLiterals(t *testing.T) {
+	rs := func(id string, kind core.SymbolKind, name, parent string, calls ...core.CallSite) core.SymbolRecord {
+		qn := name
+		if parent != "" {
+			qn = parent + "." + name
+		}
+		return core.SymbolRecord{ID: id, FilePath: "src/lib.rs", BlobSHA: "1", Language: "rust", Kind: kind, Name: name, QualifiedName: qn,
+			ParentSymbol: parent, RawText: "fn " + name + "() {}", CallSites: calls}
+	}
+	syms := []core.SymbolRecord{
+		rs("Color", core.KindStruct, "Color", ""),
+		rs("Color.matched", core.KindMethod, "matched", "Color"),
+		rs("Color.as_bytes", core.KindMethod, "as_bytes", "Color"),
+		rs("JSON", core.KindStruct, "JSON", ""),
+		rs("JSON.new", core.KindConstructor, "new", "JSON"),
+		rs("use", core.KindFunction, "use_it", "",
+			core.CallSite{Callee: "matched", Line: 2, Argc: 1},
+			core.CallSite{Callee: "<str>.as_bytes", Line: 3},
+			core.CallSite{Callee: "Printer.JSON", Line: 4, Argc: 1}),
+	}
+	for _, e := range BuildEdges(syms) {
+		if e.Type == core.EdgeCalls && e.From == "use" {
+			t.Errorf("unexpected edge to %s", e.To)
+		}
+	}
+}
