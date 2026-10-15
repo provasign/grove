@@ -601,3 +601,33 @@ public class Use {
 		t.Errorf("var typed by cast/producer not applied: %v", got)
 	}
 }
+
+// C: a header function calling a static function each includer defines
+// reaches every includer's copy (jansson util.h main -> run_tests), past
+// the fan-out cap; a parameter named like a function is not a reference.
+func TestCHeaderStaticCallsAndParameterShadowing(t *testing.T) {
+	files := map[string]string{
+		"util.h": "static void run_tests();\nint main(void) {\n    run_tests();\n    return 0;\n}\n",
+		"err.c":  "void report(int position) {\n    use(position);\n}\nvoid use(int p) {}\n",
+		"t.c":    "#include \"util.h\"\nstatic void position(void) {}\n",
+	}
+	for i := 0; i < 20; i++ {
+		files["test_"+strconv.Itoa(i)+".c"] = "#include \"util.h\"\nstatic void run_tests() {}\n"
+	}
+	_, _, stored := callEdges(t, files)
+	runs := 0
+	for _, e := range stored {
+		if e.Type != core.EdgeCalls {
+			continue
+		}
+		if strings.HasPrefix(e.From, "util.h::main") && strings.Contains(e.To, "::run_tests") {
+			runs++
+		}
+		if strings.HasPrefix(e.From, "err.c::report") && strings.HasPrefix(e.To, "t.c::position") {
+			t.Error("parameter `position` read as a reference to another file's static function")
+		}
+	}
+	if runs != 20 {
+		t.Errorf("main reaches %d run_tests copies, want 20", runs)
+	}
+}

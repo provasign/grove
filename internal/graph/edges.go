@@ -438,6 +438,53 @@ func allTypesIndexed(idx *edgeIndex, types []string) bool {
 	return true
 }
 
+// cParamNames returns the parameter names of a C function's signature.
+func cParamNames(fn *core.SymbolRecord) map[string]bool {
+	sig := fn.Signature
+	open := strings.IndexByte(sig, '(')
+	close := strings.LastIndexByte(sig, ')')
+	out := map[string]bool{}
+	if open < 0 || close <= open {
+		return out
+	}
+	for _, p := range splitTopLevel(sig[open+1:close], ',') {
+		p = strings.TrimSpace(p)
+		if i := strings.IndexByte(p, '['); i >= 0 {
+			p = p[:i]
+		}
+		fields := strings.FieldsFunc(p, func(r rune) bool { return r == ' ' || r == '*' || r == '\t' || r == '&' })
+		if len(fields) >= 2 {
+			out[fields[len(fields)-1]] = true
+		}
+	}
+	return out
+}
+
+// cHeaderStaticFanout reports whether caller sits in a header and every
+// candidate is a static function in a file that includes that header.
+func cHeaderStaticFanout(idx *edgeIndex, caller *core.SymbolRecord, cands []*core.SymbolRecord) bool {
+	if !strings.HasSuffix(caller.FilePath, ".h") && !strings.HasSuffix(caller.FilePath, ".hpp") || len(cands) == 0 {
+		return false
+	}
+	header := baseOf(caller.FilePath)
+	for _, c := range cands {
+		if c.Kind != core.KindFunction || !hasModifier(c, "static") {
+			return false
+		}
+		included := false
+		for imp := range idx.fileImports[c.FilePath] {
+			if baseOf(strings.Trim(imp, "\"<> ")) == header {
+				included = true
+				break
+			}
+		}
+		if !included {
+			return false
+		}
+	}
+	return true
+}
+
 // pyIsSubclass reports whether cls inherits from base (within four levels).
 func pyIsSubclass(idx *edgeIndex, cls, base, dir string) bool {
 	level := []string{cls}
@@ -2971,6 +3018,15 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				}
 				fmt.Fprintf(os.Stderr, "grove-trace %s: callee=%q qual=%q args=%v cands=%d capped=%v scope=%d first=%v\n", symbol.QualifiedName, cs.Callee, qualifier, cs.Args, len(cands), capped, len(scope), ids)
 			}
+			headerStatic := false
+			if capped && (symbol.Language == "c" || symbol.Language == "cpp") && qualifier == "" && cHeaderStaticFanout(idx, &symbol, cands) {
+				// A function defined in a header calls a static function each
+				// includer defines (jansson's test util.h main() ->
+				// run_tests in 18 test files): every includer's own copy is
+				// the target in its translation unit, not a fan-out guess.
+				capped = false
+				headerStatic = true
+			}
 			if symbol.Language == "python" && qualifier != "" && cs.Argc > 0 && len(cands) > 0 &&
 				!pyCallHasSplat(idx, &symbol, cs) {
 				// Python has no overloading: a method whose parameters cannot
@@ -3924,7 +3980,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// edges per call site. Precision-first, as for C#.
 				narrowed = nil
 			}
-			if len(narrowed) > maxCalleeFanout {
+			if len(narrowed) > maxCalleeFanout && !headerStatic {
 				// Still unresolvably broad after every narrowing pass:
 				// drop (the dispatch rescue below may still apply).
 				narrowed = nil
@@ -3961,11 +4017,17 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					if _, local := localTypes[arg]; local {
 						continue
 					}
+					if cParamNames(&symbol)[arg] {
+						continue // a parameter shadows any function of that name
+					}
 					refs, over := resolveCallees(idx, &symbol, arg, scope, true, true)
 					if over || len(refs) == 0 || len(refs) > 2 {
 						continue
 					}
 					for _, ref := range refs {
+						if hasModifier(ref, "static") && ref.FilePath != symbol.FilePath {
+							continue // another translation unit's static function
+						}
 						if ref.Kind == core.KindFunction && ref.ID != symbol.ID {
 							addEdge(symbol.ID, ref.ID, 0.7, core.EvidenceSourceASTKit, core.ReasonFunctionRef)
 						}
