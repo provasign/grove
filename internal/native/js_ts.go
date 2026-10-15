@@ -300,7 +300,7 @@ func (jsTSAnalyzer) Analyze(ctx context.Context, req Request) Result {
 	for _, edge := range payload.Calls {
 		from, okFrom := symbols.atOrTopLevel(edge.From, edge.FromName, edge.FromLine)
 		if edge.Ext != "" {
-			if okFrom {
+			if okFrom && jsIdentifierName(edge.Ext) {
 				marks.add(from.ID, edge.Ext, edge.Line, edge.Col)
 			}
 			continue
@@ -753,7 +753,9 @@ function externalName(checker, sym) {
     if (!(r.startsWith('..') || path.isAbsolute(r) || r.startsWith('node_modules/') || r.includes('/node_modules/'))) return undefined;
   }
   const name = sym.getName && sym.getName();
-  return name && name !== '__function' ? name : undefined;
+  // A module symbol's name is its quoted file path ("/abs/node_modules/x/index"):
+  // no call names it, and it would tie the index to the checkout location.
+  return name && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name) ? name : undefined;
 }
 function declInfo(checker, sym) {
   if (sym && sym.flags & ts.SymbolFlags.Alias) sym = checker.getAliasedSymbol(sym);
@@ -1193,4 +1195,20 @@ func WarmTSWorker(ctx context.Context, root string, files []string) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 	_, _ = tsWorkerFor(root, dir).call(ctx, request)
+}
+
+// jsIdentifierName reports a plain JS identifier: the only external names a
+// call position can carry. TypeScript names a module symbol by its quoted
+// absolute path, which must never reach the stored markers.
+func jsIdentifierName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i, r := range s {
+		ok := r == '_' || r == '$' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || i > 0 && r >= '0' && r <= '9'
+		if !ok {
+			return false
+		}
+	}
+	return true
 }

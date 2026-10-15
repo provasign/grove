@@ -129,3 +129,15 @@ func TestGoFuncValueFlowAndExternalIfaceMarkers(t *testing.T) {
 		t.Errorf("W.Write must record io.Writer as an external contract: %v", got)
 	}
 }
+
+// A TypeScript module symbol's name is its quoted absolute path; it is no
+// call name and must not reach the stored markers (the index would depend
+// on the checkout directory).
+func TestJSIdentifierName(t *testing.T) {
+	for s, want := range map[string]bool{"helmet": true, "$emit": true, "_x9": true,
+		`"/abs/node_modules/helmet/index"`: false, "a,b": false, "9x": false, "": false} {
+		if got := jsIdentifierName(s); got != want {
+			t.Errorf("%q: %v", s, got)
+		}
+	}
+}
