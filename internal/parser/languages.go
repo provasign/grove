@@ -56,7 +56,9 @@ var securityExtensions = map[string]bool{
 // 2026-10-16.3: names imported from packages are recorded (core.JSImportPackage).
 // 2026-10-16.4: argument tokens for string concatenation, C# invocations
 // (call:Name, ToString), array creation, typeof, parentheses and x!.
-const ExtractorVersion = "2026-10-16.4"
+// 2026-10-16.5: Objective-C property accessors, C calls in methods, and
+// message sends in macro bodies are call sites.
+const ExtractorVersion = "2026-10-16.5"
 
 // DetectLanguage returns the Grove language tag for a file path.
 // Returns "" for unsupported or security-excluded files.
