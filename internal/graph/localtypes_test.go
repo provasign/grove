@@ -1475,3 +1475,37 @@ func TestRustBareCallsLiteralReceiversAndTupleLiterals(t *testing.T) {
 		}
 	}
 }
+
+// An expression receiver (`(a + b).m()`, `xs[i].m()`) is an untyped method
+// call, not a bare call, and `f()?.m()` binds through f's Result<T>.
+func TestRustExpressionAndTryReceivers(t *testing.T) {
+	rs := func(id string, kind core.SymbolKind, name, parent, sig string, calls ...core.CallSite) core.SymbolRecord {
+		qn := name
+		if parent != "" {
+			qn = parent + "." + name
+		}
+		return core.SymbolRecord{ID: id, FilePath: "src/lib.rs", BlobSHA: "1", Language: "rust", Kind: kind, Name: name, QualifiedName: qn,
+			ParentSymbol: parent, Signature: sig, RawText: sig + " {}", CallSites: calls}
+	}
+	syms := []core.SymbolRecord{
+		rs("Path", core.KindStruct, "Path", "", "struct Path"),
+		rs("Path.is_link", core.KindMethod, "is_link", "Path", "fn is_link(&self) -> bool"),
+		rs("Walk", core.KindStruct, "Walk", "", "struct Walk"),
+		rs("Walk.build", core.KindMethod, "build", "Walk", "fn build(&self) -> u8"),
+		rs("Other", core.KindStruct, "Other", "", "struct Other"),
+		rs("Other.build", core.KindMethod, "build", "Other", "fn build(&self) -> u8"),
+		rs("walk", core.KindFunction, "walk", "", "fn walk() -> anyhow::Result<Walk>"),
+		rs("use", core.KindFunction, "use_it", "", "fn use_it() -> anyhow::Result<()>",
+			core.CallSite{Callee: "<expr>.is_link", Line: 2},
+			core.CallSite{Callee: "walk()?.build", Line: 3}),
+	}
+	got := map[string]bool{}
+	for _, e := range BuildEdges(syms) {
+		if e.Type == core.EdgeCalls && e.From == "use" {
+			got[e.To] = true
+		}
+	}
+	if !got["Path.is_link"] || !got["Walk.build"] || got["Other.build"] {
+		t.Fatalf("want is_link (expression receiver) and Walk.build only: %v", got)
+	}
+}

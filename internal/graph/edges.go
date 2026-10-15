@@ -2818,7 +2818,14 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				}
 				cands = compatible
 			}
-			if symbol.Language == "rust" && qualifier == "" && !strings.HasSuffix(cs.Callee, "!") {
+			rustExprReceiver := symbol.Language == "rust" && qualifier == "<expr>"
+			if rustExprReceiver {
+				// A method on an expression astkit could not name (`(a +
+				// b).m()`, `xs[i].m()`): an untyped receiver, resolved by name
+				// like one, but never a bare call.
+				qualifier = ""
+			}
+			if symbol.Language == "rust" && qualifier == "" && !rustExprReceiver && !strings.HasSuffix(cs.Callee, "!") {
 				// A bare Rust call never reaches a method (that takes self.
 				// or Type::): `matched(m)` calling a closure parameter bound
 				// to every method named matched (ripgrep printer, 11 edges).
@@ -3322,11 +3329,13 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// (parse::parse_low_raw → flags/parse.rs), else drop.
 				_, isSelf := selfVars[qualifier]
 				_, typed := localTypes[qualifier]
-				if strings.HasSuffix(qualifier, "()") {
+				if strings.HasSuffix(qualifier, "()") || strings.HasSuffix(qualifier, "()?") {
 					// Call-result receiver: builder chains live here
 					// (.line_number(true).build() narrows build by
 					// line_number's return type). Unknown results are
-					// external (.unwrap().x, .iter().y) — drop.
+					// external (.unwrap().x, .iter().y) — drop. After `?`
+					// the Result/Option is unwrapped
+					// (walk_builder()?.build_parallel()).
 					if rets := rustCallResultTypes(idx, qualifier, &symbol, scope); len(rets) > 0 {
 						var byType []*core.SymbolRecord
 						for _, cand := range cands {

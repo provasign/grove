@@ -280,7 +280,8 @@ func rustResolveTypeAlias(symbol *core.SymbolRecord, typ string) string {
 // unparseable return type makes the result unknown — guessing here turns
 // into confident wrong drops downstream.
 func rustCallResultTypes(idx *edgeIndex, qualifier string, symbol *core.SymbolRecord, scope map[string]struct{}) map[string]bool {
-	name := strings.TrimSuffix(qualifier, "()")
+	tried := strings.HasSuffix(qualifier, "()?")
+	name := strings.TrimSuffix(strings.TrimSuffix(qualifier, "?"), "()")
 	if name == "" {
 		return nil
 	}
@@ -298,6 +299,9 @@ func rustCallResultTypes(idx *edgeIndex, qualifier string, symbol *core.SymbolRe
 			continue
 		}
 		r := rustReturnType(codeSignature(cand))
+		if tried {
+			r = rustUnwrappedReturnType(codeSignature(cand))
+		}
 		if r == "Self" {
 			r = cand.ParentSymbol
 		}
@@ -366,6 +370,46 @@ func rustImplTrait(symbol *core.SymbolRecord) string {
 		}
 	}
 	return ""
+}
+
+// rustUnwrappedReturnType is the type `f()?` yields: T of a Result<T, E> /
+// Option<T> return (any path: anyhow::Result<T>, io::Result<T>), "" when
+// the return is neither.
+func rustUnwrappedReturnType(signature string) string {
+	i := strings.LastIndex(signature, "->")
+	if i < 0 {
+		return ""
+	}
+	t := strings.TrimRight(strings.TrimSpace(signature[i+2:]), "{ \t\n")
+	open := strings.IndexByte(t, '<')
+	if open < 0 || !strings.HasSuffix(t, ">") {
+		return ""
+	}
+	head := t[:open]
+	head = head[strings.LastIndex(head, ":")+1:]
+	if head != "Result" && head != "Option" {
+		return ""
+	}
+	inner := t[open+1 : len(t)-1]
+	depth := 0
+	for k := 0; k < len(inner); k++ {
+		switch inner[k] {
+		case '<', '(':
+			depth++
+		case '>', ')':
+			depth--
+		case ',':
+			if depth == 0 {
+				inner = inner[:k]
+				k = len(inner)
+			}
+		}
+	}
+	inner = strings.TrimSpace(inner)
+	if inner == "Self" {
+		return "Self"
+	}
+	return rustBareType(inner)
 }
 
 // rustReturnType extracts the bare return type from "fn x(...) -> Type".
