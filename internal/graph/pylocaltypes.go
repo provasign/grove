@@ -623,6 +623,29 @@ func pyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 		}
 	}
 
+	// An override's unannotated parameter takes the annotation its base
+	// method gives the same position: `def invoke(self, ctx)` overriding
+	// `Command.invoke(self, ctx: Context)` receives a Context.
+	if symbol.Kind == core.KindMethod && symbol.ParentSymbol != "" {
+		for name, typ := range pyInheritedParamTypes(idx, symbol) {
+			if _, typed := out[name]; !typed {
+				out[name] = typ
+			}
+		}
+	}
+
+	// A decorator that declares what it passes: `pass_context(f:
+	// Callable[Concatenate[Context, P], R])` calls the decorated function
+	// with a Context first, `Request.application(cls, f: Callable[[Request],
+	// ...])` with a Request. The decorated function's first unannotated
+	// parameter gets that type (click tests' `ctx.invoke(...)` matched
+	// Command.invoke by name).
+	if name, typ := pyDecoratorInjectedParam(idx, symbol); name != "" {
+		if _, typed := out[name]; !typed {
+			out[name] = typ
+		}
+	}
+
 	// Unannotated parameters that pytest fills from a fixture.
 	if pyIsTestModule(symbol.FilePath) {
 		for name := range pyParamNames(symbol.RawText) {
@@ -692,6 +715,8 @@ func pyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 					// called on an indexed class is typed through its own
 					// return annotation (-> Self names the class).
 					if t := pyClassFactoryType(idx, q, m[3], symbol); t != "" {
+						out[m[1]] = t
+					} else if t := pyUniformMethodReturn(idx, symbol, q, m[3]); t != "" {
 						out[m[1]] = t
 					}
 					continue
@@ -1963,6 +1988,164 @@ func pyEnclosingCallable(idx *edgeIndex, symbol *core.SymbolRecord) *core.Symbol
 			(cand.Kind == core.KindFunction || cand.Kind == core.KindMethod) &&
 			cand.Span.Start <= symbol.Span.Start && cand.Span.End >= symbol.Span.End {
 			return cand
+		}
+	}
+	return nil
+}
+
+// pyChainType types a dotted receiver chain: the head from the caller's
+// local types (or self), each later segment from the attribute types of the
+// class reached so far, its bases included. "" when any hop is unknown.
+func pyChainType(idx *edgeIndex, symbol *core.SymbolRecord, localTypes map[string]string, selfVars map[string]struct{}, chain string) string {
+	segs := strings.Split(chain, ".")
+	typ := ""
+	if _, isSelf := selfVars[segs[0]]; isSelf {
+		typ = symbol.ParentSymbol
+	} else if t, ok := localTypes[segs[0]]; ok {
+		typ = strings.TrimPrefix(t, "class:")
+	}
+	for _, seg := range segs[1:] {
+		if typ == "" || strings.HasPrefix(typ, "extern:") || !typeSymbolExists(idx, typ) {
+			return ""
+		}
+		attrs := map[string]string{}
+		classes := []string{typ}
+		seen := map[string]bool{}
+		for level := 0; level < 4 && len(classes) > 0; level++ {
+			var next []string
+			for _, c := range classes {
+				if seen[c] {
+					continue
+				}
+				seen[c] = true
+				pyClassAttrTypes(idx, symbol, c, attrs)
+				next = append(next, pyBaseClasses(idx, c, dirOf(symbol.FilePath))...)
+			}
+			classes = next
+		}
+		typ = strings.TrimPrefix(attrs[seg], "class:")
+	}
+	return typ
+}
+
+// pyUniformMethodReturn types `x = recv.method(...)` when recv is an untyped
+// local (not an imported name: `_cv_app.get(None)` is a module ContextVar)
+// and every method of that name in the repository declares the same return
+// type: click's `sub_ctx = cmd.make_context(...)` is a Context whatever
+// command cmd is.
+func pyUniformMethodReturn(idx *edgeIndex, symbol *core.SymbolRecord, recv, method string) string {
+	if strings.Contains(recv, ".") || recv == "" || recv[0] < 'a' || recv[0] > 'z' {
+		return ""
+	}
+	if _, _, _, known := idx.pyImportBinding(symbol, recv); known {
+		return ""
+	}
+	typ := ""
+	for _, cand := range idx.byName[strings.ToLower(method)] {
+		if cand.Name != method || cand.Kind != core.KindMethod || cand.Language != "python" {
+			continue
+		}
+		t := strings.TrimPrefix(pyAnnotationType(idx, cand, pyReturnType(cand)), "class:")
+		if t == "" || typ != "" && t != typ {
+			return ""
+		}
+		typ = t
+	}
+	return typ
+}
+
+var pyInjectedCallableRe = regexp.MustCompile(`Callable\[\s*(?:\[\s*|(?:\w+\.)?Concatenate\[\s*)([\w.]+)`)
+
+// pyDecoratorInjectedParam returns the decorated function's first
+// unannotated parameter and the type every decorator candidate of that name
+// declares it passes there, or "".
+func pyDecoratorInjectedParam(idx *edgeIndex, symbol *core.SymbolRecord) (string, string) {
+	if idx == nil || len(symbol.Annotations) == 0 {
+		return "", ""
+	}
+	params := pyDefParams(symbol.RawText)
+	if params == "" {
+		return "", ""
+	}
+	first := ""
+	for _, g := range splitTopLevel(params, ',') {
+		name := strings.TrimSpace(g)
+		if name == "self" || name == "cls" {
+			continue
+		}
+		if strings.ContainsAny(name, ":=*") || name == "" {
+			return "", "" // annotated, defaulted or variadic: its own text decides
+		}
+		first = name
+		break
+	}
+	if first == "" {
+		return "", ""
+	}
+decorators:
+	for _, dec := range symbol.Annotations {
+		if i := strings.IndexByte(dec, '('); i >= 0 {
+			dec = dec[:i]
+		}
+		leaf := dec[strings.LastIndexByte(dec, '.')+1:]
+		typ := ""
+		for _, cand := range idx.byName[strings.ToLower(leaf)] {
+			if cand.Name != leaf || cand.Language != "python" || (cand.Kind != core.KindFunction && cand.Kind != core.KindMethod) {
+				continue
+			}
+			m := pyInjectedCallableRe.FindStringSubmatch(pyDefParams(cand.RawText))
+			if m == nil {
+				continue // not a decorator declaring what it passes (a same-named wrapper)
+			}
+			t := strings.TrimPrefix(pyAnnotationType(idx, cand, m[1]), "class:")
+			if t == "" || typ != "" && t != typ {
+				continue decorators
+			}
+			typ = t
+		}
+		if typ != "" {
+			return first, typ
+		}
+	}
+	return "", ""
+}
+
+// pyInheritedParamTypes types an override's unannotated parameters from the
+// nearest base method of the same name that annotates the same position.
+func pyInheritedParamTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
+	own := splitTopLevel(pyDefParams(symbol.RawText), ',')
+	var untyped []int
+	for i, g := range own {
+		g = strings.TrimSpace(g)
+		if g != "" && !strings.ContainsAny(g, ":=*") && g != "self" && g != "cls" {
+			untyped = append(untyped, i)
+		}
+	}
+	if len(untyped) == 0 {
+		return nil
+	}
+	for _, base := range pyBaseClasses(idx, symbol.ParentSymbol, dirOf(symbol.FilePath)) {
+		for _, m := range pyDunderTargets(idx, base, symbol.Name, dirOf(symbol.FilePath)) {
+			theirs := splitTopLevel(pyDefParams(m.RawText), ',')
+			out := map[string]string{}
+			for _, i := range untyped {
+				if i >= len(theirs) {
+					continue
+				}
+				_, ann, ok := strings.Cut(theirs[i], ":")
+				if !ok {
+					continue
+				}
+				if eq := strings.Index(ann, "="); eq >= 0 {
+					ann = ann[:eq]
+				}
+				if t := pyAnnotationType(idx, m, ann); t != "" {
+					out[strings.TrimSpace(own[i])] = t
+				}
+			}
+			if len(out) > 0 {
+				return out
+			}
 		}
 	}
 	return nil

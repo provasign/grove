@@ -1365,3 +1365,53 @@ func TestPyCallThroughClassPassesSelf(t *testing.T) {
 		t.Fatalf("click.Group.get_command(self, ...) must bind to Group.get_command only: %v", got)
 	}
 }
+
+// click/werkzeug receiver shapes: a chain through a typed attribute
+// (sub_ctx.command.invoke), a method result whose every definition returns
+// one type (cmd.make_context(...) -> Context), a decorator that declares the
+// argument it passes (@pass_context: Callable[Concatenate[Context, P], R]),
+// and an override's parameter typed by its base (def invoke(self, ctx)).
+func TestPyClickReceiverShapes(t *testing.T) {
+	py := func(id string, kind core.SymbolKind, name, parent, raw string, start int, ann []string, calls ...core.CallSite) core.SymbolRecord {
+		qn := name
+		if parent != "" {
+			qn = parent + "." + name
+		}
+		end := start + strings.Count(raw, "\n")
+		return core.SymbolRecord{ID: id, FilePath: "core.py", BlobSHA: "1", Language: "python", Kind: kind, Name: name, QualifiedName: qn,
+			ParentSymbol: parent, RawText: raw, Signature: strings.SplitN(raw, "\n", 2)[0], Annotations: ann, CallSites: calls,
+			Span: core.LineRange{Start: start, End: end}}
+	}
+	syms := []core.SymbolRecord{
+		py("Context", core.KindClass, "Context", "", "class Context:\n    command: Command\n", 1, nil),
+		py("Context.invoke", core.KindMethod, "invoke", "Context", "def invoke(self, callback, *args):\n    return callback()\n", 3, nil),
+		py("Command", core.KindClass, "Command", "", "class Command:\n    pass\n", 10, nil),
+		py("Command.invoke", core.KindMethod, "invoke", "Command", "def invoke(self, ctx: Context):\n    return None\n", 11, nil),
+		py("Command.make_context", core.KindMethod, "make_context", "Command", "def make_context(self, name) -> Context:\n    return Context()\n", 13, nil),
+		py("pass_context", core.KindFunction, "pass_context", "", "def pass_context(f: t.Callable[te.Concatenate[Context, P], R]) -> t.Callable[P, R]:\n    return f\n", 20, nil),
+		py("chain", core.KindFunction, "chain", "", "def chain(cmd):\n    sub_ctx = cmd.make_context('x')\n    return sub_ctx.command.invoke(sub_ctx)\n", 30, nil,
+			core.CallSite{Callee: "cmd.make_context", Line: 31, Col: 19, Argc: 1}, core.CallSite{Callee: "sub_ctx.command.invoke", Line: 32, Col: 28, Argc: 1}),
+		py("decorated", core.KindFunction, "cli", "", "def cli(ctx):\n    ctx.invoke(sync)\n", 40, []string{"click.pass_context"},
+			core.CallSite{Callee: "ctx.invoke", Line: 41, Col: 9, Argc: 1}),
+		py("Sub", core.KindClass, "Sub", "", "class Sub(Command):\n    pass\n", 50, nil),
+		py("Sub.invoke", core.KindMethod, "invoke", "Sub", "def invoke(self, ctx):\n    ctx.invoke(self.callback)\n", 51, nil,
+			core.CallSite{Callee: "ctx.invoke", Line: 52, Col: 9, Argc: 1}),
+	}
+	syms[8].Signature = "class Sub(Command):"
+	got := map[string]bool{}
+	for _, e := range BuildEdges(syms) {
+		if e.Type == core.EdgeCalls {
+			got[e.From+">"+e.To] = true
+		}
+	}
+	for _, want := range []string{"chain>Command.invoke", "decorated>Context.invoke", "Sub.invoke>Context.invoke"} {
+		if !got[want] {
+			t.Errorf("missing %s (all %v)", want, got)
+		}
+	}
+	for _, bad := range []string{"chain>Context.invoke", "decorated>Command.invoke", "Sub.invoke>Command.invoke", "Sub.invoke>Sub.invoke"} {
+		if got[bad] {
+			t.Errorf("unexpected %s", bad)
+		}
+	}
+}

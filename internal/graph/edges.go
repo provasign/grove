@@ -3564,6 +3564,14 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// Receiver narrowing didn't fire; try the inferred type of
 				// the receiver variable, then import qualification.
 				kept, dispatch, decided := narrowByLocalType(idx, sat, &symbol, localTypes, qualifier, calleeName, cands, scope)
+				if !decided && symbol.Language == "python" && strings.Contains(fullChain, ".") {
+					// `sub_ctx.command.invoke(...)`: type each hop through the
+					// class attributes (sub_ctx: Context, Context.command:
+					// Command), then narrow as for a typed receiver.
+					if t := pyChainType(idx, &symbol, localTypes, selfVars, fullChain); t != "" {
+						kept, dispatch, decided = narrowByLocalType(idx, sat, &symbol, map[string]string{qualifier: t}, qualifier, calleeName, cands, scope)
+					}
+				}
 				if !decided && (tsFamilyLang(symbol.Language) || symbol.Language == "java") && strings.Contains(fullChain, ".") {
 					// Multi-hop receiver (`this.connection.driver.escape`):
 					// walk the field-type chain and dispatch to the resolved
