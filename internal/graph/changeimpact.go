@@ -851,7 +851,9 @@ func declaredSuperNames(s *core.SymbolRecord) []string {
 		// PHP uses the same `extends`/`implements` keywords. Without this
 		// case a PHP class extending a vendor base always reported
 		// Completeness "closed" even though the contract left the index.
-		if s.Kind != core.KindClass && s.Kind != core.KindInterface {
+		// Java and PHP enums implement interfaces too.
+		if s.Kind != core.KindClass && s.Kind != core.KindInterface &&
+			!(s.Kind == core.KindEnum && (s.Language == "java" || s.Language == "php")) {
 			return nil
 		}
 		text := declHeader(s)
@@ -875,7 +877,7 @@ func declaredSuperNames(s *core.SymbolRecord) []string {
 		text := declHeader(s)
 		return swiftBaseNames(text)
 	case "kotlin":
-		if s.Kind != core.KindClass && s.Kind != core.KindInterface {
+		if s.Kind != core.KindClass && s.Kind != core.KindInterface && s.Kind != core.KindEnum {
 			return nil
 		}
 		text := declHeader(s)

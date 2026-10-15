@@ -1643,9 +1643,13 @@ func buildContains(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
 			// lexical parent's qualified name. Require the exact qualified
 			// prefix and enclosing span so an unrelated same-named function in
 			// the file cannot claim the child.
+			// KindEnum: Java/Kotlin/PHP/Swift/Rust enums carry methods, and
+			// an enum implementing an interface was in the subtype closure
+			// with no member to contribute (databind SerializableEnum left
+			// out of a "closed" JsonSerializable family).
 			typeParent := parent.Kind == core.KindStruct || parent.Kind == core.KindClass ||
 				parent.Kind == core.KindInterface || parent.Kind == core.KindTrait ||
-				parent.Kind == core.KindType
+				parent.Kind == core.KindType || parent.Kind == core.KindEnum
 			mainframeParent := (symbol.Language == "cobol" || symbol.Language == "jcl") &&
 				(parent.Kind == core.SymbolKind("program") || parent.Kind == core.SymbolKind("data-item") ||
 					parent.Kind == core.SymbolKind("job") || parent.Kind == core.SymbolKind("step") ||
@@ -1713,7 +1717,11 @@ func buildExtendsImplements(idx *edgeIndex, symbols []core.SymbolRecord) []core.
 	for _, symbol := range symbols {
 		switch symbol.Language {
 		case "typescript", "tsx", "javascript", "java":
-			if symbol.Kind != core.KindClass && symbol.Kind != core.KindInterface {
+			// A Java enum implements interfaces like a class does; skipping
+			// it left `enum Kind implements Shape` out of Shape's family
+			// while the answer still said closed (databind SerializableEnum).
+			if symbol.Kind != core.KindClass && symbol.Kind != core.KindInterface &&
+				!(symbol.Language == "java" && symbol.Kind == core.KindEnum) {
 				continue
 			}
 			text := declHeader(&symbol)
@@ -1748,7 +1756,7 @@ func buildExtendsImplements(idx *edgeIndex, symbols []core.SymbolRecord) []core.
 				edges = append(edges, resolveTypeEdges(idx, symbol, name, edgeType, 0.85)...)
 			}
 		case "php":
-			if symbol.Kind != core.KindClass && symbol.Kind != core.KindInterface && symbol.Kind != core.KindTrait {
+			if symbol.Kind != core.KindClass && symbol.Kind != core.KindInterface && symbol.Kind != core.KindTrait && symbol.Kind != core.KindEnum {
 				continue
 			}
 			text := declHeader(&symbol)
@@ -1848,8 +1856,9 @@ func buildExtendsImplements(idx *edgeIndex, symbols []core.SymbolRecord) []core.
 			// Kotlin uses `class Foo : Base(), IThing` (colon, like C#), but
 			// unlike C# the superclass is unambiguous syntactically: it is
 			// the one entry (if any) written with a constructor-call `()`.
-			// Every other entry is an interface.
-			if symbol.Kind != core.KindClass && symbol.Kind != core.KindInterface {
+			// Every other entry is an interface. `enum class E : Iface`
+			// implements too.
+			if symbol.Kind != core.KindClass && symbol.Kind != core.KindInterface && symbol.Kind != core.KindEnum {
 				continue
 			}
 			text := declHeader(&symbol)

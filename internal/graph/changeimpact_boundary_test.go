@@ -309,3 +309,37 @@ func snapshotSymbols(g *CodeGraph) []core.SymbolRecord {
 	syms, _ := g.Snapshot()
 	return syms
 }
+
+// An enum implementing an interface is part of the interface's family: its
+// method is contained by the enum like a class's. Without the containment
+// edge the enum sat in the subtype closure contributing nothing, and the
+// answer still said closed (databind SerializableEnum, 2026-10-14).
+func TestChangeImpactFamilyIncludesEnumImplementations(t *testing.T) {
+	for _, lang := range []string{"java", "kotlin", "php"} {
+		header := map[string][2]string{
+			"java":   {"public enum Kind implements Shape", "public class Circle implements Shape"},
+			"kotlin": {"enum class Kind : Shape", "class Circle : Shape"},
+			"php":    {"enum Kind: string implements Shape", "class Circle implements Shape"},
+		}[lang]
+		g := New()
+		g.Replace([]core.SymbolRecord{
+			{ID: "s::Shape", FilePath: "Shape." + lang, Language: lang, Kind: core.KindInterface, Name: "Shape", QualifiedName: "Shape", Signature: "interface Shape"},
+			{ID: "s::Shape.draw", FilePath: "Shape." + lang, Language: lang, Kind: core.KindMethod, Name: "draw", QualifiedName: "Shape.draw", ParentSymbol: "Shape", Signature: "void draw()"},
+			{ID: "c::Circle", FilePath: "Circle." + lang, Language: lang, Kind: core.KindClass, Name: "Circle", QualifiedName: "Circle", Signature: header[1]},
+			{ID: "c::Circle.draw", FilePath: "Circle." + lang, Language: lang, Kind: core.KindMethod, Name: "draw", QualifiedName: "Circle.draw", ParentSymbol: "Circle", Signature: "void draw()"},
+			{ID: "k::Kind", FilePath: "Kind." + lang, Language: lang, Kind: core.KindEnum, Name: "Kind", QualifiedName: "Kind", Signature: header[0]},
+			{ID: "k::Kind.draw", FilePath: "Kind." + lang, Language: lang, Kind: core.KindMethod, Name: "draw", QualifiedName: "Kind.draw", ParentSymbol: "Kind", Signature: "void draw()"},
+		}, 1)
+		r, err := g.ChangeImpact("Shape.draw")
+		if err != nil {
+			t.Fatalf("%s: %v", lang, err)
+		}
+		got := map[string]bool{}
+		for _, f := range r.Family {
+			got[f.ID] = true
+		}
+		if !got["c::Circle.draw"] || !got["k::Kind.draw"] {
+			t.Errorf("%s: family = %v, want Circle.draw and Kind.draw", lang, got)
+		}
+	}
+}
