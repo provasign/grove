@@ -529,6 +529,36 @@ func (loc symbolLocator) at(file, name string, line int) (core.SymbolRecord, boo
 		if found {
 			return best, true
 		}
+		// No span contains the line (javac's line can sit on an annotation
+		// above the parsed declaration): the same-named symbol starting
+		// nearest it, not whichever the name map holds. That map's winner
+		// depended on input order, so a full and an incremental build bound
+		// FastDateParser.parse's calls to different methods (fuzz,
+		// 2026-10-16: CopyQuotedStrategy.parse).
+		dist, named := -1, 0
+		for _, s := range loc.byFile[file] {
+			if s.Name != name {
+				continue
+			}
+			named++
+			d := s.Span.Start - line
+			if d < 0 {
+				d = -d
+			}
+			if dist < 0 || d < dist {
+				best, dist = s, d
+			}
+		}
+		if dist >= 0 && dist <= 5 {
+			return best, true
+		}
+		if named > 1 {
+			// Several same-named symbols and none near the line: the
+			// compiler named a declaration the parser did not index (a
+			// garbled file lost FastDateParser's later parse overloads).
+			// Binding it to the earliest same-named method was a wrong edge.
+			return core.SymbolRecord{}, false
+		}
 	}
 	s, ok := loc.byName[file+"\x00"+name]
 	return s, ok
