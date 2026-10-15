@@ -338,6 +338,64 @@ func (idx *edgeIndex) pyModuleFiles(fromFile, modPath string) []string {
 	return out
 }
 
+// pyHierarchyKnown reports whether every base in cls's ancestry (four
+// levels) is an indexed class; an aliased or external base hides what the
+// class inherits (flask: `class Blueprint(SansioBlueprint)`).
+func pyHierarchyKnown(idx *edgeIndex, cls, dir string) bool {
+	level := []string{cls}
+	seen := map[string]bool{}
+	for depth := 0; depth < 4 && len(level) > 0; depth++ {
+		var next []string
+		for _, c := range level {
+			if seen[c] {
+				continue
+			}
+			seen[c] = true
+			classes := 0
+			for _, cand := range idx.byName[strings.ToLower(c)] {
+				if cand.Name == c && cand.Kind == core.KindClass && cand.Language == "python" {
+					classes++
+				}
+			}
+			if classes > 1 {
+				return false // two classes share the name: the walk cannot tell them apart
+			}
+			for _, b := range pyBaseClasses(idx, c, dir) {
+				if b == "object" || b == "ABC" || b == "abc.ABC" || b == "t.Generic" || strings.HasPrefix(b, "Generic[") {
+					continue
+				}
+				if !typeSymbolExists(idx, b) {
+					return false
+				}
+				next = append(next, b)
+			}
+		}
+		level = next
+	}
+	return true
+}
+
+// pyIsSubclass reports whether cls inherits from base (within four levels).
+func pyIsSubclass(idx *edgeIndex, cls, base, dir string) bool {
+	level := []string{cls}
+	seen := map[string]bool{}
+	for depth := 0; depth < 5 && len(level) > 0; depth++ {
+		var next []string
+		for _, c := range level {
+			if c == base && depth > 0 {
+				return true
+			}
+			if seen[c] {
+				continue
+			}
+			seen[c] = true
+			next = append(next, pyBaseClasses(idx, c, dir)...)
+		}
+		level = next
+	}
+	return false
+}
+
 // pyNestedInPackage reports whether key matched the absolute module path
 // suffix only below a package: in pkg/json, pkg/ has an __init__.py, so the
 // module is pkg.json and `import json` is the standard library's (flask's
@@ -2383,6 +2441,19 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			if _, isSelf := attrSelfVars[qualifier]; isSelf && classLanguage(symbol.Language) && len(filterByParent(cands, symbol.ParentSymbol)) == 0 {
 				if inherited := inheritedTargets(idx, &symbol, name, true); len(inherited) > 0 {
 					cands = inherited
+				} else if symbol.Language == "python" && symbol.ParentSymbol != "" && pyHierarchyKnown(idx, symbol.ParentSymbol, dirOf(symbol.FilePath)) {
+					// Neither the class nor an ancestor declares it: a plain
+					// instance attribute, or a subclass's property (self may
+					// be a subclass instance) — never an unrelated class's
+					// (flask Blueprint self.name -> App.name, oracle review
+					// 2026-10-15).
+					var sub []*core.SymbolRecord
+					for _, cand := range cands {
+						if pyIsSubclass(idx, cand.ParentSymbol, symbol.ParentSymbol, dirOf(cand.FilePath)) {
+							sub = append(sub, cand)
+						}
+					}
+					cands = sub
 				}
 			}
 			if symbol.Language == "python" && len(cands) == 0 && qualifier != "" {

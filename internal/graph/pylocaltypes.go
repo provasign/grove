@@ -889,8 +889,30 @@ func pyClassAttrTypes(idx *edgeIndex, symbol *core.SymbolRecord, className strin
 				record(m[1], m[2])
 			}
 		}
+		// `self.serializer = serializer` with `serializer: TaggedJSONSerializer`
+		// in the signature (flask JSONTag, oracle review 2026-10-15).
+		paramTypes := map[string]string{}
+		if params := pyDefParams(init.RawText); params != "" {
+			for _, g := range splitTopLevel(params, ',') {
+				name, ann, ok := strings.Cut(strings.TrimSpace(g), ":")
+				if !ok {
+					continue
+				}
+				if eq := strings.Index(ann, "="); eq >= 0 {
+					ann = ann[:eq]
+				}
+				if t := pyAnnotationType(idx, init, ann); t != "" {
+					paramTypes[strings.TrimSpace(strings.TrimLeft(name, "*"))] = t
+				}
+			}
+		}
+		for _, m := range pySelfParamRe.FindAllStringSubmatch(body, -1) {
+			record(m[1], paramTypes[m[2]])
+		}
 	}
 }
+
+var pySelfParamRe = regexp.MustCompile(`(?m)^\s*self\.(\w+)\s*=\s*(\w+)\s*$`)
 
 // pyClassAttrs holds a class body's own attribute statements: annotations
 // (`name: T`, `name: T = v`) and class references (`name = SomeClass`), as

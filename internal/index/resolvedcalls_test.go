@@ -480,3 +480,21 @@ func TestPythonStdlibModuleAndBuiltinReceivers(t *testing.T) {
 		}
 	}
 }
+
+// Python: `self.x = param` takes the parameter's annotation, and `self.name`
+// in a class whose hierarchy declares no `name` is not another class's
+// property (oracle review 2026-10-15: flask JSONTag, Blueprint.name).
+func TestPythonSelfAttributes(t *testing.T) {
+	got, _, _ := callEdges(t, map[string]string{
+		"pkg/m.py": "class Serializer:\n    def tag(self, v):\n        return v\n\n\nclass Tagger:\n    def tag(self, v):\n        return v\n\n\n" +
+			"class Holder:\n    def __init__(self, serializer: Serializer) -> None:\n        self.serializer = serializer\n\n    def go(self, v):\n        return self.serializer.tag(v)\n\n\n" +
+			"class App:\n    @property\n    def name(self):\n        return \"app\"\n\n\n" +
+			"class Blueprint:\n    def __init__(self, name):\n        self.name = name\n\n    def check(self):\n        return self.name\n",
+	})
+	if got["Holder.go→Tagger.tag"] || !got["Holder.go→Serializer.tag"] {
+		t.Errorf("self.serializer.tag not typed by the __init__ annotation: %v", got)
+	}
+	if got["Blueprint.check→App.name"] {
+		t.Error("self.name bound to an unrelated class's property")
+	}
+}
