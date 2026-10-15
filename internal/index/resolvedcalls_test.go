@@ -670,3 +670,21 @@ func TestGoFuncFieldCalls(t *testing.T) {
 		"args.go": "package m\n\nfunc NoArgs(n int) error { return nil }\n\nfunc New() *Cmd { return &Cmd{} }\n",
 	}, "go")
 }
+
+// Swift: a generic-specialized initializer is a call, and a protocol
+// extension's member is reached through a conforming type.
+func TestSwiftGenericInitAndProtocolExtension(t *testing.T) {
+	got, _, _ := callEdges(t, map[string]string{
+		"Sources/G.swift": "protocol Location { var path: String { get } }\nextension Location {\n    func delete() { print(path) }\n}\n" +
+			"struct Storage<T> {\n    let path: String\n    init(path: String) { self.path = path }\n}\n" +
+			"struct Folder: Location {\n    let path: String\n}\n" +
+			"func make() -> Storage<Int> {\n    return Storage<Int>(path: \"a\")\n}\n" +
+			"func cleanup(folder: Folder) {\n    folder.delete()\n}\n",
+	})
+	if !got["make→Storage.init"] {
+		t.Errorf("generic initializer call missing: %v", got)
+	}
+	if !got["cleanup→Location.delete"] {
+		t.Errorf("protocol extension member via conformance missing: %v", got)
+	}
+}

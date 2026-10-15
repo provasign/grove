@@ -585,6 +585,20 @@ func narrowByLocalType(idx *edgeIndex, sat *interfaceSatisfaction, caller *core.
 	if len(byType) == 0 && caller != nil && caller.Language == "csharp" {
 		byType = csharpExtensionTargets(cands, typ)
 	}
+	if len(byType) == 0 && caller != nil && caller.Language == "swift" {
+		// A protocol extension's member reaches every conforming type
+		// (Files: folder.delete() runs `extension Location { func delete() }`
+		// for Folder: Location).
+		bases := swiftConformances(idx, typ, dirOf(caller.FilePath))
+		for level := 0; level < 4 && len(bases) > 0 && len(byType) == 0; level++ {
+			var next []string
+			for _, b := range bases {
+				byType = append(byType, filterByParent(pool, b)...)
+				next = append(next, swiftConformances(idx, b, dirOf(caller.FilePath))...)
+			}
+			bases = next
+		}
+	}
 	// Class-hierarchy dispatch: a receiver typed by a class or interface
 	// runs whichever subtype's override the instance carries. The declared
 	// method (byType) stays; the overrides and implementors join as

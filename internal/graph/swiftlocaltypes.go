@@ -33,6 +33,26 @@ func swiftBaseClasses(idx *edgeIndex, className, preferDir string) []string {
 	return names[:1]
 }
 
+// swiftConformances lists every indexed supertype a Swift type declares:
+// its superclass and the protocols it conforms to.
+func swiftConformances(idx *edgeIndex, typeName, preferDir string) []string {
+	decl := tsChosenTypeDecl(idx, typeName, preferDir)
+	if decl == nil {
+		return nil
+	}
+	text := codeSignature(decl)
+	if text == "" {
+		text = maskCode(decl.Language, firstLine(decl.RawText))
+	}
+	var out []string
+	for _, n := range swiftBaseNames(text) {
+		if typeSymbolExists(idx, n) {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
 var (
 	// let x: Type = ... / var x: Type
 	swiftLetTypedRe = regexp.MustCompile(`(?m)\b(?:let|var)\s+([a-z_]\w*)\s*:\s*([^=;\n{]+)`)
