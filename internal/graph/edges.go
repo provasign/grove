@@ -3159,7 +3159,11 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// `throw LocationError(path:..)` where `typealias
 				// LocationError = FilesError<LocationErrorReason>`: the
 				// call constructs the aliased type.
-				if target := swiftTypealiasTarget(idx, calleeName); target != "" {
+				target := swiftTypealiasTarget(idx, calleeName)
+				if target == "" && calleeName == "Iterator" {
+					target = swiftSequenceIterator(idx, &symbol)
+				}
+				if target != "" {
 					cands, capped = resolveCallees(idx, &symbol, target, scope, true, sameFileWins)
 				}
 			}
@@ -3211,6 +3215,19 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// in-repo value, just an untyped one.
 				_, isSelf := selfVars[qualifier]
 				typ, typed := localTypes[qualifier]
+				if !typed && !isSelf {
+					// Folder.home.createSubfolderIfNeeded(...): astkit keeps
+					// only `home`; the chain is typed through the static
+					// property's declaration.
+					chain := fullChain
+					if !strings.Contains(chain, ".") {
+						chain = csReceiverChainAt(&symbol, cs, calleeName)
+					}
+					if t := swiftChainType(idx, &symbol, localTypes, chain); t != "" {
+						typ, typed = t, true
+						localTypes[qualifier] = t
+					}
+				}
 				external := !typed && !swiftTypeIndexed(idx, qualifier) || typed && !swiftTypeIndexed(idx, typ)
 				if !isSelf && external {
 					// Except an in-repo extension of that external type:

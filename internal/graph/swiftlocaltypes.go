@@ -59,7 +59,10 @@ var (
 	// let x = Type(...) / var x = Mod.Type(...) — Swift's plain call-syntax
 	// initializer, indistinguishable at the source level from a function
 	// call, so only a Capitalized callee is treated as a constructor.
-	swiftLetCtorRe = regexp.MustCompile(`(?m)\b(?:let|var)\s+([a-z_]\w*)\s*=\s*(?:[A-Za-z_]\w*\.)*([A-Z]\w*)\s*\(`)
+	swiftLetCtorRe = regexp.MustCompile(`(?m)\b(?:let|var)\s+([a-z_]\w*)\s*=\s*(?:try[?!]?\s+)?(?:await\s+)?(?:[A-Za-z_]\w*\.)*([A-Z]\w*)\s*\(`)
+	// let file = try folder.createFile(named: "x"): typed by the method's
+	// declared result.
+	swiftLetCallRe = regexp.MustCompile(`(?m)\b(?:let|var)\s+([a-z_]\w*)\s*=\s*(?:try[?!]?\s+)?(?:await\s+)?([a-z_]\w*)\.([a-z_]\w*)\s*\(`)
 	// func f(name: Type, _ other: Type, ext int: Type) — parameter list
 	// entries; the internal name is the token right before the colon.
 	swiftParamRe = regexp.MustCompile(`(?:(?:[A-Za-z_]\w*|_)\s+)?([a-z_]\w*)\s*:\s*([^,)=]+)`)
@@ -135,8 +138,142 @@ func swiftLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]strin
 		if i := strings.IndexByte(typ, '<'); i > 0 && typ[0] != '[' {
 			out[name] = typ[:i]
 		}
+		if typ == "Iterator" && !swiftTypeIndexed(idx, typ) {
+			if it := swiftSequenceIterator(idx, symbol); it != "" {
+				out[name] = it
+			}
+		}
+	}
+	if symbol.RawText != "" {
+		body := maskCode(symbol.Language, symbol.RawText)
+		for _, m := range swiftLetCallRe.FindAllStringSubmatch(body, -1) {
+			if _, done := out[m[1]]; done {
+				continue
+			}
+			recv := out[m[2]]
+			if recv == "" || recv[0] == '[' {
+				continue
+			}
+			if ret := swiftMethodReturnType(idx, recv, m[3], dirOf(symbol.FilePath)); ret != "" {
+				out[m[1]] = ret
+			}
+		}
 	}
 	return out
+}
+
+// swiftReturnTypeName reads the bare result type of a Swift function
+// signature (`func createFile(named: String) throws -> File` -> File), ""
+// for none, a container or a type parameter.
+func swiftReturnTypeName(sig string) string {
+	i := strings.LastIndex(sig, "->")
+	if i < 0 {
+		return ""
+	}
+	t := strings.TrimSpace(sig[i+2:])
+	if j := strings.IndexByte(t, '{'); j >= 0 {
+		t = strings.TrimSpace(t[:j])
+	}
+	if j := strings.Index(t, " where "); j >= 0 {
+		t = t[:j]
+	}
+	t = strings.TrimRight(strings.TrimSpace(t), "?!")
+	if k := strings.IndexByte(t, '<'); k > 0 {
+		t = t[:k]
+	}
+	if k := strings.LastIndexByte(t, '.'); k >= 0 {
+		t = t[k+1:]
+	}
+	if t == "" || t[0] < 'A' || t[0] > 'Z' || strings.ContainsAny(t, "[]() ,") {
+		return ""
+	}
+	return t
+}
+
+// swiftMethodReturnType is the declared result of typ's (or a conformed
+// protocol's / extension's) method name, when exactly one type results.
+func swiftMethodReturnType(idx *edgeIndex, typ, name, preferDir string) string {
+	owners := append([]string{typ}, swiftConformances(idx, typ, preferDir)...)
+	ret := ""
+	for _, o := range owners {
+		for _, f := range idx.byName[strings.ToLower(name)] {
+			if f.Name != name || f.Language != "swift" || f.ParentSymbol != o || !graphCallableSymbol(f) {
+				continue
+			}
+			r := swiftReturnTypeName(codeSignature(f))
+			if r == "Self" {
+				r = typ
+			}
+			if r == "" || ret != "" && ret != r {
+				return ""
+			}
+			ret = r
+		}
+		if ret != "" {
+			return ret
+		}
+	}
+	return ret
+}
+
+// swiftSequenceIterator names `Iterator` inside a Sequence type: the
+// associated type its makeIterator() returns (Files' ChildSequence:
+// ChildIterator).
+func swiftSequenceIterator(idx *edgeIndex, symbol *core.SymbolRecord) string {
+	if symbol.ParentSymbol == "" {
+		return ""
+	}
+	for _, m := range idx.byName["makeiterator"] {
+		if m.Language == "swift" && m.ParentSymbol == symbol.ParentSymbol {
+			if r := swiftReturnTypeName(codeSignature(m)); r != "" {
+				return r
+			}
+		}
+	}
+	return ""
+}
+
+// swiftChainType types a dotted receiver chain (`Folder.home`) hop by hop:
+// the head is a typed local or a type name, each later hop a property
+// declared on the type reached so far (its extensions included).
+func swiftChainType(idx *edgeIndex, symbol *core.SymbolRecord, localTypes map[string]string, chain string) string {
+	parts := strings.Split(chain, ".")
+	for len(parts) > 0 && parts[0] == "self" {
+		parts = parts[1:]
+	}
+	if len(parts) < 2 {
+		return ""
+	}
+	cur, ok := localTypes[parts[0]]
+	if !ok {
+		if !swiftTypeIndexed(idx, parts[0]) {
+			return ""
+		}
+		cur = parts[0]
+	}
+	for _, seg := range parts[1:] {
+		next := ""
+		for _, f := range idx.byName[strings.ToLower(seg)] {
+			if f.Name != seg || f.Language != "swift" || f.Kind != core.KindField || f.ParentSymbol != cur {
+				continue
+			}
+			if m := swiftLetTypedRe.FindStringSubmatch(codeSignature(f)); m != nil {
+				next = swiftShapeType(m[2])
+			}
+			break
+		}
+		if i := strings.IndexByte(next, '<'); i > 0 {
+			next = next[:i]
+		}
+		if next == "Self" {
+			next = cur
+		}
+		if next == "" || next[0] == '[' {
+			return ""
+		}
+		cur = next
+	}
+	return cur
 }
 
 // swiftShapeType normalizes a declared type for overload matching, keeping
