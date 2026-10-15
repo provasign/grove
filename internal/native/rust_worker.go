@@ -95,6 +95,8 @@ func (w *rustLSP) start() error {
 	cmd.Env = append(os.Environ(), "CARGO_TARGET_DIR="+rustAnalyzerTargetDir(w.root))
 	w.errText = &limitedBuffer{buf: &bytes.Buffer{}, max: 8 << 10}
 	cmd.Stderr = w.errText
+	cmd.WaitDelay = 2 * time.Second // see residentWorker.startLocked
+	isolateProcessGroup(cmd)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err
@@ -173,9 +175,7 @@ func (w *rustLSP) touch() {
 }
 
 func (w *rustLSP) stop() {
-	if w.cmd != nil && w.cmd.Process != nil {
-		_ = w.cmd.Process.Kill()
-	}
+	killProcessTree(w.cmd) // rust-analyzer's proc-macro servers too
 }
 
 func (w *rustLSP) read(r *bufio.Reader) {

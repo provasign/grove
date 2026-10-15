@@ -114,6 +114,11 @@ func (w *residentWorker) startLocked() error {
 	}
 	w.errs = &limitedWriter{max: 64 << 10}
 	cmd.Stderr = w.errs
+	// Wait returns once the process exits and its output is copied; a
+	// descendant still holding the pipes made it block forever (with the
+	// worker's lock held) and leaked the copy goroutines.
+	cmd.WaitDelay = 2 * time.Second
+	isolateProcessGroup(cmd)
 	if err := cmd.Start(); err != nil {
 		return err
 	}
@@ -130,7 +135,7 @@ func (w *residentWorker) stopLocked() {
 		return
 	}
 	_ = w.stdin.Close()
-	_ = w.cmd.Process.Kill()
+	killProcessTree(w.cmd)
 	_ = w.cmd.Wait()
 	w.cmd, w.stdin, w.out = nil, nil, nil
 }
