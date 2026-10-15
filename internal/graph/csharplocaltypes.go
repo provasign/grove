@@ -17,6 +17,12 @@ import (
 var (
 	// var x = new Foo(...) / var x = new Foo<T> { ... }
 	csharpVarNewRe = regexp.MustCompile(`(?m)\bvar\s+(\w+)\s*=\s*new\s+([A-Z]\w*)`)
+	// var o = (JObject)token;
+	csharpVarCastRe = regexp.MustCompile(`(?m)\bvar\s+(\w+)\s*=\s*\(\s*([A-Z][\w.]*(?:<[^<>]*>)?)\s*\)\s*[\w(]`)
+	// var o = token as JObject;
+	csharpVarAsRe = regexp.MustCompile(`(?m)\bvar\s+(\w+)\s*=\s*[^;]*?\bas\s+([A-Z][\w.]*(?:<[^<>]*>)?)\s*;`)
+	// var j = JObject.Parse(...); / var b = HexToBytes(...);
+	csharpVarCallRe = regexp.MustCompile(`(?m)\bvar\s+(\w+)\s*=\s*(?:([A-Z]\w*)\.)?([A-Z]\w*)\s*(?:<[^<>]*>)?\s*\(`)
 	// Type x = ... / Type x; / for (Type x : — uppercase-initial type
 	csharpLocalDeclRe = regexp.MustCompile(`(?m)(?:^|[;{}()]\s*)\s*([A-Z]\w*)(?:<[^<>]*>)?(?:\[\])?\s+(\w+)\s*[=;)]`)
 	// foreach (Type x in ...)
@@ -47,7 +53,7 @@ func csharpLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]stri
 					// Top-level members only (classBody): a method's local
 					// `Foo helper = ...` or a commented-out field is not one.
 					for _, m := range csharpFieldRe.FindAllStringSubmatch(classBody(idx, cls), -1) {
-						if t := javaBareType(m[1]); t != "" && !csharpKeyword(t) {
+						if t := javaBareType(m[1]); t != "" && csTypedLocal(idx, t) {
 							if _, exists := out[m[2]]; !exists {
 								out[m[2]] = t
 							}
@@ -71,7 +77,7 @@ func csharpLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]stri
 			if len(fields) != 2 {
 				continue
 			}
-			if t := javaBareType(fields[0]); t != "" && !csharpKeyword(t) {
+			if t := javaBareType(fields[0]); t != "" && csTypedLocal(idx, t) {
 				out[fields[1]] = t
 			}
 		}
@@ -84,18 +90,42 @@ func csharpLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]stri
 			body = body[i+1:]
 		}
 		for _, m := range csharpForeachRe.FindAllStringSubmatch(body, -1) {
-			if t := javaBareType(m[1]); t != "" && !csharpKeyword(t) {
+			if t := javaBareType(m[1]); t != "" && csTypedLocal(idx, t) {
 				out[m[2]] = t
 			}
 		}
 		for _, m := range csharpLocalDeclRe.FindAllStringSubmatch(body, -1) {
-			if t := javaBareType(m[1]); t != "" && !csharpKeyword(t) {
+			if t := javaBareType(m[1]); t != "" && csTypedLocal(idx, t) {
 				out[m[2]] = t
 			}
 		}
 		for _, m := range csharpIsPatternRe.FindAllStringSubmatch(body, -1) {
-			if t := javaBareType(m[1]); t != "" && !csharpKeyword(t) {
+			if t := javaBareType(m[1]); t != "" && csTypedLocal(idx, t) {
 				out[m[2]] = t
+			}
+		}
+		// var x = (T)y / y as T / T.Make(...) / Make(...): the cast type, or
+		// our method's declared return type (JObject.Parse -> JObject).
+		for _, m := range csharpVarCastRe.FindAllStringSubmatch(body, -1) {
+			if t := csNormalizeType(m[2]); typeSymbolExists(idx, t) {
+				out[m[1]] = t
+			}
+		}
+		for _, m := range csharpVarAsRe.FindAllStringSubmatch(body, -1) {
+			if t := csNormalizeType(m[2]); typeSymbolExists(idx, t) {
+				out[m[1]] = t
+			}
+		}
+		for _, m := range csharpVarCallRe.FindAllStringSubmatch(body, -1) {
+			name := m[3]
+			var rets []string
+			if owner := m[2]; owner != "" && typeSymbolExists(idx, owner) {
+				rets = csOwnerMethodReturnTypes(idx, owner, name)
+			} else if owner == "" {
+				rets, _ = csProducerReturnTypes(idx, name)
+			}
+			if len(rets) == 1 && typeSymbolExists(idx, rets[0]) {
+				out[m[1]] = rets[0]
 			}
 		}
 		// var x = new Type() overrides any spurious local-decl capture.
@@ -132,6 +162,42 @@ func csharpParamModifier(s string) bool {
 		return true
 	}
 	return strings.HasPrefix(s, "[") // attribute
+}
+
+// csOwnerMethodReturnTypes is csProducerReturnTypes restricted to the
+// methods declared by owner.
+func csOwnerMethodReturnTypes(idx *edgeIndex, owner, name string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, f := range idx.byName[strings.ToLower(name)] {
+		if f.Name != name || f.Language != "csharp" || f.ParentSymbol != owner {
+			continue
+		}
+		ret := csDeclaredReturnType(f.Signature, name)
+		if ret == "" || ret == "void" || len(ret) <= 2 && strings.ToUpper(ret) == ret {
+			return nil
+		}
+		if !seen[ret] {
+			seen[ret] = true
+			out = append(out, ret)
+		}
+	}
+	return out
+}
+
+// csTypedLocal: a declared local/field type worth recording. A BCL type is
+// recorded when no type of ours shares its name, so extension methods on
+// it resolve (t.IsEnum() on a Type); collection interfaces stay out: LINQ
+// look-alike extension sets (LinqBridge) cannot be told apart by arity.
+func csTypedLocal(idx *edgeIndex, t string) bool {
+	if !csharpKeyword(t) {
+		return true
+	}
+	switch t {
+	case "IEnumerable", "IList", "ICollection", "List", "Dictionary", "IDictionary", "Func", "Action", "Task", "ValueTask", "Nullable":
+		return false
+	}
+	return !typeSymbolExists(idx, t)
 }
 
 // csharpKeyword rejects C# contextual/builtin tokens that look like
@@ -499,6 +565,16 @@ func csNarrowOverloads(idx *edgeIndex, cands []*core.SymbolRecord, args []string
 					allKnown = false
 					continue
 				}
+			case strings.HasPrefix(argName, "call:"):
+				// HexToBytes("4A") as an argument: typed by our method's
+				// declared return type when it names exactly one.
+				rets, _ := csProducerReturnTypes(idx, argName[len("call:"):])
+				if len(rets) != 1 {
+					allExact = false
+					allKnown = false
+					continue
+				}
+				argType = rets[0]
 			default:
 				t, known := argTypes[argName]
 				if !known {

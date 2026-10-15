@@ -795,8 +795,11 @@ func csharpExtensionTargets(cands []*core.SymbolRecord, receiverType string) []*
 		}
 		first := strings.TrimSpace(strings.SplitN(params, ",", 2)[0])
 		fields := strings.Fields(first)
-		if len(fields) >= 3 && fields[0] == "this" && csNormalizeType(fields[1]) == receiverType {
-			out = append(out, cand)
+		if len(fields) >= 3 && fields[0] == "this" {
+			ext := csNormalizeType(fields[1])
+			if ext == receiverType {
+				out = append(out, cand)
+			}
 		}
 	}
 	return out

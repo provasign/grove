@@ -561,3 +561,43 @@ func TestObjCClassAndInstanceSelectors(t *testing.T) {
 		t.Errorf("want calls from run and go, got %v", per)
 	}
 }
+
+// C#: a BCL-typed receiver reaches our extension methods on that type;
+// `var` locals take a cast's type or our producer's return type; a call
+// argument is typed by our method's return type.
+func TestCSharpReceiverAndArgumentTyping(t *testing.T) {
+	got, _, _ := callEdges(t, map[string]string{
+		"Lib.cs": `namespace N {
+public static class TypeExtensions { public static bool IsEnum(this System.Type t) { return false; } }
+public class JObject {
+  public static JObject Parse(string s) { return new JObject(); }
+  public void CreateReader() {}
+}
+public class JArray { public void CreateReader() {} }
+public class W {
+  public void WriteValue(byte[] b) {}
+  public void WriteValue(string s) {}
+  public void WriteValue(int i) {}
+  public void WriteValue(long l) {}
+  public void WriteValue(bool b) {}
+  public void WriteValue(char c) {}
+}
+public class Util { public static byte[] HexToBytes(string s) { return null; } }
+}
+`,
+		"Use.cs": `namespace N {
+public class Use {
+  public bool A(System.Type t) { return t.IsEnum(); }
+  public void B(object token) { var o = (JObject)token; o.CreateReader(); var j = JObject.Parse("{}"); j.CreateReader(); }
+  public void C(W w) { w.WriteValue(Util.HexToBytes("4A")); w.WriteValue("#" + 1); }
+}
+}
+`,
+	})
+	if !got["Use.A→TypeExtensions.IsEnum"] {
+		t.Errorf("extension on a BCL-typed receiver missing: %v", got)
+	}
+	if got["Use.B→JArray.CreateReader"] || !got["Use.B→JObject.CreateReader"] {
+		t.Errorf("var typed by cast/producer not applied: %v", got)
+	}
+}

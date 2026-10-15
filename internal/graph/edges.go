@@ -2672,6 +2672,21 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					callPos += ":" + strconv.Itoa(cs.Col)
 				}
 			}
+			if symbol.Language == "csharp" {
+				// A call argument our methods cannot type is unknown, so the
+				// text recovery below still runs (value.GetValueOrDefault()
+				// is typed from value's declaration there).
+				for i, a := range cs.Args {
+					if name, ok := strings.CutPrefix(a, "call:"); ok {
+						if rets, _ := csProducerReturnTypes(idx, name); len(rets) != 1 {
+							if i == 0 || cs.Args[i] == a {
+								cs.Args = append([]string(nil), cs.Args...)
+							}
+							cs.Args[i] = ""
+						}
+					}
+				}
+			}
 			if symbol.Language == "csharp" && cs.Argc > 0 && hasUnknownArg(cs.Args, cs.Argc) {
 				if csArgTypeCache == nil {
 					csArgTypeCache = csharpArgTypes(idx, &symbol)

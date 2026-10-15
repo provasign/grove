@@ -54,7 +54,9 @@ var securityExtensions = map[string]bool{
 // 2026-10-16.2: JS/TS receivers behind `!` or parentheses are kept; an
 // unnamed receiver (`a[i].m()`) is "<expr>", not a bare call.
 // 2026-10-16.3: names imported from packages are recorded (core.JSImportPackage).
-const ExtractorVersion = "2026-10-16.3"
+// 2026-10-16.4: argument tokens for string concatenation, C# invocations
+// (call:Name, ToString), array creation, typeof, parentheses and x!.
+const ExtractorVersion = "2026-10-16.4"
 
 // DetectLanguage returns the Grove language tag for a file path.
 // Returns "" for unsupported or security-excluded files.
