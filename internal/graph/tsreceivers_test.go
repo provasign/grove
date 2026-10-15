@@ -60,3 +60,48 @@ func TestTSStatedReceiverTypesNarrowCalls(t *testing.T) {
 		}
 	}
 }
+
+// One body assigning a name several classes (a benchmark's `const router =
+// new RegExpRouter()` / `new TrieRouter()` in sibling callbacks): each call
+// binds to the closest assignment above it. A function-valued field is the
+// method (`match: typeof match = match`). A `name!: T` field is typed.
+func TestTSReassignedReceiversFieldMethodsAndDefiniteFields(t *testing.T) {
+	mk := func(id, file string, kind core.SymbolKind, name, parent, sig, raw string, span int, calls ...core.CallSite) core.SymbolRecord {
+		qn := name
+		if parent != "" {
+			qn = parent + "." + name
+		}
+		return core.SymbolRecord{ID: id, FilePath: file, BlobSHA: "1", Language: "typescript", Kind: kind,
+			Name: name, QualifiedName: qn, ParentSymbol: parent, Signature: sig, RawText: raw, CallSites: calls,
+			Span: core.LineRange{Start: span, End: span + 20}, Imports: []string{"./r"}}
+	}
+	syms := []core.SymbolRecord{
+		mk("r::A", "r.ts", core.KindClass, "A", "", "class A", "class A {\n  match(m: string) { return m }\n}", 1),
+		mk("r::A.match", "r.ts", core.KindMethod, "match", "A", "match(m: string)", "match(m: string) { return m }", 2),
+		mk("r::B", "r.ts", core.KindClass, "B", "", "class B", "class B {\n  match: typeof f = f\n}", 5),
+		mk("r::B.match", "r.ts", core.KindField, "match", "B", "match: typeof f = f", "match: typeof f = f", 6),
+		mk("r::App", "r.ts", core.KindClass, "App", "", "class App", "class App {\n  router!: A\n  run() { this.router.match('x') }\n}", 9),
+		mk("r::App.router", "r.ts", core.KindField, "router", "App", "router!: A", "router!: A", 10),
+		mk("r::App.run", "r.ts", core.KindMethod, "run", "App", "run()", "run() { this.router.match('x') }", 11,
+			core.CallSite{Callee: "router.match", Line: 11, Col: 28, Argc: 1}),
+		mk("b::<top-level>", "b.ts", core.KindFunction, "<top-level>", "", "",
+			"bench(() => {\n  const router = new A()\n  router.match('x')\n})\nbench(() => {\n  const router = new B()\n  router.match('y')\n})\n", 1,
+			core.CallSite{Callee: "router.match", Line: 3, Col: 10, Argc: 1},
+			core.CallSite{Callee: "router.match", Line: 7, Col: 10, Argc: 1}),
+	}
+	lines := map[string]string{}
+	for _, e := range BuildEdges(syms) {
+		if e.Type == core.EdgeCalls {
+			lines[e.From+">"+e.To] = e.Lines
+		}
+	}
+	for key, want := range map[string]string{
+		"b::<top-level>>r::A.match": "3:10",
+		"b::<top-level>>r::B.match": "7:10",
+		"r::App.run>r::A.match":     "11:28",
+	} {
+		if lines[key] != want {
+			t.Errorf("%s lines = %q, want %q (all %v)", key, lines[key], want, lines)
+		}
+	}
+}

@@ -2,6 +2,7 @@ package graph
 
 import (
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/provasign/grove/internal/core"
@@ -15,9 +16,9 @@ import (
 
 var (
 	// field signature: "public transport: Transport = default"
-	tsFieldSigRe = regexp.MustCompile(`(\w+)\??\s*:\s*([^=;]+?)\s*(?:=|;|$)`)
+	tsFieldSigRe = regexp.MustCompile(`(\w+)[?!]?\s*:\s*([^=;]+?)\s*(?:=|;|$)`)
 	// constructor parameter property: "private readonly opts: Options"
-	tsCtorPropRe = regexp.MustCompile(`(?:public|private|protected)\s+(?:readonly\s+)?(\w+)\??\s*:\s*([A-Za-z_][\w.<>\[\]| ]*)`)
+	tsCtorPropRe = regexp.MustCompile(`(?:public|private|protected)\s+(?:readonly\s+)?(\w+)[?!]?\s*:\s*([A-Za-z_][\w.<>\[\]| ]*)`)
 	// x = new Type(...) / this.x = new pkg.Type(...)
 	tsNewAssignRe = regexp.MustCompile(`(?:this\.)?(\w+)\s*=\s*new\s+(?:\w+\.)*([A-Z]\w*)`)
 	// const x: Type = ... / let x: Type = ...
@@ -27,11 +28,11 @@ var (
 	// class-body field declaration: "protected readonly driver: Driver" —
 	// applied to one class-body statement already stripped of any initializer
 	// and known not to contain '(' (which would make it a method).
-	tsBodyFieldRe = regexp.MustCompile(`^(?:(?:public|private|protected|readonly|static|declare|abstract|override|async)\s+)*(\w+)\??\s*:\s*(.+)$`)
+	tsBodyFieldRe = regexp.MustCompile(`^(?:(?:public|private|protected|readonly|static|declare|abstract|override|async)\s+)*(\w+)[?!]?\s*:\s*(.+)$`)
 	// `children.forEach((child) => child.run())`: infer the callback parameter
 	// from a Set/Array-like field's element annotation.
 	tsForEachParamRe    = regexp.MustCompile(`(?:this\.)?(\w+)\.forEach\s*\(\s*\(?\s*(\w+)\s*\)?\s*=>`)
-	tsCollectionFieldRe = regexp.MustCompile(`(?s)\b(\w+)\??\s*:\s*(?:Readonly)?(?:Set|Array|Iterable)<\s*([A-Z]\w*)`)
+	tsCollectionFieldRe = regexp.MustCompile(`(?s)\b(\w+)[?!]?\s*:\s*(?:Readonly)?(?:Set|Array|Iterable)<\s*([A-Z]\w*)`)
 )
 
 // tsBareType reduces a TS annotation to one indexable class name.
@@ -355,7 +356,7 @@ func stripLeadingGenericParams(sig string) string {
 // tsNewInitRe reads a variable or field declaration initialised with
 // `new X(...)`, with an optional annotation: `pending = new WeakMap()`,
 // `private cache = new Map<string, string>()`, `const x: T = new U()`.
-var tsNewInitRe = regexp.MustCompile(`^(?:(?:export|const|let|var|public|private|protected|readonly|static|declare|override)\s+)*(\w+)\??\s*(?::\s*([^=]+?))?\s*=\s*new\s+(?:\w+\.)*([A-Za-z_]\w*)`)
+var tsNewInitRe = regexp.MustCompile(`^(?:(?:export|const|let|var|public|private|protected|readonly|static|declare|override)\s+)*(\w+)[?!]?\s*(?::\s*([^=]+?))?\s*=\s*new\s+(?:\w+\.)*([A-Za-z_]\w*)`)
 
 // tsNewType is the type a `new X(...)` value has: X when the repository
 // declares it, "extern:X" when nothing in the repository carries the name
@@ -451,6 +452,53 @@ func tsAliasArrowParamTypes(idx *edgeIndex, symbol *core.SymbolRecord, out map[s
 	}
 }
 
+// tsTypeAtLine resolves a "multi:" local type (one name assigned several
+// classes in one body) for a call on body line rel (0-based): the closest
+// assignment at or above it, "" when there is none or it is unknown.
+func tsTypeAtLine(multi string, rel int) string {
+	best, bestLine := "", -1
+	for _, part := range strings.Split(strings.TrimPrefix(multi, "multi:"), ",") {
+		l, typ, ok := strings.Cut(part, "=")
+		n, err := strconv.Atoi(l)
+		if !ok || err != nil || n > rel || n < bestLine {
+			continue
+		}
+		best, bestLine = typ, n
+	}
+	return best
+}
+
+// tsLocalTypesAt is localTypes for one call: a "multi:" receiver (the first
+// segment of callee) takes the type of its closest assignment above the
+// call; any other "multi:" entry is left out, never handed to narrowing.
+func tsLocalTypesAt(localTypes map[string]string, callee string, rel int) map[string]string {
+	hasMulti := false
+	for _, t := range localTypes {
+		if strings.HasPrefix(t, "multi:") {
+			hasMulti = true
+			break
+		}
+	}
+	if !hasMulti {
+		return localTypes
+	}
+	head := callee
+	if i := strings.IndexAny(head, ".("); i >= 0 {
+		head = head[:i]
+	}
+	out := make(map[string]string, len(localTypes))
+	for name, t := range localTypes {
+		if !strings.HasPrefix(t, "multi:") {
+			out[name] = t
+		} else if name == head {
+			if at := tsTypeAtLine(t, rel); at != "" {
+				out[name] = at
+			}
+		}
+	}
+	return out
+}
+
 // tsLocalTypes infers identifier → type name for one TS/JS callable.
 func tsLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 	out := map[string]string{}
@@ -521,9 +569,31 @@ func tsLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 				out[m[1]] = t
 			}
 		}
-		for _, m := range tsNewAssignRe.FindAllStringSubmatch(body, -1) {
-			if typ := tsNewType(idx, symbol.FilePath, m[2]); typ != "" {
-				out[m[1]] = typ
+		// One name assigned different classes in one body (a benchmark's
+		// `router = new RegExpRouter()` / `router = new KoaRouter()` in
+		// separate callbacks) has no single type: last-wins typed every
+		// router.match external and dropped the real ones.
+		// Such a name is recorded per assignment line ("multi:"), and each
+		// call takes the closest assignment above it (tsTypeAtLine).
+		assigned := map[string]string{}
+		conflicted := map[string]bool{}
+		var multi = map[string][]string{}
+		for _, loc := range tsNewAssignRe.FindAllStringSubmatchIndex(body, -1) {
+			name, class := body[loc[2]:loc[3]], body[loc[4]:loc[5]]
+			typ := tsNewType(idx, symbol.FilePath, class)
+			if prev, ok := assigned[name]; ok && prev != typ {
+				conflicted[name] = true
+			}
+			assigned[name] = typ
+			line := strings.Count(body[:loc[0]], "\n")
+			multi[name] = append(multi[name], strconv.Itoa(line)+"="+typ)
+		}
+		for name, typ := range assigned {
+			switch {
+			case conflicted[name]:
+				out[name] = "multi:" + strings.Join(multi[name], ",")
+			case typ != "":
+				out[name] = typ
 			}
 		}
 		if symbol.ParentSymbol != "" {

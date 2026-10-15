@@ -2473,10 +2473,12 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			}
 			return cands
 		}
+		baseLocalTypes := localTypes
 		for _, cs := range expandMacroCallSites(idx, &symbol) {
 			if cs.ReferenceOnly {
 				continue
 			}
+			localTypes = tsLocalTypesAt(baseLocalTypes, cs.Callee, cs.Line-symbol.Span.Start)
 			callPos = ""
 			if cs.Line > 0 {
 				callPos = strconv.Itoa(cs.Line)
