@@ -140,3 +140,40 @@ func TestSameParamTypeKeepsBoxedOverloadsApart(t *testing.T) {
 		}
 	}
 }
+
+// A call through a library interface's method joins the project methods
+// whose external contract lists that interface as dispatch edges; the
+// predeclared error interface does not join. Regenerated, never doubled,
+// when merged edges are merged again.
+func TestMergeEdges_ExternalInterfaceDispatch(t *testing.T) {
+	native := []core.Edge{
+		{From: "render/json.go::WriteJSON@a", To: "render/json.go::WriteJSON@a", Type: core.EdgeExternalIfaceCall, Source: core.EvidenceSourceNative,
+			Lines: "net/http.ResponseWriter.Write@73:13,net/http.ResponseWriter.Header@70:4"},
+		{From: "errs.go::Wrap@a", To: "errs.go::Wrap@a", Type: core.EdgeExternalIfaceCall, Source: core.EvidenceSourceNative,
+			Lines: "error.Error@5:9"},
+		{From: "rw.go::responseWriter.Write@b", To: "rw.go::responseWriter.Write@b", Type: core.EdgeExternalContract, Source: core.EvidenceSourceNative,
+			Lines: "io.Writer,net/http.ResponseWriter"},
+		{From: "errs.go::MyErr.Error@a", To: "errs.go::MyErr.Error@a", Type: core.EdgeExternalContract, Source: core.EvidenceSourceNative,
+			Lines: "error"},
+	}
+	merged := mergeEdges(nil, native)
+	var dispatch []core.Edge
+	for _, e := range merged {
+		if e.Type == core.EdgeCalls {
+			dispatch = append(dispatch, e)
+		}
+	}
+	if len(dispatch) != 1 || dispatch[0].From != "render/json.go::WriteJSON@a" || dispatch[0].To != "rw.go::responseWriter.Write@b" ||
+		dispatch[0].Reason != core.ReasonDispatch || dispatch[0].Lines != "73:13" {
+		t.Fatalf("dispatch edges = %+v", dispatch)
+	}
+	again := 0
+	for _, e := range mergeEdges(merged, nil) {
+		if e.Type == core.EdgeCalls {
+			again++
+		}
+	}
+	if again != 1 {
+		t.Fatalf("re-merge produced %d dispatch edges, want 1", again)
+	}
+}

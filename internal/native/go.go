@@ -17,6 +17,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -550,6 +551,7 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 	pe := newPositionedEdges()
 	marks := resolvedMarks{}
 	fieldCalls := resolvedMarks{} // caller -> "dir:Type.Field@line:col" (core.EdgeFuncFieldCall)
+	ifaceCalls := resolvedMarks{} // caller -> "pkg.Iface.Method@line:col" (core.EdgeExternalIfaceCall)
 	var fieldStores []core.Edge
 	add := func(edge core.Edge) { pe.add(edge, 0, 0) }
 	lines := goLineReader(fset)
@@ -568,6 +570,12 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 			if !ok || fn.Body == nil {
 				return false
 			}
+			fnObj, _ := info.Defs[fn.Name].(*types.Func)
+			// Function values flowing through this function's parameters,
+			// its locals and other functions' results: calls through them
+			// join the stores below (see goFuncValueFlow).
+			flow := goFuncValueFlow(dir, fn, fnObj, info, pkgDirsByImport, pkg)
+			fieldStores = append(fieldStores, goReturnedFuncStores(dir, caller, fn, fnObj, info, symbolIdx, pkgDirsByImport, pkg)...)
 			// called holds the identifiers a call names; any other use of
 			// a function or method is a value reference (`f := pkg.Do`,
 			// `http.HandlerFunc(h)`, `s.Do` passed as a func), which a
@@ -594,6 +602,28 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 					}
 					if key, ok := goFuncFieldKey(dir, n.Fun, info, pkgDirsByImport, pkg); ok {
 						fieldCalls.add(caller.ID, key, line, col)
+					}
+					if key, ok := goExternalIfaceCallKey(n.Fun, info, pkgDirsByImport); ok {
+						ifaceCalls.add(caller.ID, key, line, col)
+					}
+					for _, key := range flow.callKeys(n.Fun, info, dir, pkgDirsByImport, pkg) {
+						fieldCalls.add(caller.ID, key, line, col)
+					}
+					if calleeFn := goCalledFunc(n.Fun, info); calleeFn != nil && !strings.HasSuffix(relPath, "_test.go") {
+						// F(..., G, ...): G is stored into F's parameter slot.
+						// A test passing G (MatchAll(NoArgs)) makes F call G
+						// only under that test; the test's own reference to
+						// G already carries the impact.
+						for i, arg := range n.Args {
+							target, ok := goFuncValueSymbol(dir, arg, info, symbolIdx, pkgDirsByImport, pkg)
+							if !ok {
+								continue
+							}
+							if key, ok := goFuncParamKey(dir, calleeFn, i, pkgDirsByImport, pkg); ok {
+								fieldStores = append(fieldStores, core.Edge{From: caller.ID, To: target.ID, Type: core.EdgeFuncFieldStore,
+									Confidence: 0.9, Source: core.EvidenceSourceNative, Lines: key})
+							}
+						}
 					}
 					callee, resolvedOK := goResolveCall(dir, n.Fun, info, symbolIdx, pkgDirsByImport, pkg)
 					switch {
@@ -705,7 +735,36 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 		e.Type = core.EdgeFuncFieldCall
 		out = append(out, e)
 	}
+	out = append(out, ifaceCalls.edgesOf(core.EdgeExternalIfaceCall)...)
 	return append(out, dedupeEdges(fieldStores)...), decls, pkg, nil
+}
+
+// goExternalIfaceCallKey names a call through a library interface's method
+// ("net/http.ResponseWriter.Write" for render's w.Write): the graph joins
+// it with the project's methods whose external contract lists that
+// interface. The predeclared error interface is left out: every
+// err.Error() would reach every error type.
+func goExternalIfaceCallKey(expr ast.Expr, info *types.Info, pkgDirsByImport map[string][]string) (string, bool) {
+	sel, ok := expr.(*ast.SelectorExpr)
+	if !ok {
+		return "", false
+	}
+	selection := info.Selections[sel]
+	if selection == nil || selection.Kind() != types.MethodVal {
+		return "", false
+	}
+	named, ok := selection.Recv().(*types.Named)
+	if !ok {
+		return "", false
+	}
+	if _, isIface := named.Underlying().(*types.Interface); !isIface {
+		return "", false
+	}
+	obj := named.Obj()
+	if obj == nil || obj.Pkg() == nil || len(pkgDirsByImport[obj.Pkg().Path()]) > 0 {
+		return "", false // error, or a project interface (resolved by dispatch)
+	}
+	return obj.Pkg().Path() + "." + obj.Name() + "." + selection.Obj().Name(), true
 }
 
 // goCompositeLitType is the named type a composite literal spells
@@ -1623,4 +1682,204 @@ func goSourceDeps(ctx context.Context, root string) types.Importer {
 		return nil
 	}
 	return newGoSourceImporter(pkgs)
+}
+
+// goFuncSlotKey keys a project function's parameter or result slot for the
+// function-value join ("dir:Command.UsageFunc#ret", "dir:MatchAll#p0"),
+// stable across edits like the function-field keys.
+func goFuncSlotKey(currentDir string, fn *types.Func, slot string, pkgDirsByImport map[string][]string, selfPkg *types.Package) (string, bool) {
+	if fn == nil || fn.Pkg() == nil {
+		return "", false
+	}
+	dirs := goObjectDirs(currentDir, fn.Pkg(), pkgDirsByImport, selfPkg)
+	if len(dirs) == 0 {
+		return "", false
+	}
+	name := fn.Name()
+	if recv := goFuncReceiverName(fn); recv != "" {
+		name = recv + "." + name
+	}
+	return dirs[0] + ":" + name + "#" + slot, true
+}
+
+// goFuncParamKey is the slot key of argument i of a call to fn: variadic
+// arguments share the last parameter's slot. Only func-typed parameters
+// (or a variadic of them) have one.
+func goFuncParamKey(currentDir string, fn *types.Func, i int, pkgDirsByImport map[string][]string, selfPkg *types.Package) (string, bool) {
+	sig, ok := fn.Type().(*types.Signature)
+	if !ok || sig.Params().Len() == 0 {
+		return "", false
+	}
+	n := sig.Params().Len()
+	if i >= n {
+		if !sig.Variadic() {
+			return "", false
+		}
+		i = n - 1
+	}
+	t := sig.Params().At(i).Type()
+	if sig.Variadic() && i == n-1 {
+		if sl, ok := t.(*types.Slice); ok {
+			t = sl.Elem()
+		}
+	}
+	if _, isFunc := t.Underlying().(*types.Signature); !isFunc {
+		return "", false
+	}
+	return goFuncSlotKey(currentDir, fn, "p"+strconv.Itoa(i), pkgDirsByImport, selfPkg)
+}
+
+// goFlow maps a function's func-valued variables to the slots their values
+// come from: its own parameters (MatchAll's pargs), a project function's
+// result (fn := c.getUsageTemplateFunc()), or a function-valued field
+// (completionFn := cmd.ValidArgsFunction).
+type goFlow map[*types.Var][]string
+
+// goFuncValueFlow builds the variable sources of one function body. Two
+// sweeps let a copy of a copy (`f := g; g := pargs[0]`) resolve.
+func goFuncValueFlow(dir string, fn *ast.FuncDecl, fnObj *types.Func, info *types.Info, pkgDirsByImport map[string][]string, selfPkg *types.Package) goFlow {
+	flow := goFlow{}
+	if fnObj != nil {
+		if sig, ok := fnObj.Type().(*types.Signature); ok {
+			for i := 0; i < sig.Params().Len(); i++ {
+				if key, ok := goFuncParamKey(dir, fnObj, i, pkgDirsByImport, selfPkg); ok {
+					flow[sig.Params().At(i)] = []string{key}
+				}
+			}
+		}
+	}
+	assign := func(lhs ast.Expr, rhs ast.Expr) {
+		id, ok := lhs.(*ast.Ident)
+		if !ok {
+			return
+		}
+		v, _ := info.Defs[id].(*types.Var)
+		if v == nil {
+			v, _ = info.Uses[id].(*types.Var)
+		}
+		if v == nil || v.IsField() {
+			return
+		}
+		for _, k := range flow.exprKeys(rhs, info, dir, pkgDirsByImport, selfPkg) {
+			if !containsString(flow[v], k) {
+				flow[v] = append(flow[v], k)
+			}
+		}
+	}
+	for sweep := 0; sweep < 2; sweep++ {
+		ast.Inspect(fn.Body, func(node ast.Node) bool {
+			switch n := node.(type) {
+			case *ast.AssignStmt:
+				if len(n.Lhs) == len(n.Rhs) {
+					for i := range n.Lhs {
+						assign(n.Lhs[i], n.Rhs[i])
+					}
+				}
+			case *ast.ValueSpec:
+				if len(n.Names) == len(n.Values) {
+					for i := range n.Names {
+						assign(n.Names[i], n.Values[i])
+					}
+				}
+			case *ast.RangeStmt:
+				// for _, parg := range pargs: each element of a variadic
+				// func parameter.
+				if n.Value != nil {
+					if x, ok := n.X.(*ast.Ident); ok {
+						if src, _ := info.Uses[x].(*types.Var); src != nil && len(flow[src]) > 0 {
+							assign(n.Value, n.X)
+						}
+					}
+				}
+			}
+			return true
+		})
+	}
+	return flow
+}
+
+// exprKeys returns the slots a func-valued expression's value comes from.
+func (f goFlow) exprKeys(e ast.Expr, info *types.Info, dir string, pkgDirsByImport map[string][]string, selfPkg *types.Package) []string {
+	switch x := e.(type) {
+	case *ast.ParenExpr:
+		return f.exprKeys(x.X, info, dir, pkgDirsByImport, selfPkg)
+	case *ast.Ident:
+		if v, _ := info.Uses[x].(*types.Var); v != nil {
+			return f[v]
+		}
+	case *ast.IndexExpr:
+		return f.exprKeys(x.X, info, dir, pkgDirsByImport, selfPkg)
+	case *ast.SelectorExpr:
+		if key, ok := goFuncFieldKey(dir, x, info, pkgDirsByImport, selfPkg); ok {
+			return []string{key}
+		}
+	case *ast.CallExpr:
+		if fn := goCalledFunc(x.Fun, info); fn != nil {
+			if sig, ok := fn.Type().(*types.Signature); ok && sig.Results().Len() == 1 {
+				if _, isFunc := sig.Results().At(0).Type().Underlying().(*types.Signature); isFunc {
+					if key, ok := goFuncSlotKey(dir, fn, "ret", pkgDirsByImport, selfPkg); ok {
+						return []string{key}
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// callKeys returns the slots a call's function expression draws from: a
+// func-valued local or parameter (parg(cmd, args)), an element of one
+// (pargs[0](...)), or a function's result called directly (H()(x)).
+// Field calls (c.Args(...)) are keyed by goFuncFieldKey already.
+func (f goFlow) callKeys(fun ast.Expr, info *types.Info, dir string, pkgDirsByImport map[string][]string, selfPkg *types.Package) []string {
+	switch x := fun.(type) {
+	case *ast.Ident, *ast.IndexExpr, *ast.ParenExpr, *ast.CallExpr:
+		return f.exprKeys(x, info, dir, pkgDirsByImport, selfPkg)
+	}
+	return nil
+}
+
+// goReturnedFuncStores records the project functions fn returns as values
+// (`return defaultVersionFunc`) into fn's result slot. Returns inside a
+// function literal belong to the literal and are skipped.
+func goReturnedFuncStores(dir string, caller core.SymbolRecord, fn *ast.FuncDecl, fnObj *types.Func, info *types.Info, symbolIdx goSymbolIndex, pkgDirsByImport map[string][]string, selfPkg *types.Package) []core.Edge {
+	if fnObj == nil {
+		return nil
+	}
+	sig, ok := fnObj.Type().(*types.Signature)
+	if !ok || sig.Results().Len() != 1 {
+		return nil
+	}
+	if _, isFunc := sig.Results().At(0).Type().Underlying().(*types.Signature); !isFunc {
+		return nil
+	}
+	key, ok := goFuncSlotKey(dir, fnObj, "ret", pkgDirsByImport, selfPkg)
+	if !ok {
+		return nil
+	}
+	var out []core.Edge
+	ast.Inspect(fn.Body, func(node ast.Node) bool {
+		switch n := node.(type) {
+		case *ast.FuncLit:
+			return false
+		case *ast.ReturnStmt:
+			if len(n.Results) == 1 {
+				if target, ok := goFuncValueSymbol(dir, n.Results[0], info, symbolIdx, pkgDirsByImport, selfPkg); ok {
+					out = append(out, core.Edge{From: caller.ID, To: target.ID, Type: core.EdgeFuncFieldStore,
+						Confidence: 0.9, Source: core.EvidenceSourceNative, Lines: key})
+				}
+			}
+		}
+		return true
+	})
+	return out
+}
+
+func containsString(list []string, s string) bool {
+	for _, x := range list {
+		if x == s {
+			return true
+		}
+	}
+	return false
 }
