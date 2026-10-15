@@ -1737,6 +1737,26 @@ func subclassOverrides(idx *edgeIndex, language, className, calleeName, preferDi
 	idx.subclassesOnce.Do(func() {
 		idx.subclasses = map[string]map[string][]string{}
 		seen := map[string]bool{}
+		// Simple names several classes of one language share (PhpParser's
+		// Stmt\Const_ and Node\Const_, Stmt\Unset_ and Cast\Unset_): a
+		// subclass so named is keyed with its file, so its overrides are
+		// its own file's and not every same-named class's.
+		shared := map[string]int{}
+		counted := map[string]bool{}
+		for _, cands := range idx.byName {
+			for _, c := range cands {
+				if counted[c.ID] {
+					continue
+				}
+				counted[c.ID] = true
+				switch c.Kind {
+				case core.KindClass, core.KindStruct, core.KindInterface:
+					if classLanguage(c.Language) {
+						shared[c.Language+"\x00"+c.Name]++
+					}
+				}
+			}
+		}
 		for _, cands := range idx.byName {
 			for _, c := range cands {
 				if !classLanguage(c.Language) || seen[c.ID] {
@@ -1758,7 +1778,7 @@ func subclassOverrides(idx *edgeIndex, language, className, calleeName, preferDi
 					className = c.QualifiedName
 				}
 				sub := className
-				if fileLocalTypeName(className) {
+				if fileLocalTypeName(className) || shared[c.Language+"\x00"+c.Name] > 1 && className == c.Name {
 					// Kept apart from same-named anonymous classes of
 					// other files; see subclassMembers.
 					sub = className + "\x00" + c.FilePath
@@ -1793,8 +1813,18 @@ func subclassOverrides(idx *edgeIndex, language, className, calleeName, preferDi
 	for level := 0; level < 4 && len(frontier) > 0; level++ {
 		var next []string
 		for _, cls := range frontier {
-			for _, sub := range subs[cls] {
+			lookup := cls
+			if name, _, keyed := strings.Cut(cls, "\x00"); keyed && !fileLocalTypeName(name) {
+				lookup = name // its own subclasses are recorded under the bare name
+			}
+			for _, sub := range subs[lookup] {
 				if visited[sub] {
+					continue
+				}
+				if name, _, keyed := strings.Cut(sub, "\x00"); keyed && !fileLocalTypeName(name) && visited[name] {
+					// A same-named subclass (werkzeug's wrappers.Response
+					// over sansio Response) is the walked name itself: its
+					// members are already the declared targets.
 					continue
 				}
 				visited[sub] = true

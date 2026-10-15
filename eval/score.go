@@ -140,8 +140,16 @@ func ScoreCalls(ctx context.Context, repoRoot string, header TruthFile, truth []
 			falsePos = append(falsePos, exampleFromKeys(pair, truthFuncs))
 		}
 	}
+	declCovered := 0
+	var covers func(callerID, calleeID string) bool
+	if !staticOracle {
+		covers = declarationCover(symbols, edges)
+	}
 	for pair, e := range truthSet {
 		if _, ok := groveSet[pair]; !ok {
+			if covers != nil && covers(keyToGroveID[pair[0]], keyToGroveID[pair[1]]) {
+				declCovered++
+			}
 			if len(falseNeg) < maxExamplesN() {
 				falseNeg = append(falseNeg, EdgeExample{Caller: e.Caller.String(), Callee: e.Callee.String()})
 			}
@@ -175,6 +183,10 @@ func ScoreCalls(ctx context.Context, repoRoot string, header TruthFile, truth []
 	}
 	if len(truthSet) > 0 {
 		card.Recall = ratio(tp, len(truthSet))
+		if declCovered > 0 {
+			card.DeclCovered = declCovered
+			card.RecallWithDecl = ratio(tp+declCovered, len(truthSet))
+		}
 	}
 	if card.Precision+card.Recall > 0 {
 		card.F1 = round4(2 * card.Precision * card.Recall / (card.Precision + card.Recall))
@@ -327,4 +339,71 @@ func staticGenerator(g string) bool {
 		return true
 	}
 	return false
+}
+
+// declarationCover reports, for a runtime oracle's caller->callee edge
+// Grove missed, whether Grove's caller calls a same-named method declared
+// on an ancestor (extends/implements, transitively) of the callee's type:
+// the call site Grove bound to the declaration the runtime dispatched
+// through.
+func declarationCover(symbols []core.SymbolRecord, edges []core.Edge) func(callerID, calleeID string) bool {
+	byID := make(map[string]*core.SymbolRecord, len(symbols))
+	classByQual := map[string][]*core.SymbolRecord{}
+	for i := range symbols {
+		s := &symbols[i]
+		byID[s.ID] = s
+		switch s.Kind {
+		case core.KindClass, core.KindInterface, core.KindTrait, core.KindStruct, core.KindEnum:
+			classByQual[s.QualifiedName] = append(classByQual[s.QualifiedName], s)
+		}
+	}
+	supers := map[string][]string{}
+	calls := map[string][]string{}
+	for _, e := range edges {
+		switch e.Type {
+		case core.EdgeExtends, core.EdgeImplements:
+			supers[e.From] = append(supers[e.From], e.To)
+		case core.EdgeCalls:
+			calls[e.From] = append(calls[e.From], e.To)
+		}
+	}
+	classOf := func(m *core.SymbolRecord) string {
+		for _, c := range classByQual[m.ParentSymbol] {
+			if c.FilePath == m.FilePath {
+				return c.ID
+			}
+		}
+		if cs := classByQual[m.ParentSymbol]; len(cs) == 1 {
+			return cs[0].ID
+		}
+		return ""
+	}
+	return func(callerID, calleeID string) bool {
+		callee := byID[calleeID]
+		if callee == nil {
+			return false
+		}
+		cls := classOf(callee)
+		if cls == "" {
+			return false
+		}
+		ancestors := map[string]bool{}
+		for stack := []string{cls}; len(stack) > 0; {
+			c := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			for _, s := range supers[c] {
+				if !ancestors[s] {
+					ancestors[s] = true
+					stack = append(stack, s)
+				}
+			}
+		}
+		for _, to := range calls[callerID] {
+			t := byID[to]
+			if t != nil && t.Name == callee.Name && ancestors[classOf(t)] {
+				return true
+			}
+		}
+		return false
+	}
 }

@@ -55,7 +55,7 @@ func CFamilyCallTruth(repoRoot string) (TruthFile, []TruthEdge, error) {
 		return TruthFile{}, nil, fmt.Errorf("parse %s: %w", indexPath, err)
 	}
 
-	defs := map[string]FuncRef{}  // symbol -> declaration
+	defs := map[string]FuncRef{}   // symbol -> declaration
 	byFile := map[string][]cfDef{} // file -> function defs, by line
 	funcCount := 0
 	for _, doc := range idx.Documents {
