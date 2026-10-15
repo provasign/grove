@@ -74,3 +74,31 @@ func (idx *edgeIndex) pyImportBinding(symbol *core.SymbolRecord, local string) (
 	module, member, _ = strings.Cut(target, "#")
 	return module, member, true, true
 }
+
+// pyReexportFiles follows a module-level re-export of member in file (an
+// import of member at module level, `from ._base import X as X` or plain
+// `from ._base import X`) to the files of the module it comes from, up to
+// hops levels.
+func (idx *edgeIndex) pyReexportFiles(file, member string, hops int) []string {
+	if member == "" || member == "*" || hops <= 0 {
+		return nil
+	}
+	var out []string
+	for _, b := range idx.pyImportBindings[file][member] {
+		if b.owner != "" {
+			continue // a function-local import re-exports nothing
+		}
+		module, imported, _ := strings.Cut(b.target, "#")
+		if imported == "" {
+			continue
+		}
+		for _, g := range idx.pyModuleFiles(file, module) {
+			if g == file {
+				continue
+			}
+			out = append(out, g)
+			out = append(out, idx.pyReexportFiles(g, imported, hops-1)...)
+		}
+	}
+	return out
+}

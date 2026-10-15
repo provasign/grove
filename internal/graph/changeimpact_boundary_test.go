@@ -309,3 +309,81 @@ func snapshotSymbols(g *CodeGraph) []core.SymbolRecord {
 	syms, _ := g.Snapshot()
 	return syms
 }
+
+// An enum implementing an interface is part of the interface's family: its
+// method is contained by the enum like a class's. Without the containment
+// edge the enum sat in the subtype closure contributing nothing, and the
+// answer still said closed (databind SerializableEnum, 2026-10-14).
+func TestChangeImpactFamilyIncludesEnumImplementations(t *testing.T) {
+	for _, lang := range []string{"java", "kotlin", "php"} {
+		header := map[string][2]string{
+			"java":   {"public enum Kind implements Shape", "public class Circle implements Shape"},
+			"kotlin": {"enum class Kind : Shape", "class Circle : Shape"},
+			"php":    {"enum Kind: string implements Shape", "class Circle implements Shape"},
+		}[lang]
+		g := New()
+		g.Replace([]core.SymbolRecord{
+			{ID: "s::Shape", FilePath: "Shape." + lang, Language: lang, Kind: core.KindInterface, Name: "Shape", QualifiedName: "Shape", Signature: "interface Shape"},
+			{ID: "s::Shape.draw", FilePath: "Shape." + lang, Language: lang, Kind: core.KindMethod, Name: "draw", QualifiedName: "Shape.draw", ParentSymbol: "Shape", Signature: "void draw()"},
+			{ID: "c::Circle", FilePath: "Circle." + lang, Language: lang, Kind: core.KindClass, Name: "Circle", QualifiedName: "Circle", Signature: header[1]},
+			{ID: "c::Circle.draw", FilePath: "Circle." + lang, Language: lang, Kind: core.KindMethod, Name: "draw", QualifiedName: "Circle.draw", ParentSymbol: "Circle", Signature: "void draw()"},
+			{ID: "k::Kind", FilePath: "Kind." + lang, Language: lang, Kind: core.KindEnum, Name: "Kind", QualifiedName: "Kind", Signature: header[0]},
+			{ID: "k::Kind.draw", FilePath: "Kind." + lang, Language: lang, Kind: core.KindMethod, Name: "draw", QualifiedName: "Kind.draw", ParentSymbol: "Kind", Signature: "void draw()"},
+		}, 1)
+		r, err := g.ChangeImpact("Shape.draw")
+		if err != nil {
+			t.Fatalf("%s: %v", lang, err)
+		}
+		got := map[string]bool{}
+		for _, f := range r.Family {
+			got[f.ID] = true
+		}
+		if !got["c::Circle.draw"] || !got["k::Kind.draw"] {
+			t.Errorf("%s: family = %v, want Circle.draw and Kind.draw", lang, got)
+		}
+	}
+}
+
+// A family member's own call into the change set keeps its position:
+// super().draw() inside an override is an edit site.
+func TestChangeImpactKeepsMembersOwnCallPositions(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "h.py::Base@1", FilePath: "h.py", BlobSHA: "1", Language: "python", Kind: core.KindClass, Name: "Base", QualifiedName: "Base", RawText: "class Base:\n    pass\n"},
+		{ID: "h.py::Base.draw@2", FilePath: "h.py", BlobSHA: "1", Language: "python", Kind: core.KindMethod, Name: "draw", QualifiedName: "Base.draw", ParentSymbol: "Base",
+			RawText: "def draw(self):\n    return 1\n", Span: core.LineRange{Start: 2, End: 3}},
+		{ID: "h.py::Sub@5", FilePath: "h.py", BlobSHA: "1", Language: "python", Kind: core.KindClass, Name: "Sub", QualifiedName: "Sub", Signature: "class Sub(Base):",
+			RawText: "class Sub(Base):\n    pass\n"},
+		{ID: "h.py::Sub.draw@6", FilePath: "h.py", BlobSHA: "1", Language: "python", Kind: core.KindMethod, Name: "draw", QualifiedName: "Sub.draw", ParentSymbol: "Sub",
+			RawText: "def draw(self):\n    return super().draw()\n", Span: core.LineRange{Start: 6, End: 7},
+			CallSites: []core.CallSite{{Callee: "super().draw", Line: 7, Col: 22}}},
+	}
+	g := New()
+	g.Replace(syms, 1)
+	r, err := g.ChangeImpact("Base.draw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := r.ResolvedCallerLines["h.py::Sub.draw@6"]; len(got) != 1 || got[0] != "7:22" {
+		t.Fatalf("Sub.draw's super().draw() position = %v (all %v)", got, r.ResolvedCallerLines)
+	}
+}
+
+// An ambiguity list names production declarations before anonymous and
+// test-file ones: it is capped, and test doubles crowded out the contracts.
+func TestAmbiguityListsProductionCandidatesFirst(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "z1", FilePath: "src/test/java/a/ATest.java", Language: "java", Kind: core.KindMethod, Name: "accept", QualifiedName: "ATest.<anonymous@3:1>.accept", ParentSymbol: "ATest.<anonymous@3:1>"},
+		{ID: "z2", FilePath: "src/test/java/a/ATest.java", Language: "java", Kind: core.KindMethod, Name: "accept", QualifiedName: "Stub.accept", ParentSymbol: "Stub"},
+		{ID: "p1", FilePath: "src/main/java/a/Zeta.java", Language: "java", Kind: core.KindMethod, Name: "accept", QualifiedName: "Zeta.accept", ParentSymbol: "Zeta"},
+	}
+	g := New()
+	g.Replace(syms, 1)
+	_, err := g.ChangeImpact("accept")
+	if err == nil {
+		t.Fatal("want an ambiguity error")
+	}
+	msg := err.Error()
+	if strings.Index(msg, "Zeta.accept") > strings.Index(msg, "Stub.accept") {
+		t.Fatalf("production candidate must come first:\n%s", msg)
+	}
+}

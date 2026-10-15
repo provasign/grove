@@ -1096,6 +1096,24 @@ func (idx *edgeIndex) importedFiles(fromFile string) map[string]struct{} {
 		return out
 	}
 
+	// `from .conn import Plain` where conn.py itself imports Plain from
+	// ._base (a re-export): the class lives one hop further, and stopping at
+	// conn.py left every user of the re-export out of Plain's change set
+	// (urllib3 poolmanager.py and ProxyConfig). fileImports keeps module
+	// paths only; the imported member names are in the bindings.
+	for _, bindings := range idx.pyImportBindings[fromFile] {
+		for _, b := range bindings {
+			module, member, _ := strings.Cut(b.target, "#")
+			for _, f := range idx.pyModuleFiles(fromFile, module) {
+				for _, g := range idx.pyReexportFiles(f, member, 3) {
+					if g != fromFile {
+						out[g] = struct{}{}
+					}
+				}
+			}
+		}
+	}
+
 	imports, ok := idx.fileImports[fromFile]
 	if !ok {
 		idx.importedFilesCache[fromFile] = out
@@ -1643,9 +1661,13 @@ func buildContains(idx *edgeIndex, symbols []core.SymbolRecord) []core.Edge {
 			// lexical parent's qualified name. Require the exact qualified
 			// prefix and enclosing span so an unrelated same-named function in
 			// the file cannot claim the child.
+			// KindEnum: Java/Kotlin/PHP/Swift/Rust enums carry methods, and
+			// an enum implementing an interface was in the subtype closure
+			// with no member to contribute (databind SerializableEnum left
+			// out of a "closed" JsonSerializable family).
 			typeParent := parent.Kind == core.KindStruct || parent.Kind == core.KindClass ||
 				parent.Kind == core.KindInterface || parent.Kind == core.KindTrait ||
-				parent.Kind == core.KindType
+				parent.Kind == core.KindType || parent.Kind == core.KindEnum
 			mainframeParent := (symbol.Language == "cobol" || symbol.Language == "jcl") &&
 				(parent.Kind == core.SymbolKind("program") || parent.Kind == core.SymbolKind("data-item") ||
 					parent.Kind == core.SymbolKind("job") || parent.Kind == core.SymbolKind("step") ||
@@ -1713,7 +1735,11 @@ func buildExtendsImplements(idx *edgeIndex, symbols []core.SymbolRecord) []core.
 	for _, symbol := range symbols {
 		switch symbol.Language {
 		case "typescript", "tsx", "javascript", "java":
-			if symbol.Kind != core.KindClass && symbol.Kind != core.KindInterface {
+			// A Java enum implements interfaces like a class does; skipping
+			// it left `enum Kind implements Shape` out of Shape's family
+			// while the answer still said closed (databind SerializableEnum).
+			if symbol.Kind != core.KindClass && symbol.Kind != core.KindInterface &&
+				!(symbol.Language == "java" && symbol.Kind == core.KindEnum) {
 				continue
 			}
 			text := declHeader(&symbol)
@@ -1748,7 +1774,7 @@ func buildExtendsImplements(idx *edgeIndex, symbols []core.SymbolRecord) []core.
 				edges = append(edges, resolveTypeEdges(idx, symbol, name, edgeType, 0.85)...)
 			}
 		case "php":
-			if symbol.Kind != core.KindClass && symbol.Kind != core.KindInterface && symbol.Kind != core.KindTrait {
+			if symbol.Kind != core.KindClass && symbol.Kind != core.KindInterface && symbol.Kind != core.KindTrait && symbol.Kind != core.KindEnum {
 				continue
 			}
 			text := declHeader(&symbol)
@@ -1790,6 +1816,10 @@ func buildExtendsImplements(idx *edgeIndex, symbols []core.SymbolRecord) []core.
 				continue
 			}
 			for _, base := range pythonClassBases(&symbol) {
+				if aliased := pyAliasedBaseEdges(idx, symbol, base); len(aliased) > 0 {
+					edges = append(edges, aliased...)
+					continue
+				}
 				edges = append(edges, resolveTypeEdges(idx, symbol, base, core.EdgeExtends, 0.85)...)
 			}
 		case "rust":
@@ -1848,8 +1878,9 @@ func buildExtendsImplements(idx *edgeIndex, symbols []core.SymbolRecord) []core.
 			// Kotlin uses `class Foo : Base(), IThing` (colon, like C#), but
 			// unlike C# the superclass is unambiguous syntactically: it is
 			// the one entry (if any) written with a constructor-call `()`.
-			// Every other entry is an interface.
-			if symbol.Kind != core.KindClass && symbol.Kind != core.KindInterface {
+			// Every other entry is an interface. `enum class E : Iface`
+			// implements too.
+			if symbol.Kind != core.KindClass && symbol.Kind != core.KindInterface && symbol.Kind != core.KindEnum {
 				continue
 			}
 			text := declHeader(&symbol)
@@ -2239,21 +2270,47 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 		return resolveMainframeCallEdges(idx, symbol)
 	}
 	var edges []core.Edge
-	seen := make(map[string]bool)
-
+	seen := make(map[string]int) // edge key -> index in edges
+	// callPos is the position of the call site being resolved; each edge
+	// keeps the positions of the calls that produced it, so a caller's
+	// same-named calls on other receivers are not taken for calls to the
+	// target (werkzeug test_mixed: resp.get_data() and req.get_data()).
+	callPos := ""
+	edgeLines := map[int]map[string]bool{}
 	addEdge := func(fromID, toID string, confidence float64, source core.EvidenceSource, reason core.EdgeReason) {
 		key := fromID + "::calls::" + toID
-		if seen[key] {
-			return
+		i, ok := seen[key]
+		if !ok {
+			i = len(edges)
+			seen[key] = i
+			edges = append(edges, core.Edge{
+				From: fromID, To: toID,
+				Type: core.EdgeCalls, Confidence: confidence, Source: source, Reason: reason,
+			})
 		}
-		seen[key] = true
-		edges = append(edges, core.Edge{
-			From: fromID, To: toID,
-			Type: core.EdgeCalls, Confidence: confidence, Source: source, Reason: reason,
-		})
+		if callPos != "" {
+			if edgeLines[i] == nil {
+				edgeLines[i] = map[string]bool{}
+			}
+			edgeLines[i][callPos] = true
+		}
+	}
+	withLines := func() []core.Edge {
+		for i, set := range edgeLines {
+			pos := make([]string, 0, len(set))
+			for p := range set {
+				pos = append(pos, p)
+			}
+			sort.Slice(pos, func(a, b int) bool { return positionLess(pos[a], pos[b]) })
+			edges[i].Lines = strings.Join(pos, ",")
+		}
+		return edges
 	}
 
 	executableProperty := symbol.Language == "csharp" && symbol.Kind == core.KindField && len(symbol.CallSites) > 0
+	if symbol.Language == "python" && symbol.Kind == core.KindClass {
+		return pyClassBodyMethodRefs(idx, symbol)
+	}
 	if symbol.Kind != core.KindFunction && symbol.Kind != core.KindMethod && symbol.Kind != core.KindConstructor && !executableProperty {
 		return nil
 	}
@@ -2441,9 +2498,18 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			}
 			return cands
 		}
+		baseLocalTypes := localTypes
 		for _, cs := range expandMacroCallSites(idx, &symbol) {
 			if cs.ReferenceOnly {
 				continue
+			}
+			localTypes = tsLocalTypesAt(baseLocalTypes, cs.Callee, cs.Line-symbol.Span.Start)
+			callPos = ""
+			if cs.Line > 0 {
+				callPos = strconv.Itoa(cs.Line)
+				if cs.Col > 0 {
+					callPos += ":" + strconv.Itoa(cs.Col)
+				}
 			}
 			if symbol.Language == "csharp" && cs.Argc > 0 && hasUnknownArg(cs.Args, cs.Argc) {
 				if csArgTypeCache == nil {
@@ -2734,7 +2800,59 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// Python has no overloading: a method whose parameters cannot
 				// take this call's argument count is not its target (click:
 				// ctx.invoke(other_cmd, arg=42) is not Command.invoke(self, ctx)).
-				cands = pyArityCompatible(cands, cs.Argc)
+				compatible := pyArityCompatible(cands, cs.Argc)
+				if q := qualifier; q != "" && q[0] >= 'A' && q[0] <= 'Z' && typeSymbolExists(idx, q) {
+					// Through the class (`click.Group.get_command(self, ctx,
+					// name)`) an instance method takes the instance as an
+					// explicit argument: one more than the call through an
+					// instance. Classmethods/staticmethods keep the count.
+					seen := map[string]bool{}
+					for _, c := range compatible {
+						seen[c.ID] = true
+					}
+					for _, c := range pyArityCompatible(cands, cs.Argc-1) {
+						if !seen[c.ID] {
+							compatible = append(compatible, c)
+						}
+					}
+				}
+				cands = compatible
+			}
+			rustExprReceiver := symbol.Language == "rust" && qualifier == "<expr>"
+			if rustExprReceiver {
+				// A method on an expression astkit could not name (`(a +
+				// b).m()`, `xs[i].m()`): an untyped receiver, resolved by name
+				// like one, but never a bare call.
+				qualifier = ""
+			}
+			if symbol.Language == "rust" && qualifier == "" && !rustExprReceiver && !strings.HasSuffix(cs.Callee, "!") {
+				// A bare Rust call never reaches a method (that takes self.
+				// or Type::): `matched(m)` calling a closure parameter bound
+				// to every method named matched (ripgrep printer, 11 edges).
+				var free []*core.SymbolRecord
+				for _, c := range cands {
+					if c.Kind == core.KindFunction || c.Kind == core.KindConstructor && c.ParentSymbol == "" {
+						free = append(free, c)
+					}
+				}
+				cands = free
+			}
+			if symbol.Language == "rust" && (qualifier == "<str>" || qualifier == "<slice>") {
+				// A string literal or range-index receiver (astkit marks
+				// them): a std str/slice method, unless the repository
+				// implements the method on those types.
+				var onStd []*core.SymbolRecord
+				for _, c := range cands {
+					p := c.ParentSymbol
+					if qualifier == "<str>" && (p == "str" || p == "String") ||
+						qualifier == "<slice>" && (strings.HasPrefix(p, "[") || p == "Vec") {
+						onStd = append(onStd, c)
+					}
+				}
+				cands = onStd
+				if len(cands) == 0 {
+					continue
+				}
 			}
 			if symbol.Language == "swift" && qualifier == "" && len(cands) == 0 {
 				// `throw LocationError(path:..)` where `typealias
@@ -3060,6 +3178,13 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					cands = filterByParent(cands, producer)
 				} else if !goProducerSymbolExists(idx, producer) {
 					cands = nil
+				} else if ret := goProducerReturnType(idx, producer); ret != "" {
+					// NewB().Send(): the producer's declared result type
+					// picks the method; without it the call bound to A.Send
+					// and B.Send alike.
+					if byRet := filterByParent(cands, ret); len(byRet) > 0 || typeSymbolExists(idx, ret) {
+						cands = byRet
+					}
 				}
 			}
 			if symbol.Language == "php" && strings.HasSuffix(qualifier, "()") && len(cands) > 0 {
@@ -3204,11 +3329,13 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// (parse::parse_low_raw → flags/parse.rs), else drop.
 				_, isSelf := selfVars[qualifier]
 				_, typed := localTypes[qualifier]
-				if strings.HasSuffix(qualifier, "()") {
+				if strings.HasSuffix(qualifier, "()") || strings.HasSuffix(qualifier, "()?") {
 					// Call-result receiver: builder chains live here
 					// (.line_number(true).build() narrows build by
 					// line_number's return type). Unknown results are
-					// external (.unwrap().x, .iter().y) — drop.
+					// external (.unwrap().x, .iter().y) — drop. After `?`
+					// the Result/Option is unwrapped
+					// (walk_builder()?.build_parallel()).
 					if rets := rustCallResultTypes(idx, qualifier, &symbol, scope); len(rets) > 0 {
 						var byType []*core.SymbolRecord
 						for _, cand := range cands {
@@ -3482,6 +3609,14 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// Receiver narrowing didn't fire; try the inferred type of
 				// the receiver variable, then import qualification.
 				kept, dispatch, decided := narrowByLocalType(idx, sat, &symbol, localTypes, qualifier, calleeName, cands, scope)
+				if !decided && symbol.Language == "python" && strings.Contains(fullChain, ".") {
+					// `sub_ctx.command.invoke(...)`: type each hop through the
+					// class attributes (sub_ctx: Context, Context.command:
+					// Command), then narrow as for a typed receiver.
+					if t := pyChainType(idx, &symbol, localTypes, selfVars, fullChain); t != "" {
+						kept, dispatch, decided = narrowByLocalType(idx, sat, &symbol, map[string]string{qualifier: t}, qualifier, calleeName, cands, scope)
+					}
+				}
 				if !decided && (tsFamilyLang(symbol.Language) || symbol.Language == "java") && strings.Contains(fullChain, ".") {
 					// Multi-hop receiver (`this.connection.driver.escape`):
 					// walk the field-type chain and dispatch to the resolved
@@ -3572,7 +3707,10 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			// "cls(...)" constructs the caller's own class, and a variable
 			// holding a class (null_session_class = NullSession) constructs
 			// the held class.
-			if len(narrowed) == 0 && !capped {
+			// Rust has no constructors: `JSON(x)` / `Printer::JSON(x)` builds
+			// a tuple struct or enum variant and runs no `new` (ripgrep: 12
+			// such literals bound to unrelated `new` functions).
+			if len(narrowed) == 0 && !capped && symbol.Language != "rust" {
 				ctorName := calleeName
 				if held, ok := localTypes[calleeName]; ok && strings.HasPrefix(held, "class:") {
 					ctorName = strings.TrimPrefix(held, "class:")
@@ -3599,6 +3737,14 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 						ctors = csNarrowOverloads(idx, ctors, cs.Args, csArgTypeCache)
 					}
 				}
+				if len(ctors) == 0 && symbol.Language == "python" {
+					// A class with no __init__ anywhere in its hierarchy
+					// (NamedTuple, dataclass, plain class) is still
+					// constructed here: the call reaches the class itself.
+					// It had no edge at all, so urllib3's ProxyConfig(...)
+					// calls were missing from its change set (2026-10-14).
+					ctors = instantiatedClasses(idx, &symbol, ctorName, scope)
+				}
 				for _, ctor := range ctors {
 					if ctor.ID != symbol.ID {
 						addEdge(symbol.ID, ctor.ID, 0.85, core.EvidenceSourceHeuristic, core.ReasonConstructor)
@@ -3616,7 +3762,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				}
 			}
 		}
-		return edges // CallSites authoritative; skip regex fallback for this symbol
+		return withLines() // CallSites authoritative; skip regex fallback for this symbol
 	}
 
 	// ── Fallback: one identifier-extraction pass over the stripped body ──
@@ -4835,4 +4981,122 @@ func sameOverloadSet(cands []*core.SymbolRecord) bool {
 		}
 	}
 	return true
+}
+
+// pyAliasedBaseEdges resolves a base class named through an import alias
+// (`from .sansio.blueprints import Blueprint as SansioBlueprint`, then
+// `class Blueprint(SansioBlueprint)`): no class is named SansioBlueprint, so
+// the name search found nothing and flask's Blueprint had no supertype.
+func pyAliasedBaseEdges(idx *edgeIndex, symbol core.SymbolRecord, base string) []core.Edge {
+	if strings.Contains(base, ".") {
+		return nil
+	}
+	module, member, visible, _ := idx.pyImportBinding(&symbol, base)
+	if !visible || member == "" || member == base {
+		return nil
+	}
+	files := map[string]bool{}
+	for _, f := range idx.pyModuleFiles(symbol.FilePath, module) {
+		files[f] = true
+	}
+	var out []core.Edge
+	for _, target := range idx.byName[strings.ToLower(member)] {
+		if target.Name != member || target.Kind != core.KindClass || target.ID == symbol.ID || !files[target.FilePath] {
+			continue
+		}
+		out = append(out, core.Edge{From: symbol.ID, To: target.ID, Type: core.EdgeExtends,
+			Confidence: 0.85, Source: core.EvidenceSourceHeuristic, Reason: core.ReasonTypeRef})
+	}
+	return out
+}
+
+// instantiatedClasses returns the in-scope classes named name in the
+// caller's language: the target of a constructor call when no constructor
+// is declared.
+func instantiatedClasses(idx *edgeIndex, caller *core.SymbolRecord, name string, scope map[string]struct{}) []*core.SymbolRecord {
+	if name == "" || name[0] < 'A' || name[0] > 'Z' {
+		return nil
+	}
+	var out []*core.SymbolRecord
+	for _, cls := range idx.byName[strings.ToLower(name)] {
+		if cls.Name != name || cls.Kind != core.KindClass || cls.Language != caller.Language {
+			continue
+		}
+		if _, ok := scope[cls.FilePath]; !ok && cls.FilePath != caller.FilePath {
+			continue
+		}
+		out = append(out, cls)
+	}
+	return out
+}
+
+// isPlainIdent reports whether s is a bare identifier.
+func isPlainIdent(s string) bool {
+	for i, r := range s {
+		if !(r == '_' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || i > 0 && r >= '0' && r <= '9') {
+			return false
+		}
+	}
+	return s != ""
+}
+
+// pyClassBodyMethodRefs links a class body to its own methods passed by name
+// in a class-body call (`data = property(get_data, set_data)`): renaming or
+// re-signing get_data breaks the property, and it was no site at all
+// (werkzeug Response.get_data). Other class-body calls are resolved by the
+// decorator pass, not here.
+func pyClassBodyMethodRefs(idx *edgeIndex, symbol core.SymbolRecord) []core.Edge {
+	var out []core.Edge
+	seen := map[string]int{}
+	lines := strings.Split(symbol.RawText, "\n")
+	for _, cs := range symbol.CallSites {
+		for _, arg := range cs.Args {
+			if !isPlainIdent(arg) {
+				continue
+			}
+			// The argument's own line: `property(\n    get_data,` puts it
+			// below the call.
+			pos := strconv.Itoa(cs.Line)
+			if cs.Col > 0 {
+				pos += ":" + strconv.Itoa(cs.Col)
+			}
+			word := regexp.MustCompile(`\b` + regexp.QuoteMeta(arg) + `\b`)
+			for i := cs.Line - symbol.Span.Start; i >= 0 && i < len(lines) && i <= cs.Line-symbol.Span.Start+20; i++ {
+				if loc := word.FindStringIndex(lines[i]); loc != nil && (i > cs.Line-symbol.Span.Start || cs.Col == 0 || loc[0] >= cs.Col) {
+					pos = strconv.Itoa(symbol.Span.Start+i) + ":" + strconv.Itoa(loc[0]+1)
+					break
+				}
+			}
+			for _, m := range idx.byFile[symbol.FilePath] {
+				if m.Name != arg || m.ParentSymbol != symbol.Name || m.Kind != core.KindMethod {
+					continue
+				}
+				if i, ok := seen[m.ID]; ok {
+					out[i].Lines += "," + pos
+					continue
+				}
+				seen[m.ID] = len(out)
+				out = append(out, core.Edge{From: symbol.ID, To: m.ID, Type: core.EdgeCalls, Confidence: 0.7,
+					Source: core.EvidenceSourceASTKit, Reason: core.ReasonFunctionRef, Lines: pos})
+			}
+		}
+	}
+	return out
+}
+
+// goProducerReturnType is the declared first result type of the Go
+// functions named producer, when they all agree.
+func goProducerReturnType(idx *edgeIndex, producer string) string {
+	typ := ""
+	for _, f := range idx.byName[strings.ToLower(producer)] {
+		if f.Name != producer || f.Language != "go" || f.Kind != core.KindFunction {
+			continue
+		}
+		t := goReturnType(idx, f)
+		if t == "" || typ != "" && t != typ {
+			return ""
+		}
+		typ = t
+	}
+	return typ
 }

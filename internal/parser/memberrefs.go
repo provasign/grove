@@ -56,13 +56,14 @@ func (e *Engine) MemberOccurrences(root, name string, languages []string) ([]cor
 	type task struct{ abs, rel string }
 	var tasks []task
 	var skipped atomic.Int64
+	skipDirs := NewDirSkipper(root)
 	err := filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
 		if err != nil {
 			skipped.Add(1)
 			return nil
 		}
 		if info.IsDir() {
-			if p != root && refSkipDir(info.Name()) {
+			if p != root && skipDirs.Skip(relOf(root, p), info.Name()) {
 				return filepath.SkipDir
 			}
 			return nil

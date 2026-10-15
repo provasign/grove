@@ -97,6 +97,26 @@ func (e *Engine) ExtractContent(relPath string, content []byte) ([]core.SymbolRe
 			Imports:       append([]string(nil), imports...),
 		})
 	}
+	if language == "python" && len(symbols) == 0 && len(imports) > 0 {
+		// A module that only re-exports (`from ._base import Plain as
+		// Plain`, a package __init__.py) has no symbol to carry its imports,
+		// and the edge index reads imports from symbols: users importing
+		// through it never reached the defining module (urllib3 poolmanager
+		// via connection.py, 2026-10-14). An empty module body carries them.
+		const name = "<top-level>"
+		symbols = append(symbols, core.SymbolRecord{
+			ID:            symID(relPath, name, blobSHA),
+			FilePath:      relPath,
+			BlobSHA:       blobSHA,
+			Language:      language,
+			Kind:          core.KindFunction,
+			Name:          name,
+			QualifiedName: name,
+			Signature:     name,
+			Span:          core.LineRange{Start: 1, End: strings.Count(src, "\n") + 1},
+			Imports:       append([]string(nil), imports...),
+		})
+	}
 	ensureUniqueIDs(symbols)
 	return symbols, nil
 }
@@ -127,13 +147,13 @@ func (e *Engine) Walk(root string) ([]core.SymbolRecord, int, error) {
 	var symbols []core.SymbolRecord
 	filesIndexed := 0
 
+	skipDirs := NewDirSkipper(root)
 	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
 		if entry.IsDir() {
-			name := entry.Name()
-			if name == ".git" || name == ".grove" || name == "node_modules" || name == "vendor" || name == "dist" || name == "bin" {
+			if path != root && skipDirs.Skip(relOf(root, path), entry.Name()) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -534,6 +554,9 @@ func extractSymbols(language, filePath, blobSHA, content string, fileImports []s
 	if language == "csharp" || language == "java" {
 		enrichRecoveredClassParents(merged)
 	}
+	if language == "java" {
+		attachRecoveredJavaMembers(merged, scan)
+	}
 	attachDocstrings(language, content, merged)
 	return merged
 }
@@ -641,6 +664,60 @@ func enrichRecoveredClassParents(symbols []core.SymbolRecord) {
 		symbol.QualifiedName = parent.Name + "." + symbol.Name
 		symbol.ID = symID(symbol.FilePath, symbol.QualifiedName, symbol.BlobSHA)
 	}
+}
+
+// attachRecoveredJavaMembers gives a recovered method, constructor or field
+// that is still parentless the nearest type declared above it, when its
+// line sits inside braces: Java has no top-level members, and error
+// recovery around a broken statement (an unterminated char literal mid-edit)
+// ends the class early, so its span no longer contains them (15
+// BeanDeserializer methods lost their class, 2026-10-14). The type's span
+// is extended to cover them.
+func attachRecoveredJavaMembers(symbols []core.SymbolRecord, masked string) {
+	lineDepth := javaLineBraceDepths(masked)
+	for idx := range symbols {
+		m := &symbols[idx]
+		if m.ParentSymbol != "" || (m.Kind != core.KindMethod && m.Kind != core.KindConstructor && m.Kind != core.KindField) {
+			continue
+		}
+		if m.Span.Start < 1 || m.Span.Start > len(lineDepth) || lineDepth[m.Span.Start-1] <= 0 {
+			continue
+		}
+		best := -1
+		for j := range symbols {
+			t := &symbols[j]
+			switch t.Kind {
+			case core.KindClass, core.KindInterface, core.KindEnum:
+			default:
+				continue
+			}
+			if t.Span.Start <= m.Span.Start && (best < 0 || t.Span.Start > symbols[best].Span.Start) {
+				best = j
+			}
+		}
+		if best < 0 {
+			continue
+		}
+		owner := &symbols[best]
+		m.ParentSymbol = owner.Name
+		m.QualifiedName = owner.QualifiedName + "." + m.Name
+		m.ID = symID(m.FilePath, m.QualifiedName, m.BlobSHA)
+		if owner.Span.End < m.Span.End {
+			owner.Span.End = m.Span.End
+		}
+	}
+}
+
+// javaLineBraceDepths is the brace depth at the start of each line of
+// masked source (strings and comments already blanked).
+func javaLineBraceDepths(masked string) []int {
+	var out []int
+	depth := 0
+	for _, line := range strings.Split(masked, "\n") {
+		out = append(out, depth)
+		depth += strings.Count(line, "{") - strings.Count(line, "}")
+	}
+	return out
 }
 
 const cppCallableNamePattern = `(?:operator\s*(?:\[\]|\(\)|new(?:\[\])?|delete(?:\[\])?|[+*/%<>=!&|^~-]+)|~?[A-Za-z_][A-Za-z0-9_]*)`

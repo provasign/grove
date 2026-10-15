@@ -36,7 +36,7 @@ type residentWorker struct {
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
 	out    *bufio.Reader
-	errs   *bytes.Buffer
+	errs   *limitedWriter
 	// idle stops the process after workerIdle without a request, releasing
 	// its memory; the next request starts it again.
 	idle *time.Timer
@@ -112,8 +112,13 @@ func (w *residentWorker) startLocked() error {
 	if err != nil {
 		return err
 	}
-	w.errs = &bytes.Buffer{}
-	cmd.Stderr = &limitedWriter{buf: w.errs, max: 64 << 10}
+	w.errs = &limitedWriter{max: 64 << 10}
+	cmd.Stderr = w.errs
+	// Wait returns once the process exits and its output is copied; a
+	// descendant still holding the pipes made it block forever (with the
+	// worker's lock held) and leaked the copy goroutines.
+	cmd.WaitDelay = 2 * time.Second
+	isolateProcessGroup(cmd)
 	if err := cmd.Start(); err != nil {
 		return err
 	}
@@ -130,7 +135,7 @@ func (w *residentWorker) stopLocked() {
 		return
 	}
 	_ = w.stdin.Close()
-	_ = w.cmd.Process.Kill()
+	killProcessTree(w.cmd)
 	_ = w.cmd.Wait()
 	w.cmd, w.stdin, w.out = nil, nil, nil
 }
@@ -232,12 +237,18 @@ func (w *residentWorker) armIdleLocked() {
 }
 
 // limitedWriter keeps the first max bytes of a stream (worker stderr).
+// limitedWriter keeps the first max bytes of a worker's stderr. exec's
+// copy goroutine writes it while call() may read it after a failed reply,
+// so both go through mu (a data race under -race, 2026-10-14).
 type limitedWriter struct {
-	buf *bytes.Buffer
+	mu  sync.Mutex
+	buf bytes.Buffer
 	max int
 }
 
 func (l *limitedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	if room := l.max - l.buf.Len(); room > 0 {
 		if len(p) > room {
 			l.buf.Write(p[:room])
@@ -246,4 +257,10 @@ func (l *limitedWriter) Write(p []byte) (int, error) {
 		}
 	}
 	return len(p), nil
+}
+
+func (l *limitedWriter) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
 }

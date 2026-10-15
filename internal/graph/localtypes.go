@@ -566,6 +566,12 @@ func narrowByLocalType(idx *edgeIndex, sat *interfaceSatisfaction, caller *core.
 	if caller != nil && tsFamilyLang(caller.Language) {
 		resolvedTypeFile = tsResolveClassFile(idx, typ, caller.FilePath)
 		byType = filterCandidatesByFile(byType, resolvedTypeFile)
+		if len(byType) == 0 {
+			// A function-valued field is the method (hono RegExpRouter:
+			// `match: typeof match<...> = match`); calls through a receiver
+			// of that class reach it, and nothing else.
+			byType = tsFunctionFieldMembers(idx, typ, calleeName, resolvedTypeFile)
+		}
 	}
 	if caller != nil && caller.Language == "java" {
 		// A single-type import shadows a same-package type with the same
@@ -813,4 +819,21 @@ func goProducerSymbolExists(idx *edgeIndex, name string) bool {
 		}
 	}
 	return false
+}
+
+// tsFunctionFieldMembers returns typ's field members named name, declared in
+// typ's file when known: TS classes implement methods as function-valued
+// fields, and change-impact counts them in the family.
+func tsFunctionFieldMembers(idx *edgeIndex, typ, name, typeFile string) []*core.SymbolRecord {
+	var out []*core.SymbolRecord
+	for _, cand := range idx.byName[strings.ToLower(name)] {
+		if cand.Name != name || cand.Kind != core.KindField || cand.ParentSymbol != typ || !tsFamilyLang(cand.Language) {
+			continue
+		}
+		if typeFile != "" && cand.FilePath != typeFile {
+			continue
+		}
+		out = append(out, cand)
+	}
+	return out
 }

@@ -312,11 +312,16 @@ var jsTopLevelCalleeRe = regexp.MustCompile(`^[A-Za-z_$][A-Za-z0-9_$]*(?:\??\.[A
 func jsAnonymousCallable(node *sitter.Node) bool {
 	switch node.Type() {
 	case "arrow_function", "function_expression", "function", "generator_function":
-	default:
-		return false
+		parent := node.Parent()
+		return parent != nil && parent.Type() == "arguments"
+	case "method_definition":
+		// A method of an object literal passed as an argument
+		// (zod: `core.$constructor("ZodType", init, { meta() {...} })`) is
+		// not extracted either; its calls were blanked and lost.
+		obj := node.Parent()
+		return obj != nil && obj.Type() == "object" && obj.Parent() != nil && obj.Parent().Type() == "arguments"
 	}
-	parent := node.Parent()
-	return parent != nil && parent.Type() == "arguments"
+	return false
 }
 
 func jsTopLevelSymbol(root *sitter.Node, src []byte, filePath, blobSHA, language string, imports []string) *core.SymbolRecord {

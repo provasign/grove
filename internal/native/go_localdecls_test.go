@@ -53,7 +53,7 @@ func Plain() {
 		{ID: "main.go::Base@b", FilePath: "main.go", BlobSHA: "b", Language: "go", Kind: core.KindStruct, Name: "Base", QualifiedName: "Base", Span: core.LineRange{Start: 20, End: 20}},
 		{ID: "main.go::Plain@b", FilePath: "main.go", BlobSHA: "b", Language: "go", Kind: core.KindFunction, Name: "Plain", QualifiedName: "Plain", Span: core.LineRange{Start: 22, End: 25}},
 	}
-	edges, decls, _ := goSemanticEdges(context.Background(), root, []string{"main.go"}, parsed, nil, nil)
+	edges, decls, _ := goSemanticEdges(context.Background(), root, []string{"main.go"}, parsed, nil, goDeps{})
 	declared := compilerDeclaredSymbolsFor(Request{Root: root, Symbols: parsed}, "go", decls)
 
 	byQualified := map[string]core.SymbolRecord{}

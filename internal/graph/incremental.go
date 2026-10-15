@@ -121,6 +121,16 @@ func BuildEdgesDeltaMeta(prevEdges []core.Edge, prevSymbols, symbols []core.Symb
 	for id := range bodyOnly {
 		affected[id] = true // its own call sites changed
 	}
+	// Every symbol of an edited file is re-resolved: an edit shifts the
+	// lines of everything below it, and resolver edges carry call positions,
+	// so an unchanged method kept positions one line off (51 stale edges
+	// after a one-line body edit in ObjectMapper, 2026-10-14). One file's
+	// symbols are cheap next to the fallback.
+	for i := range symbols {
+		if changedFiles[symbols[i].FilePath] {
+			affected[symbols[i].ID] = true
+		}
+	}
 	if !ok || len(affected) > int(maxAffectedFraction*float64(len(symbols))) {
 		deltaStats.fallback++
 		if os.Getenv("GROVE_TIMING") != "" {
@@ -366,6 +376,30 @@ func buildDeltaMeta(symbols []core.SymbolRecord, affected map[string]bool, chang
 // symbol EXCEPT its ID and source spans (IDs embed the file blob SHA and
 // turn over on every edit; spans shift under comment/whitespace edits; edges
 // carry neither). Two symbols with equal keys resolve identically.
+// identityText is the part of a symbol's source its edges depend on. A Java
+// type's edges read only its top-level text (header, field declarations:
+// javaFieldRe runs over classBody) and its own call sites, never the bodies
+// of its methods, which are symbols of their own. Keying the type on its
+// whole RawText marked it changed on every method-body edit, put its name in
+// the delta, and sent jackson's ObjectMapper edits to a full edge rebuild
+// (24k of 29k symbols affected, 5-8s per edit, 2026-10-14).
+func identityText(s *core.SymbolRecord) string {
+	switch s.Language {
+	case "java", "typescript", "tsx", "javascript":
+		// TS/JS class fields are read from the top-level text too
+		// (tsClassBodyFieldTypes skips nested bodies; constructors are
+		// symbols of their own).
+		switch s.Kind {
+		case core.KindClass, core.KindInterface, core.KindEnum:
+			// classBody blanks member bodies in place; whitespace carries
+			// no meaning in Java, so the blanks of an edited body (more or
+			// fewer lines) must not count.
+			return strings.Join(strings.Fields(classBody(nil, s)), " ")
+		}
+	}
+	return s.RawText
+}
+
 func contentIdentityKey(s *core.SymbolRecord) string {
 	var b strings.Builder
 	b.WriteString(s.FilePath)
@@ -382,7 +416,7 @@ func contentIdentityKey(s *core.SymbolRecord) string {
 	b.WriteByte(0)
 	b.WriteString(s.Signature)
 	b.WriteByte(0)
-	b.WriteString(s.RawText)
+	b.WriteString(identityText(s))
 	b.WriteByte(0)
 	if s.Exports {
 		b.WriteByte(1)

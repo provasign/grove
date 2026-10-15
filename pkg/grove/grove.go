@@ -532,6 +532,9 @@ type ChangeImpactResult struct {
 	// name) where a compiler resolved its calls into the change set
 	// (javac). Absent for callers without them.
 	CallerLines map[string][]string
+	// ResolvedCallerLines: the same for callers no compiler resolved, from
+	// grove's own resolver. A same-named call absent here went elsewhere.
+	ResolvedCallerLines map[string][]string
 
 	// Data-member anchors only (fields, properties, constants, variables):
 	// MemberKind is non-empty, Accesses are the confirmed read/write/init/
@@ -626,27 +629,28 @@ func (e *Engine) ChangeImpactScoped(ctx context.Context, query, file string) (Ch
 		return ChangeImpactResult{}, err
 	}
 	return ChangeImpactResult{
-		Query:              raw.Query,
-		Declarations:       raw.Declarations,
-		Supers:             raw.Supers,
-		Family:             raw.Family,
-		Callers:            raw.Callers,
-		DeclaringTypes:     raw.DeclaringTypes,
-		ExternalSupers:     raw.ExternalSupers,
-		OverridesExternal:  raw.OverridesExternal,
-		Completeness:       raw.Completeness,
-		CallerCoverage:     raw.CallerCoverage,
-		HasHeuristicRefs:   raw.HasHeuristicRefs,
-		NameMatchedCallers: raw.NameMatchedCallers,
-		CallerLines:        raw.CallerLines,
-		MemberKind:         raw.MemberKind,
-		Accesses:           raw.Accesses,
-		AmbiguousAccesses:  raw.AmbiguousAccesses,
-		ExcludedAccesses:   raw.ExcludedAccesses,
-		AccessCoverage:     raw.AccessCoverage,
-		AccessNote:         raw.AccessNote,
-		Related:            g.RelatedSites(raw),
-		ReExports:          raw.ReExports,
+		Query:               raw.Query,
+		Declarations:        raw.Declarations,
+		Supers:              raw.Supers,
+		Family:              raw.Family,
+		Callers:             raw.Callers,
+		DeclaringTypes:      raw.DeclaringTypes,
+		ExternalSupers:      raw.ExternalSupers,
+		OverridesExternal:   raw.OverridesExternal,
+		Completeness:        raw.Completeness,
+		CallerCoverage:      raw.CallerCoverage,
+		HasHeuristicRefs:    raw.HasHeuristicRefs,
+		NameMatchedCallers:  raw.NameMatchedCallers,
+		CallerLines:         raw.CallerLines,
+		ResolvedCallerLines: raw.ResolvedCallerLines,
+		MemberKind:          raw.MemberKind,
+		Accesses:            raw.Accesses,
+		AmbiguousAccesses:   raw.AmbiguousAccesses,
+		ExcludedAccesses:    raw.ExcludedAccesses,
+		AccessCoverage:      raw.AccessCoverage,
+		AccessNote:          raw.AccessNote,
+		Related:             g.RelatedSites(raw),
+		ReExports:           raw.ReExports,
 	}, nil
 }
 

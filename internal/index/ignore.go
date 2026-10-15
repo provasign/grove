@@ -198,17 +198,6 @@ func isPythonEnvDir(dir, name string) bool {
 	return false
 }
 
-func shouldSkipDirName(name string) bool {
-	switch name {
-	case ".git", ".grove", ".cache", ".venv", ".tox", ".next", ".idea",
-		"node_modules", "vendor", "dist", "bin", "__pycache__", "target",
-		"coverage", ".pytest_cache", ".mypy_cache", ".ruff_cache":
-		return true
-	default:
-		return false
-	}
-}
-
 func isSensitivePath(rel string) bool {
 	base := strings.ToLower(path.Base(filepath.ToSlash(rel)))
 	ext := strings.ToLower(path.Ext(base))

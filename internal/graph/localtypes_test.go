@@ -1127,3 +1127,385 @@ func TestCFamilyParamsFromBodyIgnoreComments(t *testing.T) {
 		t.Fatalf("str = %q, want String", got)
 	}
 }
+
+// req = wrappers.Request.from_values(...) is a Request: the classmethod says
+// -> te.Self. Untyped, req.get_data() fell back to the name and linked the
+// test to Response.get_data (werkzeug, 2026-10-14). A second, sansio
+// Request without from_values must not hide the answer.
+func TestPyClassFactoryResultIsTheClass(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "sansio/r.py::Request@1", FilePath: "sansio/r.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindClass, Name: "Request", QualifiedName: "Request",
+			RawText: "class Request:\n    pass\n"},
+		{ID: "w.py::Request@1", FilePath: "w.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindClass, Name: "Request", QualifiedName: "Request",
+			RawText: "class Request(_SansIORequest):\n    pass\n"},
+		{ID: "w.py::Request.from_values@2", FilePath: "w.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindMethod, Name: "from_values", QualifiedName: "Request.from_values", ParentSymbol: "Request",
+			RawText: "@classmethod\ndef from_values(cls, *args: t.Any) -> te.Self:\n    return cls()\n"},
+		{ID: "w.py::Request.get_data@5", FilePath: "w.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindMethod, Name: "get_data", QualifiedName: "Request.get_data", ParentSymbol: "Request",
+			RawText: "def get_data(self, cache=True):\n    return b''\n"},
+		{ID: "w.py::Response@8", FilePath: "w.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindClass, Name: "Response", QualifiedName: "Response",
+			RawText: "class Response:\n    pass\n"},
+		{ID: "w.py::Response.get_data@9", FilePath: "w.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindMethod, Name: "get_data", QualifiedName: "Response.get_data", ParentSymbol: "Response",
+			RawText: "def get_data(self, as_text=False):\n    return b''\n"},
+		{ID: "t.py::test_it@1", FilePath: "t.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindFunction, Name: "test_it", QualifiedName: "test_it",
+			RawText: "def test_it():\n    req = wrappers.Request.from_values(b'x')\n    assert req.get_data() == b''\n",
+			Imports: []string{"w"},
+			CallSites: []core.CallSite{
+				{Callee: "wrappers.Request.from_values", Line: 2},
+				{Callee: "req.get_data", Line: 3},
+			}},
+	}
+	got := map[string]bool{}
+	for _, e := range BuildEdges(syms) {
+		if e.Type == core.EdgeCalls && e.From == "t.py::test_it@1" {
+			got[e.To] = true
+		}
+	}
+	if !got["w.py::Request.get_data@5"] {
+		t.Errorf("missing edge to Request.get_data: %v", got)
+	}
+	if got["w.py::Response.get_data@9"] {
+		t.Errorf("req is a Request (from_values -> Self); no edge to Response.get_data: %v", got)
+	}
+}
+
+// A resolver edge carries the positions of the calls that produced it, so a
+// caller's same-named call on another class is not counted as a call to the
+// target: resp.get_data() and req.get_data() in one test.
+func TestResolverEdgesCarryTheirCallPositions(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "w.py::Request@1", FilePath: "w.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindClass, Name: "Request", QualifiedName: "Request", RawText: "class Request:\n    pass\n"},
+		{ID: "w.py::Request.get_data@2", FilePath: "w.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindMethod, Name: "get_data", QualifiedName: "Request.get_data", ParentSymbol: "Request",
+			RawText: "def get_data(self):\n    return b''\n"},
+		{ID: "w.py::Response@5", FilePath: "w.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindClass, Name: "Response", QualifiedName: "Response", RawText: "class Response:\n    pass\n"},
+		{ID: "w.py::Response.get_data@6", FilePath: "w.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindMethod, Name: "get_data", QualifiedName: "Response.get_data", ParentSymbol: "Response",
+			RawText: "def get_data(self):\n    return b''\n"},
+		{ID: "t.py::test_mixed@1", FilePath: "t.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindFunction, Name: "test_mixed", QualifiedName: "test_mixed",
+			RawText: "def test_mixed():\n    resp = Response()\n    req = Request()\n    resp.get_data()\n    req.get_data()\n    resp.get_data()\n",
+			Imports: []string{"w"},
+			CallSites: []core.CallSite{
+				{Callee: "Response", Line: 2, Col: 12},
+				{Callee: "Request", Line: 3, Col: 11},
+				{Callee: "resp.get_data", Line: 4, Col: 10},
+				{Callee: "req.get_data", Line: 5, Col: 9},
+				{Callee: "resp.get_data", Line: 6, Col: 10},
+			}},
+	}
+	lines := map[string]string{}
+	for _, e := range BuildEdges(syms) {
+		if e.Type == core.EdgeCalls && e.From == "t.py::test_mixed@1" {
+			lines[e.To] = e.Lines
+		}
+	}
+	if got := lines["w.py::Response.get_data@6"]; got != "4:10,6:10" {
+		t.Errorf("Response.get_data lines = %q, want 4:10,6:10 (all: %v)", got, lines)
+	}
+	if got := lines["w.py::Request.get_data@2"]; got != "5:9" {
+		t.Errorf("Request.get_data lines = %q, want 5:9 (all: %v)", got, lines)
+	}
+}
+
+// A base class named through an import alias resolves to the imported class:
+// flask's `class Blueprint(SansioBlueprint)` had no supertype, so its
+// inherited route() could not be reached (2026-10-14).
+func TestPyAliasedBaseClassResolves(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "pkg/sansio/blueprints.py::Blueprint@1", FilePath: "pkg/sansio/blueprints.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindClass, Name: "Blueprint", QualifiedName: "Blueprint", Signature: "class Blueprint:", RawText: "class Blueprint:\n    pass\n"},
+		{ID: "pkg/blueprints.py::Blueprint@4", FilePath: "pkg/blueprints.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindClass, Name: "Blueprint", QualifiedName: "Blueprint", Signature: "class Blueprint(SansioBlueprint):",
+			RawText: "class Blueprint(SansioBlueprint):\n    pass\n",
+			Imports: []string{".sansio.blueprints", ".sansio.blueprints#Blueprint", "@python-binding:1:SansioBlueprint=.sansio.blueprints#Blueprint"}},
+	}
+	for _, e := range BuildEdges(syms) {
+		if e.Type == core.EdgeExtends && e.From == "pkg/blueprints.py::Blueprint@4" && e.To == "pkg/sansio/blueprints.py::Blueprint@1" {
+			return
+		}
+	}
+	t.Fatal("Blueprint(SansioBlueprint) must extend the sansio Blueprint")
+}
+
+// A class used through a re-export (`from .conn import Plain`, where conn.py
+// imports Plain from ._base) is in the user's import scope, and a class with
+// no __init__ is the target of its constructor call: urllib3's poolmanager
+// ProxyConfig(...) was missing from ProxyConfig's change set (2026-10-14).
+func TestPyReexportedClassWithoutInitIsCalled(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "b::Plain", FilePath: "src/pkg/_base.py", BlobSHA: "1", Language: "python", Kind: core.KindClass, Name: "Plain", QualifiedName: "Plain",
+			RawText: "class Plain(typing.NamedTuple):\n    a: int\n", Span: core.LineRange{Start: 1, End: 2}},
+		{ID: "c::top", FilePath: "src/pkg/conn.py", BlobSHA: "1", Language: "python", Kind: core.KindFunction, Name: "<top-level>", QualifiedName: "<top-level>",
+			Span: core.LineRange{Start: 1, End: 1}, Imports: []string{"._base", "._base#Plain", "@python-binding:1:Plain=._base#Plain"}},
+		{ID: "p::use", FilePath: "src/pkg/pool.py", BlobSHA: "1", Language: "python", Kind: core.KindFunction, Name: "use", QualifiedName: "use",
+			Span: core.LineRange{Start: 3, End: 4}, RawText: "def use():\n    Plain(3)\n",
+			CallSites: []core.CallSite{{Callee: "Plain", Line: 4, Col: 5, Argc: 1}},
+			Imports:   []string{".conn", ".conn#Plain", "@python-binding:1:Plain=.conn#Plain"}},
+	}
+	for _, e := range BuildEdges(syms) {
+		if e.Type == core.EdgeCalls && e.From == "p::use" && e.To == "b::Plain" {
+			return
+		}
+	}
+	t.Fatal("Plain(3) through the conn.py re-export must reach Plain")
+}
+
+// Unannotated factories are typed by what they return (`return cls()` in a
+// classmethod, `return Alpha()` in a staticmethod), and a constructor behind
+// several module qualifiers (`r = lib.runner.Alpha()`) types its variable:
+// untyped, x.method() matched Beta.method by name (2026-10-14).
+func TestPyUnannotatedFactoriesAndDottedCtors(t *testing.T) {
+	py := func(id, file string, kind core.SymbolKind, name, parent, raw string, calls ...core.CallSite) core.SymbolRecord {
+		qn := name
+		if parent != "" {
+			qn = parent + "." + name
+		}
+		return core.SymbolRecord{ID: id, FilePath: file, BlobSHA: "1", Language: "python", Kind: kind, Name: name, QualifiedName: qn,
+			ParentSymbol: parent, RawText: raw, CallSites: calls, Imports: []string{"pkg.a", "pkg.b", "lib.runner"}}
+	}
+	syms := []core.SymbolRecord{
+		py("a::Alpha", "pkg/a.py", core.KindClass, "Alpha", "", "class Alpha:\n    pass\n"),
+		py("a::Alpha.create", "pkg/a.py", core.KindMethod, "create", "Alpha", "@classmethod\ndef create(cls):\n    return cls()\n"),
+		py("a::Alpha.make", "pkg/a.py", core.KindMethod, "make", "Alpha", "@staticmethod\ndef make():\n    return Alpha()\n"),
+		py("a::Alpha.method", "pkg/a.py", core.KindMethod, "method", "Alpha", "def method(self):\n    pass\n"),
+		py("b::Beta", "pkg/b.py", core.KindClass, "Beta", "", "class Beta:\n    pass\n"),
+		py("b::Beta.method", "pkg/b.py", core.KindMethod, "method", "Beta", "def method(self):\n    pass\n"),
+		py("r::Gamma", "lib/runner.py", core.KindClass, "Gamma", "", "class Gamma:\n    pass\n"),
+		py("u::create", "pkg/use.py", core.KindFunction, "use_create", "", "def use_create():\n    x = Alpha.create()\n    x.method()\n",
+			core.CallSite{Callee: "Alpha.create", Line: 2}, core.CallSite{Callee: "x.method", Line: 3}),
+		py("u::static", "pkg/use.py", core.KindFunction, "use_static", "", "def use_static():\n    z = Alpha.make()\n    z.method()\n",
+			core.CallSite{Callee: "Alpha.make", Line: 2}, core.CallSite{Callee: "z.method", Line: 3}),
+		py("u::dotted", "pkg/use.py", core.KindFunction, "use_dotted", "", "def use_dotted():\n    r = lib.runner.Gamma()\n    r.method()\n",
+			core.CallSite{Callee: "lib.runner.Gamma", Line: 2}, core.CallSite{Callee: "r.method", Line: 3}),
+	}
+	got := map[string]bool{}
+	for _, e := range BuildEdges(syms) {
+		if e.Type == core.EdgeCalls {
+			got[e.From+">"+e.To] = true
+		}
+	}
+	for _, bad := range []string{"u::create>b::Beta.method", "u::static>b::Beta.method", "u::dotted>b::Beta.method", "u::dotted>a::Alpha.method"} {
+		if got[bad] {
+			t.Errorf("unexpected edge %s", bad)
+		}
+	}
+	for _, want := range []string{"u::create>a::Alpha.method", "u::static>a::Alpha.method"} {
+		if !got[want] {
+			t.Errorf("missing edge %s (all %v)", want, got)
+		}
+	}
+}
+
+// A nested def sees its enclosing function's typed names (closure), and a
+// class body passing its own method by name (`property(get_data, ...)`)
+// references it (click Command.invoke, werkzeug Response.get_data).
+func TestPyClosureTypesAndClassBodyMethodRefs(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "c::Context", FilePath: "lib/ctx.py", BlobSHA: "1", Language: "python", Kind: core.KindClass, Name: "Context", QualifiedName: "Context", RawText: "class Context:\n    pass\n", Span: core.LineRange{Start: 1, End: 3}},
+		{ID: "c::Context.invoke", FilePath: "lib/ctx.py", BlobSHA: "1", Language: "python", Kind: core.KindMethod, Name: "invoke", QualifiedName: "Context.invoke", ParentSymbol: "Context", RawText: "def invoke(self, cb):\n    return cb()\n", Span: core.LineRange{Start: 2, End: 3}},
+		{ID: "c::Command", FilePath: "lib/ctx.py", BlobSHA: "1", Language: "python", Kind: core.KindClass, Name: "Command", QualifiedName: "Command", RawText: "class Command:\n    pass\n", Span: core.LineRange{Start: 6, End: 19},
+			CallSites: []core.CallSite{{Callee: "property", Line: 19, Col: 12, Argc: 2, Args: []string{"get_data", "set_data"}}}},
+		{ID: "c::Command.invoke", FilePath: "lib/ctx.py", BlobSHA: "1", Language: "python", Kind: core.KindMethod, Name: "invoke", QualifiedName: "Command.invoke", ParentSymbol: "Command",
+			RawText: "def invoke(self, ctx: Context):\n    def _process(value):\n        return ctx.invoke(value)\n\n    return _process(1)\n", Span: core.LineRange{Start: 7, End: 11}},
+		{ID: "c::Command.invoke._process", FilePath: "lib/ctx.py", BlobSHA: "1", Language: "python", Kind: core.KindFunction, Name: "_process", QualifiedName: "Command.invoke._process", ParentSymbol: "invoke",
+			RawText: "def _process(value):\n    return ctx.invoke(value)\n", Span: core.LineRange{Start: 8, End: 9},
+			CallSites: []core.CallSite{{Callee: "ctx.invoke", Line: 9, Col: 24, Argc: 1}}},
+		{ID: "c::Command.get_data", FilePath: "lib/ctx.py", BlobSHA: "1", Language: "python", Kind: core.KindMethod, Name: "get_data", QualifiedName: "Command.get_data", ParentSymbol: "Command", RawText: "def get_data(self):\n    return 1\n", Span: core.LineRange{Start: 13, End: 14}},
+		{ID: "c::Command.set_data", FilePath: "lib/ctx.py", BlobSHA: "1", Language: "python", Kind: core.KindMethod, Name: "set_data", QualifiedName: "Command.set_data", ParentSymbol: "Command", RawText: "def set_data(self, v):\n    pass\n", Span: core.LineRange{Start: 16, End: 17}},
+	}
+	got := map[string]bool{}
+	for _, e := range BuildEdges(syms) {
+		if e.Type == core.EdgeCalls {
+			got[e.From+">"+e.To] = true
+		}
+	}
+	for _, want := range []string{"c::Command.invoke._process>c::Context.invoke", "c::Command>c::Command.get_data", "c::Command>c::Command.set_data"} {
+		if !got[want] {
+			t.Errorf("missing %s (all %v)", want, got)
+		}
+	}
+	if got["c::Command.invoke._process>c::Command.invoke"] {
+		t.Error("ctx is a Context: ctx.invoke must not bind to Command.invoke")
+	}
+}
+
+// A call through the class passes the instance explicitly
+// (`click.Group.get_command(self, ctx, name)`): one argument more than the
+// method takes after self, and it must still bind (5 click misses).
+func TestPyCallThroughClassPassesSelf(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "c::Group", FilePath: "src/click/core.py", BlobSHA: "1", Language: "python", Kind: core.KindClass, Name: "Group", QualifiedName: "Group", RawText: "class Group:\n    pass\n"},
+		{ID: "c::Group.get_command", FilePath: "src/click/core.py", BlobSHA: "1", Language: "python", Kind: core.KindMethod, Name: "get_command", QualifiedName: "Group.get_command", ParentSymbol: "Group",
+			Signature: "def get_command(self, ctx, cmd_name):", RawText: "def get_command(self, ctx, cmd_name):\n    return None\n"},
+		{ID: "c::Other.get_command", FilePath: "src/click/core.py", BlobSHA: "1", Language: "python", Kind: core.KindMethod, Name: "get_command", QualifiedName: "Other.get_command", ParentSymbol: "Other",
+			Signature: "def get_command(self, ctx, cmd_name):", RawText: "def get_command(self, ctx, cmd_name):\n    return None\n"},
+		{ID: "a::AliasedGroup", FilePath: "examples/aliases.py", BlobSHA: "1", Language: "python", Kind: core.KindClass, Name: "AliasedGroup", QualifiedName: "AliasedGroup",
+			Signature: "class AliasedGroup(click.Group):", RawText: "class AliasedGroup(click.Group):\n    pass\n", Imports: []string{"click"}},
+		{ID: "a::use", FilePath: "examples/aliases.py", BlobSHA: "1", Language: "python", Kind: core.KindMethod, Name: "get_command", QualifiedName: "AliasedGroup.get_command", ParentSymbol: "AliasedGroup",
+			Signature: "def get_command(self, ctx, name):", RawText: "def get_command(self, ctx, name):\n    return click.Group.get_command(self, ctx, name)\n", Imports: []string{"click"},
+			Span: core.LineRange{Start: 1, End: 2},
+			CallSites: []core.CallSite{{Callee: "click.Group.get_command", Line: 2, Col: 24, Argc: 3, Args: []string{"self", "ctx", "name"}}}},
+	}
+	got := map[string]bool{}
+	for _, e := range BuildEdges(syms) {
+		if e.Type == core.EdgeCalls && e.From == "a::use" {
+			got[e.To] = true
+		}
+	}
+	if !got["c::Group.get_command"] || got["c::Other.get_command"] {
+		t.Fatalf("click.Group.get_command(self, ...) must bind to Group.get_command only: %v", got)
+	}
+}
+
+// click/werkzeug receiver shapes: a chain through a typed attribute
+// (sub_ctx.command.invoke), a method result whose every definition returns
+// one type (cmd.make_context(...) -> Context), a decorator that declares the
+// argument it passes (@pass_context: Callable[Concatenate[Context, P], R]),
+// and an override's parameter typed by its base (def invoke(self, ctx)).
+func TestPyClickReceiverShapes(t *testing.T) {
+	py := func(id string, kind core.SymbolKind, name, parent, raw string, start int, ann []string, calls ...core.CallSite) core.SymbolRecord {
+		qn := name
+		if parent != "" {
+			qn = parent + "." + name
+		}
+		end := start + strings.Count(raw, "\n")
+		return core.SymbolRecord{ID: id, FilePath: "core.py", BlobSHA: "1", Language: "python", Kind: kind, Name: name, QualifiedName: qn,
+			ParentSymbol: parent, RawText: raw, Signature: strings.SplitN(raw, "\n", 2)[0], Annotations: ann, CallSites: calls,
+			Span: core.LineRange{Start: start, End: end}}
+	}
+	syms := []core.SymbolRecord{
+		py("Context", core.KindClass, "Context", "", "class Context:\n    command: Command\n", 1, nil),
+		py("Context.invoke", core.KindMethod, "invoke", "Context", "def invoke(self, callback, *args):\n    return callback()\n", 3, nil),
+		py("Command", core.KindClass, "Command", "", "class Command:\n    pass\n", 10, nil),
+		py("Command.invoke", core.KindMethod, "invoke", "Command", "def invoke(self, ctx: Context):\n    return None\n", 11, nil),
+		py("Command.make_context", core.KindMethod, "make_context", "Command", "def make_context(self, name) -> Context:\n    return Context()\n", 13, nil),
+		py("pass_context", core.KindFunction, "pass_context", "", "def pass_context(f: t.Callable[te.Concatenate[Context, P], R]) -> t.Callable[P, R]:\n    return f\n", 20, nil),
+		py("chain", core.KindFunction, "chain", "", "def chain(cmd):\n    sub_ctx = cmd.make_context('x')\n    return sub_ctx.command.invoke(sub_ctx)\n", 30, nil,
+			core.CallSite{Callee: "cmd.make_context", Line: 31, Col: 19, Argc: 1}, core.CallSite{Callee: "sub_ctx.command.invoke", Line: 32, Col: 28, Argc: 1}),
+		py("decorated", core.KindFunction, "cli", "", "def cli(ctx):\n    ctx.invoke(sync)\n", 40, []string{"click.pass_context"},
+			core.CallSite{Callee: "ctx.invoke", Line: 41, Col: 9, Argc: 1}),
+		py("Sub", core.KindClass, "Sub", "", "class Sub(Command):\n    pass\n", 50, nil),
+		py("Sub.invoke", core.KindMethod, "invoke", "Sub", "def invoke(self, ctx):\n    ctx.invoke(self.callback)\n", 51, nil,
+			core.CallSite{Callee: "ctx.invoke", Line: 52, Col: 9, Argc: 1}),
+	}
+	syms[8].Signature = "class Sub(Command):"
+	got := map[string]bool{}
+	for _, e := range BuildEdges(syms) {
+		if e.Type == core.EdgeCalls {
+			got[e.From+">"+e.To] = true
+		}
+	}
+	for _, want := range []string{"chain>Command.invoke", "decorated>Context.invoke", "Sub.invoke>Context.invoke"} {
+		if !got[want] {
+			t.Errorf("missing %s (all %v)", want, got)
+		}
+	}
+	for _, bad := range []string{"chain>Context.invoke", "decorated>Command.invoke", "Sub.invoke>Command.invoke", "Sub.invoke>Sub.invoke"} {
+		if got[bad] {
+			t.Errorf("unexpected %s", bad)
+		}
+	}
+}
+
+// A call-result receiver (`NewB().Send()`) without the compiler binds by
+// the producer's declared result type, not to every same-named method.
+func TestGoCallResultReceiverUsesProducerType(t *testing.T) {
+	g := func(id string, kind core.SymbolKind, name, parent, sig string, calls ...core.CallSite) core.SymbolRecord {
+		qn := name
+		if parent != "" {
+			qn = parent + "." + name
+		}
+		return core.SymbolRecord{ID: id, FilePath: "main.go", BlobSHA: "1", Language: "go", Kind: kind, Name: name, QualifiedName: qn,
+			ParentSymbol: parent, Signature: sig, RawText: sig + " {}", CallSites: calls}
+	}
+	syms := []core.SymbolRecord{
+		g("A", core.KindStruct, "A", "", "type A struct{}"),
+		g("B", core.KindStruct, "B", "", "type B struct{}"),
+		g("A.Send", core.KindMethod, "Send", "A", "func (A) Send()"),
+		g("B.Send", core.KindMethod, "Send", "B", "func (*B) Send()"),
+		g("NewB", core.KindFunction, "NewB", "", "func NewB() *B"),
+		g("Work", core.KindFunction, "Work", "", "func Work()", core.CallSite{Callee: "NewB().Send", Line: 1, Col: 9}),
+	}
+	got := map[string]bool{}
+	for _, e := range BuildEdges(syms) {
+		if e.Type == core.EdgeCalls && e.From == "Work" {
+			got[e.To] = true
+		}
+	}
+	if !got["B.Send"] || got["A.Send"] {
+		t.Fatalf("NewB().Send() must bind to B.Send only: %v", got)
+	}
+}
+
+// Rust: a bare call reaches free functions only (a closure parameter
+// `matched(m)` is no method), a string-literal receiver reaches no in-repo
+// method, and a tuple-struct literal `JSON(x)` runs no `new`.
+func TestRustBareCallsLiteralReceiversAndTupleLiterals(t *testing.T) {
+	rs := func(id string, kind core.SymbolKind, name, parent string, calls ...core.CallSite) core.SymbolRecord {
+		qn := name
+		if parent != "" {
+			qn = parent + "." + name
+		}
+		return core.SymbolRecord{ID: id, FilePath: "src/lib.rs", BlobSHA: "1", Language: "rust", Kind: kind, Name: name, QualifiedName: qn,
+			ParentSymbol: parent, RawText: "fn " + name + "() {}", CallSites: calls}
+	}
+	syms := []core.SymbolRecord{
+		rs("Color", core.KindStruct, "Color", ""),
+		rs("Color.matched", core.KindMethod, "matched", "Color"),
+		rs("Color.as_bytes", core.KindMethod, "as_bytes", "Color"),
+		rs("JSON", core.KindStruct, "JSON", ""),
+		rs("JSON.new", core.KindConstructor, "new", "JSON"),
+		rs("use", core.KindFunction, "use_it", "",
+			core.CallSite{Callee: "matched", Line: 2, Argc: 1},
+			core.CallSite{Callee: "<str>.as_bytes", Line: 3},
+			core.CallSite{Callee: "Printer.JSON", Line: 4, Argc: 1}),
+	}
+	for _, e := range BuildEdges(syms) {
+		if e.Type == core.EdgeCalls && e.From == "use" {
+			t.Errorf("unexpected edge to %s", e.To)
+		}
+	}
+}
+
+// An expression receiver (`(a + b).m()`, `xs[i].m()`) is an untyped method
+// call, not a bare call, and `f()?.m()` binds through f's Result<T>.
+func TestRustExpressionAndTryReceivers(t *testing.T) {
+	rs := func(id string, kind core.SymbolKind, name, parent, sig string, calls ...core.CallSite) core.SymbolRecord {
+		qn := name
+		if parent != "" {
+			qn = parent + "." + name
+		}
+		return core.SymbolRecord{ID: id, FilePath: "src/lib.rs", BlobSHA: "1", Language: "rust", Kind: kind, Name: name, QualifiedName: qn,
+			ParentSymbol: parent, Signature: sig, RawText: sig + " {}", CallSites: calls}
+	}
+	syms := []core.SymbolRecord{
+		rs("Path", core.KindStruct, "Path", "", "struct Path"),
+		rs("Path.is_link", core.KindMethod, "is_link", "Path", "fn is_link(&self) -> bool"),
+		rs("Walk", core.KindStruct, "Walk", "", "struct Walk"),
+		rs("Walk.build", core.KindMethod, "build", "Walk", "fn build(&self) -> u8"),
+		rs("Other", core.KindStruct, "Other", "", "struct Other"),
+		rs("Other.build", core.KindMethod, "build", "Other", "fn build(&self) -> u8"),
+		rs("walk", core.KindFunction, "walk", "", "fn walk() -> anyhow::Result<Walk>"),
+		rs("use", core.KindFunction, "use_it", "", "fn use_it() -> anyhow::Result<()>",
+			core.CallSite{Callee: "<expr>.is_link", Line: 2},
+			core.CallSite{Callee: "walk()?.build", Line: 3}),
+	}
+	got := map[string]bool{}
+	for _, e := range BuildEdges(syms) {
+		if e.Type == core.EdgeCalls && e.From == "use" {
+			got[e.To] = true
+		}
+	}
+	if !got["Path.is_link"] || !got["Walk.build"] || got["Other.build"] {
+		t.Fatalf("want is_link (expression receiver) and Walk.build only: %v", got)
+	}
+}

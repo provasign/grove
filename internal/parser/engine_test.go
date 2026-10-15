@@ -1648,3 +1648,77 @@ func TestPythonRegexIgnoresDocstringProse(t *testing.T) {
 		t.Fatal("real function g missing")
 	}
 }
+
+// A Python module with imports and no definitions (a re-export module, a
+// package __init__.py) keeps its imports on an empty module body: the edge
+// index reads imports from symbols, and without one the re-export hop to the
+// defining module was impossible.
+func TestExtractPythonReexportOnlyModuleKeepsImports(t *testing.T) {
+	syms, err := NewEngine().ExtractContent("pkg/conn.py", []byte("from ._base import Plain as Plain\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(syms) != 1 || syms[0].Name != "<top-level>" {
+		t.Fatalf("want one <top-level> carrier, got %+v", syms)
+	}
+	found := false
+	for _, imp := range syms[0].Imports {
+		if strings.Contains(imp, "Plain=._base#Plain") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("binding missing from %v", syms[0].Imports)
+	}
+}
+
+// An unterminated char literal mid-edit in jackson-databind's
+// BeanDeserializer (testdata, Apache-2.0): error recovery invented a
+// constructor named "if" and a field "bean", and 15 methods after the broken
+// statement lost their class.
+func TestExtractJavaMidEditKeepsClassMembers(t *testing.T) {
+	src, err := os.ReadFile("testdata/java/BeanDeserializer.java.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.SplitAfter(string(src), "\n")
+	broken := strings.Join(lines[:296], "") + "        char c = 'x;\n" + strings.Join(lines[296:], "")
+	syms, err := NewEngine().ExtractContent("BeanDeserializer.java", []byte(broken))
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphans := 0
+	for _, s := range syms {
+		if s.Name == "if" || (s.Kind == core.KindField && s.Name == "bean") {
+			t.Errorf("phantom %s %s", s.Kind, s.QualifiedName)
+		}
+		if s.Kind == core.KindMethod && s.ParentSymbol == "" {
+			orphans++
+		}
+	}
+	if orphans > 0 {
+		t.Errorf("%d methods lost their class", orphans)
+	}
+}
+
+// Methods of an object literal passed as an argument have no symbol of
+// their own; their calls belong to the module body instead of vanishing
+// (zod: meta()/get description() inside core.$constructor(..., {...})).
+func TestExtractTSObjectLiteralArgumentMethodCalls(t *testing.T) {
+	src := "import { reg } from './r'\n\nexport const T = make(\"T\", (inst) => inst, {\n  meta() {\n    return reg.get(this)\n  },\n  get description() {\n    return reg.lookup(this)\n  },\n})\n"
+	syms, err := NewEngine().ExtractContent("schemas.ts", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := map[string]int{}
+	for _, s := range syms {
+		if s.Name == "<top-level>" {
+			for _, cs := range s.CallSites {
+				found[cs.Callee] = cs.Line
+			}
+		}
+	}
+	if found["reg.get"] != 5 || found["reg.lookup"] != 8 {
+		t.Fatalf("object-literal argument methods' calls missing from <top-level>: %v", found)
+	}
+}

@@ -61,7 +61,7 @@ func localTypesForSymbol(idx *edgeIndex, symbol *core.SymbolRecord) map[string]s
 	case "python":
 		return pyLocalTypes(idx, symbol)
 	case "typescript", "tsx", "javascript":
-		return tsLocalTypes(idx, symbol)
+		return tsLocalTypesAt(tsLocalTypes(idx, symbol), "", -1) // no call line: reassigned names stay untyped
 	case "java":
 		return javaLocalTypes(idx, symbol)
 	case "rust":

@@ -78,6 +78,11 @@ type ChangeImpactResult struct {
 	// migration reads which token calls which overload. Callers without
 	// compiler positions are absent.
 	CallerLines map[string][]string
+	// ResolvedCallerLines is the same for callers no compiler resolved: the
+	// positions grove's own resolver tied to the change set. A same-named
+	// call in the caller that is absent went to another target (a typed
+	// receiver of another class) or was not resolved.
+	ResolvedCallerLines map[string][]string
 
 	// Data-member anchors (fields, properties, constants, variables) only —
 	// see memberimpact.go. MemberKind is non-empty exactly for those.
@@ -116,10 +121,23 @@ func (c callerEvidence) note(e core.Edge) {
 // compiler edges carry.
 type callerLines map[string]map[string]bool
 
-func (c callerLines) note(e core.Edge) {
-	if e.Type != core.EdgeCalls || e.Lines == "" {
+// note records a compiler edge's positions into c and any other edge's
+// into resolved.
+func (c callerLines) note(e core.Edge, resolved callerLines) {
+	// A compiler-resolved value reference (`f := pkg.Do`) is an edit site
+	// like a call.
+	nativeRef := e.Source == core.EvidenceSourceNative && (e.Type == core.EdgeReads || e.Type == core.EdgeWrites)
+	if e.Type != core.EdgeCalls && !nativeRef || e.Lines == "" {
 		return
 	}
+	if e.Source != core.EvidenceSourceNative {
+		resolved.add(e)
+		return
+	}
+	c.add(e)
+}
+
+func (c callerLines) add(e core.Edge) {
 	for _, part := range strings.Split(e.Lines, ",") {
 		if part == "" {
 			continue
@@ -569,7 +587,7 @@ func (g *CodeGraph) changeImpactScoped(query, file string) (*ChangeImpactResult,
 	}
 	callerSeen := make(map[string]bool)
 	evidence := callerEvidence{}
-	callLines := callerLines{}
+	callLines, resolvedLines := callerLines{}, callerLines{}
 	var callers []core.SymbolRecord
 	for id := range memberIDs {
 		for _, ei := range g.inbound[id] {
@@ -584,8 +602,12 @@ func (g *CodeGraph) changeImpactScoped(query, file string) (*ChangeImpactResult,
 			}
 			if !memberIDs[edge.From] {
 				evidence.note(edge)
-				callLines.note(edge)
 			}
+			// A member's own calls into the set are edit sites too:
+			// super().highlight(text) inside an override changes with the
+			// signature. The member is listed as a site already; its call
+			// positions were dropped (19 of 21 Python misses, 2026-10-14).
+			callLines.note(edge, resolvedLines)
 			if memberIDs[edge.From] || callerSeen[edge.From] {
 				continue
 			}
@@ -624,18 +646,19 @@ func (g *CodeGraph) changeImpactScoped(query, file string) (*ChangeImpactResult,
 	sortSymbols(callers)
 	sortSymbols(declTypes)
 	return &ChangeImpactResult{
-		Query:              query,
-		Declarations:       decls,
-		Supers:             supers,
-		Family:             family,
-		Callers:            callers,
-		DeclaringTypes:     declTypes,
-		ExternalSupers:     externalSupers,
-		OverridesExternal:  overridesExternal,
-		Completeness:       completeness,
-		HasHeuristicRefs:   len(evidence.nameMatched()) > 0,
-		NameMatchedCallers: evidence.nameMatched(),
-		CallerLines:        callLines.sorted(),
+		Query:               query,
+		Declarations:        decls,
+		Supers:              supers,
+		Family:              family,
+		Callers:             callers,
+		DeclaringTypes:      declTypes,
+		ExternalSupers:      externalSupers,
+		OverridesExternal:   overridesExternal,
+		Completeness:        completeness,
+		HasHeuristicRefs:    len(evidence.nameMatched()) > 0,
+		NameMatchedCallers:  evidence.nameMatched(),
+		CallerLines:         callLines.sorted(),
+		ResolvedCallerLines: resolvedLines.sorted(),
 	}, nil
 }
 
@@ -787,7 +810,7 @@ func (g *CodeGraph) externalRootedImpact(query, typeName, methodName string, que
 	}
 	callerSeen := make(map[string]bool)
 	evidence := callerEvidence{}
-	callLines := callerLines{}
+	callLines, resolvedLines := callerLines{}, callerLines{}
 	var callers []core.SymbolRecord
 	for id := range memberIDs {
 		for _, ei := range g.inbound[id] {
@@ -797,8 +820,8 @@ func (g *CodeGraph) externalRootedImpact(query, typeName, methodName string, que
 			}
 			if !memberIDs[edge.From] {
 				evidence.note(edge)
-				callLines.note(edge)
 			}
+			callLines.note(edge, resolvedLines) // members' own calls too (see changeImpactScoped)
 			if memberIDs[edge.From] || callerSeen[edge.From] {
 				continue
 			}
@@ -812,15 +835,16 @@ func (g *CodeGraph) externalRootedImpact(query, typeName, methodName string, que
 	sortSymbols(family)
 	sortSymbols(callers)
 	return &ChangeImpactResult{
-		Query:              query,
-		Family:             family,
-		Callers:            callers,
-		ExternalSupers:     []string{typeName},
-		OverridesExternal:  []string{typeName + "#" + methodName},
-		Completeness:       "project-local",
-		HasHeuristicRefs:   len(evidence.nameMatched()) > 0,
-		NameMatchedCallers: evidence.nameMatched(),
-		CallerLines:        callLines.sorted(),
+		Query:               query,
+		Family:              family,
+		Callers:             callers,
+		ExternalSupers:      []string{typeName},
+		OverridesExternal:   []string{typeName + "#" + methodName},
+		Completeness:        "project-local",
+		HasHeuristicRefs:    len(evidence.nameMatched()) > 0,
+		NameMatchedCallers:  evidence.nameMatched(),
+		CallerLines:         callLines.sorted(),
+		ResolvedCallerLines: resolvedLines.sorted(),
 	}, nil
 }
 
@@ -834,7 +858,9 @@ func declaredSuperNames(s *core.SymbolRecord) []string {
 		// PHP uses the same `extends`/`implements` keywords. Without this
 		// case a PHP class extending a vendor base always reported
 		// Completeness "closed" even though the contract left the index.
-		if s.Kind != core.KindClass && s.Kind != core.KindInterface {
+		// Java and PHP enums implement interfaces too.
+		if s.Kind != core.KindClass && s.Kind != core.KindInterface &&
+			!(s.Kind == core.KindEnum && (s.Language == "java" || s.Language == "php")) {
 			return nil
 		}
 		text := declHeader(s)
@@ -858,7 +884,7 @@ func declaredSuperNames(s *core.SymbolRecord) []string {
 		text := declHeader(s)
 		return swiftBaseNames(text)
 	case "kotlin":
-		if s.Kind != core.KindClass && s.Kind != core.KindInterface {
+		if s.Kind != core.KindClass && s.Kind != core.KindInterface && s.Kind != core.KindEnum {
 			return nil
 		}
 		text := declHeader(s)
@@ -1171,7 +1197,28 @@ func (g *CodeGraph) resolveLooseQueryScopedLocked(query, file string) (string, e
 			return head, nil
 		}
 	}
-	sort.Strings(order)
+	// Production declarations first, anonymous and test-file ones last: the
+	// list is capped at ten, and commons-lang's `accept` showed ten
+	// anonymous FailableTest classes while the Failable* interfaces were
+	// among the "35 more".
+	weak := func(q string) bool {
+		syms := canonical[q]
+		if strings.Contains(q, "<anonymous") {
+			return true
+		}
+		for _, s := range syms {
+			if !core.IsTestPath(s.FilePath) {
+				return false
+			}
+		}
+		return len(syms) > 0
+	}
+	sort.SliceStable(order, func(i, j int) bool {
+		if wi, wj := weak(order[i]), weak(order[j]); wi != wj {
+			return !wi
+		}
+		return order[i] < order[j]
+	})
 	return "", fmt.Errorf("change-impact: %q is ambiguous — %d candidates:%s\nre-run with one of these",
 		query, len(order), formatCandidates(order, canonical))
 }
@@ -1218,19 +1265,25 @@ func (g *CodeGraph) freeFunctionImpactLocked(query, file string) *ChangeImpactRe
 		}
 	}
 	evidence := callerEvidence{}
-	callLines := callerLines{}
+	callLines, resolvedLines := callerLines{}, callerLines{}
 	seen := map[string]bool{}
 	var callers []core.SymbolRecord
 	for id := range declIDs {
 		for _, ei := range g.inbound[id] {
 			edge := g.edges[ei]
-			accept := edge.Type == core.EdgeCalls ||
+			// A compiler-resolved value reference to a function
+			// (`apply(Handle)`) breaks under a signature change like a call.
+			nativeRef := edge.Source == core.EvidenceSourceNative && (edge.Type == core.EdgeReads || edge.Type == core.EdgeWrites)
+			accept := edge.Type == core.EdgeCalls || nativeRef ||
 				(dataAnchor && (edge.Type == core.EdgeReads || edge.Type == core.EdgeWrites || edge.Type == core.EdgeRedefines))
-			if !accept || declIDs[edge.From] {
+			if !accept {
+				continue
+			}
+			callLines.note(edge, resolvedLines) // recursion is an edit site too
+			if declIDs[edge.From] {
 				continue
 			}
 			evidence.note(edge)
-			callLines.note(edge)
 			if seen[edge.From] {
 				continue
 			}
@@ -1243,14 +1296,15 @@ func (g *CodeGraph) freeFunctionImpactLocked(query, file string) *ChangeImpactRe
 	sortSymbols(decls)
 	sortSymbols(callers)
 	return &ChangeImpactResult{
-		Query:              query,
-		Declarations:       decls,
-		Callers:            callers,
-		Completeness:       "callers-only",
-		HasHeuristicRefs:   len(evidence.nameMatched()) > 0,
-		NameMatchedCallers: evidence.nameMatched(),
-		CallerLines:        callLines.sorted(),
-		ReExports:          g.jsReExportsLocked(decls),
+		Query:               query,
+		Declarations:        decls,
+		Callers:             callers,
+		Completeness:        "callers-only",
+		HasHeuristicRefs:    len(evidence.nameMatched()) > 0,
+		NameMatchedCallers:  evidence.nameMatched(),
+		CallerLines:         callLines.sorted(),
+		ResolvedCallerLines: resolvedLines.sorted(),
+		ReExports:           g.jsReExportsLocked(decls),
 	}
 }
 
