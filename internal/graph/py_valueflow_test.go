@@ -126,3 +126,44 @@ func TestPythonReceiverTyping(t *testing.T) {
 		t.Errorf("inside isinstance(obj, State), obj is a State")
 	}
 }
+
+// A malformed component ("mod." from an annotation the regex cut short)
+// panicked indexing click (replay 2026-10-17).
+func TestPyComponentTypeMalformed(t *testing.T) {
+	sym := pySym(core.KindFunction, "t.py", "f", "", "def f(): pass", 1, 1)
+	for _, c := range []string{"click.", ".", "", "''"} {
+		if got := pyComponentType(nil, &sym, c); got != "" {
+			t.Errorf("%q: got %q", c, got)
+		}
+	}
+}
+
+// result.exception is annotated BaseException | None; calling a method
+// BaseException lacks means the object is one of our subclasses.
+func TestPythonExceptionReceiverReachesSubclasses(t *testing.T) {
+	g := New()
+	sym := func(kind core.SymbolKind, name, parent, raw string, start, end int, sites ...core.CallSite) core.SymbolRecord {
+		s := pySym(kind, "t.py", name, parent, raw, start, end)
+		s.CallSites = sites
+		s.Imports = []string{"t.py"}
+		return s
+	}
+	syms := []core.SymbolRecord{
+		sym(core.KindClass, "ClickException", "", "class ClickException(Exception):\n    pass", 1, 4),
+		sym(core.KindMethod, "format_message", "ClickException", "def format_message(self) -> str:\n        return ''", 2, 3),
+		sym(core.KindClass, "Fmt", "", "class Fmt:\n    pass", 5, 8),
+		sym(core.KindMethod, "format_message", "Fmt", "def format_message(self) -> str:\n        return ''", 6, 7),
+		sym(core.KindClass, "Result", "", "class Result:\n    def __init__(self, exception: BaseException | None):\n        self.exception = exception", 10, 20),
+		sym(core.KindFunction, "check", "",
+			"def check(err: BaseException):\n    err.format_message()\n    err.with_traceback(None)", 30, 32,
+			core.CallSite{Callee: "err.format_message", Line: 31, Col: 9, Argc: 0},
+			core.CallSite{Callee: "err.with_traceback", Line: 32, Col: 9, Argc: 1}),
+	}
+	g.Replace(syms, 1)
+	if !hasEdge(g, core.EdgeCalls, "t.py::check@b", "t.py::ClickException.format_message@b") {
+		t.Errorf("err: BaseException calling format_message holds a ClickException (an Exception)")
+	}
+	if hasEdge(g, core.EdgeCalls, "t.py::check@b", "t.py::Fmt.format_message@b") {
+		t.Errorf("Fmt is no exception")
+	}
+}

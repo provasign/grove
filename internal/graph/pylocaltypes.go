@@ -2727,8 +2727,8 @@ func pyComponentType(idx *edgeIndex, symbol *core.SymbolRecord, t string) string
 	if i := strings.LastIndexByte(t, '.'); i >= 0 {
 		t = t[i+1:]
 	}
-	if len(t) == 1 || t == "Any" || t == "object" {
-		return "" // a type variable, or anything
+	if len(t) <= 1 || t == "Any" || t == "object" {
+		return "" // a type variable, anything, or a malformed "mod." component
 	}
 	if pyResolveClass(idx, t, dirOf(symbol.FilePath)) != nil {
 		return t
@@ -2908,4 +2908,41 @@ func pyIsinstanceAt(idx *edgeIndex, symbol *core.SymbolRecord, line int, name st
 		}
 	}
 	return ""
+}
+
+// pyBaseExceptionMembers are the methods BaseException itself defines.
+var pyBaseExceptionMembers = map[string]bool{"with_traceback": true, "add_note": true}
+
+// pyExceptionSubclassMembers: a receiver annotated BaseException or
+// Exception (click's Result.exception) that calls a method neither defines
+// holds one of our subclasses that does — result.exception.format_message()
+// is ClickException's. Nil otherwise.
+func pyExceptionSubclassMembers(idx *edgeIndex, caller *core.SymbolRecord, base, name string, cands []*core.SymbolRecord) []*core.SymbolRecord {
+	if base != "BaseException" && base != "Exception" || pyBaseExceptionMembers[name] || strings.HasPrefix(name, "__") {
+		return nil
+	}
+	var out []*core.SymbolRecord
+	for _, c := range cands {
+		if c.Language != "python" || c.ParentSymbol == "" || c.Name != name {
+			continue
+		}
+		for _, b := range pyMRO(idx, c.ParentSymbol, dirOf(c.FilePath)) {
+			// A runtime exception class (Exception, ValueError, ...) we do
+			// not declare: every one is a BaseException.
+			if pyRuntimeException(b) && !typeSymbolExists(idx, b) && (base == "BaseException" || b != "BaseException") {
+				out = append(out, c)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// pyRuntimeException reports a builtin exception class name.
+func pyRuntimeException(name string) bool {
+	switch name {
+	case "BaseException", "Exception", "KeyboardInterrupt", "SystemExit", "GeneratorExit", "StopIteration", "StopAsyncIteration":
+		return true
+	}
+	return strings.HasSuffix(name, "Error") || strings.HasSuffix(name, "Warning")
 }
