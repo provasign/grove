@@ -78,6 +78,11 @@ type ChangeImpactResult struct {
 	// migration reads which token calls which overload. Callers without
 	// compiler positions are absent.
 	CallerLines map[string][]string
+	// ResolvedCallerLines is the same for callers no compiler resolved: the
+	// positions grove's own resolver tied to the change set. A same-named
+	// call in the caller that is absent went to another target (a typed
+	// receiver of another class) or was not resolved.
+	ResolvedCallerLines map[string][]string
 
 	// Data-member anchors (fields, properties, constants, variables) only —
 	// see memberimpact.go. MemberKind is non-empty exactly for those.
@@ -116,10 +121,20 @@ func (c callerEvidence) note(e core.Edge) {
 // compiler edges carry.
 type callerLines map[string]map[string]bool
 
-func (c callerLines) note(e core.Edge) {
+// note records a compiler edge's positions into c and any other edge's
+// into resolved.
+func (c callerLines) note(e core.Edge, resolved callerLines) {
 	if e.Type != core.EdgeCalls || e.Lines == "" {
 		return
 	}
+	if e.Source != core.EvidenceSourceNative {
+		resolved.add(e)
+		return
+	}
+	c.add(e)
+}
+
+func (c callerLines) add(e core.Edge) {
 	for _, part := range strings.Split(e.Lines, ",") {
 		if part == "" {
 			continue
@@ -569,7 +584,7 @@ func (g *CodeGraph) changeImpactScoped(query, file string) (*ChangeImpactResult,
 	}
 	callerSeen := make(map[string]bool)
 	evidence := callerEvidence{}
-	callLines := callerLines{}
+	callLines, resolvedLines := callerLines{}, callerLines{}
 	var callers []core.SymbolRecord
 	for id := range memberIDs {
 		for _, ei := range g.inbound[id] {
@@ -584,7 +599,7 @@ func (g *CodeGraph) changeImpactScoped(query, file string) (*ChangeImpactResult,
 			}
 			if !memberIDs[edge.From] {
 				evidence.note(edge)
-				callLines.note(edge)
+				callLines.note(edge, resolvedLines)
 			}
 			if memberIDs[edge.From] || callerSeen[edge.From] {
 				continue
@@ -624,18 +639,19 @@ func (g *CodeGraph) changeImpactScoped(query, file string) (*ChangeImpactResult,
 	sortSymbols(callers)
 	sortSymbols(declTypes)
 	return &ChangeImpactResult{
-		Query:              query,
-		Declarations:       decls,
-		Supers:             supers,
-		Family:             family,
-		Callers:            callers,
-		DeclaringTypes:     declTypes,
-		ExternalSupers:     externalSupers,
-		OverridesExternal:  overridesExternal,
-		Completeness:       completeness,
-		HasHeuristicRefs:   len(evidence.nameMatched()) > 0,
-		NameMatchedCallers: evidence.nameMatched(),
-		CallerLines:        callLines.sorted(),
+		Query:               query,
+		Declarations:        decls,
+		Supers:              supers,
+		Family:              family,
+		Callers:             callers,
+		DeclaringTypes:      declTypes,
+		ExternalSupers:      externalSupers,
+		OverridesExternal:   overridesExternal,
+		Completeness:        completeness,
+		HasHeuristicRefs:    len(evidence.nameMatched()) > 0,
+		NameMatchedCallers:  evidence.nameMatched(),
+		CallerLines:         callLines.sorted(),
+		ResolvedCallerLines: resolvedLines.sorted(),
 	}, nil
 }
 
@@ -787,7 +803,7 @@ func (g *CodeGraph) externalRootedImpact(query, typeName, methodName string, que
 	}
 	callerSeen := make(map[string]bool)
 	evidence := callerEvidence{}
-	callLines := callerLines{}
+	callLines, resolvedLines := callerLines{}, callerLines{}
 	var callers []core.SymbolRecord
 	for id := range memberIDs {
 		for _, ei := range g.inbound[id] {
@@ -797,7 +813,7 @@ func (g *CodeGraph) externalRootedImpact(query, typeName, methodName string, que
 			}
 			if !memberIDs[edge.From] {
 				evidence.note(edge)
-				callLines.note(edge)
+				callLines.note(edge, resolvedLines)
 			}
 			if memberIDs[edge.From] || callerSeen[edge.From] {
 				continue
@@ -812,15 +828,16 @@ func (g *CodeGraph) externalRootedImpact(query, typeName, methodName string, que
 	sortSymbols(family)
 	sortSymbols(callers)
 	return &ChangeImpactResult{
-		Query:              query,
-		Family:             family,
-		Callers:            callers,
-		ExternalSupers:     []string{typeName},
-		OverridesExternal:  []string{typeName + "#" + methodName},
-		Completeness:       "project-local",
-		HasHeuristicRefs:   len(evidence.nameMatched()) > 0,
-		NameMatchedCallers: evidence.nameMatched(),
-		CallerLines:        callLines.sorted(),
+		Query:               query,
+		Family:              family,
+		Callers:             callers,
+		ExternalSupers:      []string{typeName},
+		OverridesExternal:   []string{typeName + "#" + methodName},
+		Completeness:        "project-local",
+		HasHeuristicRefs:    len(evidence.nameMatched()) > 0,
+		NameMatchedCallers:  evidence.nameMatched(),
+		CallerLines:         callLines.sorted(),
+		ResolvedCallerLines: resolvedLines.sorted(),
 	}, nil
 }
 
@@ -1218,7 +1235,7 @@ func (g *CodeGraph) freeFunctionImpactLocked(query, file string) *ChangeImpactRe
 		}
 	}
 	evidence := callerEvidence{}
-	callLines := callerLines{}
+	callLines, resolvedLines := callerLines{}, callerLines{}
 	seen := map[string]bool{}
 	var callers []core.SymbolRecord
 	for id := range declIDs {
@@ -1230,7 +1247,7 @@ func (g *CodeGraph) freeFunctionImpactLocked(query, file string) *ChangeImpactRe
 				continue
 			}
 			evidence.note(edge)
-			callLines.note(edge)
+			callLines.note(edge, resolvedLines)
 			if seen[edge.From] {
 				continue
 			}
@@ -1243,14 +1260,15 @@ func (g *CodeGraph) freeFunctionImpactLocked(query, file string) *ChangeImpactRe
 	sortSymbols(decls)
 	sortSymbols(callers)
 	return &ChangeImpactResult{
-		Query:              query,
-		Declarations:       decls,
-		Callers:            callers,
-		Completeness:       "callers-only",
-		HasHeuristicRefs:   len(evidence.nameMatched()) > 0,
-		NameMatchedCallers: evidence.nameMatched(),
-		CallerLines:        callLines.sorted(),
-		ReExports:          g.jsReExportsLocked(decls),
+		Query:               query,
+		Declarations:        decls,
+		Callers:             callers,
+		Completeness:        "callers-only",
+		HasHeuristicRefs:    len(evidence.nameMatched()) > 0,
+		NameMatchedCallers:  evidence.nameMatched(),
+		CallerLines:         callLines.sorted(),
+		ResolvedCallerLines: resolvedLines.sorted(),
+		ReExports:           g.jsReExportsLocked(decls),
 	}
 }
 

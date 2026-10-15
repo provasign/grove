@@ -1127,3 +1127,91 @@ func TestCFamilyParamsFromBodyIgnoreComments(t *testing.T) {
 		t.Fatalf("str = %q, want String", got)
 	}
 }
+
+// req = wrappers.Request.from_values(...) is a Request: the classmethod says
+// -> te.Self. Untyped, req.get_data() fell back to the name and linked the
+// test to Response.get_data (werkzeug, 2026-10-14). A second, sansio
+// Request without from_values must not hide the answer.
+func TestPyClassFactoryResultIsTheClass(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "sansio/r.py::Request@1", FilePath: "sansio/r.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindClass, Name: "Request", QualifiedName: "Request",
+			RawText: "class Request:\n    pass\n"},
+		{ID: "w.py::Request@1", FilePath: "w.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindClass, Name: "Request", QualifiedName: "Request",
+			RawText: "class Request(_SansIORequest):\n    pass\n"},
+		{ID: "w.py::Request.from_values@2", FilePath: "w.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindMethod, Name: "from_values", QualifiedName: "Request.from_values", ParentSymbol: "Request",
+			RawText: "@classmethod\ndef from_values(cls, *args: t.Any) -> te.Self:\n    return cls()\n"},
+		{ID: "w.py::Request.get_data@5", FilePath: "w.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindMethod, Name: "get_data", QualifiedName: "Request.get_data", ParentSymbol: "Request",
+			RawText: "def get_data(self, cache=True):\n    return b''\n"},
+		{ID: "w.py::Response@8", FilePath: "w.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindClass, Name: "Response", QualifiedName: "Response",
+			RawText: "class Response:\n    pass\n"},
+		{ID: "w.py::Response.get_data@9", FilePath: "w.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindMethod, Name: "get_data", QualifiedName: "Response.get_data", ParentSymbol: "Response",
+			RawText: "def get_data(self, as_text=False):\n    return b''\n"},
+		{ID: "t.py::test_it@1", FilePath: "t.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindFunction, Name: "test_it", QualifiedName: "test_it",
+			RawText: "def test_it():\n    req = wrappers.Request.from_values(b'x')\n    assert req.get_data() == b''\n",
+			Imports: []string{"w"},
+			CallSites: []core.CallSite{
+				{Callee: "wrappers.Request.from_values", Line: 2},
+				{Callee: "req.get_data", Line: 3},
+			}},
+	}
+	got := map[string]bool{}
+	for _, e := range BuildEdges(syms) {
+		if e.Type == core.EdgeCalls && e.From == "t.py::test_it@1" {
+			got[e.To] = true
+		}
+	}
+	if !got["w.py::Request.get_data@5"] {
+		t.Errorf("missing edge to Request.get_data: %v", got)
+	}
+	if got["w.py::Response.get_data@9"] {
+		t.Errorf("req is a Request (from_values -> Self); no edge to Response.get_data: %v", got)
+	}
+}
+
+// A resolver edge carries the positions of the calls that produced it, so a
+// caller's same-named call on another class is not counted as a call to the
+// target: resp.get_data() and req.get_data() in one test.
+func TestResolverEdgesCarryTheirCallPositions(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "w.py::Request@1", FilePath: "w.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindClass, Name: "Request", QualifiedName: "Request", RawText: "class Request:\n    pass\n"},
+		{ID: "w.py::Request.get_data@2", FilePath: "w.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindMethod, Name: "get_data", QualifiedName: "Request.get_data", ParentSymbol: "Request",
+			RawText: "def get_data(self):\n    return b''\n"},
+		{ID: "w.py::Response@5", FilePath: "w.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindClass, Name: "Response", QualifiedName: "Response", RawText: "class Response:\n    pass\n"},
+		{ID: "w.py::Response.get_data@6", FilePath: "w.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindMethod, Name: "get_data", QualifiedName: "Response.get_data", ParentSymbol: "Response",
+			RawText: "def get_data(self):\n    return b''\n"},
+		{ID: "t.py::test_mixed@1", FilePath: "t.py", BlobSHA: "1", Language: "python",
+			Kind: core.KindFunction, Name: "test_mixed", QualifiedName: "test_mixed",
+			RawText: "def test_mixed():\n    resp = Response()\n    req = Request()\n    resp.get_data()\n    req.get_data()\n    resp.get_data()\n",
+			Imports: []string{"w"},
+			CallSites: []core.CallSite{
+				{Callee: "Response", Line: 2, Col: 12},
+				{Callee: "Request", Line: 3, Col: 11},
+				{Callee: "resp.get_data", Line: 4, Col: 10},
+				{Callee: "req.get_data", Line: 5, Col: 9},
+				{Callee: "resp.get_data", Line: 6, Col: 10},
+			}},
+	}
+	lines := map[string]string{}
+	for _, e := range BuildEdges(syms) {
+		if e.Type == core.EdgeCalls && e.From == "t.py::test_mixed@1" {
+			lines[e.To] = e.Lines
+		}
+	}
+	if got := lines["w.py::Response.get_data@6"]; got != "4:10,6:10" {
+		t.Errorf("Response.get_data lines = %q, want 4:10,6:10 (all: %v)", got, lines)
+	}
+	if got := lines["w.py::Request.get_data@2"]; got != "5:9" {
+		t.Errorf("Request.get_data lines = %q, want 5:9 (all: %v)", got, lines)
+	}
+}

@@ -2239,18 +2239,41 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 		return resolveMainframeCallEdges(idx, symbol)
 	}
 	var edges []core.Edge
-	seen := make(map[string]bool)
-
+	seen := make(map[string]int) // edge key -> index in edges
+	// callPos is the position of the call site being resolved; each edge
+	// keeps the positions of the calls that produced it, so a caller's
+	// same-named calls on other receivers are not taken for calls to the
+	// target (werkzeug test_mixed: resp.get_data() and req.get_data()).
+	callPos := ""
+	edgeLines := map[int]map[string]bool{}
 	addEdge := func(fromID, toID string, confidence float64, source core.EvidenceSource, reason core.EdgeReason) {
 		key := fromID + "::calls::" + toID
-		if seen[key] {
-			return
+		i, ok := seen[key]
+		if !ok {
+			i = len(edges)
+			seen[key] = i
+			edges = append(edges, core.Edge{
+				From: fromID, To: toID,
+				Type: core.EdgeCalls, Confidence: confidence, Source: source, Reason: reason,
+			})
 		}
-		seen[key] = true
-		edges = append(edges, core.Edge{
-			From: fromID, To: toID,
-			Type: core.EdgeCalls, Confidence: confidence, Source: source, Reason: reason,
-		})
+		if callPos != "" {
+			if edgeLines[i] == nil {
+				edgeLines[i] = map[string]bool{}
+			}
+			edgeLines[i][callPos] = true
+		}
+	}
+	withLines := func() []core.Edge {
+		for i, set := range edgeLines {
+			pos := make([]string, 0, len(set))
+			for p := range set {
+				pos = append(pos, p)
+			}
+			sort.Slice(pos, func(a, b int) bool { return positionLess(pos[a], pos[b]) })
+			edges[i].Lines = strings.Join(pos, ",")
+		}
+		return edges
 	}
 
 	executableProperty := symbol.Language == "csharp" && symbol.Kind == core.KindField && len(symbol.CallSites) > 0
@@ -2444,6 +2467,13 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 		for _, cs := range expandMacroCallSites(idx, &symbol) {
 			if cs.ReferenceOnly {
 				continue
+			}
+			callPos = ""
+			if cs.Line > 0 {
+				callPos = strconv.Itoa(cs.Line)
+				if cs.Col > 0 {
+					callPos += ":" + strconv.Itoa(cs.Col)
+				}
 			}
 			if symbol.Language == "csharp" && cs.Argc > 0 && hasUnknownArg(cs.Args, cs.Argc) {
 				if csArgTypeCache == nil {
@@ -3616,7 +3646,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				}
 			}
 		}
-		return edges // CallSites authoritative; skip regex fallback for this symbol
+		return withLines() // CallSites authoritative; skip regex fallback for this symbol
 	}
 
 	// ── Fallback: one identifier-extraction pass over the stripped body ──

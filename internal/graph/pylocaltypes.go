@@ -674,6 +674,12 @@ func pyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 				// repo's `get`. Only an own-object chain, a typed local, or
 				// a bare call is typed.
 				if _, typed := out[q]; !typed {
+					// req = wrappers.Request.from_values(...): a factory
+					// called on an indexed class is typed through its own
+					// return annotation (-> Self names the class).
+					if t := pyClassFactoryType(idx, q, m[3], symbol); t != "" {
+						out[m[1]] = t
+					}
 					continue
 				}
 			}
@@ -1306,6 +1312,46 @@ func pyWithTargets(idx *edgeIndex, symbol *core.SymbolRecord, localTypes map[str
 		}
 	}
 	return out
+}
+
+// pyClassFactoryType types Cls.member(...) where the qualifier's last part
+// is an indexed class: the member's return annotation, with Self (bare,
+// typing., typing_extensions. or an alias such as te.) meaning Cls. An
+// unannotated member gives nothing.
+func pyClassFactoryType(idx *edgeIndex, qualifier, member string, symbol *core.SymbolRecord) string {
+	cls := qualifier[strings.LastIndexByte(qualifier, '.')+1:]
+	if bare := strings.TrimLeft(cls, "_"); bare == "" || bare[0] < 'A' || bare[0] > 'Z' || !typeSymbolExists(idx, cls) {
+		return ""
+	}
+	// Several classes may share the name (werkzeug: sansio.Request and
+	// wrappers.Request, only the latter declares from_values); each one's
+	// member is tried, and the classes that answer must agree.
+	dirs := map[string]bool{dirOf(symbol.FilePath): true}
+	for _, c := range idx.byName[strings.ToLower(cls)] {
+		if c.Name == cls && c.Kind == core.KindClass {
+			dirs[dirOf(c.FilePath)] = true
+		}
+	}
+	found := ""
+	for dir := range dirs {
+		for _, method := range pyDunderTargets(idx, cls, member, dir) {
+			ret := strings.Trim(strings.TrimSpace(pyReturnType(method)), `"'`)
+			typ := ""
+			if ret == "Self" || strings.HasSuffix(ret, ".Self") || ret == cls {
+				typ = cls
+			} else if t := pyAnnotationType(idx, method, ret); t != "" {
+				typ = strings.TrimPrefix(t, "class:")
+			}
+			if typ == "" {
+				continue
+			}
+			if found != "" && found != typ {
+				return ""
+			}
+			found = typ
+		}
+	}
+	return found
 }
 
 func pyContextValueType(idx *edgeIndex, className string, async bool, symbol *core.SymbolRecord) string {
