@@ -22,7 +22,8 @@ var (
 	// x: Type = ... (annotated assignment in a body)
 	pyAnnAssignRe = regexp.MustCompile(`(?m)^\s*(\w+)\s*:\s*([^=\n]+?)\s*(?:=|$)`)
 	// x = Type(...) (constructor call; verified against indexed types)
-	pyCtorAssignRe = regexp.MustCompile(`(?m)\b(\w+)\s*=\s*(?:\w+\.)?(_*[A-Z]\w*)\(`)
+	// Any number of module qualifiers: `runner = click.testing.CliRunner()`.
+	pyCtorAssignRe = regexp.MustCompile(`(?m)\b(\w+)\s*=\s*(?:\w+\.)*(_*[A-Z]\w*)\(`)
 	// x = self.attr — the local aliases a typed attribute (cls = self.test_client_class)
 	pySelfAliasRe = regexp.MustCompile(`(?m)^\s*(\w+)\s*=\s*self\.(\w+)\s*$`)
 	// self.x = Type(...) inside __init__
@@ -554,6 +555,19 @@ func pyResolveClass(idx *edgeIndex, className, preferDir string) *core.SymbolRec
 // pyLocalTypes infers identifier → type name for one Python callable.
 func pyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 	out := map[string]string{}
+
+	// A nested def sees its enclosing function's names (closure): `ctx` in
+	// `def _process(value): return ctx.invoke(value)` is the enclosing
+	// method's `ctx: Context` parameter. Lowest precedence; the nested
+	// def's own parameters shadow it.
+	if enc := pyEnclosingCallable(idx, symbol); enc != nil {
+		own := pyParamNames(symbol.RawText)
+		for name, typ := range pyLocalTypes(idx, enc) {
+			if !own[name] && name != "self" && name != "cls" {
+				out[name] = typ
+			}
+		}
+	}
 
 	// Class attribute types, own class first then ancestors (inherited
 	// attributes resolve through the hierarchy; ancestors never overwrite
@@ -1341,6 +1355,8 @@ func pyClassFactoryType(idx *edgeIndex, qualifier, member string, symbol *core.S
 				typ = cls
 			} else if t := pyAnnotationType(idx, method, ret); t != "" {
 				typ = strings.TrimPrefix(t, "class:")
+			} else if ret == "" {
+				typ = pyFactoryBodyType(method, cls)
 			}
 			if typ == "" {
 				continue
@@ -1907,4 +1923,47 @@ func (idx *edgeIndex) pyImportedGlobalType(fromFile, module, member string) stri
 		return idx.pyFileGlobals[files[0]][member]
 	}
 	return ""
+}
+
+var pyFactoryReturnRe = regexp.MustCompile(`(?m)^\s*return\s+(?:\w+\.)*(\w+)\(`)
+
+var pyClsFirstParamRe = regexp.MustCompile(`def\s+\w+\s*\(\s*cls\b`)
+
+// pyFactoryBodyType types an unannotated factory by what it returns: a
+// classmethod whose every return is `cls(...)` (or `Cls(...)`) builds the
+// class, as does a staticmethod returning `Cls(...)`. Anything else gives
+// nothing. Untyped, `x = Alpha.create()` then `x.method()` matched every
+// same-named method by name.
+func pyFactoryBodyType(method *core.SymbolRecord, cls string) string {
+	returns := pyFactoryReturnRe.FindAllStringSubmatch(maskCode(method.Language, method.RawText), -1)
+	if len(returns) == 0 || strings.Count(method.RawText, "return") != len(returns) {
+		return ""
+	}
+	for _, r := range returns {
+		if r[1] != cls && !(r[1] == "cls" && pyClsFirstParamRe.MatchString(method.RawText)) {
+			return ""
+		}
+	}
+	return cls
+}
+
+// pyEnclosingCallable returns the function or method a nested def is
+// declared in, from the qualified name and span, or nil.
+func pyEnclosingCallable(idx *edgeIndex, symbol *core.SymbolRecord) *core.SymbolRecord {
+	if idx == nil || symbol.Kind != core.KindFunction {
+		return nil
+	}
+	i := strings.LastIndexByte(symbol.QualifiedName, '.')
+	if i <= 0 {
+		return nil
+	}
+	parentQN := symbol.QualifiedName[:i]
+	for _, cand := range idx.byFile[symbol.FilePath] {
+		if cand.QualifiedName == parentQN && cand.ID != symbol.ID &&
+			(cand.Kind == core.KindFunction || cand.Kind == core.KindMethod) &&
+			cand.Span.Start <= symbol.Span.Start && cand.Span.End >= symbol.Span.End {
+			return cand
+		}
+	}
+	return nil
 }

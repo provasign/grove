@@ -1258,3 +1258,110 @@ func TestPyReexportedClassWithoutInitIsCalled(t *testing.T) {
 	}
 	t.Fatal("Plain(3) through the conn.py re-export must reach Plain")
 }
+
+// Unannotated factories are typed by what they return (`return cls()` in a
+// classmethod, `return Alpha()` in a staticmethod), and a constructor behind
+// several module qualifiers (`r = lib.runner.Alpha()`) types its variable:
+// untyped, x.method() matched Beta.method by name (2026-10-14).
+func TestPyUnannotatedFactoriesAndDottedCtors(t *testing.T) {
+	py := func(id, file string, kind core.SymbolKind, name, parent, raw string, calls ...core.CallSite) core.SymbolRecord {
+		qn := name
+		if parent != "" {
+			qn = parent + "." + name
+		}
+		return core.SymbolRecord{ID: id, FilePath: file, BlobSHA: "1", Language: "python", Kind: kind, Name: name, QualifiedName: qn,
+			ParentSymbol: parent, RawText: raw, CallSites: calls, Imports: []string{"pkg.a", "pkg.b", "lib.runner"}}
+	}
+	syms := []core.SymbolRecord{
+		py("a::Alpha", "pkg/a.py", core.KindClass, "Alpha", "", "class Alpha:\n    pass\n"),
+		py("a::Alpha.create", "pkg/a.py", core.KindMethod, "create", "Alpha", "@classmethod\ndef create(cls):\n    return cls()\n"),
+		py("a::Alpha.make", "pkg/a.py", core.KindMethod, "make", "Alpha", "@staticmethod\ndef make():\n    return Alpha()\n"),
+		py("a::Alpha.method", "pkg/a.py", core.KindMethod, "method", "Alpha", "def method(self):\n    pass\n"),
+		py("b::Beta", "pkg/b.py", core.KindClass, "Beta", "", "class Beta:\n    pass\n"),
+		py("b::Beta.method", "pkg/b.py", core.KindMethod, "method", "Beta", "def method(self):\n    pass\n"),
+		py("r::Gamma", "lib/runner.py", core.KindClass, "Gamma", "", "class Gamma:\n    pass\n"),
+		py("u::create", "pkg/use.py", core.KindFunction, "use_create", "", "def use_create():\n    x = Alpha.create()\n    x.method()\n",
+			core.CallSite{Callee: "Alpha.create", Line: 2}, core.CallSite{Callee: "x.method", Line: 3}),
+		py("u::static", "pkg/use.py", core.KindFunction, "use_static", "", "def use_static():\n    z = Alpha.make()\n    z.method()\n",
+			core.CallSite{Callee: "Alpha.make", Line: 2}, core.CallSite{Callee: "z.method", Line: 3}),
+		py("u::dotted", "pkg/use.py", core.KindFunction, "use_dotted", "", "def use_dotted():\n    r = lib.runner.Gamma()\n    r.method()\n",
+			core.CallSite{Callee: "lib.runner.Gamma", Line: 2}, core.CallSite{Callee: "r.method", Line: 3}),
+	}
+	got := map[string]bool{}
+	for _, e := range BuildEdges(syms) {
+		if e.Type == core.EdgeCalls {
+			got[e.From+">"+e.To] = true
+		}
+	}
+	for _, bad := range []string{"u::create>b::Beta.method", "u::static>b::Beta.method", "u::dotted>b::Beta.method", "u::dotted>a::Alpha.method"} {
+		if got[bad] {
+			t.Errorf("unexpected edge %s", bad)
+		}
+	}
+	for _, want := range []string{"u::create>a::Alpha.method", "u::static>a::Alpha.method"} {
+		if !got[want] {
+			t.Errorf("missing edge %s (all %v)", want, got)
+		}
+	}
+}
+
+// A nested def sees its enclosing function's typed names (closure), and a
+// class body passing its own method by name (`property(get_data, ...)`)
+// references it (click Command.invoke, werkzeug Response.get_data).
+func TestPyClosureTypesAndClassBodyMethodRefs(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "c::Context", FilePath: "lib/ctx.py", BlobSHA: "1", Language: "python", Kind: core.KindClass, Name: "Context", QualifiedName: "Context", RawText: "class Context:\n    pass\n", Span: core.LineRange{Start: 1, End: 3}},
+		{ID: "c::Context.invoke", FilePath: "lib/ctx.py", BlobSHA: "1", Language: "python", Kind: core.KindMethod, Name: "invoke", QualifiedName: "Context.invoke", ParentSymbol: "Context", RawText: "def invoke(self, cb):\n    return cb()\n", Span: core.LineRange{Start: 2, End: 3}},
+		{ID: "c::Command", FilePath: "lib/ctx.py", BlobSHA: "1", Language: "python", Kind: core.KindClass, Name: "Command", QualifiedName: "Command", RawText: "class Command:\n    pass\n", Span: core.LineRange{Start: 6, End: 19},
+			CallSites: []core.CallSite{{Callee: "property", Line: 19, Col: 12, Argc: 2, Args: []string{"get_data", "set_data"}}}},
+		{ID: "c::Command.invoke", FilePath: "lib/ctx.py", BlobSHA: "1", Language: "python", Kind: core.KindMethod, Name: "invoke", QualifiedName: "Command.invoke", ParentSymbol: "Command",
+			RawText: "def invoke(self, ctx: Context):\n    def _process(value):\n        return ctx.invoke(value)\n\n    return _process(1)\n", Span: core.LineRange{Start: 7, End: 11}},
+		{ID: "c::Command.invoke._process", FilePath: "lib/ctx.py", BlobSHA: "1", Language: "python", Kind: core.KindFunction, Name: "_process", QualifiedName: "Command.invoke._process", ParentSymbol: "invoke",
+			RawText: "def _process(value):\n    return ctx.invoke(value)\n", Span: core.LineRange{Start: 8, End: 9},
+			CallSites: []core.CallSite{{Callee: "ctx.invoke", Line: 9, Col: 24, Argc: 1}}},
+		{ID: "c::Command.get_data", FilePath: "lib/ctx.py", BlobSHA: "1", Language: "python", Kind: core.KindMethod, Name: "get_data", QualifiedName: "Command.get_data", ParentSymbol: "Command", RawText: "def get_data(self):\n    return 1\n", Span: core.LineRange{Start: 13, End: 14}},
+		{ID: "c::Command.set_data", FilePath: "lib/ctx.py", BlobSHA: "1", Language: "python", Kind: core.KindMethod, Name: "set_data", QualifiedName: "Command.set_data", ParentSymbol: "Command", RawText: "def set_data(self, v):\n    pass\n", Span: core.LineRange{Start: 16, End: 17}},
+	}
+	got := map[string]bool{}
+	for _, e := range BuildEdges(syms) {
+		if e.Type == core.EdgeCalls {
+			got[e.From+">"+e.To] = true
+		}
+	}
+	for _, want := range []string{"c::Command.invoke._process>c::Context.invoke", "c::Command>c::Command.get_data", "c::Command>c::Command.set_data"} {
+		if !got[want] {
+			t.Errorf("missing %s (all %v)", want, got)
+		}
+	}
+	if got["c::Command.invoke._process>c::Command.invoke"] {
+		t.Error("ctx is a Context: ctx.invoke must not bind to Command.invoke")
+	}
+}
+
+// A call through the class passes the instance explicitly
+// (`click.Group.get_command(self, ctx, name)`): one argument more than the
+// method takes after self, and it must still bind (5 click misses).
+func TestPyCallThroughClassPassesSelf(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "c::Group", FilePath: "src/click/core.py", BlobSHA: "1", Language: "python", Kind: core.KindClass, Name: "Group", QualifiedName: "Group", RawText: "class Group:\n    pass\n"},
+		{ID: "c::Group.get_command", FilePath: "src/click/core.py", BlobSHA: "1", Language: "python", Kind: core.KindMethod, Name: "get_command", QualifiedName: "Group.get_command", ParentSymbol: "Group",
+			Signature: "def get_command(self, ctx, cmd_name):", RawText: "def get_command(self, ctx, cmd_name):\n    return None\n"},
+		{ID: "c::Other.get_command", FilePath: "src/click/core.py", BlobSHA: "1", Language: "python", Kind: core.KindMethod, Name: "get_command", QualifiedName: "Other.get_command", ParentSymbol: "Other",
+			Signature: "def get_command(self, ctx, cmd_name):", RawText: "def get_command(self, ctx, cmd_name):\n    return None\n"},
+		{ID: "a::AliasedGroup", FilePath: "examples/aliases.py", BlobSHA: "1", Language: "python", Kind: core.KindClass, Name: "AliasedGroup", QualifiedName: "AliasedGroup",
+			Signature: "class AliasedGroup(click.Group):", RawText: "class AliasedGroup(click.Group):\n    pass\n", Imports: []string{"click"}},
+		{ID: "a::use", FilePath: "examples/aliases.py", BlobSHA: "1", Language: "python", Kind: core.KindMethod, Name: "get_command", QualifiedName: "AliasedGroup.get_command", ParentSymbol: "AliasedGroup",
+			Signature: "def get_command(self, ctx, name):", RawText: "def get_command(self, ctx, name):\n    return click.Group.get_command(self, ctx, name)\n", Imports: []string{"click"},
+			Span: core.LineRange{Start: 1, End: 2},
+			CallSites: []core.CallSite{{Callee: "click.Group.get_command", Line: 2, Col: 24, Argc: 3, Args: []string{"self", "ctx", "name"}}}},
+	}
+	got := map[string]bool{}
+	for _, e := range BuildEdges(syms) {
+		if e.Type == core.EdgeCalls && e.From == "a::use" {
+			got[e.To] = true
+		}
+	}
+	if !got["c::Group.get_command"] || got["c::Other.get_command"] {
+		t.Fatalf("click.Group.get_command(self, ...) must bind to Group.get_command only: %v", got)
+	}
+}

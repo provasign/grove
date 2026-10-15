@@ -2308,6 +2308,9 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 	}
 
 	executableProperty := symbol.Language == "csharp" && symbol.Kind == core.KindField && len(symbol.CallSites) > 0
+	if symbol.Language == "python" && symbol.Kind == core.KindClass {
+		return pyClassBodyMethodRefs(idx, symbol)
+	}
 	if symbol.Kind != core.KindFunction && symbol.Kind != core.KindMethod && symbol.Kind != core.KindConstructor && !executableProperty {
 		return nil
 	}
@@ -2797,7 +2800,23 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// Python has no overloading: a method whose parameters cannot
 				// take this call's argument count is not its target (click:
 				// ctx.invoke(other_cmd, arg=42) is not Command.invoke(self, ctx)).
-				cands = pyArityCompatible(cands, cs.Argc)
+				compatible := pyArityCompatible(cands, cs.Argc)
+				if q := qualifier; q != "" && q[0] >= 'A' && q[0] <= 'Z' && typeSymbolExists(idx, q) {
+					// Through the class (`click.Group.get_command(self, ctx,
+					// name)`) an instance method takes the instance as an
+					// explicit argument: one more than the call through an
+					// instance. Classmethods/staticmethods keep the count.
+					seen := map[string]bool{}
+					for _, c := range compatible {
+						seen[c.ID] = true
+					}
+					for _, c := range pyArityCompatible(cands, cs.Argc-1) {
+						if !seen[c.ID] {
+							compatible = append(compatible, c)
+						}
+					}
+				}
+				cands = compatible
 			}
 			if symbol.Language == "swift" && qualifier == "" && len(cands) == 0 {
 				// `throw LocationError(path:..)` where `typealias
@@ -4951,6 +4970,60 @@ func instantiatedClasses(idx *edgeIndex, caller *core.SymbolRecord, name string,
 			continue
 		}
 		out = append(out, cls)
+	}
+	return out
+}
+
+// isPlainIdent reports whether s is a bare identifier.
+func isPlainIdent(s string) bool {
+	for i, r := range s {
+		if !(r == '_' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || i > 0 && r >= '0' && r <= '9') {
+			return false
+		}
+	}
+	return s != ""
+}
+
+// pyClassBodyMethodRefs links a class body to its own methods passed by name
+// in a class-body call (`data = property(get_data, set_data)`): renaming or
+// re-signing get_data breaks the property, and it was no site at all
+// (werkzeug Response.get_data). Other class-body calls are resolved by the
+// decorator pass, not here.
+func pyClassBodyMethodRefs(idx *edgeIndex, symbol core.SymbolRecord) []core.Edge {
+	var out []core.Edge
+	seen := map[string]int{}
+	lines := strings.Split(symbol.RawText, "\n")
+	for _, cs := range symbol.CallSites {
+		for _, arg := range cs.Args {
+			if !isPlainIdent(arg) {
+				continue
+			}
+			// The argument's own line: `property(\n    get_data,` puts it
+			// below the call.
+			pos := strconv.Itoa(cs.Line)
+			if cs.Col > 0 {
+				pos += ":" + strconv.Itoa(cs.Col)
+			}
+			word := regexp.MustCompile(`\b` + regexp.QuoteMeta(arg) + `\b`)
+			for i := cs.Line - symbol.Span.Start; i >= 0 && i < len(lines) && i <= cs.Line-symbol.Span.Start+20; i++ {
+				if loc := word.FindStringIndex(lines[i]); loc != nil && (i > cs.Line-symbol.Span.Start || cs.Col == 0 || loc[0] >= cs.Col) {
+					pos = strconv.Itoa(symbol.Span.Start+i) + ":" + strconv.Itoa(loc[0]+1)
+					break
+				}
+			}
+			for _, m := range idx.byFile[symbol.FilePath] {
+				if m.Name != arg || m.ParentSymbol != symbol.Name || m.Kind != core.KindMethod {
+					continue
+				}
+				if i, ok := seen[m.ID]; ok {
+					out[i].Lines += "," + pos
+					continue
+				}
+				seen[m.ID] = len(out)
+				out = append(out, core.Edge{From: symbol.ID, To: m.ID, Type: core.EdgeCalls, Confidence: 0.7,
+					Source: core.EvidenceSourceASTKit, Reason: core.ReasonFunctionRef, Lines: pos})
+			}
+		}
 	}
 	return out
 }
