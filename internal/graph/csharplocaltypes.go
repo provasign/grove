@@ -195,9 +195,13 @@ func csTypedLocal(idx *edgeIndex, t string) bool {
 		return true
 	}
 	switch t {
-	case "IEnumerable", "IList", "ICollection", "List", "Dictionary", "IDictionary", "Func", "Action", "Task", "ValueTask", "Nullable":
+	case "Func", "Action", "Task", "ValueTask", "Nullable":
 		return false
 	}
+	// Collection types are recorded too: extension methods on them
+	// (LinqBridge's, CollectionUtils.AddRange) apply only where their
+	// namespace is in scope (csExtensionVisible), so a file importing
+	// System.Linq no longer binds a look-alike.
 	return !typeSymbolExists(idx, t)
 }
 
@@ -372,7 +376,9 @@ func csOverloadType(typ string) string {
 func csharpArgTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 	out := map[string]string{}
 	record := func(typ, name string) {
-		if typ = csNormalizeType(typ); typ != "" && name != "" {
+		// csOverloadType keeps a nullable value type nullable: value
+		// (uint? value) binds WriteValue(uint?), not WriteValue(uint).
+		if typ = csOverloadType(typ); typ != "" && name != "" {
 			out[name] = typ
 		}
 	}
@@ -445,6 +451,15 @@ func csharpArgTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string
 		}
 	}
 	delete(out, "this")
+	if symbol.ParentSymbol != "" {
+		// `this` as an argument is the caller's own type
+		// (JsonWriterException.Create(this, ...) on a BsonWriter).
+		owner := symbol.ParentSymbol
+		if k := strings.LastIndexByte(owner, '.'); k >= 0 {
+			owner = owner[k+1:]
+		}
+		out["this"] = owner
+	}
 	return out
 }
 
@@ -543,6 +558,8 @@ func csNarrowOverloadsGrouped(idx *edgeIndex, cands []*core.SymbolRecord, args [
 	}
 	var kept, exact, unparsed []*core.SymbolRecord
 	fullyKnown := map[*core.SymbolRecord]bool{} // every argument typed and compatible
+	applicableNormal := map[*core.SymbolRecord]bool{} // a normal form every argument certainly fits
+	normalFormVariadic := map[*core.SymbolRecord]bool{}
 	cost := map[*core.SymbolRecord]int{}        // literal-conversion distance (0 = exact)
 	for _, cand := range cands {
 		paramTypes, variadic := csParamTypes(cand)
@@ -552,20 +569,42 @@ func csNarrowOverloadsGrouped(idx *edgeIndex, cands []*core.SymbolRecord, args [
 			continue
 		}
 		if len(paramTypes) != len(args) && !(variadic && len(args) >= len(paramTypes)-1) {
-			kept = append(kept, cand) // optional params let argc through: neutral
+			if csArityApplicable(cand, len(args)) {
+				kept = append(kept, cand) // optional params let argc through: neutral
+			}
+			// Otherwise the call cannot bind it at all: JProperty(string,
+			// object) for new JProperty("a", 1, 2).
 			continue
 		}
 		conflict := false
 		allExact := !variadic
 		allKnown := true
+		normalArray := false // a params method applied to an array in normal form
+		// anyArgFits: every argument the call passes is known to fit, or
+		// unknown but bound to an object / type-variable parameter, which
+		// accepts anything: the normal form is then applicable for sure
+		// (new JProperty("a", x) is JProperty(string, object), not the
+		// params overload).
+		anyArgFits := !variadic
+		unknownFits := func(pi int) {
+			allExact = false
+			allKnown = false
+			if pi >= len(paramTypes) {
+				anyArgFits = false
+				return
+			}
+			p := strings.TrimSuffix(paramTypes[pi], "?")
+			if p != "object" && p != "dynamic" && !csTypeVariable(p, cand) {
+				anyArgFits = false
+			}
+		}
 		for i, argName := range args {
 			pi := i
 			if pi >= len(paramTypes) {
 				pi = len(paramTypes) - 1
 			}
 			if argName == "" {
-				allExact = false
-				allKnown = false
+				unknownFits(pi)
 				continue
 			}
 			var argType string
@@ -579,8 +618,7 @@ func csNarrowOverloadsGrouped(idx *edgeIndex, cands []*core.SymbolRecord, args [
 				if t := argName[1:]; csIsEnum(idx, t) {
 					argType = t
 				} else {
-					allExact = false
-					allKnown = false
+					unknownFits(pi)
 					continue
 				}
 			case strings.HasPrefix(argName, "call:"):
@@ -588,16 +626,14 @@ func csNarrowOverloadsGrouped(idx *edgeIndex, cands []*core.SymbolRecord, args [
 				// declared return type when it names exactly one.
 				rets, _ := csProducerReturnTypes(idx, argName[len("call:"):])
 				if len(rets) != 1 {
-					allExact = false
-					allKnown = false
+					unknownFits(pi)
 					continue
 				}
 				argType = rets[0]
 			default:
 				t, known := argTypes[argName]
 				if !known {
-					allExact = false
-					allKnown = false
+					unknownFits(pi)
 					continue
 				}
 				argType = t
@@ -626,8 +662,8 @@ func csNarrowOverloadsGrouped(idx *edgeIndex, cands []*core.SymbolRecord, args [
 			}
 			// A `#Name` marker for a nested `new Name(...)` is a typed
 			// object, not a literal: it binds like a typed identifier.
-			if isLit && len(argType) > 0 && argType[0] >= 'A' && argType[0] <= 'Z' && !csIsPrimitive(argType) {
-				isLit = false
+			if isLit && (len(argType) > 0 && argType[0] >= 'A' && argType[0] <= 'Z' && !csIsPrimitive(argType) || strings.HasSuffix(argType, "[]")) {
+				isLit = false // a constructed object or array, not a literal
 			}
 			if argNullable && !pNullable && p != "object" && csValueType(idx, argType) && !csWildcardParam(p, cand) {
 				// int? converts to object (boxing) and to interfaces, never
@@ -660,6 +696,18 @@ func csNarrowOverloadsGrouped(idx *edgeIndex, cands []*core.SymbolRecord, args [
 			default:
 				cost[cand]++ // a typed argument binding a wider parameter (JValue → JToken)
 			}
+			if variadic && pi == len(paramTypes)-1 && strings.HasSuffix(p, "[]") && strings.HasSuffix(argType, "[]") &&
+				len(args) == len(paramTypes) && csArrayConvertible(idx, argType, p, cand) {
+				// An array passed for the params slot applies the method in
+				// its normal form (new JArray(new[] { "a" }) is
+				// JArray(params object[]) with a string[], which beats
+				// JArray(object)).
+				normalArray = true
+				if argType != p {
+					cost[cand]++
+				}
+				continue
+			}
 			if variadic && pi == len(paramTypes)-1 && strings.HasSuffix(p, "[]") {
 				// A lone element binds the params slot by exact type or
 				// assignability (new BinaryConverter() into params
@@ -668,6 +716,16 @@ func csNarrowOverloadsGrouped(idx *edgeIndex, cands []*core.SymbolRecord, args [
 					allExact = false
 					continue
 				}
+			}
+			if argArr, parArr := strings.HasSuffix(argType, "[]"), strings.HasSuffix(p, "[]"); argArr && parArr {
+				// Array to array: identity or reference covariance only
+				// (an int[] is no object[]).
+				if !csArrayConvertible(idx, argType, p, cand) {
+					conflict = true
+					break
+				}
+				allExact = false
+				continue
 			}
 			allExact = false
 			argArr := strings.HasSuffix(argType, "[]")
@@ -703,8 +761,14 @@ func csNarrowOverloadsGrouped(idx *edgeIndex, cands []*core.SymbolRecord, args [
 			if allExact {
 				exact = append(exact, cand)
 			}
-			if allKnown && !variadic {
+			if allKnown && (!variadic || normalArray) {
 				fullyKnown[cand] = true
+			}
+			if normalArray {
+				normalFormVariadic[cand] = true
+			}
+			if anyArgFits && len(paramTypes) == len(args) {
+				applicableNormal[cand] = true
 			}
 		}
 	}
@@ -718,13 +782,16 @@ func csNarrowOverloadsGrouped(idx *edgeIndex, cands []*core.SymbolRecord, args [
 	// — SerializeObject(x, converter) must keep the params overload.
 	normalOn := map[string]bool{}
 	for _, c := range kept {
-		if fullyKnown[c] {
+		if fullyKnown[c] || applicableNormal[c] {
 			normalOn[group(c)] = true
 		}
 	}
 	var narrowed []*core.SymbolRecord
 	for _, c := range kept {
 		pt, v := csParamTypes(c)
+		if v && normalFormVariadic[c] {
+			v = false // applied in normal form: ranked like any other overload
+		}
 		if v && normalOn[group(c)] {
 			continue
 		}
@@ -1193,6 +1260,7 @@ func csRecoverArgs(idx *edgeIndex, symbol *core.SymbolRecord, cs core.CallSite, 
 			continue
 		}
 		t, typed := argTypes[recv]
+		t = strings.TrimSuffix(t, "?") // .Value / .GetValueOrDefault() unwrap the Nullable
 		if !typed || t == "" || strings.HasSuffix(t, "[]") {
 			continue
 		}
@@ -1280,6 +1348,13 @@ func csTypeChain(idx *edgeIndex, typ, preferDir string) map[string]int {
 // and argc at most the total unless the last is `params`. Unparsable
 // declarations are applicable.
 func csArityApplicable(cand *core.SymbolRecord, argc int) bool {
+	return csArityFits(cand, argc, false)
+}
+
+// csArityFits is csArityApplicable; staticForm counts an extension
+// method's `this` parameter, which a call written Distinct(source, null)
+// (no receiver) passes as an ordinary argument.
+func csArityFits(cand *core.SymbolRecord, argc int, staticForm bool) bool {
 	params := tsDeclParams("csharp", csDeclSource(cand))
 	if params == "" {
 		return argc == 0 || !strings.Contains(csDeclSource(cand), "()")
@@ -1287,7 +1362,7 @@ func csArityApplicable(cand *core.SymbolRecord, argc int) bool {
 	required, total, variadic := 0, 0, false
 	for _, g := range splitParams("csharp", params) {
 		g = strings.TrimSpace(g)
-		if g == "" || strings.HasPrefix(g, "this ") {
+		if g == "" || strings.HasPrefix(g, "this ") && !staticForm {
 			continue
 		}
 		total++
@@ -1315,6 +1390,32 @@ func csArityApplicable(cand *core.SymbolRecord, argc int) bool {
 // class's namespace. instance=false (a type name qualifier: static access) never
 // considers extensions. Returns nil when nothing in typ's hierarchy fits.
 func csMemberTargets(idx *edgeIndex, caller *core.SymbolRecord, cands []*core.SymbolRecord, typ string, cs core.CallSite, instance bool, argTypes map[string]string) []*core.SymbolRecord {
+	// The type name resolves by C# lookup: of several declarations named
+	// typ (a test sample's own VersionConverter, a nested File helper),
+	// the one the caller sees. Its members are the ones in its files; for
+	// a type-name qualifier with no declaration of ours in sight the type
+	// is the runtime's (File.ReadAllText is System.IO.File's).
+	if vis := idx.csVisibleTypes(caller, typ); len(vis) > 0 {
+		files := map[string]bool{}
+		for _, v := range vis {
+			files[v.FilePath] = true
+		}
+		var kept []*core.SymbolRecord
+		for _, c := range cands {
+			if c.ParentSymbol == typ && !files[c.FilePath] {
+				continue
+			}
+			kept = append(kept, c)
+		}
+		cands = kept
+	} else if !instance && !csQualifiedMemberAt(caller, cs, typ) {
+		return nil
+	}
+	if name := cs.Callee[strings.LastIndexByte(cs.Callee, '.')+1:]; csBCLInstanceMember(idx, typ, name) {
+		// The runtime type's own method beats every extension method:
+		// List<T>.AddRange is not CollectionUtils.AddRange.
+		return nil
+	}
 	chain := csTypeChain(idx, typ, dirOf(caller.FilePath))
 	best := map[string]*core.SymbolRecord{}
 	var order []string
@@ -1326,8 +1427,18 @@ func csMemberTargets(idx *edgeIndex, caller *core.SymbolRecord, cands []*core.Sy
 		key := cand.ID
 		if pt, v := csParamTypes(cand); pt != nil || csArityApplicable(cand, 0) && tsDeclParams("csharp", csDeclSource(cand)) == "" {
 			// Same parameter types: an override (Read() on JsonTextReader
-			// and JsonReader) is one member.
-			key = fmt.Sprintf("%s(%s|%v)", cand.Name, strings.Join(pt, ","), v)
+			// and JsonReader) is one member. A reference type's nullable
+			// annotation is not part of the signature (BsonWriter's
+			// override WriteValue(string) of WriteValue(string?)); a value
+			// type's is (int? is Nullable<int>).
+			norm := make([]string, len(pt))
+			for i, t := range pt {
+				if base := strings.TrimSuffix(t, "?"); base != t && !csValueType(idx, base) {
+					t = base
+				}
+				norm[i] = t
+			}
+			key = fmt.Sprintf("%s(%s|%v)", cand.Name, strings.Join(norm, ","), v)
 		}
 		cur, seen := best[key]
 		if !seen {
@@ -1485,4 +1596,60 @@ func csReceiverChainAt(caller *core.SymbolRecord, cs core.CallSite, method strin
 		return ""
 	}
 	return strings.Join(segs, ".")
+}
+
+// csArrayConvertible reports an implicit array conversion: identity, or
+// reference covariance (string[] -> object[], JValue[] -> JToken[]). A
+// value-type element is never covariant (int[] is no object[]).
+func csArrayConvertible(idx *edgeIndex, arg, param string, cand *core.SymbolRecord) bool {
+	a, p := strings.TrimSuffix(arg, "[]"), strings.TrimSuffix(param, "[]")
+	a, p = strings.TrimSuffix(a, "?"), strings.TrimSuffix(p, "?")
+	if a == p || csTypeVariable(p, cand) {
+		return true
+	}
+	if csValueType(idx, a) {
+		return false
+	}
+	return p == "object" || p == "dynamic" || csAssignable(idx, a, p)
+}
+
+// csBCLInstanceMethods lists instance methods of common runtime types that
+// projects shadow with same-named extension methods (Newtonsoft's
+// CollectionUtils, LinqBridge). An extension applies only when no
+// instance member fits, so on these receivers ours never does.
+var csBCLInstanceMethods = map[string]map[string]bool{
+	"List": setOf("Add", "AddRange", "Clear", "Contains", "CopyTo", "Exists", "Find", "FindAll", "FindIndex",
+		"FindLast", "ForEach", "GetRange", "IndexOf", "Insert", "InsertRange", "Remove", "RemoveAll", "RemoveAt",
+		"RemoveRange", "Reverse", "Sort", "ToArray", "TrueForAll", "ConvertAll", "BinarySearch", "LastIndexOf"),
+	"Dictionary": setOf("Add", "Clear", "ContainsKey", "ContainsValue", "Remove", "TryGetValue", "TryAdd"),
+	"HashSet":    setOf("Add", "Clear", "Contains", "Remove", "UnionWith", "IntersectWith", "ExceptWith", "CopyTo"),
+	"string": setOf("Contains", "EndsWith", "StartsWith", "IndexOf", "LastIndexOf", "Trim", "TrimStart", "TrimEnd",
+		"Substring", "Replace", "Split", "ToLower", "ToUpper", "ToLowerInvariant", "ToUpperInvariant", "Equals",
+		"CompareTo", "PadLeft", "PadRight", "Insert", "Remove", "ToCharArray", "IndexOfAny"),
+	"object": setOf("GetType", "ToString", "Equals", "GetHashCode"),
+}
+
+func setOf(names ...string) map[string]bool {
+	m := make(map[string]bool, len(names))
+	for _, n := range names {
+		m[n] = true
+	}
+	return m
+}
+
+// csBCLInstanceMember reports a runtime type (not one of ours) that
+// declares method name itself.
+func csBCLInstanceMember(idx *edgeIndex, typ, name string) bool {
+	t := strings.TrimSuffix(typ, "?")
+	if i := strings.IndexByte(t, '<'); i >= 0 {
+		t = t[:i]
+	}
+	switch t {
+	case "String":
+		t = "string"
+	case "Object":
+		t = "object"
+	}
+	ms, ok := csBCLInstanceMethods[t]
+	return ok && ms[name] && !typeSymbolExists(idx, t)
 }

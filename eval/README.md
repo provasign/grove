@@ -573,6 +573,26 @@ same edges are true for library-internal callers; and constructor/overload
 sets whose arguments the extractor cannot type (`new JValue(x)`,
 `WriteValue(v)`, `SerializeObject(x, converter)`).
 
+2026-10-17 (truth re-pinned, P 0.9709 / R 0.9774). The oracle now records
+what Roslyn binds but the old snapshot skipped: a constructor with no
+initializer calls the base's parameterless constructor, `: this(..)` /
+`: base(..)` initializers, target-typed `new(..)`, and query-clause calls
+(`from x in xs where ..` → `Where`, `Cast`, `OrderBy`). Resolver side: a
+receiver astkit cannot name is `<expr>` and reaches only visible extension
+methods; a bare call never reaches one and must fit by argument count
+(`Equals(a, b)` is `object.Equals`); a member no argument count can bind is
+dropped (`new S()` is a struct's implicit constructor); `.Value` /
+`.GetValueOrDefault()` unwrap a nullable argument; arrays convert by
+covariance and an array for a `params` slot applies the normal form; nested
+types are visible by simple name only inside their outer type; runtime
+instance methods (`List<T>.AddRange`, `string.EndsWith`) beat same-named
+extensions; `this.Event(..)` invokes the event. Documented oracle limit:
+the snapshot compiles `LinqBridge.cs` (no `HAVE_LINQ`) against .NET 8
+references, where `Func<,>` is ambiguous with `System.Func` (130 CS0104
+errors), so every lambda call there fails overload resolution and has no
+edge (~120 of the remaining false edges, Roslyn's own candidate set
+contains grove's target).
+
 Day-one progression (0.2632 → 0.6813), each step measured:
 
 | Fix | F1 |

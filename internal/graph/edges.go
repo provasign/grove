@@ -2837,6 +2837,12 @@ func resolveSymbolCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *inter
 					}
 				}
 			}
+			if symbol.Language == "csharp" && len(cs.Args) == 0 && cs.Argc > 0 {
+				// Arguments astkit could not type are still arguments: an
+				// empty list would read as a zero-argument call (new
+				// JArray(\n ...) bound JArray()).
+				cs.Args = make([]string, cs.Argc)
+			}
 			calleeName := cs.Callee
 			// Split receiver prefix (e.g. "user.save" → qualifier "user",
 			// name "save"); chains keep only the last segment ("a.b.Get" → "b").
@@ -3033,7 +3039,11 @@ func resolveSymbolCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *inter
 					if allCtors {
 						cands = ctors
 					}
+					qualifiedType := allCtors && csQualifiedTypeAt(&symbol, cs, calleeName)
 					switch {
+					case qualifiedType:
+						// `new Outer.Inner(..)`: the source names the type
+						// fully; simple-name lookup does not apply.
 					case allCtors && csImplicitConstructorShadows(idx, &symbol, calleeName, cands):
 						if traceCalls {
 							fmt.Fprintf(os.Stderr, "grove-trace %s: callee=%q dropped: implicit constructor of a namespace-visible class shadows %d\n", symbol.QualifiedName, cs.Callee, len(cands))
@@ -3049,7 +3059,7 @@ func resolveSymbolCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *inter
 						}
 					default:
 						before := len(cands)
-						if cands = csNarrowBareCall(idx, &symbol, cands); len(cands) == 0 {
+						if cands = csNarrowBareCall(idx, &symbol, cands, cs); len(cands) == 0 {
 							if traceCalls {
 								fmt.Fprintf(os.Stderr, "grove-trace %s: callee=%q dropped: bare call, none of %d candidates on the own type chain\n", symbol.QualifiedName, cs.Callee, before)
 							}
@@ -3162,6 +3172,11 @@ func resolveSymbolCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *inter
 				}
 				cands = compatible
 			}
+			if symbol.Language == "csharp" && qualifier == "this" && csOwnChainDelegate(idx, &symbol, calleeName, cands) {
+				// this.PropertyChanging(this, e): invoking the class's own
+				// event or delegate field, no method of ours.
+				continue
+			}
 			exprReceiver := qualifier == "<expr>"
 			if exprReceiver {
 				// A method on an expression astkit could not name (`(a +
@@ -3169,6 +3184,21 @@ func resolveSymbolCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *inter
 				// untyped receiver, resolved by name like one, but never a
 				// bare call.
 				qualifier = ""
+				if symbol.Language == "csharp" {
+					// C#: nothing types the receiver, so of our methods only
+					// an extension method in scope can be the target
+					// (o["results"].Children<JObject>()).
+					var ext []*core.SymbolRecord
+					for _, c := range cands {
+						if csIsExtensionMethod(c) && idx.csExtensionVisible(&symbol, c) {
+							ext = append(ext, c)
+						}
+					}
+					if len(ext) == 0 {
+						continue
+					}
+					cands = ext
+				}
 			}
 			if symbol.Language == "rust" && qualifier == "" && !exprReceiver && !strings.HasSuffix(cs.Callee, "!") {
 				// A bare Rust call never reaches a method (that takes self.
@@ -4161,6 +4191,22 @@ func resolveSymbolCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *inter
 				// behavior until type evidence pins the overload set down.
 				narrowed = nil
 			}
+			if symbol.Language == "csharp" && len(narrowed) > 0 {
+				// Whatever chose them, a member the argument count cannot
+				// bind is not the target: new JsonPosition() is the
+				// struct's implicit constructor, not JsonPosition(type).
+				argc := cs.Argc
+				if argc < len(cs.Args) {
+					argc = len(cs.Args)
+				}
+				var fit []*core.SymbolRecord
+				for _, c := range narrowed {
+					if csArityFits(c, argc, false) || csIsExtensionMethod(c) && csArityFits(c, argc, true) {
+						fit = append(fit, c)
+					}
+				}
+				narrowed = fit
+			}
 			if symbol.Language == "java" && len(narrowed) > 4 && sameOverloadSet(narrowed) {
 				// javac binds exactly one of these; when neither arity nor
 				// argument types could tell StrBuilder's fourteen one-arg
@@ -4250,7 +4296,15 @@ func resolveSymbolCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *inter
 					ctors = phpNarrowNewByNamespace(idx, &symbol, cs, ctorName, ctors)
 				}
 				if symbol.Language == "csharp" {
-					ctors = filterByArgc(ctors, cs.Argc)
+					// astkit's C# argument count is exact, zero included:
+					// new JsonPosition() binds no JsonPosition(type).
+					var fit []*core.SymbolRecord
+					for _, c := range ctors {
+						if csArityApplicable(c, cs.Argc) {
+							fit = append(fit, c)
+						}
+					}
+					ctors = fit
 					if len(ctors) > 1 {
 						if csArgTypeCache == nil {
 							csArgTypeCache = csharpArgTypes(idx, &symbol)

@@ -135,3 +135,49 @@ func TestCSharpMemberLookup_StaticPropertyChain(t *testing.T) {
 		t.Fatalf("an unrelated Create must not bind")
 	}
 }
+
+// Overload fan-out pass (newtonsoft oracle review 2026-10-17: P 0.951 →
+// 0.971): call shapes C# binds without type inference.
+func TestCSharpCallShapes(t *testing.T) {
+	g := New()
+	ext := func(id, name, sig string) core.SymbolRecord {
+		return csSym("U.cs::CollectionUtils."+id+"@sha", "U.cs", core.KindMethod, name, "CollectionUtils."+name, "CollectionUtils", sig, nil)
+	}
+	syms := []core.SymbolRecord{
+		csNamespace("U.cs", "Lib", 1, 100),
+		csSym("U.cs::CollectionUtils@sha", "U.cs", core.KindClass, "CollectionUtils", "CollectionUtils", "", "public static class CollectionUtils", nil),
+		ext("AddRange", "AddRange", "public static void AddRange<T>(this IList<T> initial, IEnumerable<T> collection)"),
+		ext("Children", "Children", "public static IEnumerable<T> Children<T>(this IEnumerable<T> source)"),
+		csSym("U.cs::Pos@sha", "U.cs", core.KindStruct, "Pos", "Pos", "", "public struct Pos", nil),
+		csSym("U.cs::Pos.Pos@sha", "U.cs", core.KindConstructor, "Pos", "Pos.Pos", "Pos", "public Pos(int type)", nil),
+		csSym("U.cs::Other@sha", "U.cs", core.KindClass, "Other", "Other", "", "public class Other", nil),
+		csSym("U.cs::Other.Changed@sha", "U.cs", core.KindMethod, "Changed", "Other.Changed", "Other", "public void Changed(object s, EventArgs e)", nil),
+		csNamespace("T.cs", "Lib", 1, 100),
+		csSym("T.cs::T.Changed@sha", "T.cs", core.KindField, "Changed", "T.Changed", "T", "public event EventHandler Changed", nil),
+		csSym("T.cs::T.Equals@sha", "T.cs", core.KindMethod, "Equals", "T.Equals", "T", "public override bool Equals(object obj)", nil),
+		csCaller("T.cs::T.Run@sha", "T.cs", "T",
+			"public void Run()\n{\n    List<Type> ret = new List<Type>();\n    ret.AddRange(types);\n    var c = o[\"x\"].Children();\n    var p = new Pos();\n    this.Changed(this, e);\n    Equals(a, b);\n}", 10, nil,
+			core.CallSite{Callee: "ret.AddRange", Line: 13, Col: 9, Argc: 1, Args: []string{"types"}},
+			core.CallSite{Callee: "<expr>.Children", Line: 14, Col: 21, Argc: 0},
+			core.CallSite{Callee: "Pos", Line: 15, Col: 13, Argc: 0},
+			core.CallSite{Callee: "this.Changed", Line: 16, Col: 10, Argc: 2, Args: []string{"this", "e"}},
+			core.CallSite{Callee: "Equals", Line: 17, Col: 5, Argc: 2, Args: []string{"a", "b"}}),
+	}
+	g.Replace(syms, 3)
+	from := "T.cs::T.Run@sha"
+	if hasEdge(g, core.EdgeCalls, from, "U.cs::CollectionUtils.AddRange@sha") {
+		t.Errorf("List<T>.AddRange is the runtime's instance method, not the extension")
+	}
+	if !hasEdge(g, core.EdgeCalls, from, "U.cs::CollectionUtils.Children@sha") {
+		t.Errorf("an unnamed receiver reaches the visible extension method")
+	}
+	if hasEdge(g, core.EdgeCalls, from, "U.cs::Pos.Pos@sha") {
+		t.Errorf("new Pos() is the implicit parameterless constructor, not Pos(int)")
+	}
+	if hasEdge(g, core.EdgeCalls, from, "U.cs::Other.Changed@sha") {
+		t.Errorf("this.Changed(..) invokes the class's own event")
+	}
+	if hasEdge(g, core.EdgeCalls, from, "T.cs::T.Equals@sha") {
+		t.Errorf("Equals(a, b) is object.Equals(object, object): T.Equals takes one argument")
+	}
+}

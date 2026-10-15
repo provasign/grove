@@ -1,6 +1,7 @@
 package graph
 
 import (
+	"regexp"
 	"strings"
 
 	"github.com/provasign/grove/internal/core"
@@ -100,14 +101,37 @@ func (idx *edgeIndex) csScopeRank(visible map[string]bool, caller, cand *core.Sy
 		}
 	}
 	if caller.ParentSymbol != "" && cand.FilePath == caller.FilePath {
-		// Nested in the caller's type: Outer.Person for a caller in Outer.
+		// Nested in the caller's type (Outer.Person for a caller in
+		// Outer), or in any type enclosing the caller's (a nested type's
+		// siblings: CustomersRowChangeEvent beside CustomersDataTable in
+		// Northwind). The caller's owner path comes from its qualified name.
+		callerOwner := caller.QualifiedName
+		if i := strings.LastIndexByte(callerOwner, '.'); i >= 0 {
+			callerOwner = callerOwner[:i]
+		}
 		if strings.HasPrefix(owner, caller.ParentSymbol+".") || owner == caller.ParentSymbol {
 			return csRankOwnType
 		}
-		// Enclosing type of a nested caller sees its siblings.
-		if i := strings.LastIndexByte(caller.ParentSymbol, '.'); i >= 0 && strings.HasPrefix(owner, caller.ParentSymbol[:i]+".") {
-			return csRankOwnType
+		for outer := callerOwner; outer != ""; {
+			if owner == outer || strings.HasPrefix(owner, outer+".") {
+				return csRankOwnType
+			}
+			i := strings.LastIndexByte(outer, '.')
+			if i < 0 {
+				break
+			}
+			outer = outer[:i]
 		}
+	}
+	// A type nested in another type (Tests.PreserveReferencesHandlingTests
+	// .Container) is visible by its simple name only inside that type,
+	// handled above; elsewhere it needs qualification.
+	if cand.Kind == core.KindClass || cand.Kind == core.KindStruct || cand.Kind == core.KindInterface || cand.Kind == core.KindEnum {
+		if strings.Contains(cand.QualifiedName, ".") {
+			return csRankInvisible
+		}
+	} else if strings.Contains(owner, ".") {
+		return csRankInvisible
 	}
 	ns := idx.csNamespaceOf(cand)
 	if ns == idx.csNamespaceOf(caller) {
@@ -235,20 +259,21 @@ func csExplicitInterfaceImpl(s *core.SymbolRecord) bool {
 // in the same file. C# has no free functions and imports no methods by
 // name, so a same-named method on an unrelated class is never the target
 // — `Equals(a, b)` with no own-class Equals is object.Equals.
-func csNarrowBareCall(idx *edgeIndex, caller *core.SymbolRecord, cands []*core.SymbolRecord) []*core.SymbolRecord {
+func csNarrowBareCall(idx *edgeIndex, caller *core.SymbolRecord, cands []*core.SymbolRecord, cs core.CallSite) []*core.SymbolRecord {
 	var kept []*core.SymbolRecord
 	for _, cand := range cands {
 		if cand.Kind == core.KindFunction && cand.FilePath == caller.FilePath {
 			kept = append(kept, cand)
 		}
-		// A receiver the extractor could not name (a call-chain element,
-		// a query expression) still reaches an in-repo extension method
-		// by name: `rss[..].Children()["category"].Values<string>()`.
-		if csIsExtensionMethod(cand) && idx.csExtensionVisible(caller, cand) {
-			kept = append(kept, cand)
-		}
+		// A bare call never reaches an extension method: C# applies them
+		// only to an explicit receiver (astkit marks an unnamed one
+		// "<expr>"). Contains(x) in a KeyedCollection subclass is the
+		// collection's own method, not CollectionUtils.Contains.
 	}
 	if caller.ParentSymbol != "" {
+		if csOwnChainDelegate(idx, caller, cs.Callee, cands) {
+			return nil // PropertyChanging(this, e) invokes the event
+		}
 		classes := []string{caller.ParentSymbol}
 		for level := 0; level < 6 && len(classes) > 0; level++ {
 			var next []string
@@ -263,7 +288,20 @@ func csNarrowBareCall(idx *edgeIndex, caller *core.SymbolRecord, cands []*core.S
 			kept = append(kept, filterByParent(cands, caller.ParentSymbol[:i])...)
 		}
 	}
-	return kept
+	// Member lookup finds a name; overload resolution then needs a member
+	// the arguments fit by count. Equals(a, b) in a class declaring only
+	// Equals(object) is object.Equals(object, object).
+	argc := cs.Argc
+	if argc == 0 {
+		argc = len(cs.Args)
+	}
+	var fit []*core.SymbolRecord
+	for _, c := range kept {
+		if csArityFits(c, argc, csIsExtensionMethod(c)) {
+			fit = append(fit, c)
+		}
+	}
+	return fit
 }
 
 // csIsExtensionMethod reports whether a C# method's first parameter is a
@@ -438,4 +476,91 @@ func csharpAttributeSectionTypes(idx *edgeIndex, masked string, out []string) []
 		}
 	}
 	return out
+}
+
+// csVisibleTypes returns the type declarations named name that a simple
+// name in caller resolves to: the innermost lookup rank that has any
+// (nested in the caller's own type, its namespace, an enclosing or
+// imported one). Nil when no declaration of ours is visible — the name is
+// the runtime's (System.IO.File) or a dependency's.
+func (idx *edgeIndex) csVisibleTypes(caller *core.SymbolRecord, name string) []*core.SymbolRecord {
+	visible := idx.csVisibleNamespaces(caller)
+	best := csRankInvisible
+	var out []*core.SymbolRecord
+	for _, t := range namedSymbols(idx, name) {
+		if t.Language != "csharp" || t.Name != name {
+			continue
+		}
+		switch t.Kind {
+		case core.KindClass, core.KindStruct, core.KindInterface, core.KindEnum:
+		default:
+			continue
+		}
+		r := idx.csScopeRank(visible, caller, t)
+		switch {
+		case r < best:
+			best, out = r, []*core.SymbolRecord{t}
+		case r == best && r < csRankInvisible:
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// csQualifiedTypeAt reports whether the call site's line spells the type
+// qualified (`new Outer.Inner(`, `Ns.Type(`): astkit keeps only the last
+// segment of a constructed type.
+func csQualifiedTypeAt(caller *core.SymbolRecord, cs core.CallSite, name string) bool {
+	if cs.Line <= 0 || caller.RawText == "" {
+		return false
+	}
+	lines := strings.Split(maskCode("csharp", caller.RawText), "\n")
+	i := cs.Line - caller.Span.Start
+	if i < 0 || i >= len(lines) {
+		return false
+	}
+	re := localFnRes.get(`[A-Za-z_]\w*(?:<[^<>]*>)?\s*\.\s*` + regexp.QuoteMeta(name) + `\s*[(<{]`)
+	return re.MatchString(lines[i])
+}
+
+// csQualifiedMemberAt reports whether the call site's line names the
+// qualifying type with a namespace or outer type (`Ns.Type.Method(`).
+func csQualifiedMemberAt(caller *core.SymbolRecord, cs core.CallSite, typ string) bool {
+	if cs.Line <= 0 || caller.RawText == "" {
+		return false
+	}
+	lines := strings.Split(maskCode("csharp", caller.RawText), "\n")
+	i := cs.Line - caller.Span.Start
+	if i < 0 || i >= len(lines) {
+		return false
+	}
+	re := localFnRes.get(`[A-Za-z_]\w*\s*\.\s*` + regexp.QuoteMeta(typ) + `\s*\.`)
+	return re.MatchString(lines[i])
+}
+
+// csOwnChainDelegate reports a call that invokes a field, property or
+// event of the caller's class chain (PropertyChanging(this, e)) because
+// that chain declares no method of the name.
+func csOwnChainDelegate(idx *edgeIndex, caller *core.SymbolRecord, name string, cands []*core.SymbolRecord) bool {
+	if caller.ParentSymbol == "" {
+		return false
+	}
+	field := false
+	classes := []string{caller.ParentSymbol}
+	for level := 0; level < 6 && len(classes) > 0; level++ {
+		var next []string
+		for _, cls := range classes {
+			if len(filterByParent(cands, cls)) > 0 {
+				return false
+			}
+			for _, f := range idx.byName[strings.ToLower(name)] {
+				if f.Name == name && f.ParentSymbol == cls && f.Kind == core.KindField && f.Language == "csharp" {
+					field = true
+				}
+			}
+			next = append(next, baseClassesFor(idx, "csharp", cls, dirOf(caller.FilePath))...)
+		}
+		classes = next
+	}
+	return field
 }
