@@ -284,6 +284,10 @@ func score(repo, outDir string, header eval.TruthFile, edges []eval.TruthEdge) (
 	fmt.Printf("score: universe %d/%d (%.1f%%) · grove %d edges · oracle %d edges · P %.4f R %.4f F1 %.4f\n",
 		card.MatchedUniverse, card.TruthFunctions, card.SymbolMatchRate*100,
 		card.GroveEdges, card.TruthEdges, card.Precision, card.Recall, card.F1)
+	if card.DeclCovered > 0 {
+		fmt.Printf("score: %d missed runtime edges bound to the overridden declaration (recall counting them %.4f; not gated)\n",
+			card.DeclCovered, card.RecallWithDecl)
+	}
 	fmt.Printf("score: wrote %s and %s\n", filepath.Join(outDir, "scorecard.json"), filepath.Join(outDir, "scorecard.md"))
 	return card, nil
 }

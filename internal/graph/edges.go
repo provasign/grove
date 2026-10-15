@@ -2785,6 +2785,18 @@ func resolveSymbolCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *inter
 				continue
 			}
 			localTypes = tsLocalTypesAt(baseLocalTypes, cs.Callee, cs.Line-symbol.Span.Start)
+			if symbol.Language == "php" {
+				if q, _, ok := strings.Cut(cs.Callee, "."); ok {
+					if t := phpInstanceofAt(idx, &symbol, cs.Line, q); t != "" {
+						narrowedTypes := make(map[string]string, len(localTypes)+1)
+						for k, v := range localTypes {
+							narrowedTypes[k] = v
+						}
+						narrowedTypes[q] = t
+						localTypes = narrowedTypes
+					}
+				}
+			}
 			if symbol.Language == "python" {
 				if q, _, ok := strings.Cut(cs.Callee, "."); ok {
 					if t := pyIsinstanceAt(idx, &symbol, cs.Line, q); t != "" {
@@ -3009,6 +3021,19 @@ func resolveSymbolCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *inter
 					sameFileWins = false
 				}
 			}
+			if symbol.Language == "php" && qualifier == "" {
+				// A bare call is a function (filtered below): a same-file
+				// method of that name must not shadow it.
+				sameFileWins = false
+			}
+			if symbol.Language == "php" && qualifier != "" && qualifier != "this" && qualifier != "self" &&
+				qualifier != "static" && qualifier != "parent" {
+				// PHP narrows receivers by type too (ResultSet::from($this)
+				// inside Reader is ResultSet's, not Reader's own from).
+				if _, isSelf := selfVars[qualifier]; !isSelf {
+					sameFileWins = false
+				}
+			}
 			cands, capped := resolveCallees(idx, &symbol, calleeName, scope, true, sameFileWins)
 			if symbol.Language == "csharp" && len(cands) > 0 {
 				// Namespace lookup order (see csnamespace.go): whole-repo
@@ -3178,6 +3203,27 @@ func resolveSymbolCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *inter
 				continue
 			}
 			exprReceiver := qualifier == "<expr>"
+			if exprReceiver && symbol.Language == "php" {
+				// PHP drops untyped receivers (below); an expression astkit
+				// could not name ($xs[0]->m()) is one.
+				continue
+			}
+			if symbol.Language == "php" && qualifier == "" && !exprReceiver && len(cands) > 0 {
+				// A bare call is a function: a method needs $this->, self::
+				// or static:: (canonicalize($s) is test/bootstrap.php's, not
+				// NodeDumperTest::canonicalize). `new Foo()` arrives bare
+				// too, so constructors stay.
+				var kept []*core.SymbolRecord
+				for _, c := range cands {
+					if c.Kind != core.KindMethod {
+						kept = append(kept, c)
+					}
+				}
+				if len(kept) == 0 {
+					continue
+				}
+				cands = kept
+			}
 			if exprReceiver {
 				// A method on an expression astkit could not name (`(a +
 				// b).m()`, `xs[i].m()`, `this.clients[id].close()`): an
@@ -3638,7 +3684,15 @@ func resolveSymbolCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *inter
 				// unresolvable/ambiguous result (self-returning builder method
 				// that exists on many classes) drops — mirrors Java/Rust — so
 				// the chain does not fan out to every same-named method.
-				if ret := phpCallResultType(idx, qualifier, scope); ret != "" {
+				if cls := phpChainClassAt(idx, &symbol, localTypes, cs.Line, cs.Col, calleeName); cls != nil {
+					// The chain typed hop by hop from its start, each class
+					// resolved in the file that names it: the member on cls
+					// or its nearest declaring ancestor, else a library one.
+					cands = nil
+					if m := phpMemberOn(idx, cls, calleeName); m != nil {
+						cands = []*core.SymbolRecord{m}
+					}
+				} else if ret := phpCallResultType(idx, qualifier, scope); ret != "" {
 					if byType := filterByParent(cands, ret); len(byType) > 0 {
 						cands = byType
 					} else {
@@ -4585,8 +4639,8 @@ func filterByArgc(cands []*core.SymbolRecord, argc int) []*core.SymbolRecord {
 	}
 	var out []*core.SymbolRecord
 	for _, cand := range cands {
-		n, variadic, ok := declParamCount(cand)
-		if !ok || n == argc || (variadic && argc >= n-1) {
+		n, required, variadic, ok := declParamRange(cand)
+		if !ok || n == argc || (variadic && argc >= n-1) || (required <= argc && argc <= n) {
 			out = append(out, cand)
 		}
 	}
@@ -4704,6 +4758,14 @@ func csIsGenericMethod(s *core.SymbolRecord) bool {
 // declParamCount counts declared parameters from a callable's first
 // balanced paren group (signature if complete, else raw text).
 func declParamCount(s *core.SymbolRecord) (int, bool, bool) {
+	n, _, variadic, ok := declParamRange(s)
+	return n, variadic, ok
+}
+
+// declParamRange is declParamCount with the number of parameters a call
+// must supply: those with no default value (`$mode = 'r'`, `int x = 0`,
+// `x?: T`, `x: Int = 0`) are optional.
+func declParamRange(s *core.SymbolRecord) (int, int, bool, bool) {
 	src := s.Signature
 	if !strings.Contains(src, ")") {
 		src = s.RawText
@@ -4721,15 +4783,15 @@ func declParamCount(s *core.SymbolRecord) (int, bool, bool) {
 	}
 	if params == "" {
 		if parsed {
-			return 0, false, true
+			return 0, 0, false, true
 		}
-		return 0, false, false
+		return 0, 0, false, false
 	}
 	groups := splitParams(s.Language, params)
 	if s.Language == "java" {
 		groups = splitJavaParamGroups(params)
 	}
-	n := 0
+	n, required := 0, 0
 	variadic := false
 	for _, g := range groups {
 		if strings.TrimSpace(g) == "" {
@@ -4741,9 +4803,50 @@ func declParamCount(s *core.SymbolRecord) (int, bool, bool) {
 		n++
 		if strings.Contains(g, "...") || strings.HasPrefix(strings.TrimSpace(g), "params ") {
 			variadic = true // Java `T...` / C# `params T[]`
+			continue
+		}
+		if s.Language != "java" && s.Language != "go" && paramHasDefault(g) {
+			continue
+		}
+		required++
+	}
+	return n, required, variadic, true
+}
+
+// paramHasDefault reports a parameter declared with a default value or as
+// optional: a top-level `=` (not `=>`, `==`, `<=`, `>=`, `!=`), or a
+// TypeScript `name?:`.
+func paramHasDefault(g string) bool {
+	depth := 0
+	for i := 0; i < len(g); i++ {
+		switch c := g[i]; c {
+		case '(', '[', '{', '<':
+			depth++
+		case ')', ']', '}':
+			depth--
+		case '>':
+			if i > 0 && g[i-1] == '=' {
+				continue // `=>` arrow
+			}
+			depth--
+		case '?':
+			if depth == 0 && i+1 < len(g) && g[i+1] == ':' {
+				return true
+			}
+		case '=':
+			if depth != 0 {
+				continue
+			}
+			if i+1 < len(g) && (g[i+1] == '>' || g[i+1] == '=') {
+				continue
+			}
+			if i > 0 && strings.ContainsRune("=!<>", rune(g[i-1])) {
+				continue
+			}
+			return true
 		}
 	}
-	return n, variadic, true
+	return false
 }
 
 // splitJavaParamGroups keeps commas inside generic type arguments such as

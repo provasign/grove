@@ -50,8 +50,8 @@
  },
  "php-parser": {
   "commit": "8eea230",
-  "precision": 0.9177,
-  "recall": 0.6487,
+  "precision": 0.9218,
+  "recall": 0.6825,
   "tolerance": 0.005,
   "minUniverse": 0.99
  },
@@ -134,8 +134,8 @@
  },
  "csv": {
   "commit": "89ac08c",
-  "precision": 0.8892,
-  "recall": 0.7068,
+  "precision": 0.9472,
+  "recall": 0.8367,
   "tolerance": 0.005,
   "minUniverse": 0.99
  }

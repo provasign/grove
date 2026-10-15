@@ -60,6 +60,14 @@ type Scorecard struct {
 	// IgnoredDispatch counts reason=dispatch edges skipped under a static
 	// declaration-binding oracle (neither TP nor FP there).
 	IgnoredDispatch int `json:"ignoredDispatch,omitempty"`
+	// DeclCovered (runtime oracles only) counts false negatives whose call
+	// Grove bound to a declaration the executed method overrides or
+	// implements ($node->getType() on an interface-typed Node, recorded at
+	// runtime as Echo_::getType). An abstract or interface method never
+	// runs, so the oracle cannot score that edge; reported, not gated.
+	// RecallWithDecl counts them as found.
+	DeclCovered    int     `json:"declCovered,omitempty"`
+	RecallWithDecl float64 `json:"recallWithDecl,omitempty"`
 
 	// Tests-edge scoring only: function-level coverage signal quality.
 	FunctionsCovered int     `json:"functionsCovered,omitempty"`

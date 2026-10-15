@@ -684,6 +684,31 @@ $node->getType()}($node)` in `PrettyPrinterAbstract::p` (445), reflection
 over `getSubNodeNames()` in `NodeDumper::dumpRecursive` (281) and
 `NodeTraverser::traverseNode` (124).
 
+2026-10-18 pass: php-parser P 0.9177 → 0.9218, R 0.6487 → 0.6825; csv P
+0.8892 → 0.9472, R 0.7068 → 0.8367 (Grove only; snapshots unchanged).
+`if ($x instanceof T)` narrows `$x` inside its block; a bare call binds a
+function, never a method (`canonicalize($s)` beside
+`NodeDumperTest::canonicalize`); an explicit receiver or class (`ResultSet::
+from($this)` in Reader) is not shadowed by the caller file's own `from`;
+`Class::m()` returning `static` is `Class` (late static binding); fluent
+chains, multi-line ones included, are typed hop by hop from their start
+(`$this->createClassBuilder('x')->setDocComment(..)->getNode()`), each class
+resolved in the file that names it (`use` imports, then same namespace by
+PSR-4 directory tail) since php-parser alone has three classes named
+`Class_`; `new Ns\Name()` is checked against its namespace even with one
+candidate; `(clone $b)->m()` / `(new Foo)->m()` name their receiver;
+`foreach ($x ...)` and `...$x` call `$x`'s getIterator/Iterator methods.
+Arity now honours default parameters in every language
+(`from($filename, $mode = 'r')` takes one argument) — it had kept only
+exact counts, dropping the right method and keeping a one-parameter
+namesake. Subclass dispatch keys classes sharing a short name by file.
+
+Runtime oracles never record a call to an interface or abstract method (it
+never runs): `$node->getType()` on a `Node` is recorded as the concrete
+`Echo_::getType` that executed. Grove binds the declaration. The scorecard
+reports these as `declCovered` with `recallWithDecl` (php-parser 724 edges,
+R 0.8505 → counting them); ungated, raw P/R stay the gate.
+
 Day-one progression (0.2028 → 0.6319), each step measured:
 
 | Fix | F1 |
