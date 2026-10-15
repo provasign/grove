@@ -599,8 +599,12 @@ func (g *CodeGraph) changeImpactScoped(query, file string) (*ChangeImpactResult,
 			}
 			if !memberIDs[edge.From] {
 				evidence.note(edge)
-				callLines.note(edge, resolvedLines)
 			}
+			// A member's own calls into the set are edit sites too:
+			// super().highlight(text) inside an override changes with the
+			// signature. The member is listed as a site already; its call
+			// positions were dropped (19 of 21 Python misses, 2026-10-14).
+			callLines.note(edge, resolvedLines)
 			if memberIDs[edge.From] || callerSeen[edge.From] {
 				continue
 			}
@@ -813,8 +817,8 @@ func (g *CodeGraph) externalRootedImpact(query, typeName, methodName string, que
 			}
 			if !memberIDs[edge.From] {
 				evidence.note(edge)
-				callLines.note(edge, resolvedLines)
 			}
+			callLines.note(edge, resolvedLines) // members' own calls too (see changeImpactScoped)
 			if memberIDs[edge.From] || callerSeen[edge.From] {
 				continue
 			}
@@ -1245,11 +1249,14 @@ func (g *CodeGraph) freeFunctionImpactLocked(query, file string) *ChangeImpactRe
 			edge := g.edges[ei]
 			accept := edge.Type == core.EdgeCalls ||
 				(dataAnchor && (edge.Type == core.EdgeReads || edge.Type == core.EdgeWrites || edge.Type == core.EdgeRedefines))
-			if !accept || declIDs[edge.From] {
+			if !accept {
+				continue
+			}
+			callLines.note(edge, resolvedLines) // recursion is an edit site too
+			if declIDs[edge.From] {
 				continue
 			}
 			evidence.note(edge)
-			callLines.note(edge, resolvedLines)
 			if seen[edge.From] {
 				continue
 			}

@@ -343,3 +343,27 @@ func TestChangeImpactFamilyIncludesEnumImplementations(t *testing.T) {
 		}
 	}
 }
+
+// A family member's own call into the change set keeps its position:
+// super().draw() inside an override is an edit site.
+func TestChangeImpactKeepsMembersOwnCallPositions(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "h.py::Base@1", FilePath: "h.py", BlobSHA: "1", Language: "python", Kind: core.KindClass, Name: "Base", QualifiedName: "Base", RawText: "class Base:\n    pass\n"},
+		{ID: "h.py::Base.draw@2", FilePath: "h.py", BlobSHA: "1", Language: "python", Kind: core.KindMethod, Name: "draw", QualifiedName: "Base.draw", ParentSymbol: "Base",
+			RawText: "def draw(self):\n    return 1\n", Span: core.LineRange{Start: 2, End: 3}},
+		{ID: "h.py::Sub@5", FilePath: "h.py", BlobSHA: "1", Language: "python", Kind: core.KindClass, Name: "Sub", QualifiedName: "Sub", Signature: "class Sub(Base):",
+			RawText: "class Sub(Base):\n    pass\n"},
+		{ID: "h.py::Sub.draw@6", FilePath: "h.py", BlobSHA: "1", Language: "python", Kind: core.KindMethod, Name: "draw", QualifiedName: "Sub.draw", ParentSymbol: "Sub",
+			RawText: "def draw(self):\n    return super().draw()\n", Span: core.LineRange{Start: 6, End: 7},
+			CallSites: []core.CallSite{{Callee: "super().draw", Line: 7, Col: 22}}},
+	}
+	g := New()
+	g.Replace(syms, 1)
+	r, err := g.ChangeImpact("Base.draw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := r.ResolvedCallerLines["h.py::Sub.draw@6"]; len(got) != 1 || got[0] != "7:22" {
+		t.Fatalf("Sub.draw's super().draw() position = %v (all %v)", got, r.ResolvedCallerLines)
+	}
+}
