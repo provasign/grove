@@ -16,6 +16,12 @@ import (
 )
 
 type CodeGraph struct {
+	// markers are the stored per-symbol records (core.IsMarkerEdge), kept
+	// out of the edge list and its indexes.
+	markers []core.Edge
+	// contracts: method ID -> library interfaces it fulfils
+	// (core.EdgeExternalContract).
+	contracts    map[string][]string
 	mu           sync.RWMutex
 	symbols      map[string]core.SymbolRecord
 	edges        []core.Edge
@@ -138,6 +144,24 @@ func (g *CodeGraph) install(symbols []core.SymbolRecord, edges []core.Edge, file
 		}
 		edges = kept
 	}
+	{
+		kept := edges[:0]
+		var markers []core.Edge
+		contracts := map[string][]string{}
+		for _, e := range edges {
+			if core.IsMarkerEdge(e.Type) {
+				markers = append(markers, e)
+				if e.Type == core.EdgeExternalContract && e.Lines != "" {
+					contracts[e.From] = strings.Split(e.Lines, ",")
+				}
+				continue
+			}
+			kept = append(kept, e)
+		}
+		edges = kept
+		g.markers = markers
+		g.contracts = contracts
+	}
 	g.edges = edges
 	g.filesIndexed = filesIndexed
 	// inbound and outbound key disjoint fields, so the two index builds are
@@ -258,7 +282,11 @@ func mergeEdges(base, enriched []core.Edge) []core.Edge {
 			set.static = true
 		}
 	}
+	marked := resolvedCallMarks(byKey, ordered)
 	superseded := func(e core.Edge) bool {
+		if marked.covers(e) {
+			return true
+		}
 		set := resolved[e.From][calleeNameOf(e.To)]
 		if set == nil {
 			return false
@@ -294,6 +322,62 @@ func mergeEdges(base, enriched []core.Edge) []core.Edge {
 		out = append(out, e)
 	}
 	return out
+}
+
+// callMarks holds, per caller and callee name, the call positions a
+// compiler pass resolved to no other indexed symbol (core.EdgeResolvedCalls).
+type callMarks map[string]map[string]map[string]bool
+
+func resolvedCallMarks[K comparable](byKey map[K]core.Edge, order []K) callMarks {
+	m := callMarks{}
+	for _, k := range order {
+		e := byKey[k]
+		if e.Type != core.EdgeResolvedCalls || e.Lines == "" {
+			continue
+		}
+		byName := m[e.From]
+		if byName == nil {
+			byName = map[string]map[string]bool{}
+			m[e.From] = byName
+		}
+		for _, part := range strings.Split(e.Lines, ",") {
+			name, pos, ok := strings.Cut(part, "@")
+			if !ok || name == "" || pos == "" {
+				continue
+			}
+			if byName[name] == nil {
+				byName[name] = map[string]bool{}
+			}
+			byName[name][pos] = true
+		}
+	}
+	return m
+}
+
+// covers reports whether every call position of the guessed edge e is one
+// the compiler resolved elsewhere for the same name: gin's
+// c.Request.Header.Get(key) is net/http's Header.Get, not Context.Get, and
+// commons-lang's isAssignable recursing is not a call to its overloads.
+// A guess without positions is never covered.
+func (m callMarks) covers(e core.Edge) bool {
+	if len(m) == 0 || e.Lines == "" {
+		return false
+	}
+	set := m[e.From][calleeNameOf(e.To)]
+	if set == nil {
+		return false
+	}
+	for _, pos := range strings.Split(e.Lines, ",") {
+		if set[pos] {
+			continue
+		}
+		line, _, hasCol := strings.Cut(pos, ":")
+		if hasCol && set[line] {
+			continue // the compiler gave no column
+		}
+		return false
+	}
+	return true
 }
 
 // qualOwner is the type part of a qualified member name ("" for a function).
@@ -348,6 +432,9 @@ func symbolQual(id string) (qual string, anchor bool) {
 
 // calleeNameOf is the member name in a symbol ID: "f.go::T.Name@sha" and the
 // anchor "f.go::T@sha#Name" both give "Name".
+// CalleeName is the member name a symbol ID names ("T.Name" -> "Name").
+func CalleeName(id string) string { return calleeNameOf(id) }
+
 func calleeNameOf(id string) string {
 	qual, _ := symbolQual(id)
 	if i := strings.LastIndexByte(qual, '.'); i >= 0 {
@@ -476,7 +563,8 @@ func edgeTimer() func(string) {
 func (g *CodeGraph) EdgesSnapshot() []core.Edge {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-	return append([]core.Edge(nil), g.edges...)
+	out := make([]core.Edge, 0, len(g.edges)+len(g.markers))
+	return append(append(out, g.edges...), g.markers...)
 }
 
 // DropBelowConfidence removes every edge whose confidence is below min and

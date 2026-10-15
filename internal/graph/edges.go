@@ -756,7 +756,7 @@ func declaresLocalFunction(symbol *core.SymbolRecord, body, name string) bool {
 	var pat string
 	switch symbol.Language {
 	case "javascript", "typescript", "tsx":
-		pat = `(?m)^\s*(?:async\s+)?function\*?\s+` + regexp.QuoteMeta(name) + `\s*\(`
+		pat = `(?m)^\s*(?:(?:async\s+)?function\*?\s+` + regexp.QuoteMeta(name) + `\s*\(|(?:const|let|var)\s+` + regexp.QuoteMeta(name) + `\s*=)`
 	case "python":
 		pat = `(?m)^\s*(?:async\s+)?def\s+` + regexp.QuoteMeta(name) + `\s*\(`
 	case "go":
@@ -2994,6 +2994,22 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					}
 					cands = reachable
 				}
+			}
+			if qualifier == "" && len(cands) > 0 && (symbol.Language == "javascript" || symbol.Language == "typescript" || symbol.Language == "tsx") {
+				// A bare call in JS/TS never reaches a class member: methods
+				// need a receiver. socket.io's `run()` (a local arrow) and
+				// express's `send(req, path, opts)` (the send module) were
+				// bound to same-named methods (oracle review 2026-10-15).
+				var free []*core.SymbolRecord
+				for _, cand := range cands {
+					if cand.Kind != core.KindMethod && cand.Kind != core.KindField {
+						free = append(free, cand)
+					}
+				}
+				if len(free) == 0 {
+					continue
+				}
+				cands = free
 			}
 			if symbol.Language == "objc" && len(cands) > 0 {
 				// Objective-C receivers, at the altitude clang's typed AST

@@ -742,6 +742,17 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 	nativeCfg.FileSetChanged = fileSetChanged || len(prunedFiles) > 0
 	nativeCfg.Resident = opts.Resident
 	nativeCfg.PrevChanged = replacedSymbols
+	nativeCfg.CallerFiles = nil
+	{
+		seen := map[string]bool{}
+		for _, e := range incomingNative {
+			if f, _, ok := strings.Cut(e.From, "::"); ok && !seen[f] {
+				seen[f] = true
+				nativeCfg.CallerFiles = append(nativeCfg.CallerFiles, f)
+			}
+		}
+		sort.Strings(nativeCfg.CallerFiles)
+	}
 	completed := map[string]bool{}
 	if raw, ok, err := i.store.GetMeta(ctx, core.MetaNativeComplete); err == nil && ok && raw != "" {
 		var names []string
@@ -848,7 +859,8 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 				analyzedDirs[d] = true
 			}
 		}
-		base, meta := graph.BuildEdgesDeltaMeta(opts.PrevEdges, opts.PrevSymbols, symbols, changedSet, analyzedDirs)
+		base, meta := graph.BuildEdgesDeltaMetaWith(opts.PrevEdges, opts.PrevSymbols, symbols, changedSet, analyzedDirs,
+			lostCompilerCoverage(opts.PrevEdges, nativeResult.Edges))
 		codeGraph.ReplaceWithBaseEdges(symbols, base, nativeResult.Edges, result.FilesSeen)
 		result.Native = append(result.Native, "edge construction: incremental (GROVE_INCREMENTAL=1)")
 		deltaMeta = meta
@@ -1053,6 +1065,49 @@ func externalNode(node string, files map[string]bool, indexedBefore map[string]s
 	}
 	_, wasIndexed := indexedBefore[path]
 	return !wasIndexed
+}
+
+// lostCompilerCoverage returns the callers whose stored compiler call
+// edges (and resolved-call records) name a callee the fresh compiler result
+// no longer resolves for them. Names, not IDs: an edit renames the IDs in
+// the edited file while the resolution is unchanged.
+func lostCompilerCoverage(prev, fresh []core.Edge) map[string]bool {
+	names := func(edges []core.Edge) map[string]map[string]bool {
+		out := map[string]map[string]bool{}
+		add := func(from, name string) {
+			if out[from] == nil {
+				out[from] = map[string]bool{}
+			}
+			out[from][name] = true
+		}
+		for _, e := range edges {
+			if e.Source != core.EvidenceSourceNative {
+				continue
+			}
+			switch e.Type {
+			case core.EdgeCalls:
+				add(e.From, graph.CalleeName(e.To))
+			case core.EdgeResolvedCalls:
+				for _, part := range strings.Split(e.Lines, ",") {
+					if name, _, ok := strings.Cut(part, "@"); ok {
+						add(e.From, name)
+					}
+				}
+			}
+		}
+		return out
+	}
+	before, after := names(prev), names(fresh)
+	lost := map[string]bool{}
+	for from, set := range before {
+		for name := range set {
+			if !after[from][name] {
+				lost[from] = true
+				break
+			}
+		}
+	}
+	return lost
 }
 
 // symbolRemap maps pre-edit symbol IDs of changed files to the current IDs of

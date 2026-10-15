@@ -14,6 +14,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -32,6 +33,9 @@ type goAnalyzer struct{}
 func (goAnalyzer) Name() string { return "go" }
 
 func (goAnalyzer) Languages() []string { return []string{"go"} }
+
+// Budget: see javaAnalyzer.Budget.
+func (goAnalyzer) Budget(files int) time.Duration { return compilerBudget(files) }
 
 func (goAnalyzer) Available(_ context.Context, root string) Availability {
 	if !anyFile(root, "go.mod", "go.work") {
@@ -355,12 +359,11 @@ func packageFiles(root string, pkg goListPackage) []string {
 	names := append(append([]string{}, pkg.GoFiles...), pkg.TestGoFiles...)
 	out := make([]string, 0, len(names))
 	for _, name := range names {
-		abs := filepath.Join(pkg.Dir, name)
-		rel, err := filepath.Rel(root, abs)
-		if err != nil {
-			continue
+		rel, ok := relFile(root, filepath.Join(pkg.Dir, name))
+		if !ok {
+			continue // outside this checkout
 		}
-		out = append(out, filepath.ToSlash(rel))
+		out = append(out, rel)
 	}
 	return out
 }
@@ -369,6 +372,9 @@ type goSymbolIndex struct {
 	byFileFunc map[string]core.SymbolRecord
 	byFunc     map[string]core.SymbolRecord
 	byType     map[string]core.SymbolRecord
+	// byBaseFunc keys callables by their directory's last element instead
+	// of the whole path, to recognize a project package go list did not map.
+	byBaseFunc map[string]bool
 }
 
 func newGoSymbolIndex(symbols []core.SymbolRecord) goSymbolIndex {
@@ -376,6 +382,7 @@ func newGoSymbolIndex(symbols []core.SymbolRecord) goSymbolIndex {
 		byFileFunc: map[string]core.SymbolRecord{},
 		byFunc:     map[string]core.SymbolRecord{},
 		byType:     map[string]core.SymbolRecord{},
+		byBaseFunc: map[string]bool{},
 	}
 	for _, symbol := range symbols {
 		if symbol.Language != "go" || goLocalSymbol(symbol) {
@@ -387,6 +394,7 @@ func newGoSymbolIndex(symbols []core.SymbolRecord) goSymbolIndex {
 			key := goCallableKey(dir, symbol.ParentSymbol, symbol.Name)
 			idx.byFunc[key] = symbol
 			idx.byFileFunc[symbol.FilePath+"\x00"+key] = symbol
+			idx.byBaseFunc[goCallableKey(path.Base(dir), symbol.ParentSymbol, symbol.Name)] = true
 		case core.KindStruct, core.KindInterface, core.KindType:
 			idx.byType[dir+"\x00"+symbol.Name] = symbol
 		}
@@ -455,6 +463,7 @@ func goSemanticEdges(ctx context.Context, root string, files []string, symbols [
 	type dirOutcome struct {
 		edges []core.Edge
 		decls []compilerDecl
+		pkg   *types.Package
 		err   error
 	}
 	outcomes := make([]dirOutcome, len(dirs))
@@ -479,8 +488,8 @@ func goSemanticEdges(ctx context.Context, root string, files []string, symbols [
 				if pkgPath == "" {
 					pkgPath = dirs[di]
 				}
-				e, d, err := goSemanticPackageEdges(root, pkgPath, dirs[di], filesByDir[dirs[di]], symbolIdx, pkgDirsByImport, projectImporter)
-				outcomes[di] = dirOutcome{edges: e, decls: d, err: err}
+				e, d, pkg, err := goSemanticPackageEdges(root, pkgPath, dirs[di], filesByDir[dirs[di]], symbolIdx, pkgDirsByImport, projectImporter)
+				outcomes[di] = dirOutcome{edges: e, decls: d, pkg: pkg, err: err}
 			}
 		}()
 	}
@@ -496,13 +505,18 @@ func goSemanticEdges(ctx context.Context, root string, files []string, symbols [
 		}
 		edges = append(edges, o.edges...)
 		decls = append(decls, o.decls...)
+		edges = append(edges, goExternalContracts(o.pkg, dirs[di], symbolIdx, pkgDirsByImport)...)
 	}
 	diagnostics = append(diagnostics, "resolved "+itoa(countEdgesOfType(edges, core.EdgeCalls))+" native call edge(s)")
 	diagnostics = append(diagnostics, "resolved "+itoa(countEdgesOfType(edges, core.EdgeUsesType))+" native type-use edge(s)")
 	return edges, decls, diagnostics
 }
 
-func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx goSymbolIndex, pkgDirsByImport map[string][]string, projectImporter types.Importer) ([]core.Edge, []compilerDecl, error) {
+// The checked package is returned for the contracts pass
+// (goExternalContracts), which runs once every type-check goroutine is
+// done: imported packages are shared and their scopes fill in lazily while
+// other goroutines type-check.
+func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx goSymbolIndex, pkgDirsByImport map[string][]string, projectImporter types.Importer) ([]core.Edge, []compilerDecl, *types.Package, error) {
 	fset := token.NewFileSet()
 	parsed := make([]*ast.File, 0, len(files))
 	for _, file := range files {
@@ -516,7 +530,7 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 			if err == nil {
 				err = fmt.Errorf("%s: no syntax tree", file)
 			}
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		parsed = append(parsed, f)
 	}
@@ -534,6 +548,7 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 	decls, localTypes := goLocalDecls(fset, files, parsed, info)
 
 	pe := newPositionedEdges()
+	marks := resolvedMarks{}
 	add := func(edge core.Edge) { pe.add(edge, 0, 0) }
 	lines := goLineReader(fset)
 	for _, edge := range dispatch.contractEdges() {
@@ -575,7 +590,16 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 								Confidence: 0.99, Source: core.EvidenceSourceNative, Reason: core.ReasonMethodSet})
 						}
 					}
-					if callee, ok := goResolveCall(dir, n.Fun, info, symbolIdx, pkgDirsByImport, pkg); ok && callee.ID != caller.ID {
+					callee, resolvedOK := goResolveCall(dir, n.Fun, info, symbolIdx, pkgDirsByImport, pkg)
+					switch {
+					case resolvedOK && callee.ID == caller.ID:
+						marks.add(caller.ID, callee.Name, line, col)
+					case !resolvedOK:
+						if fnObj := goCalledFunc(n.Fun, info); fnObj != nil && goExternalConcrete(dir, fnObj, symbolIdx, pkgDirsByImport, pkg) {
+							marks.add(caller.ID, fnObj.Name(), line, col)
+						}
+					}
+					if resolvedOK && callee.ID != caller.ID {
 						call(core.Edge{
 							From:       caller.ID,
 							To:         callee.ID,
@@ -621,7 +645,144 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 			return false
 		})
 	}
-	return pe.finish(), decls, nil
+	return append(pe.finish(), marks.edges()...), decls, pkg, nil
+}
+
+// goExternalContracts records, on each method of the package's own types,
+// the library interfaces (reachable through the package's imports, and
+// error) whose contract that method fulfils. Go satisfies interfaces
+// implicitly: without this record a change set for gin's
+// responseWriter.Write claimed every caller while render's w.Write on an
+// http.ResponseWriter reaches it.
+func goExternalContracts(pkg *types.Package, dir string, symbolIdx goSymbolIndex, pkgDirsByImport map[string][]string) []core.Edge {
+	if pkg == nil {
+		return nil
+	}
+	type iface struct {
+		name string
+		typ  *types.Interface
+	}
+	var ifaces []iface
+	if e, ok := types.Universe.Lookup("error").Type().Underlying().(*types.Interface); ok {
+		ifaces = append(ifaces, iface{"error", e})
+	}
+	// The package's own imports only: their scopes are complete for it,
+	// and the set depends on nothing else analyzed in the same run, so an
+	// incremental and a full index record the same contracts.
+	for _, p := range pkg.Imports() {
+		if p != nil && p.Complete() && len(pkgDirsByImport[p.Path()]) == 0 {
+			for _, name := range p.Scope().Names() {
+				obj, ok := p.Scope().Lookup(name).(*types.TypeName)
+				if !ok || !obj.Exported() {
+					continue
+				}
+				it, ok := obj.Type().Underlying().(*types.Interface)
+				if !ok || it.NumMethods() == 0 {
+					continue
+				}
+				exported := true
+				for i := 0; i < it.NumMethods(); i++ {
+					if !it.Method(i).Exported() {
+						exported = false
+						break
+					}
+				}
+				if exported {
+					ifaces = append(ifaces, iface{p.Path() + "." + name, it})
+				}
+			}
+		}
+	}
+	byMethod := map[string]map[string]bool{} // method symbol ID -> interface names
+	for _, name := range pkg.Scope().Names() {
+		obj, ok := pkg.Scope().Lookup(name).(*types.TypeName)
+		if !ok || obj.IsAlias() {
+			continue
+		}
+		named, ok := obj.Type().(*types.Named)
+		if !ok {
+			continue
+		}
+		if _, isIface := named.Underlying().(*types.Interface); isIface {
+			continue
+		}
+		ptr := types.NewPointer(named)
+		for _, it := range ifaces {
+			if !types.Implements(ptr, it.typ) {
+				continue
+			}
+			for i := 0; i < it.typ.NumMethods(); i++ {
+				m := it.typ.Method(i).Name()
+				sym, ok := symbolIdx.byFunc[goCallableKey(dir, name, m)]
+				if !ok {
+					continue // promoted from an embedded type
+				}
+				if byMethod[sym.ID] == nil {
+					byMethod[sym.ID] = map[string]bool{}
+				}
+				byMethod[sym.ID][it.name] = true
+			}
+		}
+	}
+	ids := make([]string, 0, len(byMethod))
+	for id := range byMethod {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := make([]core.Edge, 0, len(ids))
+	for _, id := range ids {
+		names := make([]string, 0, len(byMethod[id]))
+		for n := range byMethod[id] {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		out = append(out, core.Edge{From: id, To: id, Type: core.EdgeExternalContract, Confidence: 0.99,
+			Source: core.EvidenceSourceNative, Lines: strings.Join(names, ",")})
+	}
+	return out
+}
+
+// goCalledFunc is the function or method a call names, if go/types
+// resolved one.
+func goCalledFunc(expr ast.Expr, info *types.Info) *types.Func {
+	switch fun := expr.(type) {
+	case *ast.IndexExpr:
+		return goCalledFunc(fun.X, info)
+	case *ast.IndexListExpr:
+		return goCalledFunc(fun.X, info)
+	case *ast.ParenExpr:
+		return goCalledFunc(fun.X, info)
+	case *ast.Ident:
+		fn, _ := info.Uses[fun].(*types.Func)
+		return fn
+	case *ast.SelectorExpr:
+		if sel := info.Selections[fun]; sel != nil {
+			fn, _ := sel.Obj().(*types.Func)
+			return fn
+		}
+		fn, _ := info.Uses[fun.Sel].(*types.Func)
+		return fn
+	}
+	return nil
+}
+
+// goExternalConcrete: fn is a concrete function or method of a package
+// outside the project (stdlib or a dependency). An interface method is not
+// one: its dynamic target may be a project type. A package go list did not
+// map but whose last path element names a project directory declaring the
+// same callable is treated as possibly the project's own.
+func goExternalConcrete(currentDir string, fn *types.Func, symbolIdx goSymbolIndex, pkgDirsByImport map[string][]string, selfPkg *types.Package) bool {
+	if fn.Pkg() == nil || goObjectDirs(currentDir, fn.Pkg(), pkgDirsByImport, selfPkg) != nil {
+		return false
+	}
+	sig, ok := fn.Type().(*types.Signature)
+	if !ok {
+		return false
+	}
+	if recv := sig.Recv(); recv != nil && types.IsInterface(recv.Type()) {
+		return false
+	}
+	return !symbolIdx.byBaseFunc[goCallableKey(path.Base(fn.Pkg().Path()), goFuncReceiverName(fn), fn.Name())]
 }
 
 // goCalledName is the identifier a call names: f(), x.M(), pkg.F[T]().
@@ -1065,6 +1226,9 @@ func goListTopologyKey(root string, files []string, symbols []core.SymbolRecord)
 	// sets via build tags; GOFLAGS can add -mod=vendor). Known residual: an
 	// edited //go:build line rotates file content but not this key — rare,
 	// and recoverable with --force or any import-block change.
+	// go list reports absolute package directories: a cache written for
+	// another checkout (a copied .grove) names that checkout's files.
+	h.Write([]byte("root=" + filepath.Clean(root) + ";"))
 	for _, env := range []string{"GOOS", "GOARCH", "GOFLAGS", "CGO_ENABLED"} {
 		h.Write([]byte(env + "=" + os.Getenv(env) + ";"))
 	}

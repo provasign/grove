@@ -89,7 +89,25 @@ const (
 	EdgeWrites    EdgeType = "writes"        // symbol writes a data item
 	EdgeRedefines EdgeType = "redefines"     // alternate view over the same storage
 	EdgeBinds     EdgeType = "binds-dataset" // logical file bound to a physical dataset
+
+	// EdgeResolvedCalls is a compiler pass's record, on the caller itself
+	// (From == To), of calls it resolved to no other indexed symbol: a
+	// library method, or the caller recursing. Lines lists them as
+	// "name@line:col". It is not a graph edge: the graph sets these apart
+	// at install and only stores them, so a name-based guess at the same
+	// call position can be dropped in a full and an incremental build alike.
+	EdgeResolvedCalls EdgeType = "resolved-calls"
+	// EdgeExternalContract is a compiler pass's record, on a method itself
+	// (From == To), of the library interfaces whose contract the method
+	// fulfils (Lines: "net/http.ResponseWriter,io.Writer"). Go satisfies
+	// interfaces implicitly, so no extends/implements clause says so; calls
+	// typed against those interfaces may reach the method at run time. Set
+	// apart at install like EdgeResolvedCalls.
+	EdgeExternalContract EdgeType = "external-contract"
 )
+
+// IsMarkerEdge reports the stored per-symbol records that are not graph edges.
+func IsMarkerEdge(t EdgeType) bool { return t == EdgeResolvedCalls || t == EdgeExternalContract }
 
 type Edge struct {
 	From       string         `json:"from"`

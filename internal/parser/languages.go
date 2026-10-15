@@ -48,7 +48,10 @@ var securityExtensions = map[string]bool{
 // the derived TEXT id. store.migrateLegacyEdges converts a 2026-10-13.1
 // database in place and advances its stamp; older binaries see the new
 // stamp and rebuild instead of reading an empty "edges" table.
-const ExtractorVersion = "2026-10-15.1"
+// 2026-10-16.1: a call on its own declaration's line takes the call's column, not the
+// declaration name's (astkit fillCallColumns); javac and go/types record calls
+// resolved to libraries or to the caller itself (core.EdgeResolvedCalls).
+const ExtractorVersion = "2026-10-16.1"
 
 // DetectLanguage returns the Grove language tag for a file path.
 // Returns "" for unsupported or security-excluded files.

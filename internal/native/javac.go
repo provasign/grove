@@ -275,6 +275,9 @@ func javacClasspathCached(ctx context.Context, j *jdk, root, tmp string) (string
 // are none.
 func buildFilesKey(root, jdkHome string) string {
 	h := sha256.New()
+	// The classpath names this checkout's build output; a cache copied with
+	// .grove from another checkout must not be reused.
+	h.Write([]byte("root=" + filepath.Clean(root) + "\x00"))
 	n := 0
 	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -367,6 +370,14 @@ func javaScope(req Request, files []string) (units []string, dirs []string) {
 		for d := range javaDependentDirs(req, files) {
 			dirSet[d] = true
 		}
+		// Callers the graph already knows: a garbled declaration (a
+		// half-typed line between annotations) can leave their stored edges
+		// unable to follow the edit, while a full run re-binds them.
+		for _, f := range req.CallerFiles {
+			if all[f] {
+				dirSet[packageDir(f)] = true
+			}
+		}
 	}
 	for _, f := range files {
 		if dirSet[packageDir(f)] {
@@ -447,6 +458,23 @@ func javaDependentDirs(req Request, files []string) map[string]bool {
 	}
 	javaFile := fileSet(files)
 	out := map[string]bool{}
+	// The same package under another source root (src/test/java next to
+	// src/main/java) binds without an import: a renamed StopWatch.split left
+	// StopWatchTest's call on the removed method (fuzz, 2026-10-15).
+	pkgDirs := map[string]bool{}
+	for _, r := range refs {
+		if r.pkg != "" {
+			pkgDirs[strings.ReplaceAll(r.pkg, ".", "/")] = true
+		}
+	}
+	for _, f := range files {
+		d := packageDir(f)
+		for pd := range pkgDirs {
+			if d == pd || strings.HasSuffix(d, "/"+pd) {
+				out[d] = true
+			}
+		}
+	}
 	for i := range req.Symbols {
 		s := &req.Symbols[i]
 		if !javaFile[s.FilePath] || out[packageDir(s.FilePath)] {
@@ -599,10 +627,40 @@ func javacResolveScoped(ctx context.Context, req Request) ([]core.Edge, []string
 		}
 		callLines[i][callPos{c.Line, c.Col}] = true
 	}
+	// A call javac resolved to the JDK or a dependency, or to the caller
+	// itself, has no edge to carry that fact; it is recorded so a
+	// name-based guess at the same position is dropped (core.EdgeResolvedCalls).
+	// A target type the project also declares is not trusted as external:
+	// a stale compiled copy of a project class on the classpath reads as one.
+	projectTypes := map[string]bool{}
+	for _, sym := range all {
+		if sym.Language == "java" && (sym.Kind == core.KindClass || sym.Kind == core.KindInterface || sym.Kind == core.KindEnum || sym.Kind == core.KindType || sym.Kind == core.KindStruct) {
+			projectTypes[sym.Name] = true
+		}
+	}
+	marks := resolvedMarks{}
+	mark := func(from core.SymbolRecord, name string, c javacRef) {
+		marks.add(from.ID, name, c.Line, c.Col)
+		if c.Lambda && c.LambdaAt != "" {
+			if lam, ok := lambdas[from.FilePath+"\x00<lambda@"+c.LambdaAt+">"]; ok {
+				marks.add(lam.ID, name, c.Line, c.Col)
+			}
+		}
+	}
 	for _, c := range payload.Calls {
 		from, okFrom := symbols.at(c.From, c.FromName, c.FromLine)
+		if c.Ext != "" {
+			if okFrom && !projectTypes[c.ExtOwner] {
+				mark(from, c.Ext, c)
+			}
+			continue
+		}
 		to, okTo := symbols.at(c.To, c.ToName, c.ToLine)
-		if !okFrom || !okTo || from.ID == to.ID {
+		if okFrom && okTo && from.ID == to.ID {
+			mark(from, to.Name, c)
+			continue
+		}
+		if !okFrom || !okTo {
 			continue
 		}
 		if c.Lambda && c.LambdaAt != "" {
@@ -658,6 +716,7 @@ func javacResolveScoped(ctx context.Context, req Request) ([]core.Edge, []string
 		}
 		edges[i].Lines = strings.Join(parts, ",")
 	}
+	edges = append(edges, marks.edges()...)
 	for _, m := range payload.Members {
 		from, okFrom := symbols.at(m.From, m.FromName, m.FromLine)
 		to, okTo := symbols.at(m.To, m.ToName, m.ToLine)
@@ -862,6 +921,10 @@ type javacRef struct {
 	Line int  `json:"line"`
 	Col  int  `json:"col"`
 	Ref  bool `json:"ref"`
+	// Ext names a call's target declared outside the project (no To), and
+	// ExtOwner the type declaring it.
+	Ext      string `json:"ext"`
+	ExtOwner string `json:"extOwner"`
 }
 
 // compilerDecl is one declaration a compiler attributed: javac's resolver

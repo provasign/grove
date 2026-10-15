@@ -631,6 +631,22 @@ func (g *CodeGraph) changeImpactScoped(query, file string) (*ChangeImpactResult,
 		hierarchyIDs = append(hierarchyIDs, id)
 	}
 	externalSupers, overridesExternal := g.externalContract(hierarchyIDs, methodName)
+	// Implicitly satisfied library interfaces (Go): calls typed against them
+	// are not indexed callers (gin: render's w.Write on an
+	// http.ResponseWriter reaches responseWriter.Write).
+	seenContract := map[string]bool{}
+	for _, group := range [][]core.SymbolRecord{decls, family} {
+		for _, m := range group {
+			for _, iface := range g.contracts[m.ID] {
+				key := iface + "#" + methodName
+				if !seenContract[key] {
+					seenContract[key] = true
+					overridesExternal = append(overridesExternal, key)
+				}
+			}
+		}
+	}
+	sort.Strings(overridesExternal)
 	completeness := "closed"
 	if len(overridesExternal) > 0 {
 		completeness = "project-local"

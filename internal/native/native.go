@@ -19,6 +19,16 @@ import (
 
 const defaultTimeout = 5 * time.Second
 
+// compilerBudget is the incremental time budget of a compiler-backed pass:
+// a process start plus attribution scales with the files analyzed.
+func compilerBudget(files int) time.Duration {
+	d := 30*time.Second + time.Duration(files)*25*time.Millisecond
+	if d > 5*time.Minute {
+		d = 5 * time.Minute
+	}
+	return d
+}
+
 // maxScaledTimeout caps the size-scaled analyzer budget.
 const maxScaledTimeout = 60 * time.Second
 
@@ -49,6 +59,11 @@ type Config struct {
 	// package compare them with the current symbols: when declarations
 	// changed, other packages' bindings may change too.
 	PrevChanged []core.SymbolRecord
+	// CallerFiles: files whose stored compiler edges point into the changed
+	// files. When declarations changed, their calls may bind differently
+	// (or the stored edges may not follow the edited declarations), so a
+	// scoped analyzer re-attributes them too.
+	CallerFiles []string
 }
 
 // completionCap bounds a run-to-completion pass (a safety net for a hung
@@ -121,6 +136,8 @@ type Request struct {
 	Resident bool
 	// PrevChanged: see Config.PrevChanged.
 	PrevChanged []core.SymbolRecord
+	// CallerFiles: see Config.CallerFiles.
+	CallerFiles []string
 }
 
 type Result struct {
@@ -243,7 +260,7 @@ func AnalyzeChangedFiles(ctx context.Context, root string, symbols []core.Symbol
 			reqChanged = nil // a full pass analyzes every package
 		}
 		began := time.Now()
-		result := analyzer.Analyze(runCtx, Request{Root: root, Symbols: symbols, Files: reqFiles, ChangedFiles: reqChanged, FileSetChanged: cfg.FileSetChanged, Resident: cfg.Resident, PrevChanged: cfg.PrevChanged})
+		result := analyzer.Analyze(runCtx, Request{Root: root, Symbols: symbols, Files: reqFiles, ChangedFiles: reqChanged, FileSetChanged: cfg.FileSetChanged, Resident: cfg.Resident, PrevChanged: cfg.PrevChanged, CallerFiles: cfg.CallerFiles})
 		timedOut := errors.Is(runCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
 		cancel()
 		mode := "incremental"
