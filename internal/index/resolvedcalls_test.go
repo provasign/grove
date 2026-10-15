@@ -688,3 +688,24 @@ func TestSwiftGenericInitAndProtocolExtension(t *testing.T) {
 		t.Errorf("protocol extension member via conformance missing: %v", got)
 	}
 }
+
+// C#: Serializer._resolver.Resolve() arrives as _resolver.Resolve; a field
+// name every declaration of which has one type types the receiver.
+func TestCSharpForeignFieldReceiver(t *testing.T) {
+	got, _, _ := callEdges(t, map[string]string{
+		"Lib.cs": `namespace N {
+public interface IResolver { void Resolve(); }
+public class DefaultResolver : IResolver { public void Resolve() {} }
+public class Other { public void Resolve() {} }
+public class Serializer { internal IResolver _resolver; }
+public class Reader {
+  public Serializer Serializer;
+  public void Get() { Serializer._resolver.Resolve(); }
+}
+}
+`,
+	})
+	if got["Reader.Get→Other.Resolve"] || !got["Reader.Get→IResolver.Resolve"] {
+		t.Errorf("foreign field receiver not typed: %v", got)
+	}
+}

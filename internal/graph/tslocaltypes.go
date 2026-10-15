@@ -884,6 +884,8 @@ func tsResolveReceiverChain(idx *edgeIndex, localTypes map[string]string, chain,
 		var classFile string
 		if language == "java" {
 			classFile = javaClassFieldTypes(idx, curType, curFile, fields)
+		} else if language == "csharp" {
+			classFile = csClassFieldTypes(idx, curType, curFile, fields)
 		} else {
 			classFile = tsClassFieldTypes(idx, curType, curFile, fields)
 		}
@@ -897,6 +899,40 @@ func tsResolveReceiverChain(idx *edgeIndex, localTypes map[string]string, chain,
 		}
 	}
 	return curType
+}
+
+// csClassFieldTypes records a C# class's (and its bases') field and
+// property name -> declared type, returning the class's file
+// (Serializer._contractResolver.ResolveContract: newtonsoft, oracle review
+// 2026-10-15).
+func csClassFieldTypes(idx *edgeIndex, className, preferFile string, out map[string]string) string {
+	file := ""
+	seen := map[string]bool{}
+	classes := []string{className}
+	for level := 0; level < 4 && len(classes) > 0; level++ {
+		var next []string
+		for _, c := range classes {
+			if c == "" || seen[c] {
+				continue
+			}
+			seen[c] = true
+			for _, frag := range csharpTypeFragments(idx, c, dirOf(preferFile)) {
+				if file == "" {
+					file = frag.FilePath
+				}
+				for _, m := range csharpFieldRe.FindAllStringSubmatch(classBody(idx, frag), -1) {
+					if t := javaBareType(m[1]); t != "" && csTypedLocal(idx, t) {
+						if _, exists := out[m[2]]; !exists {
+							out[m[2]] = t
+						}
+					}
+				}
+			}
+			next = append(next, csBaseClasses(idx, c, dirOf(preferFile))...)
+		}
+		classes = next
+	}
+	return file
 }
 
 // javaClassFieldTypes records one Java class's field name → type from its
@@ -963,7 +999,7 @@ func narrowByChainType(idx *edgeIndex, sat *interfaceSatisfaction, localTypes ma
 			}
 		}
 	}
-	if symbol.Language == "java" {
+	if symbol.Language == "java" || symbol.Language == "csharp" {
 		// A type declared outside the repo (`result.values.size()` on a
 		// `Map<String, Integer> values` field) or a member inherited from a
 		// base: resolve the last hop exactly as a single-hop receiver of

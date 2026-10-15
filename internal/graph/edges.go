@@ -438,6 +438,28 @@ func allTypesIndexed(idx *edgeIndex, types []string) bool {
 	return true
 }
 
+// csFieldTypeByName returns the declared type shared by every C# field or
+// property named name, or "" when there are none or they disagree.
+func csFieldTypeByName(idx *edgeIndex, name string) string {
+	typ := ""
+	for _, f := range idx.byName[strings.ToLower(name)] {
+		if f.Name != name || f.Language != "csharp" || f.Kind != core.KindField || f.ParentSymbol == "" {
+			continue
+		}
+		fields := map[string]string{}
+		csClassFieldTypes(idx, f.ParentSymbol, f.FilePath, fields)
+		t := fields[name]
+		if t == "" || typ != "" && t != typ {
+			return ""
+		}
+		typ = t
+	}
+	if typ == "" || !typeSymbolExists(idx, typ) {
+		return ""
+	}
+	return typ
+}
+
 // cParamNames returns the parameter names of a C function's signature.
 func cParamNames(fn *core.SymbolRecord) map[string]bool {
 	sig := fn.Signature
@@ -3934,6 +3956,17 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			if len(narrowed) == len(cands) {
 				// Receiver narrowing didn't fire; try the inferred type of
 				// the receiver variable, then import qualification.
+				if symbol.Language == "csharp" && qualifier != "" && !strings.HasSuffix(qualifier, "()") {
+					if _, typed := localTypes[qualifier]; !typed {
+						// Serializer._contractResolver.ResolveContract arrives as
+						// _contractResolver.ResolveContract: a field of another
+						// class. When every field of that name in the repository
+						// declares one type, the receiver has it.
+						if t := csFieldTypeByName(idx, qualifier); t != "" {
+							localTypes[qualifier] = t
+						}
+					}
+				}
 				kept, dispatch, decided := narrowByLocalType(idx, sat, &symbol, localTypes, qualifier, calleeName, cands, scope)
 				if !decided && symbol.Language == "python" && strings.Contains(fullChain, ".") {
 					// `sub_ctx.command.invoke(...)`: type each hop through the
@@ -3943,7 +3976,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 						kept, dispatch, decided = narrowByLocalType(idx, sat, &symbol, map[string]string{qualifier: t}, qualifier, calleeName, cands, scope)
 					}
 				}
-				if !decided && (tsFamilyLang(symbol.Language) || symbol.Language == "java") && strings.Contains(fullChain, ".") {
+				if !decided && (tsFamilyLang(symbol.Language) || symbol.Language == "java" || symbol.Language == "csharp") && strings.Contains(fullChain, ".") {
 					// Multi-hop receiver (`this.connection.driver.escape`):
 					// walk the field-type chain and dispatch to the resolved
 					// type's implementors. The single-segment lookup above
