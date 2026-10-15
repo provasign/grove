@@ -17,16 +17,16 @@ import (
 func TestPHPCallShapes(t *testing.T) {
 	root := t.TempDir()
 	files := map[string]string{
-		"lib/Node.php":       "<?php\nnamespace P;\ninterface Node { public function getType(): string; }\n",
-		"lib/Stmt/Echo_.php": "<?php\nnamespace P\\Stmt;\nuse P\\Node;\nclass Echo_ implements Node { public function getType(): string { return 'e'; } }\n",
-		"lib/Expr/Echo_.php": "<?php\nnamespace P\\Expr;\nclass Echo_ { public function __construct($a) {} }\n",
-		"lib/Builder/Class_.php": "<?php\nnamespace P\\Builder;\nclass Class_ extends Declaration {\n  public function __construct($n) {}\n  public function getNode() { return 1; }\n}\n",
+		"lib/Node.php":                "<?php\nnamespace P;\ninterface Node { public function getType(): string; }\n",
+		"lib/Stmt/Echo_.php":          "<?php\nnamespace P\\Stmt;\nuse P\\Node;\nclass Echo_ implements Node { public function getType(): string { return 'e'; } }\n",
+		"lib/Expr/Echo_.php":          "<?php\nnamespace P\\Expr;\nclass Echo_ { public function __construct($a) {} }\n",
+		"lib/Builder/Class_.php":      "<?php\nnamespace P\\Builder;\nclass Class_ extends Declaration {\n  public function __construct($n) {}\n  public function getNode() { return 1; }\n}\n",
 		"lib/Builder/Declaration.php": "<?php\nnamespace P\\Builder;\nabstract class Declaration {\n  public function setDocComment($c) { return $this; }\n}\n",
-		"lib/Other/Class_.php": "<?php\nnamespace P\\Other;\nclass Class_ { public function getNode() { return 2; } public function setDocComment($c) { return $this; } }\n",
-		"lib/Reader.php": "<?php\nnamespace P;\nclass Reader implements \\IteratorAggregate {\n  public static function from($filename, string $mode = 'r', $context = null): static { return new static(); }\n  public function first(): array { return []; }\n  public function getIterator(): \\Iterator { return new \\ArrayIterator([]); }\n  public function chain(): ResultSet { return ResultSet::from($this); }\n}\n",
-		"lib/ResultSet.php": "<?php\nnamespace P;\nclass ResultSet {\n  public static function from($rs): self { return new self(); }\n}\n",
-		"lib/Row.php": "<?php\nnamespace P;\nclass Row {\n  public static function from(mixed $v): Row { return new Row(); }\n}\n",
-		"test/bootstrap.php": "<?php\nfunction canonicalize($s) { return $s; }\n",
+		"lib/Other/Class_.php":        "<?php\nnamespace P\\Other;\nclass Class_ { public function getNode() { return 2; } public function setDocComment($c) { return $this; } }\n",
+		"lib/Reader.php":              "<?php\nnamespace P;\nclass Reader implements \\IteratorAggregate {\n  public static function from($filename, string $mode = 'r', $context = null): static { return new static(); }\n  public function first(): array { return []; }\n  public function getIterator(): \\Iterator { return new \\ArrayIterator([]); }\n  public function chain(): ResultSet { return ResultSet::from($this); }\n}\n",
+		"lib/ResultSet.php":           "<?php\nnamespace P;\nclass ResultSet {\n  public static function from($rs): self { return new self(); }\n}\n",
+		"lib/Row.php":                 "<?php\nnamespace P;\nclass Row {\n  public static function from(mixed $v): Row { return new Row(); }\n}\n",
+		"test/bootstrap.php":          "<?php\nfunction canonicalize($s) { return $s; }\n",
 		"test/Builder/ClassTest.php": "<?php\nnamespace P\\Builder;\nuse P\\Reader;\nclass ClassTest {\n" +
 			"  protected function make($n) { return new Class_($n); }\n" +
 			"  public function canonicalize($s) { return $s; }\n" +

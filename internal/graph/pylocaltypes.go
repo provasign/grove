@@ -1821,6 +1821,12 @@ func subclassOverrides(idx *edgeIndex, language, className, calleeName, preferDi
 				if visited[sub] {
 					continue
 				}
+				if name, _, keyed := strings.Cut(sub, "\x00"); keyed && !fileLocalTypeName(name) && visited[name] {
+					// A same-named subclass (werkzeug's wrappers.Response
+					// over sansio Response) is the walked name itself: its
+					// members are already the declared targets.
+					continue
+				}
 				visited[sub] = true
 				next = append(next, sub)
 				out = append(out, subclassMembers(methods, sub)...)

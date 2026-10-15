@@ -38,9 +38,9 @@ func UniverseReport(ctx context.Context, repoRoot string, truth []TruthEdge) err
 	}
 
 	const (
-		reasonNoFile   = "file has no Grove symbols"
-		reasonNoSpan   = "no Grove span contains the decl line"
-		reasonBadName  = "span matches, name disagrees"
+		reasonNoFile      = "file has no Grove symbols"
+		reasonNoSpan      = "no Grove span contains the decl line"
+		reasonBadName     = "span matches, name disagrees"
 		reasonNotCallable = "span+name match a non-callable symbol kind"
 	)
 	misses := map[string][]string{}

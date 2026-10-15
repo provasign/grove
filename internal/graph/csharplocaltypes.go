@@ -557,10 +557,10 @@ func csNarrowOverloadsGrouped(idx *edgeIndex, cands []*core.SymbolRecord, args [
 		return cands
 	}
 	var kept, exact, unparsed []*core.SymbolRecord
-	fullyKnown := map[*core.SymbolRecord]bool{} // every argument typed and compatible
+	fullyKnown := map[*core.SymbolRecord]bool{}       // every argument typed and compatible
 	applicableNormal := map[*core.SymbolRecord]bool{} // a normal form every argument certainly fits
 	normalFormVariadic := map[*core.SymbolRecord]bool{}
-	cost := map[*core.SymbolRecord]int{}        // literal-conversion distance (0 = exact)
+	cost := map[*core.SymbolRecord]int{} // literal-conversion distance (0 = exact)
 	for _, cand := range cands {
 		paramTypes, variadic := csParamTypes(cand)
 		if paramTypes == nil {
