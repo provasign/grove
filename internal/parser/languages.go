@@ -48,7 +48,7 @@ var securityExtensions = map[string]bool{
 // the derived TEXT id. store.migrateLegacyEdges converts a 2026-10-13.1
 // database in place and advances its stamp; older binaries see the new
 // stamp and rebuild instead of reading an empty "edges" table.
-const ExtractorVersion = "2026-10-14.5"
+const ExtractorVersion = "2026-10-15.1"
 
 // DetectLanguage returns the Grove language tag for a file path.
 // Returns "" for unsupported or security-excluded files.
