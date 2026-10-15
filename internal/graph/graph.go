@@ -340,20 +340,38 @@ func mergeEdges(base, enriched []core.Edge) []core.Edge {
 // (core.EdgeFuncFieldStore). cobra: c.Args(c, args) runs NoArgs, stored by
 // `Args: NoArgs` elsewhere (oracle review 2026-10-15).
 func funcFieldEdges[K comparable](byKey map[K]core.Edge, order []K) []core.Edge {
-	stores := map[string][]string{}
-	type site struct{ caller, pos string }
+	type stored struct {
+		to     string
+		source core.EvidenceSource
+	}
+	stores := map[string][]stored{}
+	type site struct{ caller, pos, bind string }
 	calls := map[string][]site{}
+	links := map[string][]string{} // dst slot -> src slots
 	for _, k := range order {
 		e := byKey[k]
 		switch e.Type {
 		case core.EdgeFuncFieldStore:
-			if e.Lines != "" {
-				stores[e.Lines] = append(stores[e.Lines], e.To)
+			// One record per (storer, function): every slot it stores the
+			// function into, comma-separated.
+			for _, key := range strings.Split(e.Lines, ",") {
+				if key != "" {
+					stores[key] = append(stores[key], stored{e.To, e.Source})
+				}
 			}
 		case core.EdgeFuncFieldCall:
 			for _, part := range strings.Split(e.Lines, ",") {
-				if field, pos, ok := strings.Cut(part, "@"); ok {
-					calls[field] = append(calls[field], site{e.From, pos})
+				if i := strings.LastIndexByte(part, '@'); i > 0 {
+					// "key@pos" or "key@pos^bind": a call whose arguments
+					// were also stored under slot@@bind variants.
+					pos, bind, _ := strings.Cut(part[i+1:], "^")
+					calls[part[:i]] = append(calls[part[:i]], site{e.From, pos, bind})
+				}
+			}
+		case core.EdgeFuncSlotFlow:
+			for _, part := range strings.Split(e.Lines, ",") {
+				if dst, src, ok := strings.Cut(part, "<-"); ok && dst != "" && src != "" {
+					links[dst] = append(links[dst], src)
 				}
 			}
 		}
@@ -361,18 +379,49 @@ func funcFieldEdges[K comparable](byKey map[K]core.Edge, order []K) []core.Edge 
 	if len(stores) == 0 || len(calls) == 0 {
 		return nil
 	}
+	// A slot holds what was stored into it and into every slot linked to it,
+	// transitively (cycles are fine: each slot is visited once per closure).
+	// At a call bound to a site, a parameter slot's site variant
+	// (slot@@site) replaces the slot: a function returning its argument
+	// hands back that call's argument, not every caller's.
+	closure := func(key, bind string) []stored {
+		seen := map[string]bool{key: true}
+		queue := []string{key}
+		var out []stored
+		for len(queue) > 0 {
+			k := queue[0]
+			queue = queue[1:]
+			if bind != "" && strings.Contains(k, "#p:") {
+				// A parameter at a bound call is that call's argument only;
+				// none recorded means no function was passed there.
+				k = k + "@@" + bind
+			}
+			out = append(out, stores[k]...)
+			for _, src := range links[k] {
+				if !seen[src] {
+					seen[src] = true
+					queue = append(queue, src)
+				}
+			}
+		}
+		return out
+	}
 	type pair struct{ from, to string }
 	lines := map[pair][]string{}
+	sources := map[pair]core.EvidenceSource{}
 	var order2 []pair
 	for field, sites := range calls {
-		for _, target := range stores[field] {
-			for _, s := range sites {
-				if s.caller == target {
+		for _, s := range sites {
+			for _, target := range closure(field, s.bind) {
+				if s.caller == target.to {
 					continue
 				}
-				p := pair{s.caller, target}
+				p := pair{s.caller, target.to}
 				if _, seen := lines[p]; !seen {
 					order2 = append(order2, p)
+					sources[p] = target.source
+				} else if target.source == core.EvidenceSourceNative {
+					sources[p] = target.source
 				}
 				lines[p] = append(lines[p], s.pos)
 			}
@@ -388,8 +437,12 @@ func funcFieldEdges[K comparable](byKey map[K]core.Edge, order []K) []core.Edge 
 	for _, p := range order2 {
 		pos := lines[p]
 		sort.Strings(pos)
-		out = append(out, core.Edge{From: p.from, To: p.to, Type: core.EdgeCalls, Confidence: 0.9,
-			Source: core.EvidenceSourceNative, Reason: core.ReasonFuncField, Lines: strings.Join(uniqueSortedStrings(pos), ",")})
+		conf := 0.9
+		if sources[p] != core.EvidenceSourceNative {
+			conf = 0.75 // a value-flow guess, not a compiler's
+		}
+		out = append(out, core.Edge{From: p.from, To: p.to, Type: core.EdgeCalls, Confidence: conf,
+			Source: sources[p], Reason: core.ReasonFuncField, Lines: strings.Join(uniqueSortedStrings(pos), ",")})
 	}
 	return out
 }

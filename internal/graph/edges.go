@@ -2484,6 +2484,16 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 
 // resolveCallEdges resolves one caller's outgoing call/property edges.
 func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSatisfaction) []core.Edge {
+	edges := resolveSymbolCallEdges(idx, symbol, sat)
+	if symbol.Language == "python" {
+		// Function values flowing through this symbol (pyvalueflow.go),
+		// whether or not it has call sites of its own.
+		edges = append(edges, pyValueFlowMarkers(idx, &symbol)...)
+	}
+	return edges
+}
+
+func resolveSymbolCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSatisfaction) []core.Edge {
 	if symbol.Language == "cobol" || symbol.Language == "jcl" {
 		// Mainframe semantics live in their own resolver; the machinery
 		// below never sees these symbols.
@@ -2562,6 +2572,16 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			}
 			cands := resolvePropertyTargets(idx, &symbol, name, scope, as.Write)
 			cands = narrowByReceiver(cands, &symbol, qualifier, attrSelfVars)
+			if symbol.Language == "python" && qualifier != "" {
+				if t := pyIsinstanceAt(idx, &symbol, as.Line, qualifier); t != "" {
+					narrowedTypes := make(map[string]string, len(attrLocalTypes)+1)
+					for k, v := range attrLocalTypes {
+						narrowedTypes[k] = v
+					}
+					narrowedTypes[qualifier] = t
+					attrLocalTypes = narrowedTypes
+				}
+			}
 			if _, isSelf := attrSelfVars[qualifier]; !isSelf && qualifier != "" {
 				// ctx.request with ctx typed AppContext reads that class's
 				// property (or an ancestor's), not every `request` property
@@ -2573,13 +2593,25 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					pool = resolvePropertyTargets(idx, &symbol, name, nil, as.Write)
 				}
 				if kept, dispatch, decided := narrowByLocalType(idx, nil, &symbol, attrLocalTypes, qualifier, name, pool, scope); decided {
-					cands = append(kept, dispatch...)
+					// The type pass may widen to every callable of the name;
+					// an attribute read runs only a property (self.json.dumps
+					// is a bound-method reference, no call).
+					cands = cands[:0:0]
+					for _, c := range append(kept, dispatch...) {
+						if propertyAnnotationMatches(c, as.Write) {
+							cands = append(cands, c)
+						}
+					}
 				}
 			}
 			if _, isSelf := attrSelfVars[qualifier]; isSelf && classLanguage(symbol.Language) && len(filterByParent(cands, symbol.ParentSymbol)) == 0 {
 				if inherited := inheritedTargets(idx, &symbol, name, true); len(inherited) > 0 {
 					cands = inherited
-				} else if symbol.Language == "python" && symbol.ParentSymbol != "" && pyHierarchyKnown(idx, symbol.ParentSymbol, dirOf(symbol.FilePath)) {
+				} else if symbol.Language == "python" && symbol.ParentSymbol != "" &&
+					(pyHierarchyKnown(idx, symbol.ParentSymbol, dirOf(symbol.FilePath)) || pyTypeHasMember(idx, symbol.ParentSymbol, name, dirOf(symbol.FilePath))) {
+					// (The class declaring the attribute as data — Blueprint's
+					// self.name — settles it even when a same-named class
+					// elsewhere leaves the hierarchy ambiguous.)
 					// Neither the class nor an ancestor declares it: a plain
 					// instance attribute, or a subclass's property (self may
 					// be a subclass instance) — never an unrelated class's
@@ -2753,6 +2785,18 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				continue
 			}
 			localTypes = tsLocalTypesAt(baseLocalTypes, cs.Callee, cs.Line-symbol.Span.Start)
+			if symbol.Language == "python" {
+				if q, _, ok := strings.Cut(cs.Callee, "."); ok {
+					if t := pyIsinstanceAt(idx, &symbol, cs.Line, q); t != "" {
+						narrowedTypes := make(map[string]string, len(localTypes)+1)
+						for k, v := range localTypes {
+							narrowedTypes[k] = v
+						}
+						narrowedTypes[q] = t
+						localTypes = narrowedTypes
+					}
+				}
+			}
 			callPos = ""
 			if cs.Line > 0 {
 				callPos = strconv.Itoa(cs.Line)
@@ -4347,6 +4391,16 @@ func callerSelfQualifiers(symbol *core.SymbolRecord) map[string]struct{} {
 	if symbol.Language == "go" && symbol.Kind == core.KindMethod {
 		if v := goReceiverVar(symbol.Signature); v != "" {
 			out[v] = struct{}{}
+		}
+	}
+	if symbol.Language == "python" && symbol.Kind == core.KindFunction {
+		// A function (not a method) whose own parameter is annotated
+		// `self: Scaffold` (flask's setupmethod wrapper) has a typed
+		// variable named self, not a receiver of some class of its own.
+		for name, ann := range pyFlowParamAnnotations(symbol) {
+			if (name == "self" || name == "cls") && ann != "" {
+				delete(out, name)
+			}
 		}
 	}
 	return out
