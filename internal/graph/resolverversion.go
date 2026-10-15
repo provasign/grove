@@ -4,7 +4,7 @@ import "github.com/provasign/grove/internal/core"
 
 // Bump when edge resolution changes for unchanged source. Stored call edges
 // cannot be reused across this boundary merely because blob hashes match.
-const ResolverVersion = "2026-10-14-language-graph-v28"
+const ResolverVersion = "2026-10-14-language-graph-v29"
 
 // CurrentNativeEdges keeps supplemental evidence that remains valid during
 // a resolver upgrade. Legacy Python native calls were name-only bindings.

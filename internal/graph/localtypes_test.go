@@ -1235,3 +1235,26 @@ func TestPyAliasedBaseClassResolves(t *testing.T) {
 	}
 	t.Fatal("Blueprint(SansioBlueprint) must extend the sansio Blueprint")
 }
+
+// A class used through a re-export (`from .conn import Plain`, where conn.py
+// imports Plain from ._base) is in the user's import scope, and a class with
+// no __init__ is the target of its constructor call: urllib3's poolmanager
+// ProxyConfig(...) was missing from ProxyConfig's change set (2026-10-14).
+func TestPyReexportedClassWithoutInitIsCalled(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "b::Plain", FilePath: "src/pkg/_base.py", BlobSHA: "1", Language: "python", Kind: core.KindClass, Name: "Plain", QualifiedName: "Plain",
+			RawText: "class Plain(typing.NamedTuple):\n    a: int\n", Span: core.LineRange{Start: 1, End: 2}},
+		{ID: "c::top", FilePath: "src/pkg/conn.py", BlobSHA: "1", Language: "python", Kind: core.KindFunction, Name: "<top-level>", QualifiedName: "<top-level>",
+			Span: core.LineRange{Start: 1, End: 1}, Imports: []string{"._base", "._base#Plain", "@python-binding:1:Plain=._base#Plain"}},
+		{ID: "p::use", FilePath: "src/pkg/pool.py", BlobSHA: "1", Language: "python", Kind: core.KindFunction, Name: "use", QualifiedName: "use",
+			Span: core.LineRange{Start: 3, End: 4}, RawText: "def use():\n    Plain(3)\n",
+			CallSites: []core.CallSite{{Callee: "Plain", Line: 4, Col: 5, Argc: 1}},
+			Imports:   []string{".conn", ".conn#Plain", "@python-binding:1:Plain=.conn#Plain"}},
+	}
+	for _, e := range BuildEdges(syms) {
+		if e.Type == core.EdgeCalls && e.From == "p::use" && e.To == "b::Plain" {
+			return
+		}
+	}
+	t.Fatal("Plain(3) through the conn.py re-export must reach Plain")
+}

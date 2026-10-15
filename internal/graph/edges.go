@@ -1096,6 +1096,24 @@ func (idx *edgeIndex) importedFiles(fromFile string) map[string]struct{} {
 		return out
 	}
 
+	// `from .conn import Plain` where conn.py itself imports Plain from
+	// ._base (a re-export): the class lives one hop further, and stopping at
+	// conn.py left every user of the re-export out of Plain's change set
+	// (urllib3 poolmanager.py and ProxyConfig). fileImports keeps module
+	// paths only; the imported member names are in the bindings.
+	for _, bindings := range idx.pyImportBindings[fromFile] {
+		for _, b := range bindings {
+			module, member, _ := strings.Cut(b.target, "#")
+			for _, f := range idx.pyModuleFiles(fromFile, module) {
+				for _, g := range idx.pyReexportFiles(f, member, 3) {
+					if g != fromFile {
+						out[g] = struct{}{}
+					}
+				}
+			}
+		}
+	}
+
 	imports, ok := idx.fileImports[fromFile]
 	if !ok {
 		idx.importedFilesCache[fromFile] = out
@@ -3644,6 +3662,14 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 						ctors = csNarrowOverloads(idx, ctors, cs.Args, csArgTypeCache)
 					}
 				}
+				if len(ctors) == 0 && symbol.Language == "python" {
+					// A class with no __init__ anywhere in its hierarchy
+					// (NamedTuple, dataclass, plain class) is still
+					// constructed here: the call reaches the class itself.
+					// It had no edge at all, so urllib3's ProxyConfig(...)
+					// calls were missing from its change set (2026-10-14).
+					ctors = instantiatedClasses(idx, &symbol, ctorName, scope)
+				}
 				for _, ctor := range ctors {
 					if ctor.ID != symbol.ID {
 						addEdge(symbol.ID, ctor.ID, 0.85, core.EvidenceSourceHeuristic, core.ReasonConstructor)
@@ -4905,6 +4931,26 @@ func pyAliasedBaseEdges(idx *edgeIndex, symbol core.SymbolRecord, base string) [
 		}
 		out = append(out, core.Edge{From: symbol.ID, To: target.ID, Type: core.EdgeExtends,
 			Confidence: 0.85, Source: core.EvidenceSourceHeuristic, Reason: core.ReasonTypeRef})
+	}
+	return out
+}
+
+// instantiatedClasses returns the in-scope classes named name in the
+// caller's language: the target of a constructor call when no constructor
+// is declared.
+func instantiatedClasses(idx *edgeIndex, caller *core.SymbolRecord, name string, scope map[string]struct{}) []*core.SymbolRecord {
+	if name == "" || name[0] < 'A' || name[0] > 'Z' {
+		return nil
+	}
+	var out []*core.SymbolRecord
+	for _, cls := range idx.byName[strings.ToLower(name)] {
+		if cls.Name != name || cls.Kind != core.KindClass || cls.Language != caller.Language {
+			continue
+		}
+		if _, ok := scope[cls.FilePath]; !ok && cls.FilePath != caller.FilePath {
+			continue
+		}
+		out = append(out, cls)
 	}
 	return out
 }

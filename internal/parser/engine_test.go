@@ -1648,3 +1648,26 @@ func TestPythonRegexIgnoresDocstringProse(t *testing.T) {
 		t.Fatal("real function g missing")
 	}
 }
+
+// A Python module with imports and no definitions (a re-export module, a
+// package __init__.py) keeps its imports on an empty module body: the edge
+// index reads imports from symbols, and without one the re-export hop to the
+// defining module was impossible.
+func TestExtractPythonReexportOnlyModuleKeepsImports(t *testing.T) {
+	syms, err := NewEngine().ExtractContent("pkg/conn.py", []byte("from ._base import Plain as Plain\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(syms) != 1 || syms[0].Name != "<top-level>" {
+		t.Fatalf("want one <top-level> carrier, got %+v", syms)
+	}
+	found := false
+	for _, imp := range syms[0].Imports {
+		if strings.Contains(imp, "Plain=._base#Plain") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("binding missing from %v", syms[0].Imports)
+	}
+}
