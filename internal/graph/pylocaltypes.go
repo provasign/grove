@@ -648,6 +648,13 @@ func pyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 			g = strings.TrimSpace(g)
 			name, ann, ok := strings.Cut(g, ":")
 			if !ok {
+				// `**options` is a dict and `*args` a tuple, whatever the
+				// caller passes: options.get(...) is dict.get.
+				if n := strings.TrimSpace(g); strings.HasPrefix(n, "**") && len(n) > 2 {
+					out[n[2:]] = "extern:dict"
+				} else if strings.HasPrefix(n, "*") && len(n) > 1 {
+					out[n[1:]] = "extern:tuple"
+				}
 				continue
 			}
 			name = strings.TrimSpace(strings.TrimLeft(name, "*"))
@@ -716,6 +723,16 @@ func pyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 		for _, m := range pyCtorAssignRe.FindAllStringSubmatch(body, -1) {
 			if typeSymbolExists(idx, m[2]) {
 				out[m[1]] = m[2]
+			}
+		}
+		// for tag in self.order: with `self.order: list[JSONTag]` (or a
+		// list[...] parameter / local annotation), tag is a JSONTag.
+		for _, m := range pyForRe.FindAllStringSubmatch(body, -1) {
+			if _, typed := out[m[1]]; typed {
+				continue
+			}
+			if t := pyIterableElementType(idx, symbol, m[2] != "", m[3]); t != "" {
+				out[m[1]] = t
 			}
 		}
 		selfVars := callerSelfQualifiers(symbol)
@@ -866,10 +883,22 @@ func pyClassAttrTypes(idx *edgeIndex, symbol *core.SymbolRecord, className strin
 			break
 		}
 	}
+	// A builtin container annotation (`view_functions: dict[...]`) types
+	// the attribute as the runtime's: view_functions.get(...) is dict.get,
+	// never a same-named method of ours (flask Scaffold.get).
+	annType := func(owner *core.SymbolRecord, ann string) string {
+		if t := pyAnnotationType(idx, owner, ann); t != "" {
+			return t
+		}
+		if b := pyBuiltinAnnotation(ann); b != "" && !typeSymbolExists(idx, b) {
+			return "extern:" + b
+		}
+		return ""
+	}
 	if class != nil {
 		attrs := pyClassBodyAttrs(idx, class)
 		for _, a := range attrs.anns {
-			record(a[0], pyAnnotationType(idx, class, a[1]))
+			record(a[0], annType(class, a[1]))
 		}
 		for _, a := range attrs.refs {
 			if typeSymbolExists(idx, a[1]) {
@@ -895,7 +924,7 @@ func pyClassAttrTypes(idx *edgeIndex, symbol *core.SymbolRecord, className strin
 	if init != nil {
 		body := maskCode(init.Language, init.RawText)
 		for _, m := range pySelfAnnRe.FindAllStringSubmatch(body, -1) {
-			record(m[1], pyAnnotationType(idx, init, m[2]))
+			record(m[1], annType(init, m[2]))
 		}
 		for _, m := range pySelfCtorRe.FindAllStringSubmatch(body, -1) {
 			if typeSymbolExists(idx, m[2]) {
@@ -1618,7 +1647,7 @@ func subclassOverrides(idx *edgeIndex, language, className, calleeName, preferDi
 			methods = append(methods, cand)
 		}
 	}
-	if len(methods) == 0 {
+	if len(methods) == 0 && language != "python" {
 		return nil
 	}
 	var out []*core.SymbolRecord
@@ -1634,6 +1663,11 @@ func subclassOverrides(idx *edgeIndex, language, className, calleeName, preferDi
 				visited[sub] = true
 				next = append(next, sub)
 				out = append(out, subclassMembers(methods, sub)...)
+				if language == "python" {
+					if alias := pyMethodAlias(idx, sub, calleeName); alias != nil {
+						out = append(out, alias)
+					}
+				}
 			}
 		}
 		frontier = next
@@ -2262,4 +2296,190 @@ func pyInheritedParamTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string
 		}
 	}
 	return nil
+}
+
+// pyDescriptorValueRe reads the class a class attribute's value constructs:
+// `name = ConfigAttribute[bool]("TESTING")` -> ConfigAttribute.
+var pyDescriptorValueRe = regexp.MustCompile(`^[^=]*?=\s*([A-Za-z_][\w.]*)\s*(?:\[[^\]]*\])?\s*\(`)
+
+// pyDescriptorTargets returns the __get__ (or, for a write, __set__) of the
+// descriptor class whose instance className (or a base, in MRO order)
+// stores as its class attribute name. Nil when the attribute is not a
+// descriptor instance.
+func pyDescriptorTargets(idx *edgeIndex, className, name string, write bool, preferDir string) []*core.SymbolRecord {
+	dunder := "__get__"
+	if write {
+		dunder = "__set__"
+	}
+	for _, cn := range pyMRO(idx, className, preferDir) {
+		for _, f := range idx.byName[strings.ToLower(name)] {
+			if f.Name != name || f.ParentSymbol != cn || f.Language != "python" || f.Kind != core.KindField {
+				continue
+			}
+			m := pyDescriptorValueRe.FindStringSubmatch(maskCode("python", f.RawText))
+			if m == nil {
+				return nil
+			}
+			desc := m[1]
+			if i := strings.LastIndexByte(desc, '.'); i >= 0 {
+				desc = desc[i+1:]
+			}
+			if desc == "" || desc[0] < 'A' || desc[0] > 'Z' {
+				return nil
+			}
+			return pyDunderTargets(idx, desc, dunder, dirOf(f.FilePath))
+		}
+	}
+	return nil
+}
+
+// pyClassAttrClassRe reads a class attribute that holds a class: its
+// assigned class name (`x: type[A] = B` -> B), else its type[...] annotation.
+var (
+	pyClassAttrValueRe = regexp.MustCompile(`=\s*([A-Z][\w]*(?:\.[A-Z][\w]*)*)\s*$`)
+	pyClassAttrTypeRe  = regexp.MustCompile(`^[^=:]*:\s*(?:t\.|typing\.)?[Tt]ype\[\s*([A-Z][\w.]*)\s*\]`)
+)
+
+// pyClassAttrClass returns the class held by className's (or an ancestor's)
+// class attribute name: the assigned class when it is one the index
+// declares, else the type[X] annotation's X. "" when name is not such an
+// attribute.
+func pyClassAttrClass(idx *edgeIndex, className, name, preferDir string) string {
+	for _, cn := range pyMRO(idx, className, preferDir) {
+		for _, f := range idx.byName[strings.ToLower(name)] {
+			if f.Name != name || f.ParentSymbol != cn || f.Language != "python" || f.Kind != core.KindField {
+				continue
+			}
+			text := strings.TrimSpace(maskCode("python", f.RawText))
+			if m := pyClassAttrValueRe.FindStringSubmatch(text); m != nil {
+				v := m[1][strings.LastIndexByte(m[1], '.')+1:]
+				if pyResolveClass(idx, v, dirOf(f.FilePath)) != nil {
+					return v
+				}
+			}
+			if m := pyClassAttrTypeRe.FindStringSubmatch(text); m != nil {
+				v := m[1][strings.LastIndexByte(m[1], '.')+1:]
+				if pyResolveClass(idx, v, dirOf(f.FilePath)) != nil {
+					return v
+				}
+			}
+			return ""
+		}
+	}
+	return ""
+}
+
+// pyTypeHasMethod reports whether className or an ancestor declares a
+// method name.
+func pyTypeHasMethod(idx *edgeIndex, className, name, preferDir string) bool {
+	for _, cn := range pyMRO(idx, className, preferDir) {
+		for _, f := range idx.byName[strings.ToLower(name)] {
+			if f.Name == name && f.ParentSymbol == cn && f.Language == "python" && (f.Kind == core.KindMethod || f.Kind == core.KindFunction) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// pyMethodAliasRe matches a class-body alias of a method: `tag = to_json`.
+var pyMethodAliasRe = regexp.MustCompile(`^\s*(\w+)\s*=\s*([A-Za-z_]\w*)\s*$`)
+
+// pyMethodAlias returns the method className's class attribute name aliases
+// (`tag = to_json` in PassDict: calling tag runs PassDict.to_json), or nil.
+func pyMethodAlias(idx *edgeIndex, className, name string) *core.SymbolRecord {
+	for _, f := range idx.byName[strings.ToLower(name)] {
+		if f.Name != name || f.ParentSymbol != className || f.Language != "python" || f.Kind != core.KindField {
+			continue
+		}
+		m := pyMethodAliasRe.FindStringSubmatch(maskCode("python", f.RawText))
+		if m == nil || m[1] != name {
+			return nil
+		}
+		for _, t := range idx.byName[strings.ToLower(m[2])] {
+			if t.Name == m[2] && t.ParentSymbol == className && t.FilePath == f.FilePath && t.Kind == core.KindMethod {
+				return t
+			}
+		}
+	}
+	return nil
+}
+
+// pyOverridesWithoutSuper reports whether class sub declares its own
+// method (or method alias) name whose body does not call super(): an
+// instance of sub never runs the base class's name, so a self.x() call
+// inside the base's name does not dispatch into sub.
+func pyOverridesWithoutSuper(idx *edgeIndex, sub, name string) bool {
+	if pyMethodAlias(idx, sub, name) != nil {
+		return true
+	}
+	for _, m := range idx.byName[strings.ToLower(name)] {
+		if m.Name == name && m.ParentSymbol == sub && m.Language == "python" && m.Kind == core.KindMethod {
+			return !strings.Contains(maskCode("python", m.RawText), "super(")
+		}
+	}
+	return false
+}
+
+var (
+	// for x in self.attr: / for x in name:
+	pyForRe = regexp.MustCompile(`(?m)^\s*(?:async\s+)?for\s+([A-Za-z_]\w*)\s+in\s+(self\.)?([A-Za-z_]\w*)\s*:`)
+	// list[X] / t.Sequence[X] / Set[X] ... : the element class X.
+	pyContainerElemRe = regexp.MustCompile(`^\s*(?:t\.|typing\.|collections\.abc\.)?(?:list|List|set|Set|frozenset|FrozenSet|Sequence|MutableSequence|Iterable|Iterator|Collection|deque|Deque|tuple|Tuple)\[\s*["']?([A-Z][\w.]*)["']?\s*(?:,\s*\.\.\.\s*)?\]`)
+)
+
+// pyIterableElementType types the loop variable of `for x in <iterable>`:
+// the element class of the iterable's container annotation — a self
+// attribute's (`self.order: list[JSONTag]` anywhere in the class or its
+// bases, or a class-level `order: list[JSONTag]`), or a parameter's or
+// local's annotation in the caller.
+func pyIterableElementType(idx *edgeIndex, symbol *core.SymbolRecord, self bool, name string) string {
+	elem := func(ann string) string {
+		m := pyContainerElemRe.FindStringSubmatch(ann)
+		if m == nil {
+			return ""
+		}
+		t := m[1][strings.LastIndexByte(m[1], '.')+1:]
+		if pyResolveClass(idx, t, dirOf(symbol.FilePath)) == nil {
+			return ""
+		}
+		return t
+	}
+	if !self {
+		if params := pyDefParams(symbol.RawText); params != "" {
+			for _, g := range splitTopLevel(params, ',') {
+				pn, ann, ok := strings.Cut(strings.TrimSpace(g), ":")
+				if ok && strings.TrimSpace(pn) == name {
+					if eq := strings.Index(ann, "="); eq >= 0 {
+						ann = ann[:eq]
+					}
+					return elem(ann)
+				}
+			}
+		}
+		re := localFnRes.get(`(?m)^\s*` + regexp.QuoteMeta(name) + `\s*:\s*([^=\n]+)`)
+		if m := re.FindStringSubmatch(maskCode("python", symbol.RawText)); m != nil {
+			return elem(m[1])
+		}
+		return ""
+	}
+	if symbol.ParentSymbol == "" {
+		return ""
+	}
+	selfAnn := localFnRes.get(`self\.` + regexp.QuoteMeta(name) + `\s*:\s*([^=\n]+)`)
+	classAnn := localFnRes.get(`(?m)^\s*` + regexp.QuoteMeta(name) + `\s*:\s*([^=\n]+)`)
+	for _, cn := range pyMRO(idx, symbol.ParentSymbol, dirOf(symbol.FilePath)) {
+		cls := pyResolveClass(idx, cn, dirOf(symbol.FilePath))
+		if cls == nil {
+			continue
+		}
+		body := maskCode("python", cls.RawText)
+		if m := selfAnn.FindStringSubmatch(body); m != nil {
+			return elem(m[1])
+		}
+		if m := classAnn.FindStringSubmatch(body); m != nil {
+			return elem(m[1])
+		}
+	}
+	return ""
 }

@@ -1,28 +1,28 @@
 {
  "gin": {
   "commit": "d75fcd4",
-  "precision": 0.9787,
-  "recall": 0.9735,
+  "precision": 0.9792,
+  "recall": 0.9965,
   "tolerance": 0.005,
   "minUniverse": 0.99
  },
  "flask": {
   "commit": "36e4a824",
-  "precision": 0.8818,
-  "recall": 0.7412,
+  "precision": 0.8924,
+  "recall": 0.7557,
   "tolerance": 0.005,
   "minUniverse": 0.97
  },
  "socket.io": {
   "commit": "3ad4e1f2",
-  "precision": 0.9323,
-  "recall": 0.9917,
+  "precision": 0.9367,
+  "recall": 0.9918,
   "tolerance": 0.005,
   "minUniverse": 0.98
  },
  "express": {
   "commit": "dae209ae",
-  "precision": 0.875,
+  "precision": 0.8846,
   "recall": 1,
   "tolerance": 0.02,
   "minUniverse": 0.88
@@ -43,8 +43,8 @@
  },
  "newtonsoft": {
   "commit": "0a2e291",
-  "precision": 0.9409,
-  "recall": 0.9563,
+  "precision": 0.951,
+  "recall": 0.9764,
   "tolerance": 0.005,
   "minUniverse": 0.99
  },
@@ -72,7 +72,7 @@
  "turtle": {
   "commit": "3cfc963",
   "precision": 1,
-  "recall": 0.9881,
+  "recall": 1.0,
   "tolerance": 0.02,
   "minUniverse": 0.75
  },
@@ -85,8 +85,8 @@
  },
  "cobra": {
   "commit": "adbc881",
-  "precision": 0.9944,
-  "recall": 0.9889,
+  "precision": 0.9945,
+  "recall": 1.0,
   "tolerance": 0.005,
   "minUniverse": 0.99
  },
@@ -120,8 +120,8 @@
  },
  "Files": {
   "commit": "e85f2b4",
-  "precision": 0.9885,
-  "recall": 0.9556,
+  "precision": 0.989,
+  "recall": 1.0,
   "tolerance": 0.02,
   "minUniverse": 0.95
  },

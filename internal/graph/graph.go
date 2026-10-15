@@ -203,8 +203,9 @@ func mergeEdges(base, enriched []core.Edge) []core.Edge {
 	ordered := make([]key, 0, len(base)+len(enriched))
 	byKey := make(map[key]core.Edge, len(base)+len(enriched))
 	add := func(edge core.Edge) {
-		if edge.Reason == core.ReasonFuncField && edge.Type == core.EdgeCalls {
-			return // regenerated below from the field markers (funcFieldEdges)
+		if edge.Type == core.EdgeCalls && (edge.Reason == core.ReasonFuncField ||
+			edge.Reason == core.ReasonDispatch && edge.Source == core.EvidenceSourceNative) {
+			return // regenerated below from the markers (funcFieldEdges, externalIfaceEdges)
 		}
 		if edge.Source == "" {
 			edge.Source = core.EvidenceSourceUnknown
@@ -312,9 +313,10 @@ func mergeEdges(base, enriched []core.Edge) []core.Edge {
 		return set.static
 	}
 	out := make([]core.Edge, 0, len(ordered))
-	for _, e := range funcFieldEdges(byKey, ordered) {
+	for _, e := range append(funcFieldEdges(byKey, ordered), externalIfaceEdges(byKey, ordered)...) {
 		k := key{from: e.From, to: e.To, typ: e.Type}
 		if _, exists := byKey[k]; !exists {
+			byKey[k] = e
 			out = append(out, e)
 		}
 	}
@@ -388,6 +390,70 @@ func funcFieldEdges[K comparable](byKey map[K]core.Edge, order []K) []core.Edge 
 		sort.Strings(pos)
 		out = append(out, core.Edge{From: p.from, To: p.to, Type: core.EdgeCalls, Confidence: 0.9,
 			Source: core.EvidenceSourceNative, Reason: core.ReasonFuncField, Lines: strings.Join(uniqueSortedStrings(pos), ",")})
+	}
+	return out
+}
+
+// externalIfaceEdges joins calls through a library interface's method
+// (core.EdgeExternalIfaceCall: render's w.Write on an http.ResponseWriter)
+// with the project's methods whose external contract lists that interface
+// (core.EdgeExternalContract: gin's responseWriter.Write), as dispatch
+// edges: the call may run that method. Built from markers alone, so a full
+// and an incremental index agree.
+func externalIfaceEdges[K comparable](byKey map[K]core.Edge, order []K) []core.Edge {
+	type site struct{ caller, pos string }
+	calls := map[string][]site{} // "pkg.Iface.Method" -> sites
+	implementers := map[string][]string{}
+	for _, k := range order {
+		e := byKey[k]
+		switch e.Type {
+		case core.EdgeExternalIfaceCall:
+			for _, part := range strings.Split(e.Lines, ",") {
+				if method, pos, ok := strings.Cut(part, "@"); ok {
+					calls[method] = append(calls[method], site{e.From, pos})
+				}
+			}
+		case core.EdgeExternalContract:
+			name := calleeNameOf(e.From)
+			for _, iface := range strings.Split(e.Lines, ",") {
+				if iface != "" && iface != "error" {
+					implementers[iface+"."+name] = append(implementers[iface+"."+name], e.From)
+				}
+			}
+		}
+	}
+	if len(calls) == 0 || len(implementers) == 0 {
+		return nil
+	}
+	type pair struct{ from, to string }
+	lines := map[pair][]string{}
+	var pairs []pair
+	for method, sites := range calls {
+		for _, target := range implementers[method] {
+			for _, s := range sites {
+				if s.caller == target {
+					continue
+				}
+				p := pair{s.caller, target}
+				if _, seen := lines[p]; !seen {
+					pairs = append(pairs, p)
+				}
+				lines[p] = append(lines[p], s.pos)
+			}
+		}
+	}
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].from != pairs[j].from {
+			return pairs[i].from < pairs[j].from
+		}
+		return pairs[i].to < pairs[j].to
+	})
+	out := make([]core.Edge, 0, len(pairs))
+	for _, p := range pairs {
+		pos := lines[p]
+		sort.Strings(pos)
+		out = append(out, core.Edge{From: p.from, To: p.to, Type: core.EdgeCalls, Confidence: 0.7,
+			Source: core.EvidenceSourceNative, Reason: core.ReasonDispatch, Lines: strings.Join(uniqueSortedStrings(pos), ",")})
 	}
 	return out
 }

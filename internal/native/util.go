@@ -185,7 +185,10 @@ func (m resolvedMarks) add(caller, name string, line, col int) {
 	m[caller][pos] = true
 }
 
-func (m resolvedMarks) edges() []core.Edge {
+func (m resolvedMarks) edges() []core.Edge { return m.edgesOf(core.EdgeResolvedCalls) }
+
+// edgesOf emits the marks as per-caller marker records of type t.
+func (m resolvedMarks) edgesOf(t core.EdgeType) []core.Edge {
 	callers := make([]string, 0, len(m))
 	for c := range m {
 		callers = append(callers, c)
@@ -198,7 +201,7 @@ func (m resolvedMarks) edges() []core.Edge {
 			list = append(list, p)
 		}
 		sort.Strings(list)
-		out = append(out, core.Edge{From: c, To: c, Type: core.EdgeResolvedCalls, Confidence: 0.99,
+		out = append(out, core.Edge{From: c, To: c, Type: t, Confidence: 0.99,
 			Source: core.EvidenceSourceNative, Lines: strings.Join(list, ",")})
 	}
 	return out

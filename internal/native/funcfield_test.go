@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/provasign/grove/internal/core"
@@ -66,5 +67,77 @@ func TestSymbolLocatorDoesNotGuessAmongNamesakes(t *testing.T) {
 	}
 	if s, ok := loc.at("A.java", "only", 90); !ok || s.ID != "a::A.only" {
 		t.Errorf("a single namesake still answers: %v %v", s.ID, ok)
+	}
+}
+
+// Function values flowing through a parameter slot (All(NoArgs) then c(n)
+// inside All) and a result slot (Def returns NoArgs, f := Def(); f(n)) are
+// keyed like fields; a call through a library interface (w.Write on an
+// io.Writer) is recorded for the external-contract join.
+func TestGoFuncValueFlowAndExternalIfaceMarkers(t *testing.T) {
+	root := t.TempDir()
+	src := "package fv\n\nimport \"io\"\n\ntype Check func(n int) error\n\nfunc NoArgs(n int) error { return nil }\n\n" +
+		"func All(cs ...Check) Check {\n\treturn func(n int) error {\n\t\tfor _, c := range cs {\n\t\t\tif err := c(n); err != nil {\n\t\t\t\treturn err\n\t\t\t}\n\t\t}\n\t\treturn nil\n\t}\n}\n\n" +
+		"func Def() Check { return NoArgs }\n\nfunc Use(n int) error {\n\tf := Def()\n\treturn f(n)\n}\n\nfunc Build() Check { return All(NoArgs) }\n\n" +
+		"type W struct{}\n\nfunc (W) Write(p []byte) (int, error) { return len(p), nil }\n\nfunc Emit(w io.Writer) { w.Write(nil) }\n"
+	if err := os.WriteFile(filepath.Join(root, "fv.go"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sym := func(kind core.SymbolKind, name, qual, parent string, start, end int) core.SymbolRecord {
+		return core.SymbolRecord{ID: "fv.go::" + qual + "@b", FilePath: "fv.go", BlobSHA: "b", Language: "go", Kind: kind,
+			Name: name, QualifiedName: qual, ParentSymbol: parent, Span: core.LineRange{Start: start, End: end}}
+	}
+	parsed := []core.SymbolRecord{
+		sym(core.KindType, "Check", "Check", "", 5, 5),
+		sym(core.KindFunction, "NoArgs", "NoArgs", "", 7, 7),
+		sym(core.KindFunction, "All", "All", "", 9, 18),
+		sym(core.KindFunction, "Def", "Def", "", 20, 20),
+		sym(core.KindFunction, "Use", "Use", "", 22, 25),
+		sym(core.KindFunction, "Build", "Build", "", 27, 27),
+		sym(core.KindStruct, "W", "W", "", 29, 29),
+		sym(core.KindMethod, "Write", "W.Write", "W", 31, 31),
+		sym(core.KindFunction, "Emit", "Emit", "", 33, 33),
+	}
+	edges, _, _ := goSemanticEdges(context.Background(), root, []string{"fv.go"}, parsed, nil, goDeps{})
+	got := map[string]bool{}
+	for _, e := range edges {
+		switch e.Type {
+		case core.EdgeFuncFieldStore:
+			got["store "+e.Lines+" "+e.To] = true
+		case core.EdgeFuncFieldCall, core.EdgeExternalIfaceCall, core.EdgeExternalContract:
+			got[string(e.Type)+" "+e.From+" "+e.Lines] = true
+		}
+	}
+	for _, want := range []string{
+		"store .:All#p0 fv.go::NoArgs@b",
+		"store .:Def#ret fv.go::NoArgs@b",
+		"func-field-call fv.go::All@b .:All#p0@12:14",
+		"func-field-call fv.go::Use@b .:Def#ret@24:9",
+		"external-iface-call fv.go::Emit@b io.Writer.Write@33:28",
+	} {
+		if !got[want] {
+			t.Errorf("missing %q in %v", want, got)
+		}
+	}
+	contract := false
+	for k := range got {
+		if strings.HasPrefix(k, "external-contract fv.go::W.Write@b ") && strings.Contains(k, "io.Writer") {
+			contract = true
+		}
+	}
+	if !contract {
+		t.Errorf("W.Write must record io.Writer as an external contract: %v", got)
+	}
+}
+
+// A TypeScript module symbol's name is its quoted absolute path; it is no
+// call name and must not reach the stored markers (the index would depend
+// on the checkout directory).
+func TestJSIdentifierName(t *testing.T) {
+	for s, want := range map[string]bool{"helmet": true, "$emit": true, "_x9": true,
+		`"/abs/node_modules/helmet/index"`: false, "a,b": false, "9x": false, "": false} {
+		if got := jsIdentifierName(s); got != want {
+			t.Errorf("%q: %v", s, got)
+		}
 	}
 }

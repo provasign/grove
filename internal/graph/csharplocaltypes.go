@@ -1,6 +1,7 @@
 package graph
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 
@@ -18,19 +19,19 @@ var (
 	// var x = new Foo(...) / var x = new Foo<T> { ... }
 	csharpVarNewRe = regexp.MustCompile(`(?m)\bvar\s+(\w+)\s*=\s*new\s+([A-Z]\w*)`)
 	// var o = (JObject)token;
-	csharpVarCastRe = regexp.MustCompile(`(?m)\bvar\s+(\w+)\s*=\s*\(\s*([A-Z][\w.]*(?:<[^<>]*>)?)\s*\)\s*[\w(]`)
+	csharpVarCastRe = regexp.MustCompile(`(?m)\bvar\s+(\w+)\s*=\s*\(\s*([A-Z][\w.]*(?:<(?:[^<>]|<(?:[^<>]|<[^<>]*>)*>)*>)?)\??\s*\)\s*[\w(]`)
 	// var o = token as JObject;
-	csharpVarAsRe = regexp.MustCompile(`(?m)\bvar\s+(\w+)\s*=\s*[^;]*?\bas\s+([A-Z][\w.]*(?:<[^<>]*>)?)\s*;`)
+	csharpVarAsRe = regexp.MustCompile(`(?m)\bvar\s+(\w+)\s*=\s*[^;]*?\bas\s+([A-Z][\w.]*(?:<(?:[^<>]|<(?:[^<>]|<[^<>]*>)*>)*>)?)\??\s*;`)
 	// var j = JObject.Parse(...); / var b = HexToBytes(...);
 	csharpVarCallRe = regexp.MustCompile(`(?m)\bvar\s+(\w+)\s*=\s*(?:([A-Z]\w*)\.)?([A-Z]\w*)\s*(?:<[^<>]*>)?\s*\(`)
 	// Type x = ... / Type x; / for (Type x : — uppercase-initial type
-	csharpLocalDeclRe = regexp.MustCompile(`(?m)(?:^|[;{}()]\s*)\s*([A-Z]\w*)(?:<[^<>]*>)?(?:\[\])?\s+(\w+)\s*[=;)]`)
+	csharpLocalDeclRe = regexp.MustCompile(`(?m)(?:^|[;{}()]\s*)\s*([A-Z]\w*)(?:<(?:[^<>]|<(?:[^<>]|<[^<>]*>)*>)*>)?\??(?:\[\])?\??\s+(\w+)\s*[=;)]`)
 	// foreach (Type x in ...)
-	csharpForeachRe = regexp.MustCompile(`\bforeach\s*\(\s*(?:var|([A-Z]\w*)(?:<[^<>]*>)?)\s+(\w+)\s+in\b`)
+	csharpForeachRe = regexp.MustCompile(`\bforeach\s*\(\s*(?:var|([A-Z]\w*)(?:<(?:[^<>]|<(?:[^<>]|<[^<>]*>)*>)*>)?\??)\s+(\w+)\s+in\b`)
 	// if (value is Type name) / while (... is Type name)
 	csharpIsPatternRe = regexp.MustCompile(`\bis\s+([A-Z]\w*)(?:<[^<>]*>)?\s+([a-z_]\w*)\b`)
 	// auto-property / field: "public Foo Bar { ..." or "Foo _bar ;|="
-	csharpFieldRe = regexp.MustCompile(`(?m)^\s*(?:(?:public|private|protected|internal|static|readonly|virtual|override|sealed|abstract|new|volatile|const)\s+)*([A-Z]\w*)(?:<[^<>]*>)?(?:\[\])?\s+(\w+)\s*[{;=]`)
+	csharpFieldRe = regexp.MustCompile(`(?m)^\s*(?:(?:public|private|protected|internal|static|readonly|virtual|override|sealed|abstract|new|volatile|const|required)\s+)*([A-Z]\w*)(?:<(?:[^<>]|<(?:[^<>]|<[^<>]*>)*>)*>)?\??(?:\[\])?\??\s+(\w+)\s*[{;=]`)
 )
 
 // csharpLocalTypes infers identifier → indexable type name for one C#
@@ -53,7 +54,7 @@ func csharpLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]stri
 					// Top-level members only (classBody): a method's local
 					// `Foo helper = ...` or a commented-out field is not one.
 					for _, m := range csharpFieldRe.FindAllStringSubmatch(classBody(idx, cls), -1) {
-						if t := javaBareType(m[1]); t != "" && csTypedLocal(idx, t) {
+						if t := csBareType(m[1]); t != "" && csTypedLocal(idx, t) {
 							if _, exists := out[m[2]]; !exists {
 								out[m[2]] = t
 							}
@@ -77,7 +78,7 @@ func csharpLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]stri
 			if len(fields) != 2 {
 				continue
 			}
-			if t := javaBareType(fields[0]); t != "" && csTypedLocal(idx, t) {
+			if t := csBareType(fields[0]); t != "" && csTypedLocal(idx, t) {
 				out[fields[1]] = t
 			}
 		}
@@ -90,17 +91,17 @@ func csharpLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]stri
 			body = body[i+1:]
 		}
 		for _, m := range csharpForeachRe.FindAllStringSubmatch(body, -1) {
-			if t := javaBareType(m[1]); t != "" && csTypedLocal(idx, t) {
+			if t := csBareType(m[1]); t != "" && csTypedLocal(idx, t) {
 				out[m[2]] = t
 			}
 		}
 		for _, m := range csharpLocalDeclRe.FindAllStringSubmatch(body, -1) {
-			if t := javaBareType(m[1]); t != "" && csTypedLocal(idx, t) {
+			if t := csBareType(m[1]); t != "" && csTypedLocal(idx, t) {
 				out[m[2]] = t
 			}
 		}
 		for _, m := range csharpIsPatternRe.FindAllStringSubmatch(body, -1) {
-			if t := javaBareType(m[1]); t != "" && csTypedLocal(idx, t) {
+			if t := csBareType(m[1]); t != "" && csTypedLocal(idx, t) {
 				out[m[2]] = t
 			}
 		}
@@ -488,11 +489,15 @@ func csLiteralCompatible(lit, param string) bool {
 		"long":   {"long", "ulong", "float", "double", "decimal"},
 		"float":  {"float", "double"},
 		"double": {"double"},
-		"char":   {"char", "int", "uint", "long", "ulong", "float", "double", "decimal"},
+		"char":   {"char", "ushort", "int", "uint", "long", "ulong", "float", "double", "decimal"},
 		"bool":   {"bool"},
 		"string": {"string"},
 	}
-	for _, ok := range compat[lit] {
+	list, ok := compat[lit]
+	if !ok {
+		list = csNumericOrder[lit] // a cast marker: (byte)x is a typed byte
+	}
+	for _, ok := range list {
 		if param == ok {
 			return true
 		}
@@ -506,6 +511,19 @@ func csLiteralCompatible(lit, param string) bool {
 // (Roslyn's better-conversion rule, approximated). Mirrors
 // narrowOverloadsByArgTypes; never zeroes the set.
 func csNarrowOverloads(idx *edgeIndex, cands []*core.SymbolRecord, args []string, argTypes map[string]string) []*core.SymbolRecord {
+	return csNarrowOverloadsGrouped(idx, cands, args, argTypes, true)
+}
+
+// csNarrowOverloadsGrouped is csNarrowOverloads; perParent=false ranks all
+// candidates as one overload set (a receiver's members across its type
+// hierarchy) instead of each declaring type separately.
+func csNarrowOverloadsGrouped(idx *edgeIndex, cands []*core.SymbolRecord, args []string, argTypes map[string]string, perParent bool) []*core.SymbolRecord {
+	group := func(c *core.SymbolRecord) string {
+		if perParent {
+			return c.ParentSymbol
+		}
+		return ""
+	}
 	if len(cands) < 2 {
 		return cands
 	}
@@ -554,7 +572,7 @@ func csNarrowOverloads(idx *edgeIndex, cands []*core.SymbolRecord, args []string
 			isLit := argName[0] == '#'
 			switch {
 			case isLit:
-				argType = csNormalizeType(argName[1:])
+				argType = csOverloadType(argName[1:]) // keeps int? nullable
 			case argName[0] == '%':
 				// Formatting.Indented: typed only when Formatting is an
 				// indexed enum; a static member's type is unknown.
@@ -611,10 +629,36 @@ func csNarrowOverloads(idx *edgeIndex, cands []*core.SymbolRecord, args []string
 			if isLit && len(argType) > 0 && argType[0] >= 'A' && argType[0] <= 'Z' && !csIsPrimitive(argType) {
 				isLit = false
 			}
-			if isLit {
+			if argNullable && !pNullable && p != "object" && csValueType(idx, argType) && !csWildcardParam(p, cand) {
+				// int? converts to object (boxing) and to interfaces, never
+				// to a non-nullable value type: JValue(int?) is not
+				// JValue(long).
+				conflict = true
+				break
+			}
+			if csIsPrimitive(argType) && csIsPrimitive(p) {
+				// Implicit numeric conversions (C# §10.2.3), ranked by the
+				// better-conversion-target rule: JValue((uint)x) binds
+				// JValue(long), JValue(b) for a byte binds JValue(long).
+				r := csNumericRank(argType, p, isLit && !argNullable)
+				if r < 0 {
+					conflict = true
+					break
+				}
+				cost[cand] += r
+				allExact = false
+				continue
+			}
+			switch {
+			case isLit:
 				cost[cand] += csLiteralRank(argType, p)
-			} else {
-				cost[cand]++ // a typed argument binding a wider parameter (int → object, JValue → JToken)
+			case p == "object":
+				// Boxing a value or widening to object is the worst
+				// conversion: a base class or interface beats it
+				// (JValue → JToken over JValue → object).
+				cost[cand] += 20
+			default:
+				cost[cand]++ // a typed argument binding a wider parameter (JValue → JToken)
 			}
 			if variadic && pi == len(paramTypes)-1 && strings.HasSuffix(p, "[]") {
 				// A lone element binds the params slot by exact type or
@@ -675,13 +719,13 @@ func csNarrowOverloads(idx *edgeIndex, cands []*core.SymbolRecord, args []string
 	normalOn := map[string]bool{}
 	for _, c := range kept {
 		if fullyKnown[c] {
-			normalOn[c.ParentSymbol] = true
+			normalOn[group(c)] = true
 		}
 	}
 	var narrowed []*core.SymbolRecord
 	for _, c := range kept {
 		pt, v := csParamTypes(c)
-		if v && normalOn[c.ParentSymbol] {
+		if v && normalOn[group(c)] {
 			continue
 		}
 		if v && len(args) == len(pt)-1 && csNormalFormSibling(kept, c, pt[:len(pt)-1]) {
@@ -704,8 +748,8 @@ func csNarrowOverloads(idx *edgeIndex, cands []*core.SymbolRecord, args []string
 		if !fullyKnown[c] {
 			continue
 		}
-		if cur, ok := best[c.ParentSymbol]; !ok || cost[c] < cur {
-			best[c.ParentSymbol] = cost[c]
+		if cur, ok := best[group(c)]; !ok || cost[c] < cur {
+			best[group(c)] = cost[c]
 		}
 	}
 	if len(best) == 0 {
@@ -717,7 +761,7 @@ func csNarrowOverloads(idx *edgeIndex, cands []*core.SymbolRecord, args []string
 	}
 	var out []*core.SymbolRecord
 	for _, c := range kept {
-		b, ranked := best[c.ParentSymbol]
+		b, ranked := best[group(c)]
 		if isUnparsed[c] || !ranked || (fullyKnown[c] && cost[c] == b) || (!fullyKnown[c] && b > 0) {
 			out = append(out, c)
 		}
@@ -758,20 +802,61 @@ func csIsEnum(idx *edgeIndex, t string) bool {
 	return false
 }
 
+// csNumericOrder lists, per numeric source type, the types it implicitly
+// converts to in better-conversion order (exact first; signed before
+// unsigned; narrower before wider).
+var csNumericOrder = map[string][]string{
+	"sbyte":   {"sbyte", "short", "int", "long", "float", "double", "decimal"},
+	"byte":    {"byte", "short", "ushort", "int", "uint", "long", "ulong", "float", "double", "decimal"},
+	"short":   {"short", "int", "long", "float", "double", "decimal"},
+	"ushort":  {"ushort", "int", "uint", "long", "ulong", "float", "double", "decimal"},
+	"int":     {"int", "long", "float", "double", "decimal"},
+	"uint":    {"uint", "long", "ulong", "float", "double", "decimal"},
+	"long":    {"long", "float", "double", "decimal"},
+	"ulong":   {"ulong", "float", "double", "decimal"},
+	"char":    {"char", "ushort", "int", "uint", "long", "ulong", "float", "double", "decimal"},
+	"float":   {"float", "double"},
+	"double":  {"double"},
+	"decimal": {"decimal"},
+	"bool":    {"bool"},
+}
+
+// csNumericRank is the conversion distance from a primitive argument type
+// to a primitive parameter type, or -1 when no implicit conversion exists.
+// A literal (constant) follows csLiteralRank, which also admits the
+// constant conversions (an int literal binds uint).
+func csNumericRank(arg, param string, literal bool) int {
+	if literal {
+		if _, ok := csLiteralOrder[arg]; ok {
+			if !csLiteralCompatible(arg, param) {
+				return -1
+			}
+			return csLiteralRank(arg, param)
+		}
+	}
+	for i, t := range csNumericOrder[arg] {
+		if t == param {
+			return i
+		}
+	}
+	return -1
+}
+
 // csLiteralRank orders the implicit conversions a literal allows: the
 // smaller, the better the overload (int literal: int 0, uint 1, long 2,
 // ulong 3, float 4, double 5, decimal 6; object last).
+var csLiteralOrder = map[string][]string{
+	"int":    {"int", "uint", "long", "ulong", "float", "double", "decimal", "object"},
+	"long":   {"long", "ulong", "float", "double", "decimal", "object"},
+	"float":  {"float", "double", "object"},
+	"double": {"double", "object"},
+	"char":   {"char", "ushort", "int", "uint", "long", "ulong", "float", "double", "decimal", "object"},
+	"bool":   {"bool", "object"},
+	"string": {"string", "object"},
+}
+
 func csLiteralRank(lit, param string) int {
-	order := map[string][]string{
-		"int":    {"int", "uint", "long", "ulong", "float", "double", "decimal", "object"},
-		"long":   {"long", "ulong", "float", "double", "decimal", "object"},
-		"float":  {"float", "double", "object"},
-		"double": {"double", "object"},
-		"char":   {"char", "ushort", "int", "uint", "long", "ulong", "float", "double", "decimal", "object"},
-		"bool":   {"bool", "object"},
-		"string": {"string", "object"},
-	}
-	for i, p := range order[lit] {
+	for i, p := range csLiteralOrder[lit] {
 		if p == param {
 			return i
 		}
@@ -1165,4 +1250,239 @@ func csNormalFormSibling(kept []*core.SymbolRecord, params *core.SymbolRecord, p
 		}
 	}
 	return false
+}
+
+// csTypeChain returns typ and its base classes and interfaces (indexed, and
+// the BCL bases csBclBases knows), each with its inheritance depth (typ is
+// 0). Five levels bound the walk.
+func csTypeChain(idx *edgeIndex, typ, preferDir string) map[string]int {
+	depth := map[string]int{typ: 0}
+	frontier := []string{typ}
+	for level := 1; level <= 5 && len(frontier) > 0; level++ {
+		var next []string
+		for _, cls := range frontier {
+			bases := append([]string(nil), csBaseClasses(idx, cls, preferDir)...)
+			bases = append(bases, csBclBases[cls]...)
+			for _, b := range bases {
+				if _, seen := depth[b]; !seen {
+					depth[b] = level
+					next = append(next, b)
+				}
+			}
+		}
+		frontier = next
+	}
+	return depth
+}
+
+// csArityApplicable reports whether a call with argc arguments can bind
+// cand by count: required parameters (no default, not params) at most argc,
+// and argc at most the total unless the last is `params`. Unparsable
+// declarations are applicable.
+func csArityApplicable(cand *core.SymbolRecord, argc int) bool {
+	params := tsDeclParams("csharp", csDeclSource(cand))
+	if params == "" {
+		return argc == 0 || !strings.Contains(csDeclSource(cand), "()")
+	}
+	required, total, variadic := 0, 0, false
+	for _, g := range splitParams("csharp", params) {
+		g = strings.TrimSpace(g)
+		if g == "" || strings.HasPrefix(g, "this ") {
+			continue
+		}
+		total++
+		switch {
+		case strings.HasPrefix(g, "params "):
+			variadic = true
+		case strings.Contains(g, "="):
+		default:
+			required++
+		}
+	}
+	return argc >= required && (argc <= total || variadic)
+}
+
+// csMemberTargets resolves `recv.name(args)` for a receiver of static type
+// typ, following C# member lookup: the same-named methods of typ and every
+// base share one overload set, an override counts once (at its most-derived
+// declaration), and the best overload is chosen across the whole set — a
+// JsonTextWriter receiver calling WriteValue((char?)null) runs JsonWriter's
+// WriteValue(char?) when JsonTextWriter does not override it. Only when no
+// instance member applies by arity do extension methods apply: those whose
+// `this` parameter is typ, any base or interface of it, or a type variable
+// (person.IsValid(schema) on a JObject runs Extensions.IsValid(this JToken
+// ...)) — when the caller's file imports, or sits in, the extension
+// class's namespace. instance=false (a type name qualifier: static access) never
+// considers extensions. Returns nil when nothing in typ's hierarchy fits.
+func csMemberTargets(idx *edgeIndex, caller *core.SymbolRecord, cands []*core.SymbolRecord, typ string, cs core.CallSite, instance bool, argTypes map[string]string) []*core.SymbolRecord {
+	chain := csTypeChain(idx, typ, dirOf(caller.FilePath))
+	best := map[string]*core.SymbolRecord{}
+	var order []string
+	for _, cand := range cands {
+		d, ok := chain[cand.ParentSymbol]
+		if !ok || !graphCallableSymbol(cand) {
+			continue
+		}
+		key := cand.ID
+		if pt, v := csParamTypes(cand); pt != nil || csArityApplicable(cand, 0) && tsDeclParams("csharp", csDeclSource(cand)) == "" {
+			// Same parameter types: an override (Read() on JsonTextReader
+			// and JsonReader) is one member.
+			key = fmt.Sprintf("%s(%s|%v)", cand.Name, strings.Join(pt, ","), v)
+		}
+		cur, seen := best[key]
+		if !seen {
+			order = append(order, key)
+			best[key] = cand
+		} else if chain[cur.ParentSymbol] > d {
+			best[key] = cand // the override nearer the receiver type
+		}
+	}
+	var members []*core.SymbolRecord
+	for _, k := range order {
+		members = append(members, best[k])
+	}
+	argc := cs.Argc
+	if argc == 0 {
+		argc = len(cs.Args)
+	}
+	if instance {
+		applicable := false
+		for _, m := range members {
+			if csArityApplicable(m, argc) {
+				applicable = true
+				break
+			}
+		}
+		if !applicable {
+			var ext []*core.SymbolRecord
+			for _, cand := range cands {
+				if et := csExtensionThisType(cand); et != "" && idx.csExtensionVisible(caller, cand) {
+					if _, ok := chain[et]; ok || csTypeVariable(et, cand) {
+						if csArityApplicable(cand, argc) {
+							ext = append(ext, cand)
+						}
+					}
+				}
+			}
+			if len(ext) > 0 {
+				members = ext
+			}
+		}
+	}
+	if len(members) > 1 {
+		members = csNarrowOverloadsGrouped(idx, members, cs.Args, argTypes, false)
+	}
+	return members
+}
+
+// csExtensionThisType is the normalized type of an extension method's
+// `this` parameter, or "" for an ordinary method.
+func csExtensionThisType(cand *core.SymbolRecord) string {
+	params := tsDeclParams(cand.Language, cand.Signature)
+	if params == "" {
+		params = tsDeclParams(cand.Language, cand.RawText)
+	}
+	first := strings.TrimSpace(strings.SplitN(params, ",", 2)[0])
+	fields := strings.Fields(first)
+	if len(fields) >= 3 && fields[0] == "this" {
+		return csNormalizeType(fields[1])
+	}
+	return ""
+}
+
+// csExtensionVisible reports whether an extension method is in scope for
+// caller: C# finds extension methods only in the caller's enclosing
+// namespaces and its file's `using` namespaces. newtonsoft's LinqBridge
+// (namespace Newtonsoft.Json.Utilities.LinqBridge) is not what `.Where()`
+// means in a file that imports only System.Linq.
+func (idx *edgeIndex) csExtensionVisible(caller, cand *core.SymbolRecord) bool {
+	return idx.csVisibleNamespaces(caller)[idx.csNamespaceOf(cand)]
+}
+
+// csBareType is javaBareType for C#: a nullable annotation (`ITraceWriter?`)
+// does not change the type a member lookup uses.
+func csBareType(t string) string {
+	return javaBareType(strings.TrimSuffix(strings.TrimSpace(t), "?"))
+}
+
+// csChainType types a dotted C# receiver chain hop by hop: the head is a
+// typed local/field/parameter, or a type name (static access:
+// ExpressionReflectionDelegateFactory.Instance), and every later hop is a
+// field or property declared on the type reached so far or its bases.
+// "" when the chain has a single segment or any hop is unknown.
+func csChainType(idx *edgeIndex, caller *core.SymbolRecord, localTypes map[string]string, chain string) string {
+	parts := strings.Split(chain, ".")
+	for len(parts) > 0 && (parts[0] == "this" || parts[0] == "base") {
+		parts = parts[1:]
+	}
+	if len(parts) < 2 {
+		return ""
+	}
+	for _, p := range parts {
+		if p == "" || strings.ContainsAny(p, "()[]") {
+			return ""
+		}
+	}
+	lt := localTypes
+	if _, ok := localTypes[parts[0]]; !ok {
+		if !typeSymbolExists(idx, parts[0]) {
+			return ""
+		}
+		lt = map[string]string{parts[0]: parts[0]}
+	}
+	return tsResolveReceiverChain(idx, lt, strings.Join(parts, "."), caller.FilePath, "csharp")
+}
+
+// csReceiverChainAt recovers the dotted receiver written before the called
+// name at cs.Line:cs.Col in the caller's source — astkit keeps only the last
+// receiver segment ("Instance.CreateSet" for
+// `ExpressionReflectionDelegateFactory.Instance.CreateSet<object>(...)`).
+// Only plain identifier hops (with ?. and !.) count; "" otherwise.
+func csReceiverChainAt(caller *core.SymbolRecord, cs core.CallSite, method string) string {
+	if cs.Line <= 0 || cs.Col <= 0 || caller.RawText == "" {
+		return ""
+	}
+	lines := strings.Split(caller.RawText, "\n")
+	i := cs.Line - caller.Span.Start
+	if i < 0 || i >= len(lines) {
+		return ""
+	}
+	line := []rune(lines[i])
+	at := cs.Col - 1
+	if at <= 0 || at+len([]rune(method)) > len(line) || string(line[at:at+len([]rune(method))]) != method {
+		return ""
+	}
+	j := at - 1
+	skip := func() {
+		for j >= 0 && (line[j] == ' ' || line[j] == '\t') {
+			j--
+		}
+	}
+	var segs []string
+	for {
+		skip()
+		if j < 0 || line[j] != '.' {
+			break
+		}
+		j--
+		if j >= 0 && (line[j] == '?' || line[j] == '!') {
+			j--
+		}
+		skip()
+		end := j + 1
+		for j >= 0 && (line[j] == '_' || line[j] >= 'a' && line[j] <= 'z' || line[j] >= 'A' && line[j] <= 'Z' || line[j] >= '0' && line[j] <= '9') {
+			j--
+		}
+		if end == j+1 {
+			return "" // a call, index or parenthesized receiver
+		}
+		segs = append([]string{string(line[j+1 : end])}, segs...)
+	}
+	if j >= 0 && (line[j] == ')' || line[j] == ']' || line[j] == '>') {
+		return ""
+	}
+	if len(segs) < 2 {
+		return ""
+	}
+	return strings.Join(segs, ".")
 }

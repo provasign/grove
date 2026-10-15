@@ -114,11 +114,18 @@ const (
 	// function-valued struct field by From: Lines "dir:Type.Field". The
 	// graph joins stores and calls of the same field into call edges.
 	EdgeFuncFieldStore EdgeType = "func-field-store"
+	// EdgeExternalIfaceCall records, on a caller (From == To), its calls
+	// through a library interface's method: Lines
+	// "net/http.ResponseWriter.Write@line:col,...". The graph joins them
+	// with the EdgeExternalContract records of the project's methods that
+	// fulfil that interface into dispatch call edges.
+	EdgeExternalIfaceCall EdgeType = "external-iface-call"
 )
 
 // IsMarkerEdge reports the stored per-symbol records that are not graph edges.
 func IsMarkerEdge(t EdgeType) bool {
-	return t == EdgeResolvedCalls || t == EdgeExternalContract || t == EdgeFuncFieldCall || t == EdgeFuncFieldStore
+	return t == EdgeResolvedCalls || t == EdgeExternalContract || t == EdgeFuncFieldCall || t == EdgeFuncFieldStore ||
+		t == EdgeExternalIfaceCall
 }
 
 type Edge struct {

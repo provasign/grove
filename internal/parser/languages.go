@@ -59,7 +59,9 @@ var securityExtensions = map[string]bool{
 // 2026-10-16.5: Objective-C property accessors, C calls in methods, and
 // message sends in macro bodies are call sites.
 // 2026-10-16.6: Swift generic-specialized initializers are call sites.
-const ExtractorVersion = "2026-10-16.6"
+// 2026-10-17.1: C# typed constant argument tokens and #if/#else using
+// selection; JS/TS nested function declarations are local symbols.
+const ExtractorVersion = "2026-10-17.1"
 
 // DetectLanguage returns the Grove language tag for a file path.
 // Returns "" for unsupported or security-excluded files.

@@ -1352,7 +1352,7 @@ func TestPyCallThroughClassPassesSelf(t *testing.T) {
 			Signature: "class AliasedGroup(click.Group):", RawText: "class AliasedGroup(click.Group):\n    pass\n", Imports: []string{"click"}},
 		{ID: "a::use", FilePath: "examples/aliases.py", BlobSHA: "1", Language: "python", Kind: core.KindMethod, Name: "get_command", QualifiedName: "AliasedGroup.get_command", ParentSymbol: "AliasedGroup",
 			Signature: "def get_command(self, ctx, name):", RawText: "def get_command(self, ctx, name):\n    return click.Group.get_command(self, ctx, name)\n", Imports: []string{"click"},
-			Span: core.LineRange{Start: 1, End: 2},
+			Span:      core.LineRange{Start: 1, End: 2},
 			CallSites: []core.CallSite{{Callee: "click.Group.get_command", Line: 2, Col: 24, Argc: 3, Args: []string{"self", "ctx", "name"}}}},
 	}
 	got := map[string]bool{}

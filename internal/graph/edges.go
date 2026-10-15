@@ -2337,6 +2337,9 @@ func resolveCallees(idx *edgeIndex, symbol *core.SymbolRecord, calleeName string
 		if _, ok := scope[cand.FilePath]; !ok {
 			continue
 		}
+		if hasModifier(cand, "local") && tsFamilyLang(cand.Language) && !idx.jsLocalVisible(symbol, cand) {
+			continue
+		}
 		if cand.FilePath == symbol.FilePath {
 			sameFile = append(sameFile, cand)
 		} else {
@@ -2601,6 +2604,14 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 						addEdge(symbol.ID, target.ID, 0.7, core.EvidenceSourceHeuristic, core.ReasonImplicitDunder)
 					}
 				}
+				if typ != "" {
+					// `testing = ConfigAttribute[bool]("TESTING")` on the
+					// class: reading app.testing runs the descriptor's
+					// __get__, assigning it its __set__.
+					for _, target := range pyDescriptorTargets(idx, typ, name, as.Write, dirOf(symbol.FilePath)) {
+						addEdge(symbol.ID, target.ID, 0.7, core.EvidenceSourceHeuristic, core.ReasonImplicitDunder)
+					}
+				}
 			}
 			for _, cand := range cands {
 				addEdge(symbol.ID, cand.ID, 0.7, core.EvidenceSourceASTKit, core.ReasonProperty)
@@ -2670,6 +2681,8 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			return *maskedBody
 		}
 		var ktShapeCache map[string]string
+		var ktReceiverScopes []ktReceiverScope
+		ktScopesDone := false
 		javaTypesFor := func(cands []*core.SymbolRecord, cs core.CallSite) map[string]string {
 			if javaArgTypeCache == nil {
 				javaArgTypeCache = javaArgTypes(idx, &symbol)
@@ -2707,6 +2720,12 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				cands = narrowOverloadsByArgTypes(cands, cs.Args, argTypes)
 			}
 			return cands
+		}
+		csArgTypesFor := func() map[string]string {
+			if csArgTypeCache == nil {
+				csArgTypeCache = csharpArgTypes(idx, &symbol)
+			}
+			return csArgTypeCache
 		}
 		narrowDispatch := func(cands []*core.SymbolRecord, cs core.CallSite) []*core.SymbolRecord {
 			if symbol.Language != "csharp" && symbol.Language != "java" {
@@ -2848,6 +2867,16 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				continue
 			}
 			localDefinition := qualifier == "" && symbol.Name != "<top-level>" && declaresLocalFunction(&symbol, codeBody(), calleeName)
+			if localDefinition && tsFamilyLang(symbol.Language) {
+				// A nested `function run(i)` is indexed as a local symbol:
+				// the bare call binds the innermost one in scope.
+				if local := idx.jsLexicalLocal(&symbol, calleeName); local != nil {
+					if local.ID != symbol.ID {
+						addEdge(symbol.ID, local.ID, 0.95, core.EvidenceSourceASTKit, core.ReasonASTNarrowed)
+					}
+					continue
+				}
+			}
 			if localDefinition && (symbol.Language != "python" || len(pythonLexicalChild(idx, &symbol, calleeName)) == 0) {
 				// A function declared inside the caller's own body
 				// (`function run(i)` nested in Socket.run, a nested `def`)
@@ -2855,6 +2884,23 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// closure, so any same-named function elsewhere is a
 				// fabricated target. Emit nothing.
 				continue
+			}
+			if symbol.Language == "python" && qualifier != "" && symbol.ParentSymbol != "" {
+				if _, isSelf := selfVars[qualifier]; isSelf && !pyTypeHasMethod(idx, symbol.ParentSymbol, calleeName, dirOf(symbol.FilePath)) {
+					// `self.json_provider_class(self)` with the class
+					// attribute `json_provider_class: type[JSONProvider] =
+					// DefaultJSONProvider`: the call constructs the held
+					// class (its __init__ in MRO order).
+					if cls := pyClassAttrClass(idx, symbol.ParentSymbol, calleeName, dirOf(symbol.FilePath)); cls != "" {
+						targets := pyDunderTargets(idx, cls, "__init__", dirOf(symbol.FilePath))
+						for _, target := range targets {
+							addEdge(symbol.ID, target.ID, 0.85, core.EvidenceSourceHeuristic, core.ReasonConstructor)
+						}
+						if len(targets) > 0 {
+							continue
+						}
+					}
+				}
 			}
 			if symbol.Language == "python" && qualifier == "" && pyParams[calleeName] {
 				if _, typed := localTypes[calleeName]; !typed {
@@ -3113,7 +3159,11 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// `throw LocationError(path:..)` where `typealias
 				// LocationError = FilesError<LocationErrorReason>`: the
 				// call constructs the aliased type.
-				if target := swiftTypealiasTarget(idx, calleeName); target != "" {
+				target := swiftTypealiasTarget(idx, calleeName)
+				if target == "" && calleeName == "Iterator" {
+					target = swiftSequenceIterator(idx, &symbol)
+				}
+				if target != "" {
 					cands, capped = resolveCallees(idx, &symbol, target, scope, true, sameFileWins)
 				}
 			}
@@ -3165,6 +3215,19 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// in-repo value, just an untyped one.
 				_, isSelf := selfVars[qualifier]
 				typ, typed := localTypes[qualifier]
+				if !typed && !isSelf {
+					// Folder.home.createSubfolderIfNeeded(...): astkit keeps
+					// only `home`; the chain is typed through the static
+					// property's declaration.
+					chain := fullChain
+					if !strings.Contains(chain, ".") {
+						chain = csReceiverChainAt(&symbol, cs, calleeName)
+					}
+					if t := swiftChainType(idx, &symbol, localTypes, chain); t != "" {
+						typ, typed = t, true
+						localTypes[qualifier] = t
+					}
+				}
 				external := !typed && !swiftTypeIndexed(idx, qualifier) || typed && !swiftTypeIndexed(idx, typ)
 				if !isSelf && external {
 					// Except an in-repo extension of that external type:
@@ -3224,7 +3287,24 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				}
 				cands = byType
 			}
+			ktLambdaReceiver := false
 			if symbol.Language == "kotlin" && qualifier == "" && len(cands) > 0 {
+				// Inside a lambda with receiver (`shellRun { command(...) }`
+				// where shellRun takes `script: ShellScript.() -> String`,
+				// or x.apply { }, x.run { }, with(x) { }), the lambda's
+				// receiver is the innermost implicit receiver.
+				if !ktScopesDone {
+					ktReceiverScopes = kotlinReceiverScopes(idx, &symbol, localTypes)
+					ktScopesDone = true
+				}
+				if t := kotlinReceiverAt(ktReceiverScopes, cs.Line, cs.Col); t != "" {
+					if members := kotlinTypeMembers(idx, cands, t, dirOf(symbol.FilePath)); len(members) > 0 {
+						cands = members
+						ktLambdaReceiver = true
+					}
+				}
+			}
+			if symbol.Language == "kotlin" && qualifier == "" && len(cands) > 0 && !ktLambdaReceiver {
 				// A bare call resolves against the implicit receivers in
 				// scope: the enclosing class and, in an extension
 				// function, its receiver type. Outside both — a top-level
@@ -3494,26 +3574,15 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					cands = nil
 				}
 			}
+			csMemberResolved := false // C# member lookup over the receiver's type decided cands
 			if symbol.Language == "csharp" && strings.HasSuffix(qualifier, "()") && len(cands) > 0 {
 				// `new Dog().Move()` is extracted as receiver `Dog()`. When that
 				// name is an indexed type, construction gives us an exact receiver
 				// type; retaining other same-named methods fabricates edges.
 				typ := strings.TrimSuffix(qualifier, "()")
 				if typeSymbolExists(idx, typ) {
-					byType := filterByParent(cands, typ)
-					if len(byType) == 0 {
-						byType = csharpExtensionTargets(cands, typ)
-					}
-					bases := baseClassesFor(idx, symbol.Language, typ, dirOf(symbol.FilePath))
-					for level := 0; level < 4 && len(bases) > 0 && len(byType) == 0; level++ {
-						var next []string
-						for _, base := range bases {
-							byType = append(byType, filterByParent(cands, base)...)
-							next = append(next, baseClassesFor(idx, symbol.Language, base, dirOf(symbol.FilePath))...)
-						}
-						bases = next
-					}
-					cands = byType
+					cands = csMemberTargets(idx, &symbol, cands, typ, cs, true, csArgTypesFor())
+					csMemberResolved = true
 				} else if rets, exists := csProducerReturnTypes(idx, typ); !exists {
 					// Not a type and no method of ours by that name: a
 					// library call's result (LINQ Select, a BCL getter).
@@ -3523,33 +3592,23 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					// which may be ours (newtonsoft: 67 such guesses, oracle
 					// review 2026-10-15).
 					if !csElementProducers[typ] {
-						cands = csharpExtensionMethods(cands)
+						var visible []*core.SymbolRecord
+						for _, c := range csharpExtensionMethods(cands) {
+							if idx.csExtensionVisible(&symbol, c) {
+								visible = append(visible, c)
+							}
+						}
+						cands = visible
 					}
 				} else if len(rets) > 0 {
 					// Our producer's declared result type picks the method
 					// (channel.Property("x").Remove() -> JProperty's chain).
 					var byType []*core.SymbolRecord
 					for _, ret := range rets {
-						if !typeSymbolExists(idx, ret) {
-							byType = append(byType, csharpExtensionTargets(cands, ret)...)
-							continue
-						}
-						found := filterByParent(cands, ret)
-						bases := baseClassesFor(idx, symbol.Language, ret, dirOf(symbol.FilePath))
-						for level := 0; level < 4 && len(bases) > 0 && len(found) == 0; level++ {
-							var next []string
-							for _, base := range bases {
-								found = append(found, filterByParent(cands, base)...)
-								next = append(next, baseClassesFor(idx, symbol.Language, base, dirOf(symbol.FilePath))...)
-							}
-							bases = next
-						}
-						if len(found) == 0 {
-							found = csharpExtensionTargets(cands, ret)
-						}
-						byType = append(byType, found...)
+						byType = append(byType, csMemberTargets(idx, &symbol, cands, ret, cs, true, csArgTypesFor())...)
 					}
 					cands = byType
+					csMemberResolved = true
 				}
 			}
 			if tsFamilyLang(symbol.Language) && strings.HasSuffix(qualifier, "()") {
@@ -3596,6 +3655,25 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// $logger->info) whose method isn't ours — a same-name
 				// match is noise: drop. A resolvable type narrows by parent.
 				held, ok := localTypes[qualifier]
+				if symbol.Language == "csharp" && !ok && !strings.HasSuffix(qualifier, "[]") {
+					// A property chain (`ExpressionReflectionDelegateFactory
+					// .Instance.CreateSet`, `writer.Token.ToString()`) is
+					// typed hop by hop through declared member types; a lone
+					// field of another class (`_contractResolver` from
+					// `Serializer._contractResolver`) by the one type every
+					// same-named field declares.
+					chain := fullChain
+					if !strings.Contains(chain, ".") {
+						chain = csReceiverChainAt(&symbol, cs, calleeName)
+					}
+					if t := csChainType(idx, &symbol, localTypes, chain); t != "" {
+						held, ok = t, true
+					} else if fullChain == qualifier && !typeSymbolExists(idx, qualifier) {
+						if t := csFieldTypeByName(idx, qualifier); t != "" {
+							held, ok = t, true
+						}
+					}
+				}
 				if symbol.Language == "csharp" && strings.HasSuffix(qualifier, "[]") {
 					// `o["x"].Children()`: the receiver is an element of
 					// o — typed by o's array element type or indexer
@@ -3607,11 +3685,13 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 						cands = nil
 					}
 				}
-				if ok {
+				if ok && symbol.Language == "csharp" {
+					// Member lookup over held's hierarchy, overloads chosen
+					// across it, extensions when no member applies.
+					cands = csMemberTargets(idx, &symbol, cands, held, cs, true, csArgTypesFor())
+					csMemberResolved = true
+				} else if ok {
 					byType := filterByParent(cands, held)
-					if symbol.Language == "csharp" && len(byType) == 0 {
-						byType = csharpExtensionTargets(cands, held)
-					}
 					// Inherited: `BsonReader reader; reader.ReadAsBytes()`
 					// runs JsonReader's. Walk the declared type's bases
 					// before concluding the method is not ours.
@@ -3629,6 +3709,12 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					} else {
 						cands = nil
 					}
+				} else if symbol.Language == "csharp" && typeSymbolExists(idx, qualifier) {
+					// A type name: its static members and its bases'
+					// (`NamingStrategy.GetType()` with no member of ours on
+					// the chain is object.GetType: nil).
+					cands = csMemberTargets(idx, &symbol, cands, qualifier, cs, false, csArgTypesFor())
+					csMemberResolved = true
 				} else if byQual := filterByParent(cands, qualifier); len(byQual) > 0 {
 					cands = byQual
 				} else if symbol.Language == "csharp" && (csIsPrimitive(qualifier) || qualifier == "string" || qualifier == "object") {
@@ -3656,6 +3742,19 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					}
 					cands = byBase
 				}
+			}
+			if symbol.Language == "csharp" && qualifier != "" && len(cands) > 0 {
+				// `x.Single()` reaches an extension method only when its
+				// namespace is in scope, whatever x's type; a static call
+				// names the class (`Enumerable.Single(x)`) and is exempt.
+				var kept []*core.SymbolRecord
+				for _, c := range cands {
+					if c.ParentSymbol != qualifier && csIsExtensionMethod(c) && !idx.csExtensionVisible(&symbol, c) {
+						continue
+					}
+					kept = append(kept, c)
+				}
+				cands = kept
 			}
 			if symbol.Language == "rust" && qualifier != "" && len(cands) > 1 {
 				cands = rustPinByPath(idx, &symbol, codeBody(), cs, qualifier, cands)
@@ -3932,6 +4031,12 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					// The own-class edge stays; the overrides join as
 					// dispatch so change-impact on the base call sees them.
 					for _, m := range subclassOverrides(idx, symbol.Language, symbol.ParentSymbol, calleeName, dirOf(symbol.FilePath)) {
+						if symbol.Language == "python" && pyOverridesWithoutSuper(idx, m.ParentSymbol, symbol.Name) {
+							// PassDict overrides tag itself (tag = to_json):
+							// JSONTag.tag never runs on a PassDict, so its
+							// self.to_json() does not reach PassDict.to_json.
+							continue
+						}
 						if m.ID != symbol.ID {
 							addEdge(symbol.ID, m.ID, 0.7, core.EvidenceSourceHeuristic, core.ReasonDispatch)
 						}
@@ -3983,6 +4088,13 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					// cannot see `driver` because it is a field of the chain's
 					// intermediate type, not of the enclosing class.
 					kept, dispatch, decided = narrowByChainType(idx, sat, localTypes, &symbol, fullChain, calleeName, cands)
+				}
+				if csMemberResolved {
+					// csMemberTargets already chose the members (across the
+					// hierarchy, extensions included); the type pass adds
+					// only the overriding implementations as dispatch.
+					decided = true
+					kept = cands
 				}
 				if decided {
 					// The receiver type was known: this call site is resolved
@@ -5544,7 +5656,13 @@ func csProducerReturnTypes(idx *edgeIndex, producer string) ([]string, bool) {
 		}
 		exists = true
 		ret := csDeclaredReturnType(f.Signature, producer)
-		if ret == "" || ret == "void" || len(ret) <= 2 && strings.ToUpper(ret) == ret {
+		if ret == "void" {
+			// A call used as a receiver or an argument has a value: a
+			// void method of this name (a [Test] named Children) is not
+			// the producer.
+			continue
+		}
+		if ret == "" || len(ret) <= 2 && strings.ToUpper(ret) == ret {
 			return nil, true // unknown or a type parameter (T, TKey)
 		}
 		if !seen[ret] {
@@ -5600,4 +5718,45 @@ func goProducerReturnType(idx *edgeIndex, producer string) string {
 		typ = t
 	}
 	return typ
+}
+
+// jsLocalVisible reports whether a JS/TS function declared inside another
+// function (astkit marks it "local") is in scope for caller: only code
+// within the declaring function's span sees it. A file's many nested
+// `function next()` helpers are never one another's, nor another file's.
+func (idx *edgeIndex) jsLocalVisible(caller, local *core.SymbolRecord) bool {
+	if caller.FilePath != local.FilePath {
+		return false
+	}
+	var encl *core.SymbolRecord
+	for _, s := range idx.byFile[local.FilePath] {
+		if s.ID == local.ID || s.Name == "<top-level>" || !graphCallableSymbol(s) {
+			continue
+		}
+		if s.Span.Start <= local.Span.Start && s.Span.End >= local.Span.End &&
+			(s.Span.Start != local.Span.Start || s.Span.End != local.Span.End) {
+			if encl == nil || s.Span.End-s.Span.Start < encl.Span.End-encl.Span.Start {
+				encl = s
+			}
+		}
+	}
+	if encl == nil {
+		return true // declared in an anonymous callback of the file's top-level code
+	}
+	return caller.Span.Start >= encl.Span.Start && caller.Span.End <= encl.Span.End
+}
+
+// jsLexicalLocal is the innermost JS/TS local function named name visible
+// from caller (declared in caller's body or an enclosing function's), or nil.
+func (idx *edgeIndex) jsLexicalLocal(caller *core.SymbolRecord, name string) *core.SymbolRecord {
+	var best *core.SymbolRecord
+	for _, s := range idx.byFile[caller.FilePath] {
+		if s.Name != name || !hasModifier(s, "local") || !tsFamilyLang(s.Language) || !idx.jsLocalVisible(caller, s) {
+			continue
+		}
+		if best == nil || s.Span.Start > best.Span.Start {
+			best = s // declared deeper or later in the scope chain
+		}
+	}
+	return best
 }
