@@ -553,6 +553,42 @@ func pyResolveClass(idx *edgeIndex, className, preferDir string) *core.SymbolRec
 }
 
 // pyLocalTypes infers identifier → type name for one Python callable.
+// pyBuiltins are annotation types whose methods are never the project's.
+var pyBuiltins = map[string]bool{
+	"dict": true, "list": true, "set": true, "frozenset": true, "tuple": true, "str": true, "bytes": true,
+	"bytearray": true, "int": true, "float": true, "bool": true, "complex": true,
+	"Dict": true, "List": true, "Set": true, "FrozenSet": true, "Tuple": true, "DefaultDict": true,
+}
+
+// pyBuiltinAnnotation returns the builtin container or scalar type an
+// annotation names (dict, t.Dict[str, int], Optional[list], dict | None),
+// or "".
+func pyBuiltinAnnotation(ann string) string {
+	ann = strings.TrimSpace(ann)
+	for _, wrap := range []string{"Optional[", "t.Optional[", "typing.Optional["} {
+		if strings.HasPrefix(ann, wrap) && strings.HasSuffix(ann, "]") {
+			ann = strings.TrimSpace(ann[len(wrap) : len(ann)-1])
+		}
+	}
+	if head, tail, ok := strings.Cut(ann, "|"); ok {
+		if strings.TrimSpace(tail) != "None" {
+			return ""
+		}
+		ann = strings.TrimSpace(head)
+	}
+	if i := strings.IndexByte(ann, '['); i >= 0 {
+		ann = ann[:i]
+	}
+	ann = strings.Trim(ann, `"' `)
+	for _, prefix := range []string{"t.", "typing.", "builtins."} {
+		ann = strings.TrimPrefix(ann, prefix)
+	}
+	if pyBuiltins[ann] {
+		return ann
+	}
+	return ""
+}
+
 func pyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 	out := map[string]string{}
 
@@ -619,6 +655,11 @@ func pyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 			}
 			if t := pyAnnotationType(idx, symbol, ann); t != "" && name != "" {
 				out[name] = t
+			} else if b := pyBuiltinAnnotation(ann); b != "" && name != "" && !typeSymbolExists(idx, b) {
+				// `options: dict`: options.get(...) is dict.get, never a
+				// same-named method of ours (flask: Scaffold.get, oracle
+				// review 2026-10-15).
+				out[name] = "extern:" + b
 			}
 		}
 	}

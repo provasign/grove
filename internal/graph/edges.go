@@ -324,12 +324,36 @@ func (idx *edgeIndex) pyModuleFiles(fromFile, modPath string) []string {
 	joined := strings.ToLower(strings.Join(segs, "/"))
 	var out []string
 	for _, pathKey := range idx.pathSuffix[joined] {
+		if idx.pyNestedInPackage(pathKey, joined) {
+			continue
+		}
 		out = append(out, idx.importPathToFiles[pathKey]...)
 	}
 	for _, dir := range idx.dirSuffix[joined] {
+		if idx.pyNestedInPackage(dir, joined) {
+			continue
+		}
 		out = append(out, idx.dirFilesLower[dir]...)
 	}
 	return out
+}
+
+// pyNestedInPackage reports whether key matched the absolute module path
+// suffix only below a package: in pkg/json, pkg/ has an __init__.py, so the
+// module is pkg.json and `import json` is the standard library's (flask's
+// json/provider.py: json.loads bound to its own loads methods, oracle
+// review 2026-10-15). Suffix matching stays for source roots (src/flask).
+func (idx *edgeIndex) pyNestedInPackage(key, suffix string) bool {
+	if key == suffix || !strings.HasSuffix(key, "/"+suffix) {
+		return false
+	}
+	parent := strings.TrimSuffix(key, "/"+suffix)
+	for _, f := range idx.dirFilesLower[parent] {
+		if strings.HasSuffix(f, "/__init__.py") && strings.EqualFold(f[:len(f)-len("/__init__.py")], parent) {
+			return true
+		}
+	}
+	return false
 }
 
 // segmentSuffixIndex maps each segment-boundary suffix of every key to the
@@ -3239,6 +3263,42 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 						bases = next
 					}
 					cands = byType
+				} else if rets, exists := csProducerReturnTypes(idx, typ); !exists {
+					// Not a type and no method of ours by that name: a
+					// library call's result (LINQ Select, a BCL getter).
+					// Our extension methods may apply to it; same-named
+					// members of our types do not, unless the library method
+					// returns its element type (GetValueOrDefault, First),
+					// which may be ours (newtonsoft: 67 such guesses, oracle
+					// review 2026-10-15).
+					if !csElementProducers[typ] {
+						cands = csharpExtensionMethods(cands)
+					}
+				} else if len(rets) > 0 {
+					// Our producer's declared result type picks the method
+					// (channel.Property("x").Remove() -> JProperty's chain).
+					var byType []*core.SymbolRecord
+					for _, ret := range rets {
+						if !typeSymbolExists(idx, ret) {
+							byType = append(byType, csharpExtensionTargets(cands, ret)...)
+							continue
+						}
+						found := filterByParent(cands, ret)
+						bases := baseClassesFor(idx, symbol.Language, ret, dirOf(symbol.FilePath))
+						for level := 0; level < 4 && len(bases) > 0 && len(found) == 0; level++ {
+							var next []string
+							for _, base := range bases {
+								found = append(found, filterByParent(cands, base)...)
+								next = append(next, baseClassesFor(idx, symbol.Language, base, dirOf(symbol.FilePath))...)
+							}
+							bases = next
+						}
+						if len(found) == 0 {
+							found = csharpExtensionTargets(cands, ret)
+						}
+						byType = append(byType, found...)
+					}
+					cands = byType
 				}
 			}
 			if tsFamilyLang(symbol.Language) && strings.HasSuffix(qualifier, "()") {
@@ -5098,6 +5158,91 @@ func pyClassBodyMethodRefs(idx *edgeIndex, symbol core.SymbolRecord) []core.Edge
 		}
 	}
 	return out
+}
+
+// csElementProducers are library methods whose result is their receiver's
+// element or underlying type, which may be one of ours.
+var csElementProducers = map[string]bool{
+	"GetValueOrDefault": true, "First": true, "FirstOrDefault": true, "Last": true, "LastOrDefault": true,
+	"Single": true, "SingleOrDefault": true, "ElementAt": true, "ElementAtOrDefault": true,
+	"Max": true, "Min": true, "Aggregate": true, "Find": true, "Peek": true, "Pop": true, "Dequeue": true,
+	"GetValue": true, "GetOrAdd": true, "Invoke": true, "Clone": true,
+}
+
+// csharpExtensionMethods keeps the candidates declared as extension methods
+// (first parameter `this T`).
+func csharpExtensionMethods(cands []*core.SymbolRecord) []*core.SymbolRecord {
+	var out []*core.SymbolRecord
+	for _, cand := range cands {
+		params := tsDeclParams(cand.Language, cand.Signature)
+		if params == "" {
+			params = tsDeclParams(cand.Language, cand.RawText)
+		}
+		if strings.HasPrefix(strings.TrimSpace(params), "this ") {
+			out = append(out, cand)
+		}
+	}
+	return out
+}
+
+// csProducerReturnTypes returns the declared return types (normalized) of
+// the C# methods named producer, and whether any exists. A producer whose
+// result type is unknown (a type parameter, unparsable) yields nil types
+// with exists true: nothing to narrow by.
+func csProducerReturnTypes(idx *edgeIndex, producer string) ([]string, bool) {
+	exists := false
+	seen := map[string]bool{}
+	var out []string
+	for _, f := range idx.byName[strings.ToLower(producer)] {
+		if f.Name != producer || f.Language != "csharp" {
+			continue
+		}
+		switch f.Kind {
+		case core.KindMethod, core.KindFunction:
+		default:
+			continue
+		}
+		exists = true
+		ret := csDeclaredReturnType(f.Signature, producer)
+		if ret == "" || ret == "void" || len(ret) <= 2 && strings.ToUpper(ret) == ret {
+			return nil, true // unknown or a type parameter (T, TKey)
+		}
+		if !seen[ret] {
+			seen[ret] = true
+			out = append(out, ret)
+		}
+	}
+	return out, exists
+}
+
+// csDeclaredReturnType is the normalized type written before name( in a C#
+// method signature ("public static JObject Parse(string json)" -> JObject).
+func csDeclaredReturnType(sig, name string) string {
+	i := strings.Index(sig, " "+name+"(")
+	if i < 0 {
+		i = strings.Index(sig, " "+name+"<")
+	}
+	if i < 0 {
+		return ""
+	}
+	head := strings.TrimSpace(sig[:i])
+	// The last whitespace-separated token, keeping generic arguments that
+	// contain spaces (Dictionary<string, int>).
+	depth, j := 0, len(head)-1
+	for ; j >= 0; j-- {
+		switch head[j] {
+		case '>':
+			depth++
+		case '<':
+			depth--
+		case ' ', '\t':
+			if depth == 0 {
+				goto done
+			}
+		}
+	}
+done:
+	return csNormalizeType(head[j+1:])
 }
 
 // goProducerReturnType is the declared first result type of the Go

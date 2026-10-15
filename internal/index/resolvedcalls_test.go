@@ -427,3 +427,56 @@ func TestJSBareCallsDoNotBindMethods(t *testing.T) {
 		}
 	}
 }
+
+// C#: a call result's methods are narrowed by the producer. A library
+// producer (no method of ours by that name) reaches only our extension
+// methods; our producer's declared return type picks the class.
+func TestCSharpCallResultReceivers(t *testing.T) {
+	got, _, _ := callEdges(t, map[string]string{
+		"Lib.cs": `namespace N {
+public class JProperty { public void Remove() {} }
+public class JObject {
+  public JProperty Property(string name) { return new JProperty(); }
+}
+public class JArrayTests { public void Remove() {} }
+public static class Ext { public static int Count2(this System.Collections.IEnumerable e) { return 0; } }
+}
+`,
+		"Use.cs": `namespace N {
+using System.Linq;
+public class Use {
+  public void A(JObject o) { o.Property("x").Remove(); }
+  public void B(int[] xs) { xs.Select(x => x).ToArray(); }
+  public int C(int[] xs) { return xs.Where(x => x > 0).Count2(); }
+}
+}
+`,
+	})
+	if got["Use.A→JArrayTests.Remove"] {
+		t.Error("Property(...).Remove() bound to an unrelated class's Remove")
+	}
+	if !got["Use.A→JProperty.Remove"] {
+		t.Errorf("Property(...).Remove() lost its real target: %v", got)
+	}
+	if !got["Use.C→Ext.Count2"] {
+		t.Errorf("an extension method on a library result was dropped: %v", got)
+	}
+}
+
+// Python: `import json` inside a package that has its own json subpackage
+// is the standard library's (absolute import), and a dict-annotated
+// parameter's methods are dict's (oracle review 2026-10-15: flask).
+func TestPythonStdlibModuleAndBuiltinReceivers(t *testing.T) {
+	got, _, _ := callEdges(t, map[string]string{
+		"pkg/__init__.py":      "",
+		"pkg/json/__init__.py": "import json as _json\n\n\ndef loads(s):\n    return _json.loads(s)\n",
+		"pkg/json/provider.py": "import json\n\n\nclass Provider:\n    def loads(self, s):\n        return json.loads(s)\n",
+		"pkg/app.py": "class Scaffold:\n    def get(self, rule):\n        return rule\n\n\nclass App(Scaffold):\n" +
+			"    def register(self, options: dict) -> str:\n        return options.get(\"name\", \"\")\n",
+	})
+	for k := range got {
+		if strings.HasSuffix(k, "→loads") || strings.HasSuffix(k, "→Provider.loads") || k == "App.register→Scaffold.get" {
+			t.Errorf("guess survived: %s", k)
+		}
+	}
+}

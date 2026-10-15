@@ -97,7 +97,10 @@ func (e *Engine) ExtractContent(relPath string, content []byte) ([]core.SymbolRe
 			Imports:       append([]string(nil), imports...),
 		})
 	}
-	if language == "python" && len(symbols) == 0 && len(imports) > 0 {
+	// An __init__.py marks its directory a package even when empty: module
+	// paths resolve against it (pkg/json is pkg.json, so `import json` is
+	// the standard library's; see the graph's pyNestedInPackage).
+	if language == "python" && len(symbols) == 0 && (len(imports) > 0 || filepath.Base(relPath) == "__init__.py") {
 		// A module that only re-exports (`from ._base import Plain as
 		// Plain`, a package __init__.py) has no symbol to carry its imports,
 		// and the edge index reads imports from symbols: users importing
