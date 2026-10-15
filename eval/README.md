@@ -122,6 +122,16 @@ corpora of each language:
   commons-lang and commons-io). Both snapshots were re-pinned with the
   corrected oracle: commons-lang R 0.9808 -> 0.9970, commons-io
   0.9829 -> 0.9960 on an unchanged Grove build.
+- **Access and erasure bridges** (2026-10-17). javac adds ACC_BRIDGE methods
+  to a public class for public methods it inherits from a package-private
+  superclass (commons-io's `BoundedInputStream.Builder` over
+  `AbstractBuilder.setMaxCount`), and calls link to them. The oracle took a
+  bridge for a declaration at the class's line: the real target looked like a
+  false positive and the bridge appeared as a caller. Bridges now resolve to
+  the method they delegate to and are never callers. Both Java snapshots were
+  re-pinned: on the same Grove build commons-io P 0.9983 -> 1.0000,
+  commons-lang unchanged at 1.0000 (its bridge edges were outside the matched
+  universe); matched universes rose to 99.3% / 99.6%.
 - **Implicit super-constructor calls** (Java, C#): a constructor with no
   `super(...)`/`this(...)` calls the superclass's parameterless constructor,
   which javac emits and the oracle records — 89 of commons-io's misses. The

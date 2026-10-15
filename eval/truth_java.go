@@ -49,6 +49,10 @@ type javaMethod struct {
 	file       string // repo-relative source path
 	line       int    // first LineNumberTable line (inside the body)
 	invokes    []javaInvoke
+	// bridge: javac-synthesized (ACC_BRIDGE) — a public copy of a
+	// package-private superclass's method, or a generic erasure bridge.
+	// It has no source; its body calls the real declaration.
+	bridge bool
 }
 
 type javaInvoke struct {
@@ -134,7 +138,9 @@ func JavaCallTruth(repoRoot string) (TruthFile, []TruthEdge, error) {
 			}
 			m.file = filepath.ToSlash(rel)
 			methods[m.classFQN+"."+m.name+":"+m.descriptor] = m
-			ordered = append(ordered, m)
+			if !m.bridge {
+				ordered = append(ordered, m) // a bridge is no caller of its own
+			}
 		}
 	}
 
@@ -219,7 +225,18 @@ func resolveJavaMethod(methods map[string]*javaMethod, supers map[string][]strin
 		}
 		return nil
 	}
-	return walk(cls)
+	m := walk(cls)
+	// A bridge stands for the method it delegates to: commons-io's public
+	// BoundedInputStream.Builder gets bridges for the package-private
+	// AbstractBuilder's setMaxCount, and calls link to them.
+	for depth := 0; m != nil && m.bridge && depth < 4; depth++ {
+		if len(m.invokes) == 0 {
+			return nil
+		}
+		inv := m.invokes[0]
+		m = resolveJavaMethod(methods, supers, strings.ReplaceAll(inv.classFQN, "/", "."), inv.name+":"+inv.descriptor)
+	}
+	return m
 }
 
 // parseJavapSupers reads a class's direct supertypes from javap's header
@@ -291,6 +308,10 @@ func parseJavap(out, classFQN string) []*javaMethod {
 			cur = &javaMethod{classFQN: classFQN, name: name, file: sourceFile}
 			methods = append(methods, cur)
 			inLineTable = false
+			continue
+		}
+		if cur != nil && strings.Contains(line, "flags:") && strings.Contains(line, "ACC_BRIDGE") {
+			cur.bridge = true
 			continue
 		}
 		if cur != nil && cur.descriptor == "" {
