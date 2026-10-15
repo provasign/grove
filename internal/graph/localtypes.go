@@ -585,6 +585,20 @@ func narrowByLocalType(idx *edgeIndex, sat *interfaceSatisfaction, caller *core.
 	if len(byType) == 0 && caller != nil && caller.Language == "csharp" {
 		byType = csharpExtensionTargets(cands, typ)
 	}
+	if len(byType) == 0 && caller != nil && caller.Language == "swift" {
+		// A protocol extension's member reaches every conforming type
+		// (Files: folder.delete() runs `extension Location { func delete() }`
+		// for Folder: Location).
+		bases := swiftConformances(idx, typ, dirOf(caller.FilePath))
+		for level := 0; level < 4 && len(bases) > 0 && len(byType) == 0; level++ {
+			var next []string
+			for _, b := range bases {
+				byType = append(byType, filterByParent(pool, b)...)
+				next = append(next, swiftConformances(idx, b, dirOf(caller.FilePath))...)
+			}
+			bases = next
+		}
+	}
 	// Class-hierarchy dispatch: a receiver typed by a class or interface
 	// runs whichever subtype's override the instance carries. The declared
 	// method (byType) stays; the overrides and implementors join as
@@ -607,7 +621,12 @@ func narrowByLocalType(idx *edgeIndex, sat *interfaceSatisfaction, caller *core.
 			targets = append(targets, m)
 		}
 	}
-	if sat != nil {
+	if sat != nil && !nominalImplementsLang(lang) {
+		// Structural satisfaction is Go's and TypeScript's rule. A C# or
+		// Java class with a same-shaped method that does not declare the
+		// interface is no implementor: its method is not a dispatch target
+		// (Other.Resolve beside DefaultResolver : IResolver). Declared
+		// implementers arrive through subclassOverrides above.
 		for _, iface := range idx.byName[strings.ToLower(typ)] {
 			if iface.Kind != core.KindInterface || iface.Name != typ ||
 				(caller != nil && !callLanguagesCompatible(caller.Language, iface.Language)) {
@@ -786,6 +805,16 @@ func typeOrInheritedMethodTargets(idx *edgeIndex, caller *core.SymbolRecord, typ
 	return nil
 }
 
+// nominalImplementsLang: languages where implementing an interface takes a
+// declaration (implements / : I / conformance), not a matching method set.
+func nominalImplementsLang(lang string) bool {
+	switch lang {
+	case "java", "csharp", "kotlin", "php", "swift", "scala", "cpp", "objc":
+		return true
+	}
+	return false
+}
+
 func csharpExtensionTargets(cands []*core.SymbolRecord, receiverType string) []*core.SymbolRecord {
 	var out []*core.SymbolRecord
 	for _, cand := range cands {
@@ -795,8 +824,11 @@ func csharpExtensionTargets(cands []*core.SymbolRecord, receiverType string) []*
 		}
 		first := strings.TrimSpace(strings.SplitN(params, ",", 2)[0])
 		fields := strings.Fields(first)
-		if len(fields) >= 3 && fields[0] == "this" && csNormalizeType(fields[1]) == receiverType {
-			out = append(out, cand)
+		if len(fields) >= 3 && fields[0] == "this" {
+			ext := csNormalizeType(fields[1])
+			if ext == receiverType {
+				out = append(out, cand)
+			}
 		}
 	}
 	return out

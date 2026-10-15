@@ -250,6 +250,8 @@ func (jsTSAnalyzer) Analyze(ctx context.Context, req Request) Result {
 			ToLine   int    `json:"toLine"`
 			Line     int    `json:"line"`
 			Col      int    `json:"col"`
+			// Ext names a callee declared outside the project (no To).
+			Ext string `json:"ext"`
 		} `json:"calls"`
 		Types []struct {
 			From     string `json:"from"`
@@ -294,14 +296,26 @@ func (jsTSAnalyzer) Analyze(ctx context.Context, req Request) Result {
 		edges = append(edges, nativeImportEdge(from, to, 0.97))
 	}
 	calls := newPositionedEdges()
+	marks := resolvedMarks{}
 	for _, edge := range payload.Calls {
 		from, okFrom := symbols.atOrTopLevel(edge.From, edge.FromName, edge.FromLine)
+		if edge.Ext != "" {
+			if okFrom {
+				marks.add(from.ID, edge.Ext, edge.Line, edge.Col)
+			}
+			continue
+		}
 		to, okTo := symbols.at(edge.To, edge.ToName, edge.ToLine)
-		if okFrom && okTo && from.ID != to.ID {
+		if okFrom && okTo && from.ID == to.ID {
+			marks.add(from.ID, to.Name, edge.Line, edge.Col)
+			continue
+		}
+		if okFrom && okTo {
 			calls.add(symbolEdge(from, to, core.EdgeCalls, 0.98), edge.Line, edge.Col)
 		}
 	}
 	edges = append(edges, calls.finish()...)
+	edges = append(edges, marks.edges()...)
 	for _, edge := range payload.Types {
 		from, okFrom := symbols.atOrTopLevel(edge.From, edge.FromName, edge.FromLine)
 		to, okTo := symbols.at(edge.To, edge.ToName, edge.ToLine)
@@ -726,6 +740,21 @@ function primaryDecl(sym) {
   });
   return ordered.find(d => d.body) || ordered[0];
 }
+// externalName: the name of a symbol every declaration of which lies
+// outside the project (TypeScript's default libs, node_modules, files
+// outside the root), or undefined.
+function externalName(checker, sym) {
+  if (sym && sym.flags & ts.SymbolFlags.Alias) sym = checker.getAliasedSymbol(sym);
+  if (!sym || !sym.declarations || !sym.declarations.length) return undefined;
+  for (const d of sym.declarations) {
+    const f = d.getSourceFile();
+    if (!f) return undefined;
+    const r = rel(f.fileName);
+    if (!(r.startsWith('..') || path.isAbsolute(r) || r.startsWith('node_modules/') || r.includes('/node_modules/'))) return undefined;
+  }
+  const name = sym.getName && sym.getName();
+  return name && name !== '__function' ? name : undefined;
+}
 function declInfo(checker, sym) {
   if (sym && sym.flags & ts.SymbolFlags.Alias) sym = checker.getAliasedSymbol(sym);
   if (!sym || !sym.declarations || !sym.declarations.length) return undefined;
@@ -874,7 +903,17 @@ function visit(checker, options, host, sf, node, stack) {
   const fromLine = enclosing && enclosing.line;
   if (fromName && ts.isCallExpression(node)) {
     const expr = ts.isPropertyAccessExpression(node.expression) ? node.expression.name : node.expression;
-    const target = declInfo(checker, checker.getSymbolAtLocation(expr));
+    const sym = checker.getSymbolAtLocation(expr);
+    const ext = externalName(checker, sym);
+    const target = ext ? undefined : declInfo(checker, sym);
+    if (ext && (ts.isIdentifier(expr) || ts.isPrivateIdentifier(expr))) {
+      // Declared outside the project (TypeScript's libs, node_modules): no
+      // edge, but grove drops a name-based guess at this position.
+      const at = sf.getLineAndCharacterOfPosition(expr.getStart(sf));
+      const call = {from: rel(sf.fileName), fromName, fromLine, ext, line: at.line + 1, col: at.character + 1};
+      const key = JSON.stringify(call);
+      if (!callKeys.has(key)) { callKeys.add(key); calls.push(call); }
+    }
     if (target) {
       const call = {from: rel(sf.fileName), fromName, fromLine, to: target.file, toName: target.name, toLine: target.line};
       // The called name's position (1-based line, UTF-16 column), only when

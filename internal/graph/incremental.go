@@ -78,6 +78,15 @@ func BuildEdgesDelta(prevEdges []core.Edge, prevSymbols, symbols []core.SymbolRe
 }
 
 func BuildEdgesDeltaMeta(prevEdges []core.Edge, prevSymbols, symbols []core.SymbolRecord, changedFiles map[string]bool, nativeAnalyzedDirs map[string]bool) ([]core.Edge, *DeltaMeta) {
+	return BuildEdgesDeltaMetaWith(prevEdges, prevSymbols, symbols, changedFiles, nativeAnalyzedDirs, nil)
+}
+
+// BuildEdgesDeltaMetaWith also re-resolves the owners in reResolve. Stored
+// edges are the merged set: a name-based guess the compiler superseded is
+// not stored, so when an owner's compiler edges go away (its package stops
+// type-checking mid-edit) its guesses must be computed again, as a full
+// build does (fuzz, 2026-10-15: cobra callers of a half-typed file).
+func BuildEdgesDeltaMetaWith(prevEdges []core.Edge, prevSymbols, symbols []core.SymbolRecord, changedFiles map[string]bool, nativeAnalyzedDirs map[string]bool, reResolve map[string]bool) ([]core.Edge, *DeltaMeta) {
 	if len(prevEdges) == 0 || len(changedFiles) == 0 || hasMainframeSymbols(symbols) {
 		// Mainframe estates force a full rebuild: the include closure makes
 		// per-file invalidation wrong until plan phase 0.4 lands, and these
@@ -127,7 +136,7 @@ func BuildEdgesDeltaMeta(prevEdges []core.Edge, prevSymbols, symbols []core.Symb
 	// after a one-line body edit in ObjectMapper, 2026-10-14). One file's
 	// symbols are cheap next to the fallback.
 	for i := range symbols {
-		if changedFiles[symbols[i].FilePath] {
+		if changedFiles[symbols[i].FilePath] || reResolve[symbols[i].ID] {
 			affected[symbols[i].ID] = true
 		}
 	}

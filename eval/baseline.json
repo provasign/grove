@@ -1,50 +1,50 @@
 {
  "gin": {
   "commit": "d75fcd4",
-  "precision": 0.9599,
+  "precision": 0.9787,
   "recall": 0.9735,
   "tolerance": 0.005,
   "minUniverse": 0.99
  },
  "flask": {
   "commit": "36e4a824",
-  "precision": 0.8544,
-  "recall": 0.7288,
+  "precision": 0.8818,
+  "recall": 0.7412,
   "tolerance": 0.005,
   "minUniverse": 0.97
  },
  "socket.io": {
   "commit": "3ad4e1f2",
-  "precision": 0.9156,
+  "precision": 0.9323,
   "recall": 0.9917,
   "tolerance": 0.005,
   "minUniverse": 0.98
  },
  "express": {
   "commit": "dae209ae",
-  "precision": 0.84,
+  "precision": 0.875,
   "recall": 1,
   "tolerance": 0.02,
   "minUniverse": 0.88
  },
  "commons-lang": {
   "commit": "44298fe",
-  "precision": 0.9631,
-  "recall": 0.9807,
+  "precision": 1.0,
+  "recall": 0.997,
   "minUniverse": 0.96,
   "tolerance": 0.005
  },
  "ripgrep": {
   "commit": "82313cf",
-  "precision": 0.9366,
-  "recall": 0.9047,
+  "precision": 0.965,
+  "recall": 0.9055,
   "tolerance": 0.005,
   "minUniverse": 0.98
  },
  "newtonsoft": {
   "commit": "0a2e291",
-  "precision": 0.935,
-  "recall": 0.9467,
+  "precision": 0.9409,
+  "recall": 0.9563,
   "tolerance": 0.005,
   "minUniverse": 0.99
  },
@@ -57,8 +57,8 @@
  },
  "jansson": {
   "commit": "684e18c",
-  "precision": 0.9991,
-  "recall": 0.9837,
+  "precision": 1.0,
+  "recall": 0.9983,
   "tolerance": 0.005,
   "minUniverse": 0.97
  },
@@ -79,21 +79,21 @@
  "json-framework": {
   "commit": "93e4ca5",
   "precision": 1,
-  "recall": 0.9914,
+  "recall": 1.0,
   "tolerance": 0.02,
   "minUniverse": 0.97
  },
  "cobra": {
   "commit": "adbc881",
-  "precision": 0.9834,
-  "recall": 0.987,
+  "precision": 0.9944,
+  "recall": 0.9889,
   "tolerance": 0.005,
   "minUniverse": 0.99
  },
  "commons-io": {
   "commit": "8ad9867d",
-  "precision": 0.9317,
-  "recall": 0.9776,
+  "precision": 0.9983,
+  "recall": 0.996,
   "tolerance": 0.005,
   "minUniverse": 0.93
  },
@@ -120,21 +120,21 @@
  },
  "Files": {
   "commit": "e85f2b4",
-  "precision": 0.9881,
-  "recall": 0.9222,
+  "precision": 0.9885,
+  "recall": 0.9556,
   "tolerance": 0.02,
   "minUniverse": 0.95
  },
  "CocoaLumberjack": {
   "commit": "f54de25f",
-  "precision": 0.9414,
-  "recall": 0.5679,
+  "precision": 0.9751,
+  "recall": 0.9565,
   "tolerance": 0.02,
   "minUniverse": 0.78
  },
  "csv": {
   "commit": "89ac08c",
-  "precision": 0.8888,
+  "precision": 0.8892,
   "recall": 0.7068,
   "tolerance": 0.005,
   "minUniverse": 0.99

@@ -19,6 +19,16 @@ import (
 
 const defaultTimeout = 5 * time.Second
 
+// compilerBudget is the incremental time budget of a compiler-backed pass:
+// a process start plus attribution scales with the files analyzed.
+func compilerBudget(files int) time.Duration {
+	d := 30*time.Second + time.Duration(files)*25*time.Millisecond
+	if d > 5*time.Minute {
+		d = 5 * time.Minute
+	}
+	return d
+}
+
 // maxScaledTimeout caps the size-scaled analyzer budget.
 const maxScaledTimeout = 60 * time.Second
 
@@ -49,6 +59,11 @@ type Config struct {
 	// package compare them with the current symbols: when declarations
 	// changed, other packages' bindings may change too.
 	PrevChanged []core.SymbolRecord
+	// CallerFiles: files whose stored compiler edges point into the changed
+	// files. When declarations changed, their calls may bind differently
+	// (or the stored edges may not follow the edited declarations), so a
+	// scoped analyzer re-attributes them too.
+	CallerFiles []string
 }
 
 // completionCap bounds a run-to-completion pass (a safety net for a hung
@@ -121,6 +136,8 @@ type Request struct {
 	Resident bool
 	// PrevChanged: see Config.PrevChanged.
 	PrevChanged []core.SymbolRecord
+	// CallerFiles: see Config.CallerFiles.
+	CallerFiles []string
 }
 
 type Result struct {
@@ -243,7 +260,7 @@ func AnalyzeChangedFiles(ctx context.Context, root string, symbols []core.Symbol
 			reqChanged = nil // a full pass analyzes every package
 		}
 		began := time.Now()
-		result := analyzer.Analyze(runCtx, Request{Root: root, Symbols: symbols, Files: reqFiles, ChangedFiles: reqChanged, FileSetChanged: cfg.FileSetChanged, Resident: cfg.Resident, PrevChanged: cfg.PrevChanged})
+		result := analyzer.Analyze(runCtx, Request{Root: root, Symbols: symbols, Files: reqFiles, ChangedFiles: reqChanged, FileSetChanged: cfg.FileSetChanged, Resident: cfg.Resident, PrevChanged: cfg.PrevChanged, CallerFiles: cfg.CallerFiles})
 		timedOut := errors.Is(runCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
 		cancel()
 		mode := "incremental"
@@ -511,6 +528,36 @@ func (loc symbolLocator) at(file, name string, line int) (core.SymbolRecord, boo
 		}
 		if found {
 			return best, true
+		}
+		// No span contains the line (javac's line can sit on an annotation
+		// above the parsed declaration): the same-named symbol starting
+		// nearest it, not whichever the name map holds. That map's winner
+		// depended on input order, so a full and an incremental build bound
+		// FastDateParser.parse's calls to different methods (fuzz,
+		// 2026-10-16: CopyQuotedStrategy.parse).
+		dist, named := -1, 0
+		for _, s := range loc.byFile[file] {
+			if s.Name != name {
+				continue
+			}
+			named++
+			d := s.Span.Start - line
+			if d < 0 {
+				d = -d
+			}
+			if dist < 0 || d < dist {
+				best, dist = s, d
+			}
+		}
+		if dist >= 0 && dist <= 5 {
+			return best, true
+		}
+		if named > 1 {
+			// Several same-named symbols and none near the line: the
+			// compiler named a declaration the parser did not index (a
+			// garbled file lost FastDateParser's later parse overloads).
+			// Binding it to the earliest same-named method was a wrong edge.
+			return core.SymbolRecord{}, false
 		}
 	}
 	s, ok := loc.byName[file+"\x00"+name]

@@ -281,7 +281,10 @@ public class GroveJavacResolver {
         }
         void emit(StringBuilder out, Element target, Boolean write) {
             String[] from = enclosing(), to = declared(target);
-            if (from == null || to == null) return;
+            // A call to a method declared outside the project (the JDK, a
+            // dependency) is still reported, as "ext", so grove can drop a
+            // name-based guess at the same position.
+            if (from == null || to == null && (write != null || target == null)) return;
             // The call expression's own line: grove keeps, per compiler call
             // edge, the lines javac resolved to that target.
             // A chained call split across lines (writer(out)\n    .value(x))
@@ -290,7 +293,7 @@ public class GroveJavacResolver {
             // The position is the method name's own start (line:column,
             // 1-based characters), so an edit can replace exactly that token
             // even when two overloads are called on one line.
-            Tree leaf = getCurrentPath().getLeaf();
+            Tree leaf = posOverride != null ? posOverride : getCurrentPath().getLeaf();
             long at = -1, col = -1;
             if (write == null) {
                 long pos = trees.getSourcePositions().getStartPosition(cu, leaf);
@@ -306,9 +309,13 @@ public class GroveJavacResolver {
                     col = pos - cu.getLineMap().getStartPosition(at) + 1;
                 }
             }
+            String target_ = to != null ? ",\"to\":" + q(to[0]) + ",\"toName\":" + q(to[1]) + ",\"toLine\":" + to[2]
+                : ",\"ext\":" + q(target.getKind() == ElementKind.CONSTRUCTOR ? target.getEnclosingElement().getSimpleName().toString() : target.getSimpleName().toString())
+                  + ",\"extOwner\":" + q(target.getEnclosingElement().getSimpleName().toString());
+            if (to == null && at <= 0) return;
             String json = "{\"from\":" + q(file) + ",\"fromName\":" + q(from[0]) + ",\"fromLine\":" + from[1] +
                 (at > 0 ? ",\"line\":" + at + ",\"col\":" + col : "") +
-                ",\"to\":" + q(to[0]) + ",\"toName\":" + q(to[1]) + ",\"toLine\":" + to[2] +
+                target_ +
                 (write == null ? "" : ",\"write\":" + write) + (inLambda() ? ",\"lambda\":true" + (lambdaAt() == null ? "" : ",\"lambdaAt\":" + q(lambdaAt())) : "") +
                 (inMethodRef ? ",\"ref\":true" : "") + "}";
             if (!seen.add(json)) return;
@@ -328,6 +335,44 @@ public class GroveJavacResolver {
             return super.visitNewClass(t, v);
         }
         boolean inMethodRef = false;
+        // The tree whose start an emitted call is positioned at, when the
+        // call has no expression of its own (a resource's implicit close()).
+        Tree posOverride = null;
+        // try-with-resources calls each resource's close() on exit; there is
+        // no call expression, so the call is positioned at the resource.
+        @Override public Void visitTry(TryTree t, Void v) {
+            for (Tree r : t.getResources()) {
+                javax.lang.model.type.TypeMirror m = trees.getTypeMirror(new TreePath(getCurrentPath(), r));
+                Element close = closeMethod(m);
+                if (close != null) {
+                    posOverride = r instanceof VariableTree ? ((VariableTree) r).getType() : r;
+                    emit(calls, close, null);
+                    posOverride = null;
+                }
+            }
+            return super.visitTry(t, v);
+        }
+        // The close() a resource of static type m binds to: declared on the
+        // type or inherited (superclasses first, then interfaces).
+        Element closeMethod(javax.lang.model.type.TypeMirror m) {
+            if (!(m instanceof javax.lang.model.type.DeclaredType)) return null;
+            Deque<javax.lang.model.type.TypeMirror> work = new ArrayDeque<>();
+            Set<Element> seen = new HashSet<>();
+            work.add(m);
+            while (!work.isEmpty()) {
+                javax.lang.model.type.TypeMirror cur = work.poll();
+                if (!(cur instanceof javax.lang.model.type.DeclaredType)) continue;
+                Element te = ((javax.lang.model.type.DeclaredType) cur).asElement();
+                if (!(te instanceof TypeElement) || !seen.add(te)) continue;
+                for (Element e : te.getEnclosedElements()) {
+                    if (e.getKind() == ElementKind.METHOD && e.getSimpleName().contentEquals("close")
+                        && ((ExecutableElement) e).getParameters().isEmpty()) return e;
+                }
+                work.add(((TypeElement) te).getSuperclass());
+                work.addAll(((TypeElement) te).getInterfaces());
+            }
+            return null;
+        }
         @Override public Void visitMemberReference(MemberReferenceTree t, Void v) {
             Element e = element();
             if (e != null && (e.getKind() == ElementKind.METHOD || e.getKind() == ElementKind.CONSTRUCTOR)) {

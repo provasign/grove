@@ -48,7 +48,18 @@ var securityExtensions = map[string]bool{
 // the derived TEXT id. store.migrateLegacyEdges converts a 2026-10-13.1
 // database in place and advances its stamp; older binaries see the new
 // stamp and rebuild instead of reading an empty "edges" table.
-const ExtractorVersion = "2026-10-15.1"
+// 2026-10-16.1: a call on its own declaration's line takes the call's column, not the
+// declaration name's (astkit fillCallColumns); javac and go/types record calls
+// resolved to libraries or to the caller itself (core.EdgeResolvedCalls).
+// 2026-10-16.2: JS/TS receivers behind `!` or parentheses are kept; an
+// unnamed receiver (`a[i].m()`) is "<expr>", not a bare call.
+// 2026-10-16.3: names imported from packages are recorded (core.JSImportPackage).
+// 2026-10-16.4: argument tokens for string concatenation, C# invocations
+// (call:Name, ToString), array creation, typeof, parentheses and x!.
+// 2026-10-16.5: Objective-C property accessors, C calls in methods, and
+// message sends in macro bodies are call sites.
+// 2026-10-16.6: Swift generic-specialized initializers are call sites.
+const ExtractorVersion = "2026-10-16.6"
 
 // DetectLanguage returns the Grove language tag for a file path.
 // Returns "" for unsupported or security-excluded files.

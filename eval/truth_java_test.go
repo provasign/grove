@@ -62,3 +62,41 @@ func TestJavaCallTruthResolvesInheritedMethods(t *testing.T) {
 		}
 	}
 }
+
+// javap prints a class initializer as `static {};` and generic bounds with
+// `?` before the method name; both start a new method, so their invokes are
+// not attributed to the method printed before them.
+func TestParseJavapStaticInitializerAndWildcardHeaders(t *testing.T) {
+	out := `Compiled from "C.java"
+public class p.C {
+  public java.lang.String toString();
+    descriptor: ()Ljava/lang/String;
+    Code:
+      LineNumberTable:
+        line 10: 0
+  public static <T extends java.lang.Comparable<? super T>> T max(T...);
+    descriptor: ([Ljava/lang/Comparable;)Ljava/lang/Comparable;
+    Code:
+         0: invokestatic  #2                  // Method of:(I)V
+      LineNumberTable:
+        line 20: 0
+  static {};
+    descriptor: ()V
+    Code:
+         0: invokespecial #3                  // Method "<init>":()V
+      LineNumberTable:
+        line 5: 0
+}
+`
+	methods := parseJavap(out, "p.C")
+	byName := map[string]*javaMethod{}
+	for _, m := range methods {
+		byName[m.name] = m
+	}
+	if byName["max"] == nil || len(byName["max"].invokes) != 1 {
+		t.Fatalf("wildcard header not parsed as its own method: %+v", methods)
+	}
+	if byName["<clinit>"] == nil || len(byName["<clinit>"].invokes) != 1 || len(byName["toString"].invokes) != 0 {
+		t.Fatalf("static initializer invokes misattributed: %+v", methods)
+	}
+}

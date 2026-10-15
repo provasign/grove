@@ -36,6 +36,7 @@ var (
 	pyClassRefRe = regexp.MustCompile(`(?m)^\s+(\w+)\s*=\s*(?:\w+\.)?([A-Z]\w*)\s*$`)
 	// x = [await] [self.|mod.]func(...) — typed through func's return
 	// annotation (ctx = self.app_context() → AppContext)
+	pyWalrusCallRe = regexp.MustCompile(`\(\s*(\w+)\s*:=\s*(?:await\s+)?(?:((?:\w+\.)*\w+)\.)?([a-z_]\w*)\(`)
 	pyCallAssignRe = regexp.MustCompile(`(?m)^\s*(\w+)\s*=\s*(?:await\s+)?(?:((?:\w+\.)*\w+)\.)?([a-z_]\w*)\(`)
 	// with [async] item[, item]: — parenthesized items may span lines, and
 	// the suite may begin on the same line after the colon.
@@ -553,6 +554,42 @@ func pyResolveClass(idx *edgeIndex, className, preferDir string) *core.SymbolRec
 }
 
 // pyLocalTypes infers identifier → type name for one Python callable.
+// pyBuiltins are annotation types whose methods are never the project's.
+var pyBuiltins = map[string]bool{
+	"dict": true, "list": true, "set": true, "frozenset": true, "tuple": true, "str": true, "bytes": true,
+	"bytearray": true, "int": true, "float": true, "bool": true, "complex": true,
+	"Dict": true, "List": true, "Set": true, "FrozenSet": true, "Tuple": true, "DefaultDict": true,
+}
+
+// pyBuiltinAnnotation returns the builtin container or scalar type an
+// annotation names (dict, t.Dict[str, int], Optional[list], dict | None),
+// or "".
+func pyBuiltinAnnotation(ann string) string {
+	ann = strings.TrimSpace(ann)
+	for _, wrap := range []string{"Optional[", "t.Optional[", "typing.Optional["} {
+		if strings.HasPrefix(ann, wrap) && strings.HasSuffix(ann, "]") {
+			ann = strings.TrimSpace(ann[len(wrap) : len(ann)-1])
+		}
+	}
+	if head, tail, ok := strings.Cut(ann, "|"); ok {
+		if strings.TrimSpace(tail) != "None" {
+			return ""
+		}
+		ann = strings.TrimSpace(head)
+	}
+	if i := strings.IndexByte(ann, '['); i >= 0 {
+		ann = ann[:i]
+	}
+	ann = strings.Trim(ann, `"' `)
+	for _, prefix := range []string{"t.", "typing.", "builtins."} {
+		ann = strings.TrimPrefix(ann, prefix)
+	}
+	if pyBuiltins[ann] {
+		return ann
+	}
+	return ""
+}
+
 func pyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 	out := map[string]string{}
 
@@ -619,6 +656,11 @@ func pyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 			}
 			if t := pyAnnotationType(idx, symbol, ann); t != "" && name != "" {
 				out[name] = t
+			} else if b := pyBuiltinAnnotation(ann); b != "" && name != "" && !typeSymbolExists(idx, b) {
+				// `options: dict`: options.get(...) is dict.get, never a
+				// same-named method of ours (flask: Scaffold.get, oracle
+				// review 2026-10-15).
+				out[name] = "extern:" + b
 			}
 		}
 	}
@@ -701,7 +743,10 @@ func pyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 				aliased[m[1]] = true
 			}
 		}
-		for _, m := range pyCallAssignRe.FindAllStringSubmatch(body, -1) {
+		callAssigns := pyCallAssignRe.FindAllStringSubmatch(body, -1)
+		// `if (ctx := _cv_app.get(None)) is not None:` assigns too.
+		callAssigns = append(callAssigns, pyWalrusCallRe.FindAllStringSubmatch(body, -1)...)
+		for _, m := range callAssigns {
 			if _, done := out[m[1]]; done {
 				continue // annotation / constructor evidence wins
 			}
@@ -710,6 +755,15 @@ func pyLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 				// ContextVar, not anything indexed — its `get` is not the
 				// repo's `get`. Only an own-object chain, a typed local, or
 				// a bare call is typed.
+				if _, typed := out[q]; !typed && m[3] == "get" {
+					// ctx = _cv_app.get(None) with `_cv_app: ContextVar[AppContext]`
+					// at module level: the value the ContextVar holds (flask
+					// helpers, oracle review 2026-10-15).
+					if t := pyContextVarType(idx, symbol, q); t != "" {
+						out[m[1]] = t
+						continue
+					}
+				}
 				if _, typed := out[q]; !typed {
 					// req = wrappers.Request.from_values(...): a factory
 					// called on an indexed class is typed through its own
@@ -848,8 +902,30 @@ func pyClassAttrTypes(idx *edgeIndex, symbol *core.SymbolRecord, className strin
 				record(m[1], m[2])
 			}
 		}
+		// `self.serializer = serializer` with `serializer: TaggedJSONSerializer`
+		// in the signature (flask JSONTag, oracle review 2026-10-15).
+		paramTypes := map[string]string{}
+		if params := pyDefParams(init.RawText); params != "" {
+			for _, g := range splitTopLevel(params, ',') {
+				name, ann, ok := strings.Cut(strings.TrimSpace(g), ":")
+				if !ok {
+					continue
+				}
+				if eq := strings.Index(ann, "="); eq >= 0 {
+					ann = ann[:eq]
+				}
+				if t := pyAnnotationType(idx, init, ann); t != "" {
+					paramTypes[strings.TrimSpace(strings.TrimLeft(name, "*"))] = t
+				}
+			}
+		}
+		for _, m := range pySelfParamRe.FindAllStringSubmatch(body, -1) {
+			record(m[1], paramTypes[m[2]])
+		}
 	}
 }
+
+var pySelfParamRe = regexp.MustCompile(`(?m)^\s*self\.(\w+)\s*=\s*(\w+)\s*$`)
 
 // pyClassAttrs holds a class body's own attribute statements: annotations
 // (`name: T`, `name: T = v`) and class references (`name = SomeClass`), as
@@ -2026,6 +2102,43 @@ func pyChainType(idx *edgeIndex, symbol *core.SymbolRecord, localTypes map[strin
 		typ = strings.TrimPrefix(attrs[seg], "class:")
 	}
 	return typ
+}
+
+var pyContextVarRe = regexp.MustCompile(`:\s*(?:contextvars\.)?ContextVar\[\s*["']?([\w.]+)["']?\s*\]`)
+
+// pyContextVarType returns T for a module-level variable named name
+// annotated `ContextVar[T]` (the caller's own module first, else the one
+// such variable in the repository), when T is indexed.
+func pyContextVarType(idx *edgeIndex, symbol *core.SymbolRecord, name string) string {
+	var found []*core.SymbolRecord
+	for _, cand := range namedSymbols(idx, name) {
+		if cand.Language != "python" || cand.ParentSymbol != "" || cand.Kind != core.KindVariable {
+			continue
+		}
+		if cand.FilePath == symbol.FilePath {
+			found = []*core.SymbolRecord{cand}
+			break
+		}
+		found = append(found, cand)
+	}
+	if len(found) != 1 {
+		return ""
+	}
+	m := pyContextVarRe.FindStringSubmatch(found[0].Signature)
+	if m == nil {
+		m = pyContextVarRe.FindStringSubmatch(firstLine(found[0].RawText))
+	}
+	if m == nil {
+		return ""
+	}
+	t := m[1]
+	if i := strings.LastIndexByte(t, '.'); i >= 0 {
+		t = t[i+1:]
+	}
+	if !typeSymbolExists(idx, t) {
+		return ""
+	}
+	return t
 }
 
 // pyUniformMethodReturn types `x = recv.method(...)` when recv is an untyped

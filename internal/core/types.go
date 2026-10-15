@@ -89,7 +89,37 @@ const (
 	EdgeWrites    EdgeType = "writes"        // symbol writes a data item
 	EdgeRedefines EdgeType = "redefines"     // alternate view over the same storage
 	EdgeBinds     EdgeType = "binds-dataset" // logical file bound to a physical dataset
+
+	// EdgeResolvedCalls is a compiler pass's record, on the caller itself
+	// (From == To), of calls it resolved to no other indexed symbol: a
+	// library method, or the caller recursing. Lines lists them as
+	// "name@line:col". It is not a graph edge: the graph sets these apart
+	// at install and only stores them, so a name-based guess at the same
+	// call position can be dropped in a full and an incremental build alike.
+	EdgeResolvedCalls EdgeType = "resolved-calls"
+	// EdgeExternalContract is a compiler pass's record, on a method itself
+	// (From == To), of the library interfaces whose contract the method
+	// fulfils (Lines: "net/http.ResponseWriter,io.Writer"). Go satisfies
+	// interfaces implicitly, so no extends/implements clause says so; calls
+	// typed against those interfaces may reach the method at run time. Set
+	// apart at install like EdgeResolvedCalls.
+	EdgeExternalContract EdgeType = "external-contract"
 )
+
+const (
+	// EdgeFuncFieldCall records, on a caller (From == To), its calls through
+	// a function-valued struct field: Lines "dir:Type.Field@line:col,...".
+	EdgeFuncFieldCall EdgeType = "func-field-call"
+	// EdgeFuncFieldStore records a function (To) stored into a
+	// function-valued struct field by From: Lines "dir:Type.Field". The
+	// graph joins stores and calls of the same field into call edges.
+	EdgeFuncFieldStore EdgeType = "func-field-store"
+)
+
+// IsMarkerEdge reports the stored per-symbol records that are not graph edges.
+func IsMarkerEdge(t EdgeType) bool {
+	return t == EdgeResolvedCalls || t == EdgeExternalContract || t == EdgeFuncFieldCall || t == EdgeFuncFieldStore
+}
 
 type Edge struct {
 	From       string         `json:"from"`
@@ -275,6 +305,7 @@ const (
 	ReasonMethodSet      EdgeReason = "method-set"      // overrides/implements by method-set inclusion
 	ReasonDecorator      EdgeReason = "decorator"       // decorator/wrapper call edge
 	ReasonFunctionRef    EdgeReason = "function-ref"    // C/C++ function passed as an argument (function-pointer reach)
+	ReasonFuncField      EdgeReason = "func-field"      // a call through a function-valued field reaches a function stored in it
 	ReasonImplicitDunder EdgeReason = "implicit-dunder" // language-implicit protocol method (e.g. Python __setattr__ on "x.y = v") with no call site in source
 )
 

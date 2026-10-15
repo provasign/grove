@@ -165,3 +165,41 @@ func charColumn(line string, byteOff int) int {
 	}
 	return n + 1
 }
+
+// resolvedMarks collects, per caller, the calls a compiler pass resolved to
+// no other indexed symbol (a library method, or the caller itself), and
+// emits them as core.EdgeResolvedCalls records.
+type resolvedMarks map[string]map[string]bool // caller ID -> "name@line:col"
+
+func (m resolvedMarks) add(caller, name string, line, col int) {
+	if caller == "" || name == "" || line <= 0 {
+		return
+	}
+	pos := name + "@" + strconv.Itoa(line)
+	if col > 0 {
+		pos += ":" + strconv.Itoa(col)
+	}
+	if m[caller] == nil {
+		m[caller] = map[string]bool{}
+	}
+	m[caller][pos] = true
+}
+
+func (m resolvedMarks) edges() []core.Edge {
+	callers := make([]string, 0, len(m))
+	for c := range m {
+		callers = append(callers, c)
+	}
+	sort.Strings(callers)
+	out := make([]core.Edge, 0, len(callers))
+	for _, c := range callers {
+		list := make([]string, 0, len(m[c]))
+		for p := range m[c] {
+			list = append(list, p)
+		}
+		sort.Strings(list)
+		out = append(out, core.Edge{From: c, To: c, Type: core.EdgeResolvedCalls, Confidence: 0.99,
+			Source: core.EvidenceSourceNative, Lines: strings.Join(list, ",")})
+	}
+	return out
+}

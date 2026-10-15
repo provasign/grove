@@ -114,6 +114,14 @@ corpora of each language:
   build scores R 0.913. The **commons-lang snapshot was re-pinned** with the
   corrected oracle too: R 0.9202 → 0.9517 on an unchanged Grove build (its
   gate moves up accordingly).
+- **The Java oracle missed `static {};` and wildcard-bounded headers**
+  (2026-10-16). javap prints a class initializer as `static {};` and a
+  generic bound like `<T extends Comparable<? super T>>` before the method
+  name; neither matched `javapMethodRe`, so their invokes were attributed to
+  the method printed before them (81 + 26 apparent misses across
+  commons-lang and commons-io). Both snapshots were re-pinned with the
+  corrected oracle: commons-lang R 0.9808 -> 0.9970, commons-io
+  0.9829 -> 0.9960 on an unchanged Grove build.
 - **Implicit super-constructor calls** (Java, C#): a constructor with no
   `super(...)`/`this(...)` calls the superclass's parameterless constructor,
   which javac emits and the oracle records — 89 of commons-io's misses. The

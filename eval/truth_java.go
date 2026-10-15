@@ -27,7 +27,13 @@ var (
 	// attributed to the previous method — commons-io declares throws on
 	// most of its API, and its misses looked like calls from the wrong
 	// caller.
-	javapMethodRe = regexp.MustCompile(`^  [\w<>\[\].$, ]*?([\w$.]+|"<init>")\((.*)\)(?: throws [\w.$, ]+)?;$`)
+	// The prefix holds modifiers and the return type, generic bounds
+	// included: `<T extends Comparable<? super T>> T max(T...)` needs ? and &.
+	javapMethodRe = regexp.MustCompile(`^  [\w<>\[\].$, ?&]*?([\w$.]+|"<init>")\((.*)\)(?: throws [\w.$, ]+)?;$`)
+	// `static {};` is the class initializer: its invokes belong to no
+	// source method (attributing them to the method javap printed before it
+	// made 81 commons-lang/io calls look missed, 2026-10-15).
+	javapClinitRe = regexp.MustCompile(`^  static \{\};$`)
 	// 5: invokevirtual #16  // Method demo/Helper.size:(...)I
 	javapInvokeRe = regexp.MustCompile(`// (?:Interface)?Method (?:([\w/$]+)\.)?"?([\w$<>]+)"?:(\(.*?\)\S+)`)
 	javapLineRe   = regexp.MustCompile(`^\s+line (\d+): \d+`)
@@ -269,6 +275,12 @@ func parseJavap(out, classFQN string) []*javaMethod {
 	for _, line := range strings.Split(out, "\n") {
 		if m := javapSourceRe.FindStringSubmatch(line); m != nil {
 			sourceFile = m[1]
+			continue
+		}
+		if javapClinitRe.MatchString(line) {
+			cur = &javaMethod{classFQN: classFQN, name: "<clinit>", file: sourceFile}
+			methods = append(methods, cur)
+			inLineTable = false
 			continue
 		}
 		if m := javapMethodRe.FindStringSubmatch(line); m != nil {

@@ -594,10 +594,18 @@ func extractImportsFromAST(language string, src []byte) ([]string, bool) {
 			if len(match) != 2 {
 				continue
 			}
+			bare := imp.Path != "" && imp.Path[0] != '.' && imp.Path[0] != '/'
 			for _, item := range strings.Split(match[1], ",") {
 				item = strings.TrimSpace(item)
 				item = strings.TrimSpace(strings.TrimPrefix(item, "type "))
 				parts := strings.Fields(item)
+				if bare && (len(parts) == 1 || len(parts) == 3 && parts[1] == "as") {
+					encoded := core.JSImportPackage(parts[len(parts)-1], imp.Path)
+					if encoded != "" && !seen[encoded] {
+						seen[encoded] = true
+						imports = append(imports, encoded)
+					}
+				}
 				if len(parts) != 3 || parts[1] != "as" {
 					continue
 				}

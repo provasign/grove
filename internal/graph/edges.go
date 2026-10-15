@@ -42,6 +42,10 @@ type edgeIndex struct {
 	// import — ~0.5 billion string ops on a 19k-file monorepo.
 	dirFilesLower  map[string][]string
 	dirFilesByBase map[string][]string
+	// workspaceFiles memoizes jsWorkspaceFiles per package specifier.
+	workspaceFiles sync.Map
+	// jsPackageImports: file -> local name -> package it is imported from.
+	jsPackageImports map[string]map[string]string
 
 	// importPathToFiles maps a slash-separated import path without extension to
 	// files whose path matches that import exactly or by package directory.
@@ -131,6 +135,7 @@ func newEdgeIndex(symbols []core.SymbolRecord) *edgeIndex {
 		importedFilesCache: make(map[string]map[string]struct{}),
 		pyImportBindings:   make(map[string]map[string][]pyImportBinding),
 		jsImportAliases:    make(map[string]map[string]string),
+		jsPackageImports:   make(map[string]map[string]string),
 		jsReExports:        make(map[string]map[string]struct{}),
 		goImportAliases:    make(map[string]map[string]string),
 	}
@@ -166,6 +171,13 @@ func newEdgeIndex(symbols []core.SymbolRecord) *edgeIndex {
 		}
 		for _, imp := range s.Imports {
 			if _, _, _, binding := core.ParsePythonImportBinding(imp); binding {
+				continue
+			}
+			if local, pkg, named := core.ParseJSImportPackage(imp); named {
+				if idx.jsPackageImports[s.FilePath] == nil {
+					idx.jsPackageImports[s.FilePath] = map[string]string{}
+				}
+				idx.jsPackageImports[s.FilePath][local] = pkg
 				continue
 			}
 			if local, target, alias := core.ParseJSImportAlias(imp); alias {
@@ -280,6 +292,9 @@ func (idx *edgeIndex) bindPySubmoduleImports(symbols []core.SymbolRecord) {
 			if _, _, alias := core.ParseJSImportAlias(imp); alias {
 				continue
 			}
+			if _, _, named := core.ParseJSImportPackage(imp); named {
+				continue
+			}
 			if _, _, alias := core.ParseGoImportAlias(imp); alias {
 				continue
 			}
@@ -324,12 +339,211 @@ func (idx *edgeIndex) pyModuleFiles(fromFile, modPath string) []string {
 	joined := strings.ToLower(strings.Join(segs, "/"))
 	var out []string
 	for _, pathKey := range idx.pathSuffix[joined] {
+		if idx.pyNestedInPackage(pathKey, joined) {
+			continue
+		}
 		out = append(out, idx.importPathToFiles[pathKey]...)
 	}
 	for _, dir := range idx.dirSuffix[joined] {
+		if idx.pyNestedInPackage(dir, joined) {
+			continue
+		}
 		out = append(out, idx.dirFilesLower[dir]...)
 	}
 	return out
+}
+
+// pyHierarchyKnown reports whether every base in cls's ancestry (four
+// levels) is an indexed class; an aliased or external base hides what the
+// class inherits (flask: `class Blueprint(SansioBlueprint)`).
+func pyHierarchyKnown(idx *edgeIndex, cls, dir string) bool {
+	level := []string{cls}
+	seen := map[string]bool{}
+	for depth := 0; depth < 4 && len(level) > 0; depth++ {
+		var next []string
+		for _, c := range level {
+			if seen[c] {
+				continue
+			}
+			seen[c] = true
+			classes := 0
+			for _, cand := range idx.byName[strings.ToLower(c)] {
+				if cand.Name == c && cand.Kind == core.KindClass && cand.Language == "python" {
+					classes++
+				}
+			}
+			if classes > 1 {
+				return false // two classes share the name: the walk cannot tell them apart
+			}
+			for _, b := range pyBaseClasses(idx, c, dir) {
+				if b == "object" || b == "ABC" || b == "abc.ABC" || b == "t.Generic" || strings.HasPrefix(b, "Generic[") {
+					continue
+				}
+				if !typeSymbolExists(idx, b) {
+					return false
+				}
+				next = append(next, b)
+			}
+		}
+		level = next
+	}
+	return true
+}
+
+// tsElementProducers are library methods returning an element of their
+// receiver (Map.get, Array.find), whose type may be one of ours.
+var tsElementProducers = map[string]bool{
+	"get": true, "find": true, "findLast": true, "at": true, "pop": true, "shift": true,
+	"deref": true, "next": true, "item": true, "peek": true, "first": true, "last": true,
+}
+
+// tsProducerReturnTypes returns the declared return types (bare names) of
+// the TS/JS functions and methods named producer, and whether any exists. An
+// unannotated producer yields no types: nothing to narrow by.
+func tsProducerReturnTypes(idx *edgeIndex, producer string) ([]string, bool) {
+	exists := false
+	seen := map[string]bool{}
+	var out []string
+	for _, f := range idx.byName[strings.ToLower(producer)] {
+		if f.Name != producer || !tsFamilyLang(f.Language) {
+			continue
+		}
+		switch f.Kind {
+		case core.KindMethod, core.KindFunction, core.KindField, core.KindVariable:
+		default:
+			continue
+		}
+		exists = true
+		ret := tsDeclaredReturnType(f.Signature)
+		if ret == "" || ret == tsAnonymousType || ret == "this" || ret == "void" || ret == "any" || ret == "unknown" {
+			return nil, true
+		}
+		if j := strings.LastIndexByte(ret, '.'); j >= 0 {
+			ret = ret[j+1:]
+		}
+		if !seen[ret] {
+			seen[ret] = true
+			out = append(out, ret)
+		}
+	}
+	return out, exists
+}
+
+func allTypesIndexed(idx *edgeIndex, types []string) bool {
+	for _, t := range types {
+		if !typeSymbolExists(idx, t) {
+			return false
+		}
+	}
+	return true
+}
+
+// csFieldTypeByName returns the declared type shared by every C# field or
+// property named name, or "" when there are none or they disagree.
+func csFieldTypeByName(idx *edgeIndex, name string) string {
+	typ := ""
+	for _, f := range idx.byName[strings.ToLower(name)] {
+		if f.Name != name || f.Language != "csharp" || f.Kind != core.KindField || f.ParentSymbol == "" {
+			continue
+		}
+		fields := map[string]string{}
+		csClassFieldTypes(idx, f.ParentSymbol, f.FilePath, fields)
+		t := fields[name]
+		if t == "" || typ != "" && t != typ {
+			return ""
+		}
+		typ = t
+	}
+	if typ == "" || !typeSymbolExists(idx, typ) {
+		return ""
+	}
+	return typ
+}
+
+// cParamNames returns the parameter names of a C function's signature.
+func cParamNames(fn *core.SymbolRecord) map[string]bool {
+	sig := fn.Signature
+	open := strings.IndexByte(sig, '(')
+	close := strings.LastIndexByte(sig, ')')
+	out := map[string]bool{}
+	if open < 0 || close <= open {
+		return out
+	}
+	for _, p := range splitTopLevel(sig[open+1:close], ',') {
+		p = strings.TrimSpace(p)
+		if i := strings.IndexByte(p, '['); i >= 0 {
+			p = p[:i]
+		}
+		fields := strings.FieldsFunc(p, func(r rune) bool { return r == ' ' || r == '*' || r == '\t' || r == '&' })
+		if len(fields) >= 2 {
+			out[fields[len(fields)-1]] = true
+		}
+	}
+	return out
+}
+
+// cHeaderStaticFanout reports whether caller sits in a header and every
+// candidate is a static function in a file that includes that header.
+func cHeaderStaticFanout(idx *edgeIndex, caller *core.SymbolRecord, cands []*core.SymbolRecord) bool {
+	if !strings.HasSuffix(caller.FilePath, ".h") && !strings.HasSuffix(caller.FilePath, ".hpp") || len(cands) == 0 {
+		return false
+	}
+	header := baseOf(caller.FilePath)
+	for _, c := range cands {
+		if c.Kind != core.KindFunction || !hasModifier(c, "static") {
+			return false
+		}
+		included := false
+		for imp := range idx.fileImports[c.FilePath] {
+			if baseOf(strings.Trim(imp, "\"<> ")) == header {
+				included = true
+				break
+			}
+		}
+		if !included {
+			return false
+		}
+	}
+	return true
+}
+
+// pyIsSubclass reports whether cls inherits from base (within four levels).
+func pyIsSubclass(idx *edgeIndex, cls, base, dir string) bool {
+	level := []string{cls}
+	seen := map[string]bool{}
+	for depth := 0; depth < 5 && len(level) > 0; depth++ {
+		var next []string
+		for _, c := range level {
+			if c == base && depth > 0 {
+				return true
+			}
+			if seen[c] {
+				continue
+			}
+			seen[c] = true
+			next = append(next, pyBaseClasses(idx, c, dir)...)
+		}
+		level = next
+	}
+	return false
+}
+
+// pyNestedInPackage reports whether key matched the absolute module path
+// suffix only below a package: in pkg/json, pkg/ has an __init__.py, so the
+// module is pkg.json and `import json` is the standard library's (flask's
+// json/provider.py: json.loads bound to its own loads methods, oracle
+// review 2026-10-15). Suffix matching stays for source roots (src/flask).
+func (idx *edgeIndex) pyNestedInPackage(key, suffix string) bool {
+	if key == suffix || !strings.HasSuffix(key, "/"+suffix) {
+		return false
+	}
+	parent := strings.TrimSuffix(key, "/"+suffix)
+	for _, f := range idx.dirFilesLower[parent] {
+		if strings.HasSuffix(f, "/__init__.py") && strings.EqualFold(f[:len(f)-len("/__init__.py")], parent) {
+			return true
+		}
+	}
+	return false
 }
 
 // segmentSuffixIndex maps each segment-boundary suffix of every key to the
@@ -756,7 +970,7 @@ func declaresLocalFunction(symbol *core.SymbolRecord, body, name string) bool {
 	var pat string
 	switch symbol.Language {
 	case "javascript", "typescript", "tsx":
-		pat = `(?m)^\s*(?:async\s+)?function\*?\s+` + regexp.QuoteMeta(name) + `\s*\(`
+		pat = `(?m)^\s*(?:(?:async\s+)?function\*?\s+` + regexp.QuoteMeta(name) + `\s*\(|(?:const|let|var)\s+` + regexp.QuoteMeta(name) + `\s*=)`
 	case "python":
 		pat = `(?m)^\s*(?:async\s+)?def\s+` + regexp.QuoteMeta(name) + `\s*\(`
 	case "go":
@@ -1543,6 +1757,9 @@ func buildDefinesAndImports(symbols []core.SymbolRecord) []core.Edge {
 				continue
 			}
 			if _, _, alias := core.ParseJSImportAlias(imp); alias {
+				continue
+			}
+			if _, _, named := core.ParseJSImportPackage(imp); named {
 				continue
 			}
 			if _, reexport := core.ParseJSImportReExport(imp); reexport {
@@ -2359,6 +2576,19 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			if _, isSelf := attrSelfVars[qualifier]; isSelf && classLanguage(symbol.Language) && len(filterByParent(cands, symbol.ParentSymbol)) == 0 {
 				if inherited := inheritedTargets(idx, &symbol, name, true); len(inherited) > 0 {
 					cands = inherited
+				} else if symbol.Language == "python" && symbol.ParentSymbol != "" && pyHierarchyKnown(idx, symbol.ParentSymbol, dirOf(symbol.FilePath)) {
+					// Neither the class nor an ancestor declares it: a plain
+					// instance attribute, or a subclass's property (self may
+					// be a subclass instance) — never an unrelated class's
+					// (flask Blueprint self.name -> App.name, oracle review
+					// 2026-10-15).
+					var sub []*core.SymbolRecord
+					for _, cand := range cands {
+						if pyIsSubclass(idx, cand.ParentSymbol, symbol.ParentSymbol, dirOf(cand.FilePath)) {
+							sub = append(sub, cand)
+						}
+					}
+					cands = sub
 				}
 			}
 			if symbol.Language == "python" && len(cands) == 0 && qualifier != "" {
@@ -2509,6 +2739,21 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				callPos = strconv.Itoa(cs.Line)
 				if cs.Col > 0 {
 					callPos += ":" + strconv.Itoa(cs.Col)
+				}
+			}
+			if symbol.Language == "csharp" {
+				// A call argument our methods cannot type is unknown, so the
+				// text recovery below still runs (value.GetValueOrDefault()
+				// is typed from value's declaration there).
+				for i, a := range cs.Args {
+					if name, ok := strings.CutPrefix(a, "call:"); ok {
+						if rets, _ := csProducerReturnTypes(idx, name); len(rets) != 1 {
+							if i == 0 || cs.Args[i] == a {
+								cs.Args = append([]string(nil), cs.Args...)
+							}
+							cs.Args[i] = ""
+						}
+					}
 				}
 			}
 			if symbol.Language == "csharp" && cs.Argc > 0 && hasUnknownArg(cs.Args, cs.Argc) {
@@ -2795,6 +3040,15 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				}
 				fmt.Fprintf(os.Stderr, "grove-trace %s: callee=%q qual=%q args=%v cands=%d capped=%v scope=%d first=%v\n", symbol.QualifiedName, cs.Callee, qualifier, cs.Args, len(cands), capped, len(scope), ids)
 			}
+			headerStatic := false
+			if capped && (symbol.Language == "c" || symbol.Language == "cpp") && qualifier == "" && cHeaderStaticFanout(idx, &symbol, cands) {
+				// A function defined in a header calls a static function each
+				// includer defines (jansson's test util.h main() ->
+				// run_tests in 18 test files): every includer's own copy is
+				// the target in its translation unit, not a fan-out guess.
+				capped = false
+				headerStatic = true
+			}
 			if symbol.Language == "python" && qualifier != "" && cs.Argc > 0 && len(cands) > 0 &&
 				!pyCallHasSplat(idx, &symbol, cs) {
 				// Python has no overloading: a method whose parameters cannot
@@ -2818,14 +3072,15 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				}
 				cands = compatible
 			}
-			rustExprReceiver := symbol.Language == "rust" && qualifier == "<expr>"
-			if rustExprReceiver {
+			exprReceiver := qualifier == "<expr>"
+			if exprReceiver {
 				// A method on an expression astkit could not name (`(a +
-				// b).m()`, `xs[i].m()`): an untyped receiver, resolved by name
-				// like one, but never a bare call.
+				// b).m()`, `xs[i].m()`, `this.clients[id].close()`): an
+				// untyped receiver, resolved by name like one, but never a
+				// bare call.
 				qualifier = ""
 			}
-			if symbol.Language == "rust" && qualifier == "" && !rustExprReceiver && !strings.HasSuffix(cs.Callee, "!") {
+			if symbol.Language == "rust" && qualifier == "" && !exprReceiver && !strings.HasSuffix(cs.Callee, "!") {
 				// A bare Rust call never reaches a method (that takes self.
 				// or Type::): `matched(m)` calling a closure parameter bound
 				// to every method named matched (ripgrep printer, 11 edges).
@@ -2995,6 +3250,22 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					cands = reachable
 				}
 			}
+			if qualifier == "" && !exprReceiver && len(cands) > 0 && (symbol.Language == "javascript" || symbol.Language == "typescript" || symbol.Language == "tsx") {
+				// A bare call in JS/TS never reaches a class member: methods
+				// need a receiver. socket.io's `run()` (a local arrow) and
+				// express's `send(req, path, opts)` (the send module) were
+				// bound to same-named methods (oracle review 2026-10-15).
+				var free []*core.SymbolRecord
+				for _, cand := range cands {
+					if cand.Kind != core.KindMethod && cand.Kind != core.KindField {
+						free = append(free, cand)
+					}
+				}
+				if len(free) == 0 {
+					continue
+				}
+				cands = free
+			}
 			if symbol.Language == "objc" && len(cands) > 0 {
 				// Objective-C receivers, at the altitude clang's typed AST
 				// reports (the oracle): a message to `super` binds the
@@ -3041,6 +3312,26 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 						cands = byType
 					} else {
 						continue
+					}
+				}
+				if qualifier != "" {
+					// `+flushLog` and `-flushLog` share a selector. A message
+					// to a class name, or to self/super inside a class
+					// method, sends the class method; any other receiver an
+					// instance method (CocoaLumberjack, oracle review
+					// 2026-10-15).
+					wantClass := qualifier[0] >= 'A' && qualifier[0] <= 'Z' && !strings.HasSuffix(qualifier, "()")
+					if qualifier == "self" || qualifier == "super" {
+						wantClass = hasModifier(&symbol, "class")
+					}
+					var side []*core.SymbolRecord
+					for _, cand := range cands {
+						if hasModifier(cand, "class") == wantClass {
+							side = append(side, cand)
+						}
+					}
+					if len(side) > 0 {
+						cands = side
 					}
 				}
 			}
@@ -3223,6 +3514,42 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 						bases = next
 					}
 					cands = byType
+				} else if rets, exists := csProducerReturnTypes(idx, typ); !exists {
+					// Not a type and no method of ours by that name: a
+					// library call's result (LINQ Select, a BCL getter).
+					// Our extension methods may apply to it; same-named
+					// members of our types do not, unless the library method
+					// returns its element type (GetValueOrDefault, First),
+					// which may be ours (newtonsoft: 67 such guesses, oracle
+					// review 2026-10-15).
+					if !csElementProducers[typ] {
+						cands = csharpExtensionMethods(cands)
+					}
+				} else if len(rets) > 0 {
+					// Our producer's declared result type picks the method
+					// (channel.Property("x").Remove() -> JProperty's chain).
+					var byType []*core.SymbolRecord
+					for _, ret := range rets {
+						if !typeSymbolExists(idx, ret) {
+							byType = append(byType, csharpExtensionTargets(cands, ret)...)
+							continue
+						}
+						found := filterByParent(cands, ret)
+						bases := baseClassesFor(idx, symbol.Language, ret, dirOf(symbol.FilePath))
+						for level := 0; level < 4 && len(bases) > 0 && len(found) == 0; level++ {
+							var next []string
+							for _, base := range bases {
+								found = append(found, filterByParent(cands, base)...)
+								next = append(next, baseClassesFor(idx, symbol.Language, base, dirOf(symbol.FilePath))...)
+							}
+							bases = next
+						}
+						if len(found) == 0 {
+							found = csharpExtensionTargets(cands, ret)
+						}
+						byType = append(byType, found...)
+					}
+					cands = byType
 				}
 			}
 			if tsFamilyLang(symbol.Language) && strings.HasSuffix(qualifier, "()") {
@@ -3233,6 +3560,27 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				typ := strings.TrimSuffix(qualifier, "()")
 				if typeSymbolExists(idx, typ) {
 					cands = typeOrInheritedMethodTargets(idx, &symbol, typ, calleeName, cands)
+				} else if rets, exists := tsProducerReturnTypes(idx, typ); !exists {
+					// No function or method of ours by that name: a library
+					// call's result (arr.map(...).filter, JSON.parse(...).x)
+					// (oracle review 2026-10-15: socket.io fan-out) — unless
+					// the library method returns an element it holds
+					// (map.get(k)!.createChild()), which may be ours.
+					if !tsElementProducers[typ] {
+						cands = nil
+					}
+				} else if len(rets) > 0 {
+					// this.newBroadcastOperator().to(room): the producer's
+					// declared return type picks the method.
+					var byType []*core.SymbolRecord
+					for _, ret := range rets {
+						if typeSymbolExists(idx, ret) {
+							byType = append(byType, typeOrInheritedMethodTargets(idx, &symbol, ret, calleeName, cands)...)
+						}
+					}
+					if len(byType) > 0 || allTypesIndexed(idx, rets) {
+						cands = byType
+					}
 				}
 			}
 			if (symbol.Language == "csharp" || symbol.Language == "php" ||
@@ -3608,6 +3956,17 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			if len(narrowed) == len(cands) {
 				// Receiver narrowing didn't fire; try the inferred type of
 				// the receiver variable, then import qualification.
+				if symbol.Language == "csharp" && qualifier != "" && !strings.HasSuffix(qualifier, "()") {
+					if _, typed := localTypes[qualifier]; !typed {
+						// Serializer._contractResolver.ResolveContract arrives as
+						// _contractResolver.ResolveContract: a field of another
+						// class. When every field of that name in the repository
+						// declares one type, the receiver has it.
+						if t := csFieldTypeByName(idx, qualifier); t != "" {
+							localTypes[qualifier] = t
+						}
+					}
+				}
 				kept, dispatch, decided := narrowByLocalType(idx, sat, &symbol, localTypes, qualifier, calleeName, cands, scope)
 				if !decided && symbol.Language == "python" && strings.Contains(fullChain, ".") {
 					// `sub_ctx.command.invoke(...)`: type each hop through the
@@ -3617,7 +3976,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 						kept, dispatch, decided = narrowByLocalType(idx, sat, &symbol, map[string]string{qualifier: t}, qualifier, calleeName, cands, scope)
 					}
 				}
-				if !decided && (tsFamilyLang(symbol.Language) || symbol.Language == "java") && strings.Contains(fullChain, ".") {
+				if !decided && (tsFamilyLang(symbol.Language) || symbol.Language == "java" || symbol.Language == "csharp") && strings.Contains(fullChain, ".") {
 					// Multi-hop receiver (`this.connection.driver.escape`):
 					// walk the field-type chain and dispatch to the resolved
 					// type's implementors. The single-segment lookup above
@@ -3654,7 +4013,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// edges per call site. Precision-first, as for C#.
 				narrowed = nil
 			}
-			if len(narrowed) > maxCalleeFanout {
+			if len(narrowed) > maxCalleeFanout && !headerStatic {
 				// Still unresolvably broad after every narrowing pass:
 				// drop (the dispatch rescue below may still apply).
 				narrowed = nil
@@ -3691,11 +4050,17 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					if _, local := localTypes[arg]; local {
 						continue
 					}
+					if cParamNames(&symbol)[arg] {
+						continue // a parameter shadows any function of that name
+					}
 					refs, over := resolveCallees(idx, &symbol, arg, scope, true, true)
 					if over || len(refs) == 0 || len(refs) > 2 {
 						continue
 					}
 					for _, ref := range refs {
+						if hasModifier(ref, "static") && ref.FilePath != symbol.FilePath {
+							continue // another translation unit's static function
+						}
 						if ref.Kind == core.KindFunction && ref.ID != symbol.ID {
 							addEdge(symbol.ID, ref.ID, 0.7, core.EvidenceSourceASTKit, core.ReasonFunctionRef)
 						}
@@ -4865,6 +5230,31 @@ func resolveTypeEdges(idx *edgeIndex, symbol core.SymbolRecord, targetName strin
 	// receiver-chain fix addressed, here for supertype references. Import
 	// resolution the graph cannot model still falls through to the fan-out,
 	// so real cross-file hierarchies are never dropped.
+	if tsFamilyLang(symbol.Language) {
+		// `class Transport extends Emitter` with Emitter imported from a
+		// package: an npm package's class, unless the package is one of
+		// this repository's workspace packages (a directory of that name).
+		// The bare-name fan-out below bound socket.io's Transport to an
+		// unrelated in-repo Emitter (oracle review 2026-10-15).
+		local := simple
+		if qualifier != "" {
+			local = qualifier // `extends ns.Emitter` with `import * as ns`
+		}
+		mod, _, ok := idx.jsImportAlias(symbol.FilePath, local)
+		if !ok {
+			mod, ok = idx.jsPackageImports[symbol.FilePath][local]
+		}
+		if ok && mod != "" && mod[0] != '.' && mod[0] != '/' {
+			files := idx.jsWorkspaceFiles(mod)
+			var inPkg []*core.SymbolRecord
+			for _, c := range cands {
+				if files[c.FilePath] {
+					inPkg = append(inPkg, c)
+				}
+			}
+			cands = inPkg
+		}
+	}
 	var local []*core.SymbolRecord
 	for _, c := range cands {
 		if c.FilePath == symbol.FilePath {
@@ -4901,6 +5291,32 @@ func resolveTypeEdges(idx *edgeIndex, symbol core.SymbolRecord, targetName strin
 			Reason:     core.ReasonTypeRef,
 		})
 	}
+	return out
+}
+
+// jsWorkspaceFiles returns the files of the repository directory a bare
+// package specifier names ("engine.io", "@socket.io/component-emitter" ->
+// a directory "component-emitter"), or none: an npm dependency.
+func (idx *edgeIndex) jsWorkspaceFiles(spec string) map[string]bool {
+	if v, ok := idx.workspaceFiles.Load(spec); ok {
+		return v.(map[string]bool)
+	}
+	last := spec
+	if strings.HasPrefix(last, "@") {
+		if _, rest, ok := strings.Cut(last, "/"); ok {
+			last = rest
+		}
+	}
+	last, _, _ = strings.Cut(last, "/")
+	out := map[string]bool{}
+	if last != "" {
+		for f := range idx.byFile {
+			if strings.HasPrefix(f, last+"/") || strings.Contains(f, "/"+last+"/") {
+				out[f] = true
+			}
+		}
+	}
+	idx.workspaceFiles.Store(spec, out)
 	return out
 }
 
@@ -5082,6 +5498,91 @@ func pyClassBodyMethodRefs(idx *edgeIndex, symbol core.SymbolRecord) []core.Edge
 		}
 	}
 	return out
+}
+
+// csElementProducers are library methods whose result is their receiver's
+// element or underlying type, which may be one of ours.
+var csElementProducers = map[string]bool{
+	"GetValueOrDefault": true, "First": true, "FirstOrDefault": true, "Last": true, "LastOrDefault": true,
+	"Single": true, "SingleOrDefault": true, "ElementAt": true, "ElementAtOrDefault": true,
+	"Max": true, "Min": true, "Aggregate": true, "Find": true, "Peek": true, "Pop": true, "Dequeue": true,
+	"GetValue": true, "GetOrAdd": true, "Invoke": true, "Clone": true,
+}
+
+// csharpExtensionMethods keeps the candidates declared as extension methods
+// (first parameter `this T`).
+func csharpExtensionMethods(cands []*core.SymbolRecord) []*core.SymbolRecord {
+	var out []*core.SymbolRecord
+	for _, cand := range cands {
+		params := tsDeclParams(cand.Language, cand.Signature)
+		if params == "" {
+			params = tsDeclParams(cand.Language, cand.RawText)
+		}
+		if strings.HasPrefix(strings.TrimSpace(params), "this ") {
+			out = append(out, cand)
+		}
+	}
+	return out
+}
+
+// csProducerReturnTypes returns the declared return types (normalized) of
+// the C# methods named producer, and whether any exists. A producer whose
+// result type is unknown (a type parameter, unparsable) yields nil types
+// with exists true: nothing to narrow by.
+func csProducerReturnTypes(idx *edgeIndex, producer string) ([]string, bool) {
+	exists := false
+	seen := map[string]bool{}
+	var out []string
+	for _, f := range idx.byName[strings.ToLower(producer)] {
+		if f.Name != producer || f.Language != "csharp" {
+			continue
+		}
+		switch f.Kind {
+		case core.KindMethod, core.KindFunction:
+		default:
+			continue
+		}
+		exists = true
+		ret := csDeclaredReturnType(f.Signature, producer)
+		if ret == "" || ret == "void" || len(ret) <= 2 && strings.ToUpper(ret) == ret {
+			return nil, true // unknown or a type parameter (T, TKey)
+		}
+		if !seen[ret] {
+			seen[ret] = true
+			out = append(out, ret)
+		}
+	}
+	return out, exists
+}
+
+// csDeclaredReturnType is the normalized type written before name( in a C#
+// method signature ("public static JObject Parse(string json)" -> JObject).
+func csDeclaredReturnType(sig, name string) string {
+	i := strings.Index(sig, " "+name+"(")
+	if i < 0 {
+		i = strings.Index(sig, " "+name+"<")
+	}
+	if i < 0 {
+		return ""
+	}
+	head := strings.TrimSpace(sig[:i])
+	// The last whitespace-separated token, keeping generic arguments that
+	// contain spaces (Dictionary<string, int>).
+	depth, j := 0, len(head)-1
+	for ; j >= 0; j-- {
+		switch head[j] {
+		case '>':
+			depth++
+		case '<':
+			depth--
+		case ' ', '\t':
+			if depth == 0 {
+				goto done
+			}
+		}
+	}
+done:
+	return csNormalizeType(head[j+1:])
 }
 
 // goProducerReturnType is the declared first result type of the Go

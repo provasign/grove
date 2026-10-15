@@ -4,6 +4,7 @@ import (
 	"context"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/provasign/grove/internal/core"
 	"sort"
@@ -14,6 +15,11 @@ type javaAnalyzer struct{}
 func (javaAnalyzer) Name() string { return "java" }
 
 func (javaAnalyzer) Languages() []string { return []string{"java"} }
+
+// Budget: javac starts a JVM and attributes the scoped packages; the 5s
+// default killed it under load and the run lost every stored call edge
+// (fuzz, 2026-10-15).
+func (javaAnalyzer) Budget(files int) time.Duration { return compilerBudget(files) }
 
 // Available: javac needs only a JDK, not a build system (a plain-javac
 // project has no pom.xml); jdtls/Maven/Gradle alone still run the
@@ -41,6 +47,12 @@ func (javaAnalyzer) Analyze(ctx context.Context, req Request) Result {
 	// attributes only the affected packages; the text pass below follows the
 	// same scope so every other package's stored edges carry forward whole.
 	javacEdges, javacDiags, scopedDirs, declared := javacResolveScoped(ctx, req)
+	if req.ChangedFiles != nil && javacEdges == nil && javacFailed(javacDiags) {
+		// An incremental run whose javac pass failed reports nothing, so the
+		// indexer carries every stored Java edge forward instead of replacing
+		// them with the text pass alone.
+		return Result{Diagnostics: append([]string{"project tooling detected"}, javacDiags...)}
+	}
 	semanticSymbols := req.Symbols
 	if len(declared) > 0 {
 		// Compiler-declared symbols take part in the text passes too: an
@@ -70,6 +82,17 @@ func (javaAnalyzer) Analyze(ctx context.Context, req Request) Result {
 		res.Partial = map[string][]string{"java": scopedDirs}
 	}
 	return res
+}
+
+// javacFailed: the javac pass did not run to completion (killed, crashed),
+// as opposed to running with compile errors tolerated.
+func javacFailed(diags []string) bool {
+	for _, d := range diags {
+		if strings.HasPrefix(d, "javac resolver failed") {
+			return true
+		}
+	}
+	return false
 }
 
 type javaIndex struct {
