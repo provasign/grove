@@ -549,6 +549,8 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 
 	pe := newPositionedEdges()
 	marks := resolvedMarks{}
+	fieldCalls := resolvedMarks{} // caller -> "dir:Type.Field@line:col" (core.EdgeFuncFieldCall)
+	var fieldStores []core.Edge
 	add := func(edge core.Edge) { pe.add(edge, 0, 0) }
 	lines := goLineReader(fset)
 	for _, edge := range dispatch.contractEdges() {
@@ -590,6 +592,9 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 								Confidence: 0.99, Source: core.EvidenceSourceNative, Reason: core.ReasonMethodSet})
 						}
 					}
+					if key, ok := goFuncFieldKey(dir, n.Fun, info, pkgDirsByImport, pkg); ok {
+						fieldCalls.add(caller.ID, key, line, col)
+					}
 					callee, resolvedOK := goResolveCall(dir, n.Fun, info, symbolIdx, pkgDirsByImport, pkg)
 					switch {
 					case resolvedOK && callee.ID == caller.ID:
@@ -607,6 +612,56 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 							Confidence: 0.99,
 							Source:     core.EvidenceSourceNative,
 						})
+					}
+				case *ast.CompositeLit:
+					// &Command{Args: NoArgs}: a function stored into a
+					// function-valued field.
+					litType := goCompositeLitType(n, info)
+					for _, elt := range n.Elts {
+						kv, ok := elt.(*ast.KeyValueExpr)
+						if !ok {
+							continue
+						}
+						keyIdent, ok := kv.Key.(*ast.Ident)
+						if !ok {
+							continue
+						}
+						fieldObj := info.Uses[keyIdent]
+						if fieldObj == nil && litType != nil {
+							if st, ok := litType.Underlying().(*types.Struct); ok {
+								for fi := 0; fi < st.NumFields(); fi++ {
+									if st.Field(fi).Name() == keyIdent.Name {
+										fieldObj = st.Field(fi)
+									}
+								}
+							}
+						}
+						if litType == nil {
+							continue
+						}
+						if key, ok := goFieldVarKey(dir, fieldObj, litType, pkgDirsByImport, pkg); ok {
+							if target, ok := goFuncValueSymbol(dir, kv.Value, info, symbolIdx, pkgDirsByImport, pkg); ok {
+								fieldStores = append(fieldStores, core.Edge{From: caller.ID, To: target.ID, Type: core.EdgeFuncFieldStore,
+									Confidence: 0.9, Source: core.EvidenceSourceNative, Lines: key})
+							}
+						}
+					}
+				case *ast.AssignStmt:
+					// c.Args = NoArgs
+					for i, lhs := range n.Lhs {
+						if i >= len(n.Rhs) {
+							break
+						}
+						sel, ok := lhs.(*ast.SelectorExpr)
+						if !ok {
+							continue
+						}
+						if key, ok := goFuncFieldKey(dir, sel, info, pkgDirsByImport, pkg); ok {
+							if target, ok := goFuncValueSymbol(dir, n.Rhs[i], info, symbolIdx, pkgDirsByImport, pkg); ok {
+								fieldStores = append(fieldStores, core.Edge{From: caller.ID, To: target.ID, Type: core.EdgeFuncFieldStore,
+									Confidence: 0.9, Source: core.EvidenceSourceNative, Lines: key})
+							}
+						}
 					}
 				case *ast.Ident:
 					if fnObj, ok := info.Uses[n].(*types.Func); ok && !called[n.Pos()] {
@@ -645,7 +700,106 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 			return false
 		})
 	}
-	return append(pe.finish(), marks.edges()...), decls, pkg, nil
+	out := append(pe.finish(), marks.edges()...)
+	for _, e := range fieldCalls.edges() {
+		e.Type = core.EdgeFuncFieldCall
+		out = append(out, e)
+	}
+	return append(out, dedupeEdges(fieldStores)...), decls, pkg, nil
+}
+
+// goCompositeLitType is the named type a composite literal spells
+// (Cmd{...}, pkg.Cmd{...}), from the type name's object: the pass records
+// no expression types.
+func goCompositeLitType(lit *ast.CompositeLit, info *types.Info) types.Type {
+	var id *ast.Ident
+	switch t := lit.Type.(type) {
+	case *ast.Ident:
+		id = t
+	case *ast.SelectorExpr:
+		id = t.Sel
+	}
+	if id == nil {
+		return nil
+	}
+	if tn, ok := info.Uses[id].(*types.TypeName); ok {
+		return tn.Type()
+	}
+	return nil
+}
+
+// goFuncFieldKey names the function-valued struct field a selector selects
+// ("dir:Type.Field"), when the struct is the project's.
+func goFuncFieldKey(dir string, expr ast.Expr, info *types.Info, pkgDirsByImport map[string][]string, selfPkg *types.Package) (string, bool) {
+	sel, ok := expr.(*ast.SelectorExpr)
+	if !ok {
+		return "", false
+	}
+	selection := info.Selections[sel]
+	if selection == nil || selection.Kind() != types.FieldVal {
+		return "", false
+	}
+	return goFieldVarKey(dir, selection.Obj(), selection.Recv(), pkgDirsByImport, selfPkg)
+}
+
+// goFieldVarKey keys a func-typed field object of a project struct type.
+func goFieldVarKey(dir string, obj types.Object, owner types.Type, pkgDirsByImport map[string][]string, selfPkg *types.Package) (string, bool) {
+	field, ok := obj.(*types.Var)
+	if !ok || !field.IsField() {
+		return "", false
+	}
+	if _, isFunc := field.Type().Underlying().(*types.Signature); !isFunc {
+		return "", false
+	}
+	for {
+		if ptr, ok := owner.(*types.Pointer); ok {
+			owner = ptr.Elem()
+			continue
+		}
+		break
+	}
+	named, ok := owner.(*types.Named)
+	if !ok || named.Obj().Pkg() == nil {
+		return "", false
+	}
+	dirs := goObjectDirs(dir, named.Obj().Pkg(), pkgDirsByImport, selfPkg)
+	if len(dirs) == 0 {
+		return "", false
+	}
+	return dirs[0] + ":" + named.Obj().Name() + "." + field.Name(), true
+}
+
+// goFuncValueSymbol resolves a function-value expression (NoArgs,
+// pkg.NoArgs, obj.Method) to the project function it names.
+func goFuncValueSymbol(dir string, expr ast.Expr, info *types.Info, symbolIdx goSymbolIndex, pkgDirsByImport map[string][]string, selfPkg *types.Package) (core.SymbolRecord, bool) {
+	var fn *types.Func
+	switch v := expr.(type) {
+	case *ast.Ident:
+		fn, _ = info.Uses[v].(*types.Func)
+	case *ast.SelectorExpr:
+		if sel := info.Selections[v]; sel != nil {
+			fn, _ = sel.Obj().(*types.Func)
+		} else {
+			fn, _ = info.Uses[v.Sel].(*types.Func)
+		}
+	}
+	if fn == nil {
+		return core.SymbolRecord{}, false
+	}
+	return goSymbolForFunc(dir, fn, symbolIdx, pkgDirsByImport, selfPkg)
+}
+
+func dedupeEdges(edges []core.Edge) []core.Edge {
+	seen := map[string]bool{}
+	out := edges[:0]
+	for _, e := range edges {
+		k := e.From + "\x00" + e.To + "\x00" + e.Lines
+		if !seen[k] {
+			seen[k] = true
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 // goExternalContracts records, on each method of the package's own types,

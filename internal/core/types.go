@@ -106,8 +106,20 @@ const (
 	EdgeExternalContract EdgeType = "external-contract"
 )
 
+const (
+	// EdgeFuncFieldCall records, on a caller (From == To), its calls through
+	// a function-valued struct field: Lines "dir:Type.Field@line:col,...".
+	EdgeFuncFieldCall EdgeType = "func-field-call"
+	// EdgeFuncFieldStore records a function (To) stored into a
+	// function-valued struct field by From: Lines "dir:Type.Field". The
+	// graph joins stores and calls of the same field into call edges.
+	EdgeFuncFieldStore EdgeType = "func-field-store"
+)
+
 // IsMarkerEdge reports the stored per-symbol records that are not graph edges.
-func IsMarkerEdge(t EdgeType) bool { return t == EdgeResolvedCalls || t == EdgeExternalContract }
+func IsMarkerEdge(t EdgeType) bool {
+	return t == EdgeResolvedCalls || t == EdgeExternalContract || t == EdgeFuncFieldCall || t == EdgeFuncFieldStore
+}
 
 type Edge struct {
 	From       string         `json:"from"`
@@ -293,6 +305,7 @@ const (
 	ReasonMethodSet      EdgeReason = "method-set"      // overrides/implements by method-set inclusion
 	ReasonDecorator      EdgeReason = "decorator"       // decorator/wrapper call edge
 	ReasonFunctionRef    EdgeReason = "function-ref"    // C/C++ function passed as an argument (function-pointer reach)
+	ReasonFuncField      EdgeReason = "func-field"      // a call through a function-valued field reaches a function stored in it
 	ReasonImplicitDunder EdgeReason = "implicit-dunder" // language-implicit protocol method (e.g. Python __setattr__ on "x.y = v") with no call site in source
 )
 

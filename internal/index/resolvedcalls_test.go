@@ -644,3 +644,29 @@ func TestPythonContextVarWalrus(t *testing.T) {
 		t.Errorf("ctx from ContextVar[Ctx].get not typed: %v", got)
 	}
 }
+
+// Go: a call through a function-valued field reaches the functions stored
+// into that field elsewhere (cobra c.Args(c, args) -> NoArgs), in a full
+// and an incremental build alike.
+func TestGoFuncFieldCalls(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go not installed")
+	}
+	files := map[string]string{
+		"go.mod": "module m\n\ngo 1.22\n",
+		"cmd.go": "package m\n\ntype Check func(n int) error\n\ntype Cmd struct{ Args Check }\n\nfunc (c *Cmd) Validate(n int) error {\n\treturn c.Args(n)\n}\n",
+		"args.go": "package m\n\nfunc NoArgs(n int) error { return nil }\n\nfunc New() *Cmd { return &Cmd{Args: NoArgs} }\n",
+	}
+	got, diags, _ := callEdges(t, files)
+	skipUnless(t, diags, "go")
+	if !got["Cmd.Validate→NoArgs"] {
+		t.Errorf("call through the Args field does not reach NoArgs: %v", got)
+	}
+	for i := 0; i < 40; i++ {
+		n := strconv.Itoa(i)
+		files["p"+n+"/f.go"] = "package p" + n + "\n\nfunc F() int { return 1 }\n"
+	}
+	incMatchesFull(t, files, map[string]string{
+		"args.go": "package m\n\nfunc NoArgs(n int) error { return nil }\n\nfunc New() *Cmd { return &Cmd{} }\n",
+	}, "go")
+}

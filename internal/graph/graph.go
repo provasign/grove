@@ -203,6 +203,9 @@ func mergeEdges(base, enriched []core.Edge) []core.Edge {
 	ordered := make([]key, 0, len(base)+len(enriched))
 	byKey := make(map[key]core.Edge, len(base)+len(enriched))
 	add := func(edge core.Edge) {
+		if edge.Reason == core.ReasonFuncField && edge.Type == core.EdgeCalls {
+			return // regenerated below from the field markers (funcFieldEdges)
+		}
 		if edge.Source == "" {
 			edge.Source = core.EvidenceSourceUnknown
 		}
@@ -309,6 +312,12 @@ func mergeEdges(base, enriched []core.Edge) []core.Edge {
 		return set.static
 	}
 	out := make([]core.Edge, 0, len(ordered))
+	for _, e := range funcFieldEdges(byKey, ordered) {
+		k := key{from: e.From, to: e.To, typ: e.Type}
+		if _, exists := byKey[k]; !exists {
+			out = append(out, e)
+		}
+	}
 	for _, k := range ordered {
 		e := byKey[k]
 		// Only a guess the compiler contradicts is dropped. rust-analyzer
@@ -320,6 +329,75 @@ func mergeEdges(base, enriched []core.Edge) []core.Edge {
 			continue
 		}
 		out = append(out, e)
+	}
+	return out
+}
+
+// funcFieldEdges joins the function-field markers: a call through field F
+// (core.EdgeFuncFieldCall) reaches every function stored into F
+// (core.EdgeFuncFieldStore). cobra: c.Args(c, args) runs NoArgs, stored by
+// `Args: NoArgs` elsewhere (oracle review 2026-10-15).
+func funcFieldEdges[K comparable](byKey map[K]core.Edge, order []K) []core.Edge {
+	stores := map[string][]string{}
+	type site struct{ caller, pos string }
+	calls := map[string][]site{}
+	for _, k := range order {
+		e := byKey[k]
+		switch e.Type {
+		case core.EdgeFuncFieldStore:
+			if e.Lines != "" {
+				stores[e.Lines] = append(stores[e.Lines], e.To)
+			}
+		case core.EdgeFuncFieldCall:
+			for _, part := range strings.Split(e.Lines, ",") {
+				if field, pos, ok := strings.Cut(part, "@"); ok {
+					calls[field] = append(calls[field], site{e.From, pos})
+				}
+			}
+		}
+	}
+	if len(stores) == 0 || len(calls) == 0 {
+		return nil
+	}
+	type pair struct{ from, to string }
+	lines := map[pair][]string{}
+	var order2 []pair
+	for field, sites := range calls {
+		for _, target := range stores[field] {
+			for _, s := range sites {
+				if s.caller == target {
+					continue
+				}
+				p := pair{s.caller, target}
+				if _, seen := lines[p]; !seen {
+					order2 = append(order2, p)
+				}
+				lines[p] = append(lines[p], s.pos)
+			}
+		}
+	}
+	sort.Slice(order2, func(i, j int) bool {
+		if order2[i].from != order2[j].from {
+			return order2[i].from < order2[j].from
+		}
+		return order2[i].to < order2[j].to
+	})
+	out := make([]core.Edge, 0, len(order2))
+	for _, p := range order2 {
+		pos := lines[p]
+		sort.Strings(pos)
+		out = append(out, core.Edge{From: p.from, To: p.to, Type: core.EdgeCalls, Confidence: 0.9,
+			Source: core.EvidenceSourceNative, Reason: core.ReasonFuncField, Lines: strings.Join(uniqueSortedStrings(pos), ",")})
+	}
+	return out
+}
+
+func uniqueSortedStrings(in []string) []string {
+	out := in[:0]
+	for i, s := range in {
+		if i == 0 || s != in[i-1] {
+			out = append(out, s)
+		}
 	}
 	return out
 }
