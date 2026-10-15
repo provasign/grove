@@ -223,7 +223,14 @@ func BuildEdgesDeltaMetaWith(prevEdges []core.Edge, prevSymbols, symbols []core.
 
 	var prevCalls []core.Edge
 	for _, e := range prevEdges {
-		if e.Type != core.EdgeCalls {
+		if e.Type != core.EdgeCalls && !resolverMarker(idx, e) {
+			continue
+		}
+		if e.Type == core.EdgeCalls && (e.Reason == core.ReasonFuncField ||
+			e.Reason == core.ReasonDispatch && e.Source == core.EvidenceSourceNative) {
+			// Joined from markers at install (mergeEdges), never a call-pass
+			// result: carried, it fed the decorator builder a call the full
+			// build's never saw (flask Blueprint.register -> setupmethod).
 			continue
 		}
 		// Decorator edges are regenerated wholesale below, never carried:
@@ -783,4 +790,21 @@ func scopedCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSati
 		edges = append(edges, r...)
 	}
 	return edges
+}
+
+// resolverMarker reports a marker the call pass itself emits per owner
+// (Python function-value flow, pyvalueflow.go): carried for unaffected
+// owners exactly like their calls. Go's markers come from the native
+// analyzer and travel with its rows.
+func resolverMarker(idx *edgeIndex, e core.Edge) bool {
+	switch e.Type {
+	case core.EdgeFuncFieldStore, core.EdgeFuncFieldCall, core.EdgeFuncSlotFlow:
+	default:
+		return false
+	}
+	if e.Source == core.EvidenceSourceNative {
+		return false
+	}
+	path, _, _ := strings.Cut(e.From, "::")
+	return strings.HasSuffix(path, ".py") || strings.HasSuffix(path, ".pyi")
 }
