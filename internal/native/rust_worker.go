@@ -50,7 +50,7 @@ type rustLSP struct {
 	legend  []string
 	open    map[string]int // open document -> version
 	idle    *time.Timer
-	errText bytes.Buffer
+	errText *limitedBuffer
 }
 
 type rustLSPResponse struct {
@@ -93,7 +93,8 @@ func (w *rustLSP) start() error {
 	cmd := exec.Command(w.bin)
 	cmd.Dir = w.root
 	cmd.Env = append(os.Environ(), "CARGO_TARGET_DIR="+rustAnalyzerTargetDir(w.root))
-	cmd.Stderr = &limitedBuffer{buf: &w.errText, max: 8 << 10}
+	w.errText = &limitedBuffer{buf: &bytes.Buffer{}, max: 8 << 10}
+	cmd.Stderr = w.errText
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err
@@ -290,7 +291,7 @@ func (w *rustLSP) ready(ctx context.Context) error {
 	case <-w.quiet:
 		return nil
 	case <-w.done:
-		return errors.New("rust-analyzer exited: " + lastLine(w.errText.String()))
+		return errors.New("rust-analyzer exited: " + lastLine(w.errText.String())) // locked: exec's copy goroutine may still write
 	case <-ctx.Done():
 		return errors.New("rust-analyzer still warming up")
 	}
@@ -576,6 +577,15 @@ type limitedBuffer struct {
 	mu  sync.Mutex
 	buf *bytes.Buffer
 	max int
+}
+
+func (b *limitedBuffer) String() string {
+	if b == nil {
+		return ""
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 func (b *limitedBuffer) Write(p []byte) (int, error) {
