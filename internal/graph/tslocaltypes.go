@@ -45,6 +45,9 @@ func tsBareType(ann string) string {
 	if i := strings.IndexByte(ann, '<'); i > 0 && !strings.ContainsAny(ann[:i], "<>[]|&(){}, ") {
 		ann = ann[:i]
 	}
+	if head := strings.TrimSuffix(ann, "[]"); head != ann && !strings.ContainsAny(head, "<>[]|&(){}, ") {
+		return "extern:Array" // xs: Foo[] — its methods are Array's
+	}
 	if strings.ContainsAny(ann, "<>[]|&(){}, ") {
 		return ""
 	}
@@ -349,11 +352,124 @@ func stripLeadingGenericParams(sig string) string {
 	return sig // unbalanced: leave untouched
 }
 
+// tsNewInitRe reads a variable or field declaration initialised with
+// `new X(...)`, with an optional annotation: `pending = new WeakMap()`,
+// `private cache = new Map<string, string>()`, `const x: T = new U()`.
+var tsNewInitRe = regexp.MustCompile(`^(?:(?:export|const|let|var|public|private|protected|readonly|static|declare|override)\s+)*(\w+)\??\s*(?::\s*([^=]+?))?\s*=\s*new\s+(?:\w+\.)*([A-Za-z_]\w*)`)
+
+// tsNewType is the type a `new X(...)` value has: X when the repository
+// declares it, "extern:X" when nothing in the repository carries the name
+// (Map, WeakMap, Set, URL: a call through it never reaches an indexed
+// method), "" otherwise (X names a function or variable; unknown).
+func tsNewType(idx *edgeIndex, file, name string) string {
+	typ := tsAliasType(idx, file, name)
+	if typ == "" || strings.HasPrefix(typ, "extern:") || typeSymbolExists(idx, typ) {
+		return typ
+	}
+	if len(namedSymbols(idx, typ)) == 0 {
+		return "extern:" + typ
+	}
+	return ""
+}
+
+// tsDeclaredType is the type of a variable or field declaration: its
+// annotation, else the class it is constructed from.
+func tsDeclaredType(idx *edgeIndex, file, decl string) (name, typ string) {
+	m := tsNewInitRe.FindStringSubmatch(strings.TrimSpace(decl))
+	if m == nil {
+		return "", ""
+	}
+	if ann := strings.TrimSpace(m[2]); ann != "" {
+		return m[1], tsAliasType(idx, file, tsBareType(ann))
+	}
+	return m[1], tsNewType(idx, file, m[3])
+}
+
+// tsAliasArrowRe reads `name: Alias<...> = (a, b) =>`: an arrow function
+// whose parameters take their types from a function-type alias
+// (zod: `nullableProcessor: Processor<...> = (schema, ctx, json, params) =>`).
+var tsAliasArrowRe = regexp.MustCompile(`^(?:export\s+)?(?:const\s+|let\s+)?\w+\s*:\s*(?:\w+\.)*([A-Z]\w*)\s*(?:<[^=]*>)?\s*=\s*(?:async\s+)?\(([^()]*)\)\s*(?::[^=]*)?=>`)
+
+var tsTypeParamNameRe = regexp.MustCompile(`(?:^|[<,])\s*([A-Za-z_]\w*)`)
+
+// tsAliasArrowParamTypes types an arrow function's untyped parameters from
+// the function-type alias it is declared with, by position. The alias's own
+// type parameters (T) are not types to narrow by and are skipped.
+func tsAliasArrowParamTypes(idx *edgeIndex, symbol *core.SymbolRecord, out map[string]string) {
+	m := tsAliasArrowRe.FindStringSubmatch(strings.TrimSpace(symbol.Signature))
+	if m == nil {
+		return
+	}
+	var alias *core.SymbolRecord
+	for _, cand := range namedSymbols(idx, m[1]) {
+		if cand.Kind == core.KindType && tsFamilyLang(cand.Language) {
+			if alias != nil && alias.Signature != cand.Signature {
+				return // two different aliases of that name: no guess
+			}
+			alias = cand
+		}
+	}
+	if alias == nil {
+		return
+	}
+	decl := alias.Signature
+	eq := strings.Index(decl, "=")
+	if eq < 0 {
+		return
+	}
+	typeParams := map[string]bool{}
+	if lt := strings.IndexByte(decl[:eq], '<'); lt >= 0 {
+		for _, tp := range tsTypeParamNameRe.FindAllStringSubmatch(decl[lt:eq], -1) {
+			typeParams[tp[1]] = true
+		}
+	}
+	params := tsDeclParams(symbol.Language, decl[eq+1:])
+	if params == "" {
+		return
+	}
+	var types []string
+	for _, g := range splitParams(symbol.Language, params) {
+		_, ann, ok := strings.Cut(g, ":")
+		t := ""
+		if ok {
+			if bare := tsBareType(ann); bare != "" && !typeParams[bare] {
+				t = tsAliasType(idx, alias.FilePath, bare)
+			}
+		}
+		types = append(types, t)
+	}
+	for i, raw := range strings.Split(m[2], ",") {
+		name := strings.TrimSpace(raw)
+		if j := strings.IndexAny(name, "=:"); j >= 0 {
+			continue // annotated or defaulted here: the own text decides
+		}
+		if i < len(types) && types[i] != "" && name != "" && name != "_" {
+			if _, set := out[name]; !set {
+				out[name] = types[i]
+			}
+		}
+	}
+}
+
 // tsLocalTypes infers identifier → type name for one TS/JS callable.
 func tsLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 	out := map[string]string{}
 
-	// Class fields, own class then ancestors (lowest precedence).
+	// Module-level variables of the caller's file (lowest precedence):
+	// `const pending = new WeakMap()` makes pending.get(o) a WeakMap call,
+	// not the repository's only get (zod rewriteKeyNames, 2026-10-14).
+	if idx != nil {
+		for _, v := range idx.byFile[symbol.FilePath] {
+			if v.ParentSymbol != "" || (v.Kind != core.KindVariable && v.Kind != core.KindConst) {
+				continue
+			}
+			if name, typ := tsDeclaredType(idx, v.FilePath, v.Signature); name == v.Name && typ != "" {
+				out[name] = typ
+			}
+		}
+	}
+
+	// Class fields, own class then ancestors (lower precedence than locals).
 	if symbol.Kind == core.KindMethod || symbol.Kind == core.KindConstructor {
 		seen := map[string]bool{}
 		classes := []string{symbol.ParentSymbol}
@@ -393,6 +509,10 @@ func tsLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 		}
 	}
 
+	if idx != nil {
+		tsAliasArrowParamTypes(idx, symbol, out)
+	}
+
 	// Body declarations (highest precedence).
 	if symbol.RawText != "" {
 		body := maskCode(symbol.Language, symbol.RawText)
@@ -402,7 +522,7 @@ func tsLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]string {
 			}
 		}
 		for _, m := range tsNewAssignRe.FindAllStringSubmatch(body, -1) {
-			if typ := tsAliasType(idx, symbol.FilePath, m[2]); typeSymbolExists(idx, typ) {
+			if typ := tsNewType(idx, symbol.FilePath, m[2]); typ != "" {
 				out[m[1]] = typ
 			}
 		}
@@ -534,7 +654,9 @@ func tsClassFieldTypes(idx *edgeIndex, className, preferFile string, out map[str
 		}
 		switch member.Kind {
 		case core.KindField:
-			if m := tsFieldSigRe.FindStringSubmatch(member.Signature); m != nil && m[1] == member.Name {
+			if name, typ := tsDeclaredType(idx, member.FilePath, member.Signature); name == member.Name && typ != "" {
+				record(member.Name, typ) // private cache = new Map<...>()
+			} else if m := tsFieldSigRe.FindStringSubmatch(member.Signature); m != nil && m[1] == member.Name {
 				record(member.Name, tsBareType(m[2]))
 			}
 		case core.KindConstructor:
@@ -543,9 +665,7 @@ func tsClassFieldTypes(idx *edgeIndex, className, preferFile string, out map[str
 				record(m[1], tsBareType(m[2]))
 			}
 			for _, m := range tsNewAssignRe.FindAllStringSubmatch(body, -1) {
-				if typeSymbolExists(idx, m[2]) {
-					record(m[1], m[2])
-				}
+				record(m[1], tsNewType(idx, member.FilePath, m[2]))
 			}
 			// this.transport = transport — a plain assignment from a typed
 			// constructor parameter carries the parameter's annotation.
@@ -709,6 +829,15 @@ func narrowByChainType(idx *edgeIndex, sat *interfaceSatisfaction, localTypes ma
 	typ := tsResolveReceiverChain(idx, localTypes, fullChain, symbol.FilePath, symbol.Language)
 	if typ == "" {
 		return cands, nil, false
+	}
+	if bare := strings.TrimPrefix(typ, "extern:"); tsFamilyLang(symbol.Language) &&
+		(bare != typ || len(namedSymbols(idx, bare)) == 0) &&
+		len(subclassOverrides(idx, symbol.Language, bare, calleeName, "")) == 0 {
+		// The chain ends on a type nothing in the repository declares
+		// (ctx.seen typed Map<...>) and no in-repo subtype overrides the
+		// method: no indexed method can be the target (zod ctx.seen.get
+		// bound to $ZodRegistry.get, 2026-10-14).
+		return nil, nil, true
 	}
 	if byType := filterByParent(cands, typ); len(byType) > 0 {
 		return byType, nil, true
