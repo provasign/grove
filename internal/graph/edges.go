@@ -2604,6 +2604,14 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 						addEdge(symbol.ID, target.ID, 0.7, core.EvidenceSourceHeuristic, core.ReasonImplicitDunder)
 					}
 				}
+				if typ != "" {
+					// `testing = ConfigAttribute[bool]("TESTING")` on the
+					// class: reading app.testing runs the descriptor's
+					// __get__, assigning it its __set__.
+					for _, target := range pyDescriptorTargets(idx, typ, name, as.Write, dirOf(symbol.FilePath)) {
+						addEdge(symbol.ID, target.ID, 0.7, core.EvidenceSourceHeuristic, core.ReasonImplicitDunder)
+					}
+				}
 			}
 			for _, cand := range cands {
 				addEdge(symbol.ID, cand.ID, 0.7, core.EvidenceSourceASTKit, core.ReasonProperty)
@@ -2874,6 +2882,23 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// closure, so any same-named function elsewhere is a
 				// fabricated target. Emit nothing.
 				continue
+			}
+			if symbol.Language == "python" && qualifier != "" && symbol.ParentSymbol != "" {
+				if _, isSelf := selfVars[qualifier]; isSelf && !pyTypeHasMethod(idx, symbol.ParentSymbol, calleeName, dirOf(symbol.FilePath)) {
+					// `self.json_provider_class(self)` with the class
+					// attribute `json_provider_class: type[JSONProvider] =
+					// DefaultJSONProvider`: the call constructs the held
+					// class (its __init__ in MRO order).
+					if cls := pyClassAttrClass(idx, symbol.ParentSymbol, calleeName, dirOf(symbol.FilePath)); cls != "" {
+						targets := pyDunderTargets(idx, cls, "__init__", dirOf(symbol.FilePath))
+						for _, target := range targets {
+							addEdge(symbol.ID, target.ID, 0.85, core.EvidenceSourceHeuristic, core.ReasonConstructor)
+						}
+						if len(targets) > 0 {
+							continue
+						}
+					}
+				}
 			}
 			if symbol.Language == "python" && qualifier == "" && pyParams[calleeName] {
 				if _, typed := localTypes[calleeName]; !typed {
@@ -3970,6 +3995,12 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					// The own-class edge stays; the overrides join as
 					// dispatch so change-impact on the base call sees them.
 					for _, m := range subclassOverrides(idx, symbol.Language, symbol.ParentSymbol, calleeName, dirOf(symbol.FilePath)) {
+						if symbol.Language == "python" && pyOverridesWithoutSuper(idx, m.ParentSymbol, symbol.Name) {
+							// PassDict overrides tag itself (tag = to_json):
+							// JSONTag.tag never runs on a PassDict, so its
+							// self.to_json() does not reach PassDict.to_json.
+							continue
+						}
 						if m.ID != symbol.ID {
 							addEdge(symbol.ID, m.ID, 0.7, core.EvidenceSourceHeuristic, core.ReasonDispatch)
 						}
