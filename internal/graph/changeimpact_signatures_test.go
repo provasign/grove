@@ -128,7 +128,7 @@ func TestGoParamTokens(t *testing.T) {
 		{"a, b string", []string{"string", "string"}},
 		{"ctx context.Context, fn func(ctx context.Context) error", []string{"Context", "func"}},
 		{"context.Context, DBTransactionFunc", []string{"Context", "DBTransactionFunc"}}, // unnamed interface spec
-		{"args ...interface{}", []string{"interface{}"}}, // variadic strips; token is stable on both sides
+		{"args ...interface{}", []string{"interface{}"}},                                 // variadic strips; token is stable on both sides
 	}
 	for _, tc := range cases {
 		got := goParamTokens(tc.inner)

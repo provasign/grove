@@ -525,10 +525,10 @@ func TestTSCallResultReceivers(t *testing.T) {
 // of ours; one from a workspace package (a directory of that name) is.
 func TestTSBaseFromPackage(t *testing.T) {
 	got, _, _ := callEdges(t, map[string]string{
-		"pkgA/emitter.ts": "export class Emitter {\n  emit(ev: string): void {}\n}\n",
-		"pkgB/transport.ts": "import { Emitter } from \"@socket.io/component-emitter\";\nexport class Client extends Emitter {\n  fire(): void { this.emit(\"x\"); }\n}\n",
+		"pkgA/emitter.ts":    "export class Emitter {\n  emit(ev: string): void {}\n}\n",
+		"pkgB/transport.ts":  "import { Emitter } from \"@socket.io/component-emitter\";\nexport class Client extends Emitter {\n  fire(): void { this.emit(\"x\"); }\n}\n",
 		"engine/lib/base.ts": "export class Base {\n  emit(ev: string): void {}\n}\n",
-		"pkgC/local.ts": "import { Base } from \"engine\";\nexport class Local extends Base {\n  fire(): void { this.emit(\"y\"); }\n}\n",
+		"pkgC/local.ts":      "import { Base } from \"engine\";\nexport class Local extends Base {\n  fire(): void { this.emit(\"y\"); }\n}\n",
 	})
 	if got["Client.fire→Emitter.emit"] {
 		t.Error("a package base class resolved to a same-named class of ours")
@@ -638,7 +638,7 @@ func TestPythonContextVarWalrus(t *testing.T) {
 		"pkg/__init__.py": "",
 		"pkg/ctx.py":      "class Ctx:\n    def push(self):\n        return 1\n\n\nclass Other:\n    def push(self):\n        return 2\n",
 		"pkg/globals.py":  "from contextvars import ContextVar\nfrom .ctx import Ctx\n\n_cv: ContextVar[Ctx] = ContextVar(\"x\")\n",
-		"pkg/helpers.py": "from .globals import _cv\n\n\ndef stream():\n    if (ctx := _cv.get(None)) is not None:\n        ctx.push()\n",
+		"pkg/helpers.py":  "from .globals import _cv\n\n\ndef stream():\n    if (ctx := _cv.get(None)) is not None:\n        ctx.push()\n",
 	})
 	if !got["stream→Ctx.push"] || got["stream→Other.push"] {
 		t.Errorf("ctx from ContextVar[Ctx].get not typed: %v", got)
@@ -653,8 +653,8 @@ func TestGoFuncFieldCalls(t *testing.T) {
 		t.Skip("go not installed")
 	}
 	files := map[string]string{
-		"go.mod": "module m\n\ngo 1.22\n",
-		"cmd.go": "package m\n\ntype Check func(n int) error\n\ntype Cmd struct{ Args Check }\n\nfunc (c *Cmd) Validate(n int) error {\n\treturn c.Args(n)\n}\n",
+		"go.mod":  "module m\n\ngo 1.22\n",
+		"cmd.go":  "package m\n\ntype Check func(n int) error\n\ntype Cmd struct{ Args Check }\n\nfunc (c *Cmd) Validate(n int) error {\n\treturn c.Args(n)\n}\n",
 		"args.go": "package m\n\nfunc NoArgs(n int) error { return nil }\n\nfunc New() *Cmd { return &Cmd{Args: NoArgs} }\n",
 	}
 	got, diags, _ := callEdges(t, files)
