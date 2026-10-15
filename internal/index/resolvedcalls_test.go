@@ -537,3 +537,27 @@ func TestTSBaseFromPackage(t *testing.T) {
 		t.Errorf("a workspace package's base class was dropped: %v", got)
 	}
 }
+
+// Objective-C: a class name or self in a class method sends the class
+// method; self in an instance method the instance method.
+func TestObjCClassAndInstanceSelectors(t *testing.T) {
+	_, _, stored := callEdges(t, map[string]string{
+		"L.h": "@interface L : NSObject\n+ (void)flushLog;\n- (void)flushLog;\n- (void)run;\n+ (void)go;\n@end\n",
+		"L.m": "#import \"L.h\"\n@implementation L\n+ (void)flushLog {}\n- (void)flushLog {}\n" +
+			"- (void)run {\n  [self flushLog];\n}\n+ (void)go {\n  [L flushLog];\n}\n@end\n",
+	})
+	per := map[string]int{}
+	for _, e := range stored {
+		if e.Type == core.EdgeCalls && strings.Contains(e.To, "flushLog") {
+			per[stripSHA(e.From)]++
+		}
+	}
+	for from, n := range per {
+		if n != 1 {
+			t.Errorf("%s calls %d flushLog methods, want 1", from, n)
+		}
+	}
+	if len(per) != 2 {
+		t.Errorf("want calls from run and go, got %v", per)
+	}
+}

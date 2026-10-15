@@ -3221,6 +3221,26 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 						continue
 					}
 				}
+				if qualifier != "" {
+					// `+flushLog` and `-flushLog` share a selector. A message
+					// to a class name, or to self/super inside a class
+					// method, sends the class method; any other receiver an
+					// instance method (CocoaLumberjack, oracle review
+					// 2026-10-15).
+					wantClass := qualifier[0] >= 'A' && qualifier[0] <= 'Z' && !strings.HasSuffix(qualifier, "()")
+					if qualifier == "self" || qualifier == "super" {
+						wantClass = hasModifier(&symbol, "class")
+					}
+					var side []*core.SymbolRecord
+					for _, cand := range cands {
+						if hasModifier(cand, "class") == wantClass {
+							side = append(side, cand)
+						}
+					}
+					if len(side) > 0 {
+						cands = side
+					}
+				}
 			}
 			if phpTraitCall {
 				for _, cand := range cands {
