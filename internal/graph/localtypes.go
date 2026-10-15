@@ -621,7 +621,12 @@ func narrowByLocalType(idx *edgeIndex, sat *interfaceSatisfaction, caller *core.
 			targets = append(targets, m)
 		}
 	}
-	if sat != nil {
+	if sat != nil && !nominalImplementsLang(lang) {
+		// Structural satisfaction is Go's and TypeScript's rule. A C# or
+		// Java class with a same-shaped method that does not declare the
+		// interface is no implementor: its method is not a dispatch target
+		// (Other.Resolve beside DefaultResolver : IResolver). Declared
+		// implementers arrive through subclassOverrides above.
 		for _, iface := range idx.byName[strings.ToLower(typ)] {
 			if iface.Kind != core.KindInterface || iface.Name != typ ||
 				(caller != nil && !callLanguagesCompatible(caller.Language, iface.Language)) {
@@ -798,6 +803,16 @@ func typeOrInheritedMethodTargets(idx *edgeIndex, caller *core.SymbolRecord, typ
 		bases = next
 	}
 	return nil
+}
+
+// nominalImplementsLang: languages where implementing an interface takes a
+// declaration (implements / : I / conformance), not a matching method set.
+func nominalImplementsLang(lang string) bool {
+	switch lang {
+	case "java", "csharp", "kotlin", "php", "swift", "scala", "cpp", "objc":
+		return true
+	}
+	return false
 }
 
 func csharpExtensionTargets(cands []*core.SymbolRecord, receiverType string) []*core.SymbolRecord {
