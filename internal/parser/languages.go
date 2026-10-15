@@ -53,7 +53,8 @@ var securityExtensions = map[string]bool{
 // resolved to libraries or to the caller itself (core.EdgeResolvedCalls).
 // 2026-10-16.2: JS/TS receivers behind `!` or parentheses are kept; an
 // unnamed receiver (`a[i].m()`) is "<expr>", not a bare call.
-const ExtractorVersion = "2026-10-16.2"
+// 2026-10-16.3: names imported from packages are recorded (core.JSImportPackage).
+const ExtractorVersion = "2026-10-16.3"
 
 // DetectLanguage returns the Grove language tag for a file path.
 // Returns "" for unsupported or security-excluded files.

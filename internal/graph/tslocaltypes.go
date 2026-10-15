@@ -110,7 +110,38 @@ func tsBaseClasses(idx *edgeIndex, className, preferDir string) []string {
 	var out []string
 	out = append(out, inheritanceClauseTypes(sig, "extends", "implements")...)
 	out = append(out, inheritanceClauseTypes(sig, "implements")...)
+	if tsFamilyLang(chosen.Language) {
+		// A base imported from an npm package is that package's class, not
+		// a same-named one of ours (socket.io Transport extends the
+		// component-emitter Emitter, oracle review 2026-10-15).
+		kept := out[:0]
+		for _, base := range out {
+			if !idx.tsBaseFromPackage(chosen.FilePath, base) {
+				kept = append(kept, base)
+			}
+		}
+		out = kept
+	}
 	return uniqueStrings(out)
+}
+
+// tsBaseFromPackage reports whether file imports name from a package that
+// is not one of this repository's workspace packages declaring it.
+func (idx *edgeIndex) tsBaseFromPackage(file, name string) bool {
+	mod, _, ok := idx.jsImportAlias(file, name)
+	if !ok {
+		mod, ok = idx.jsPackageImports[file][name]
+	}
+	if !ok || mod == "" || mod[0] == '.' || mod[0] == '/' {
+		return false
+	}
+	files := idx.jsWorkspaceFiles(mod)
+	for _, c := range namedSymbols(idx, name) {
+		if files[c.FilePath] {
+			return false
+		}
+	}
+	return true
 }
 
 func rustBaseClasses(chosen *core.SymbolRecord) []string {

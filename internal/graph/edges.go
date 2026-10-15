@@ -42,6 +42,10 @@ type edgeIndex struct {
 	// import — ~0.5 billion string ops on a 19k-file monorepo.
 	dirFilesLower  map[string][]string
 	dirFilesByBase map[string][]string
+	// workspaceFiles memoizes jsWorkspaceFiles per package specifier.
+	workspaceFiles sync.Map
+	// jsPackageImports: file -> local name -> package it is imported from.
+	jsPackageImports map[string]map[string]string
 
 	// importPathToFiles maps a slash-separated import path without extension to
 	// files whose path matches that import exactly or by package directory.
@@ -131,6 +135,7 @@ func newEdgeIndex(symbols []core.SymbolRecord) *edgeIndex {
 		importedFilesCache: make(map[string]map[string]struct{}),
 		pyImportBindings:   make(map[string]map[string][]pyImportBinding),
 		jsImportAliases:    make(map[string]map[string]string),
+		jsPackageImports:   make(map[string]map[string]string),
 		jsReExports:        make(map[string]map[string]struct{}),
 		goImportAliases:    make(map[string]map[string]string),
 	}
@@ -166,6 +171,13 @@ func newEdgeIndex(symbols []core.SymbolRecord) *edgeIndex {
 		}
 		for _, imp := range s.Imports {
 			if _, _, _, binding := core.ParsePythonImportBinding(imp); binding {
+				continue
+			}
+			if local, pkg, named := core.ParseJSImportPackage(imp); named {
+				if idx.jsPackageImports[s.FilePath] == nil {
+					idx.jsPackageImports[s.FilePath] = map[string]string{}
+				}
+				idx.jsPackageImports[s.FilePath][local] = pkg
 				continue
 			}
 			if local, target, alias := core.ParseJSImportAlias(imp); alias {
@@ -278,6 +290,9 @@ func (idx *edgeIndex) bindPySubmoduleImports(symbols []core.SymbolRecord) {
 				continue
 			}
 			if _, _, alias := core.ParseJSImportAlias(imp); alias {
+				continue
+			}
+			if _, _, named := core.ParseJSImportPackage(imp); named {
 				continue
 			}
 			if _, _, alias := core.ParseGoImportAlias(imp); alias {
@@ -1673,6 +1688,9 @@ func buildDefinesAndImports(symbols []core.SymbolRecord) []core.Edge {
 				continue
 			}
 			if _, _, alias := core.ParseJSImportAlias(imp); alias {
+				continue
+			}
+			if _, _, named := core.ParseJSImportPackage(imp); named {
 				continue
 			}
 			if _, reexport := core.ParseJSImportReExport(imp); reexport {
@@ -5082,6 +5100,31 @@ func resolveTypeEdges(idx *edgeIndex, symbol core.SymbolRecord, targetName strin
 	// receiver-chain fix addressed, here for supertype references. Import
 	// resolution the graph cannot model still falls through to the fan-out,
 	// so real cross-file hierarchies are never dropped.
+	if tsFamilyLang(symbol.Language) {
+		// `class Transport extends Emitter` with Emitter imported from a
+		// package: an npm package's class, unless the package is one of
+		// this repository's workspace packages (a directory of that name).
+		// The bare-name fan-out below bound socket.io's Transport to an
+		// unrelated in-repo Emitter (oracle review 2026-10-15).
+		local := simple
+		if qualifier != "" {
+			local = qualifier // `extends ns.Emitter` with `import * as ns`
+		}
+		mod, _, ok := idx.jsImportAlias(symbol.FilePath, local)
+		if !ok {
+			mod, ok = idx.jsPackageImports[symbol.FilePath][local]
+		}
+		if ok && mod != "" && mod[0] != '.' && mod[0] != '/' {
+			files := idx.jsWorkspaceFiles(mod)
+			var inPkg []*core.SymbolRecord
+			for _, c := range cands {
+				if files[c.FilePath] {
+					inPkg = append(inPkg, c)
+				}
+			}
+			cands = inPkg
+		}
+	}
 	var local []*core.SymbolRecord
 	for _, c := range cands {
 		if c.FilePath == symbol.FilePath {
@@ -5118,6 +5161,32 @@ func resolveTypeEdges(idx *edgeIndex, symbol core.SymbolRecord, targetName strin
 			Reason:     core.ReasonTypeRef,
 		})
 	}
+	return out
+}
+
+// jsWorkspaceFiles returns the files of the repository directory a bare
+// package specifier names ("engine.io", "@socket.io/component-emitter" ->
+// a directory "component-emitter"), or none: an npm dependency.
+func (idx *edgeIndex) jsWorkspaceFiles(spec string) map[string]bool {
+	if v, ok := idx.workspaceFiles.Load(spec); ok {
+		return v.(map[string]bool)
+	}
+	last := spec
+	if strings.HasPrefix(last, "@") {
+		if _, rest, ok := strings.Cut(last, "/"); ok {
+			last = rest
+		}
+	}
+	last, _, _ = strings.Cut(last, "/")
+	out := map[string]bool{}
+	if last != "" {
+		for f := range idx.byFile {
+			if strings.HasPrefix(f, last+"/") || strings.Contains(f, "/"+last+"/") {
+				out[f] = true
+			}
+		}
+	}
+	idx.workspaceFiles.Store(spec, out)
 	return out
 }
 

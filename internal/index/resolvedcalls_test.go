@@ -520,3 +520,20 @@ func TestTSCallResultReceivers(t *testing.T) {
 		t.Errorf("map.get(k)!.createChild lost its target: %v", got)
 	}
 }
+
+// TS: a base class imported from an npm package is not a same-named class
+// of ours; one from a workspace package (a directory of that name) is.
+func TestTSBaseFromPackage(t *testing.T) {
+	got, _, _ := callEdges(t, map[string]string{
+		"pkgA/emitter.ts": "export class Emitter {\n  emit(ev: string): void {}\n}\n",
+		"pkgB/transport.ts": "import { Emitter } from \"@socket.io/component-emitter\";\nexport class Client extends Emitter {\n  fire(): void { this.emit(\"x\"); }\n}\n",
+		"engine/lib/base.ts": "export class Base {\n  emit(ev: string): void {}\n}\n",
+		"pkgC/local.ts": "import { Base } from \"engine\";\nexport class Local extends Base {\n  fire(): void { this.emit(\"y\"); }\n}\n",
+	})
+	if got["Client.fire→Emitter.emit"] {
+		t.Error("a package base class resolved to a same-named class of ours")
+	}
+	if !got["Local.fire→Base.emit"] {
+		t.Errorf("a workspace package's base class was dropped: %v", got)
+	}
+}
