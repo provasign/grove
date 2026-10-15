@@ -158,8 +158,108 @@ func swiftLocalTypes(idx *edgeIndex, symbol *core.SymbolRecord) map[string]strin
 				out[m[1]] = ret
 			}
 		}
+		// `forEach { try $0.delete() }` inside ChildSequence<Child: Location>:
+		// $0 is the element (Child), a generic placeholder standing for its
+		// constraint (Location). Typed only when every such closure in the
+		// body agrees.
+		dollar := ""
+		consistent := true
+		for _, m := range swiftClosureIterRe.FindAllStringSubmatch(body, -1) {
+			recv := symbol.ParentSymbol
+			if m[1] != "" && m[1] != "self" {
+				recv = out[m[1]]
+			}
+			elem := ""
+			if recv != "" && recv[0] != '[' {
+				elem = strings.TrimRight(swiftElementType(idx, recv), "?!")
+				elem = swiftGenericConstraint(idx, recv, elem)
+			}
+			if elem == "" || strings.HasPrefix(elem, "(") || dollar != "" && dollar != elem {
+				consistent = false
+				break
+			}
+			dollar = elem
+		}
+		if consistent && dollar != "" {
+			out["$0"] = dollar
+		}
+		// for (key, _) in other: with other a JSON (a Collection whose
+		// subscript(position:) returns (String, JSON)), key is a String.
+		for _, m := range swiftForInRe.FindAllStringSubmatch(body, -1) {
+			coll := out[m[3]]
+			if coll == "" || coll[0] == '[' {
+				continue
+			}
+			elem := swiftElementType(idx, coll)
+			if elem == "" {
+				continue
+			}
+			if m[2] == "" {
+				if !strings.HasPrefix(elem, "(") {
+					out[m[1]] = elem
+				}
+				continue
+			}
+			names := splitTopLevel(m[2], ',')
+			if !strings.HasPrefix(elem, "(") || !strings.HasSuffix(elem, ")") {
+				continue
+			}
+			parts := splitTopLevel(elem[1:len(elem)-1], ',')
+			if len(parts) != len(names) {
+				continue
+			}
+			for i, n := range names {
+				n = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(n), "let "))
+				if n == "" || n == "_" {
+					continue
+				}
+				if t := swiftShapeType(parts[i]); t != "" {
+					out[n] = t
+				}
+			}
+		}
 	}
 	return out
+}
+
+// for x in coll / for (a, b) in coll / for case let ...
+var swiftForInRe = regexp.MustCompile(`(?m)\bfor\s+(?:case\s+)?(?:let\s+|var\s+)?(?:([a-z_]\w*)|\(([^()]*)\))\s+in\s+([a-z_]\w*)\s*[{\n]`)
+
+// swiftElementType is the element an in-repo Sequence/Collection type
+// yields: its subscript(position:) result, else its iterator's next()
+// result (optional dropped). "(String, JSON)" for SwiftyJSON's JSON.
+func swiftElementType(idx *edgeIndex, typ string) string {
+	for _, f := range idx.byName["subscript"] {
+		if f.Language != "swift" || f.ParentSymbol != typ {
+			continue
+		}
+		sig := codeSignature(f)
+		if !strings.Contains(sig, "(position:") {
+			continue
+		}
+		if i := strings.LastIndex(sig, "->"); i >= 0 {
+			t := strings.TrimSpace(sig[i+2:])
+			if j := strings.IndexByte(t, '{'); j >= 0 {
+				t = strings.TrimSpace(t[:j])
+			}
+			return t
+		}
+	}
+	for _, m := range idx.byName["makeiterator"] {
+		if m.Language != "swift" || m.ParentSymbol != typ {
+			continue
+		}
+		it := swiftReturnTypeName(codeSignature(m))
+		if it == "" {
+			return ""
+		}
+		for _, n := range idx.byName["next"] {
+			if n.Language == "swift" && n.ParentSymbol == it {
+				return swiftReturnTypeName(codeSignature(n))
+			}
+		}
+	}
+	return ""
 }
 
 // swiftReturnTypeName reads the bare result type of a Swift function
@@ -615,9 +715,16 @@ func swiftNarrowByLabels(cands []*core.SymbolRecord, args []string) (out []*core
 // whole repo, so no later inheritance fallback can know better), and the
 // caller must stop resolving the call site rather than let those fallbacks
 // re-source the same-name members it just ruled out.
-func swiftNarrowCall(cands []*core.SymbolRecord, cs core.CallSite, caller *core.SymbolRecord) (out []*core.SymbolRecord, decided bool) {
+func swiftNarrowCall(idx *edgeIndex, cands []*core.SymbolRecord, cs core.CallSite, caller *core.SymbolRecord, localTypes map[string]string) (out []*core.SymbolRecord, decided bool) {
 	if out, decided = swiftNarrowByLabels(cands, cs.Args); decided {
-		return swiftNarrowByArgShapes(out, cs.Args, swiftParamShapes(codeSignature(caller)), caller), true
+		shapes := swiftParamShapes(codeSignature(caller))
+		for name, typ := range localTypes {
+			if _, ok := shapes[name]; !ok && name != "self" {
+				shapes[name] = typ
+			}
+		}
+		out = swiftNarrowByArgShapes(out, cs.Args, shapes, caller)
+		return swiftDropIncompatible(idx, out, cs.Args, shapes), true
 	}
 	return filterByArgc(cands, cs.Argc), false
 }
@@ -701,4 +808,160 @@ unwrapped:
 		return ""
 	}
 	return t
+}
+
+// swiftDropIncompatible removes the candidates a typed argument cannot bind:
+// a String into an Index or an array parameter. A parameter accepts its own
+// type, a protocol the argument's type conforms to, Any/AnyObject, or a
+// generic placeholder; a variadic parameter accepts one element. Untyped
+// arguments and unparsable declarations decide nothing; the set is never
+// emptied.
+func swiftDropIncompatible(idx *edgeIndex, cands []*core.SymbolRecord, args []string, shapes map[string]string) []*core.SymbolRecord {
+	if len(cands) < 2 {
+		return cands
+	}
+	callLabels, ok := swiftCallLabels(args)
+	if !ok {
+		return cands
+	}
+	var kept []*core.SymbolRecord
+	for _, cand := range cands {
+		params, ok := swiftDeclParams(cand)
+		pshapes := swiftDeclParamShapes(cand)
+		bind, ok2 := swiftBindLabels(params, callLabels)
+		if !ok || !ok2 || len(pshapes) != len(params) {
+			kept = append(kept, cand)
+			continue
+		}
+		fits := true
+		for i, a := range args {
+			v := a[strings.IndexByte(a, ':')+1:]
+			shape := swiftLiteralShape(v)
+			if shape == "" {
+				shape = shapes[v]
+			}
+			if shape == "" || strings.HasPrefix(shape, "(") {
+				continue
+			}
+			p := pshapes[bind[i]]
+			if params[bind[i]].variadic {
+				p = strings.TrimSuffix(strings.TrimPrefix(p, "["), "]")
+			}
+			if !swiftAccepts(idx, p, shape, cand) {
+				fits = false
+				break
+			}
+		}
+		if fits {
+			kept = append(kept, cand)
+		}
+	}
+	if len(kept) == 0 {
+		return cands
+	}
+	return kept
+}
+
+func swiftAccepts(idx *edgeIndex, param, arg string, cand *core.SymbolRecord) bool {
+	if param == "" || param == arg || param == "Any" || param == "AnyObject" {
+		return true
+	}
+	if i := strings.IndexByte(param, '<'); i > 0 {
+		param = param[:i]
+	}
+	if param == arg {
+		return true
+	}
+	pArr, aArr := strings.HasPrefix(param, "["), strings.HasPrefix(arg, "[")
+	if pArr != aArr {
+		return false
+	}
+	if pArr {
+		return true // element types are not compared
+	}
+	// A generic placeholder declared by the candidate (or a lone capital).
+	if len(param) == 1 || strings.Contains(cand.Signature, "<"+param) || strings.Contains(cand.Signature, ", "+param+":") {
+		return true
+	}
+	for _, c := range swiftConformances(idx, arg, "") {
+		if c == param {
+			return true
+		}
+	}
+	if swiftWitnesses(idx, arg, param) {
+		return true
+	}
+	return !swiftTypeIndexed(idx, param) && !swiftTypeIndexed(idx, arg) && !swiftPrimitives[strings.ToLower(param)] && !swiftPrimitives[strings.ToLower(arg)]
+}
+
+// swiftWitnesses reports whether the repository makes typ conform to the
+// indexed protocol proto by extension: `extension String: JSONSubscriptType`
+// is not itself indexed (String is the standard library's), but its members
+// are (String.jsonKey). typ conforms when it has a member for every one
+// proto declares.
+func swiftWitnesses(idx *edgeIndex, typ, proto string) bool {
+	if idx == nil || swiftTypeIndexed(idx, typ) {
+		return false
+	}
+	var files []string
+	for _, p := range namedSymbols(idx, proto) {
+		if p.Language == "swift" && p.Kind == core.KindInterface {
+			files = append(files, p.FilePath) // requirements live in the protocol body
+		}
+	}
+	if len(files) == 0 {
+		return false
+	}
+	required := 0
+	for _, f := range files {
+		for _, m := range idx.byFile[f] {
+			if m.Language != "swift" || m.ParentSymbol != proto || m.Name == "" {
+				continue
+			}
+			required++
+			found := false
+			for _, w := range idx.byName[strings.ToLower(m.Name)] {
+				if w.Name == m.Name && w.ParentSymbol == typ && w.Language == "swift" {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return false
+			}
+		}
+	}
+	return required > 0
+}
+
+var swiftClosureIterRe = regexp.MustCompile(`(?:\b([a-z_]\w*)\.|(?:^|[^.\w]))(?:forEach|map|compactMap|flatMap|filter)\s*\{`)
+
+// swiftGenericConstraint maps a generic placeholder of owner
+// (`struct ChildSequence<Child: Location>`) to its constraint (Location);
+// any other type comes back unchanged.
+func swiftGenericConstraint(idx *edgeIndex, owner, typ string) string {
+	if typ == "" {
+		return ""
+	}
+	for _, d := range namedSymbols(idx, owner) {
+		if d.Language != "swift" {
+			continue
+		}
+		sig := codeSignature(d)
+		i := strings.IndexByte(sig, '<')
+		if i < 0 {
+			continue
+		}
+		j := strings.IndexByte(sig[i:], '>')
+		if j < 0 {
+			continue
+		}
+		for _, g := range splitTopLevel(sig[i+1:i+j], ',') {
+			name, constraint, ok := strings.Cut(strings.TrimSpace(g), ":")
+			if ok && strings.TrimSpace(name) == typ {
+				return swiftShapeType(constraint)
+			}
+		}
+	}
+	return typ
 }

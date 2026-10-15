@@ -2822,14 +2822,14 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			if symbol.Language == "swift" && calleeName == "init" && symbol.ParentSymbol != "" {
 				switch qualifier {
 				case "self":
-					ctors, _ := swiftNarrowCall(constructorTargets(idx, symbol.ParentSymbol, scope), cs, &symbol)
+					ctors, _ := swiftNarrowCall(idx, constructorTargets(idx, symbol.ParentSymbol, scope), cs, &symbol, localTypes)
 					for _, ctor := range ctors {
 						addEdge(symbol.ID, ctor.ID, 0.9, core.EvidenceSourceASTKit, core.ReasonASTNarrowed)
 					}
 					continue
 				case "super":
 					for _, base := range constructorBaseClasses(idx, "swift", symbol.ParentSymbol, dirOf(symbol.FilePath)) {
-						ctors, _ := swiftNarrowCall(constructorTargets(idx, base, scope), cs, &symbol)
+						ctors, _ := swiftNarrowCall(idx, constructorTargets(idx, base, scope), cs, &symbol, localTypes)
 						for _, ctor := range ctors {
 							addEdge(symbol.ID, ctor.ID, 0.85, core.EvidenceSourceHeuristic, core.ReasonInheritance)
 						}
@@ -3175,7 +3175,7 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// routinely share an arity and a value shape while
 				// differing only in label. Arity is the fallback.
 				var decided bool
-				if cands, decided = swiftNarrowCall(cands, cs, &symbol); decided && len(cands) == 0 {
+				if cands, decided = swiftNarrowCall(idx, cands, cs, &symbol, localTypes); decided && len(cands) == 0 {
 					continue
 				}
 			} else if symbol.Language == "kotlin" {
