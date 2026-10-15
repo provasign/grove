@@ -554,6 +554,9 @@ func extractSymbols(language, filePath, blobSHA, content string, fileImports []s
 	if language == "csharp" || language == "java" {
 		enrichRecoveredClassParents(merged)
 	}
+	if language == "java" {
+		attachRecoveredJavaMembers(merged, scan)
+	}
 	attachDocstrings(language, content, merged)
 	return merged
 }
@@ -661,6 +664,60 @@ func enrichRecoveredClassParents(symbols []core.SymbolRecord) {
 		symbol.QualifiedName = parent.Name + "." + symbol.Name
 		symbol.ID = symID(symbol.FilePath, symbol.QualifiedName, symbol.BlobSHA)
 	}
+}
+
+// attachRecoveredJavaMembers gives a recovered method, constructor or field
+// that is still parentless the nearest type declared above it, when its
+// line sits inside braces: Java has no top-level members, and error
+// recovery around a broken statement (an unterminated char literal mid-edit)
+// ends the class early, so its span no longer contains them (15
+// BeanDeserializer methods lost their class, 2026-10-14). The type's span
+// is extended to cover them.
+func attachRecoveredJavaMembers(symbols []core.SymbolRecord, masked string) {
+	lineDepth := javaLineBraceDepths(masked)
+	for idx := range symbols {
+		m := &symbols[idx]
+		if m.ParentSymbol != "" || (m.Kind != core.KindMethod && m.Kind != core.KindConstructor && m.Kind != core.KindField) {
+			continue
+		}
+		if m.Span.Start < 1 || m.Span.Start > len(lineDepth) || lineDepth[m.Span.Start-1] <= 0 {
+			continue
+		}
+		best := -1
+		for j := range symbols {
+			t := &symbols[j]
+			switch t.Kind {
+			case core.KindClass, core.KindInterface, core.KindEnum:
+			default:
+				continue
+			}
+			if t.Span.Start <= m.Span.Start && (best < 0 || t.Span.Start > symbols[best].Span.Start) {
+				best = j
+			}
+		}
+		if best < 0 {
+			continue
+		}
+		owner := &symbols[best]
+		m.ParentSymbol = owner.Name
+		m.QualifiedName = owner.QualifiedName + "." + m.Name
+		m.ID = symID(m.FilePath, m.QualifiedName, m.BlobSHA)
+		if owner.Span.End < m.Span.End {
+			owner.Span.End = m.Span.End
+		}
+	}
+}
+
+// javaLineBraceDepths is the brace depth at the start of each line of
+// masked source (strings and comments already blanked).
+func javaLineBraceDepths(masked string) []int {
+	var out []int
+	depth := 0
+	for _, line := range strings.Split(masked, "\n") {
+		out = append(out, depth)
+		depth += strings.Count(line, "{") - strings.Count(line, "}")
+	}
+	return out
 }
 
 const cppCallableNamePattern = `(?:operator\s*(?:\[\]|\(\)|new(?:\[\])?|delete(?:\[\])?|[+*/%<>=!&|^~-]+)|~?[A-Za-z_][A-Za-z0-9_]*)`

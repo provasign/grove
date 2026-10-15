@@ -1671,3 +1671,32 @@ func TestExtractPythonReexportOnlyModuleKeepsImports(t *testing.T) {
 		t.Fatalf("binding missing from %v", syms[0].Imports)
 	}
 }
+
+// An unterminated char literal mid-edit in jackson-databind's
+// BeanDeserializer (testdata, Apache-2.0): error recovery invented a
+// constructor named "if" and a field "bean", and 15 methods after the broken
+// statement lost their class.
+func TestExtractJavaMidEditKeepsClassMembers(t *testing.T) {
+	src, err := os.ReadFile("testdata/java/BeanDeserializer.java.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.SplitAfter(string(src), "\n")
+	broken := strings.Join(lines[:296], "") + "        char c = 'x;\n" + strings.Join(lines[296:], "")
+	syms, err := NewEngine().ExtractContent("BeanDeserializer.java", []byte(broken))
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphans := 0
+	for _, s := range syms {
+		if s.Name == "if" || (s.Kind == core.KindField && s.Name == "bean") {
+			t.Errorf("phantom %s %s", s.Kind, s.QualifiedName)
+		}
+		if s.Kind == core.KindMethod && s.ParentSymbol == "" {
+			orphans++
+		}
+	}
+	if orphans > 0 {
+		t.Errorf("%d methods lost their class", orphans)
+	}
+}
