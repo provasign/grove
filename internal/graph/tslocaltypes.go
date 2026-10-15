@@ -921,7 +921,7 @@ func csClassFieldTypes(idx *edgeIndex, className, preferFile string, out map[str
 					file = frag.FilePath
 				}
 				for _, m := range csharpFieldRe.FindAllStringSubmatch(classBody(idx, frag), -1) {
-					if t := javaBareType(m[1]); t != "" && csTypedLocal(idx, t) {
+					if t := csBareType(m[1]); t != "" && csTypedLocal(idx, t) {
 						if _, exists := out[m[2]]; !exists {
 							out[m[2]] = t
 						}

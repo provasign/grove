@@ -2708,6 +2708,12 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 			}
 			return cands
 		}
+		csArgTypesFor := func() map[string]string {
+			if csArgTypeCache == nil {
+				csArgTypeCache = csharpArgTypes(idx, &symbol)
+			}
+			return csArgTypeCache
+		}
 		narrowDispatch := func(cands []*core.SymbolRecord, cs core.CallSite) []*core.SymbolRecord {
 			if symbol.Language != "csharp" && symbol.Language != "java" {
 				return cands
@@ -3494,26 +3500,15 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					cands = nil
 				}
 			}
+			csMemberResolved := false // C# member lookup over the receiver's type decided cands
 			if symbol.Language == "csharp" && strings.HasSuffix(qualifier, "()") && len(cands) > 0 {
 				// `new Dog().Move()` is extracted as receiver `Dog()`. When that
 				// name is an indexed type, construction gives us an exact receiver
 				// type; retaining other same-named methods fabricates edges.
 				typ := strings.TrimSuffix(qualifier, "()")
 				if typeSymbolExists(idx, typ) {
-					byType := filterByParent(cands, typ)
-					if len(byType) == 0 {
-						byType = csharpExtensionTargets(cands, typ)
-					}
-					bases := baseClassesFor(idx, symbol.Language, typ, dirOf(symbol.FilePath))
-					for level := 0; level < 4 && len(bases) > 0 && len(byType) == 0; level++ {
-						var next []string
-						for _, base := range bases {
-							byType = append(byType, filterByParent(cands, base)...)
-							next = append(next, baseClassesFor(idx, symbol.Language, base, dirOf(symbol.FilePath))...)
-						}
-						bases = next
-					}
-					cands = byType
+					cands = csMemberTargets(idx, &symbol, cands, typ, cs, true, csArgTypesFor())
+					csMemberResolved = true
 				} else if rets, exists := csProducerReturnTypes(idx, typ); !exists {
 					// Not a type and no method of ours by that name: a
 					// library call's result (LINQ Select, a BCL getter).
@@ -3523,33 +3518,23 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					// which may be ours (newtonsoft: 67 such guesses, oracle
 					// review 2026-10-15).
 					if !csElementProducers[typ] {
-						cands = csharpExtensionMethods(cands)
+						var visible []*core.SymbolRecord
+						for _, c := range csharpExtensionMethods(cands) {
+							if idx.csExtensionVisible(&symbol, c) {
+								visible = append(visible, c)
+							}
+						}
+						cands = visible
 					}
 				} else if len(rets) > 0 {
 					// Our producer's declared result type picks the method
 					// (channel.Property("x").Remove() -> JProperty's chain).
 					var byType []*core.SymbolRecord
 					for _, ret := range rets {
-						if !typeSymbolExists(idx, ret) {
-							byType = append(byType, csharpExtensionTargets(cands, ret)...)
-							continue
-						}
-						found := filterByParent(cands, ret)
-						bases := baseClassesFor(idx, symbol.Language, ret, dirOf(symbol.FilePath))
-						for level := 0; level < 4 && len(bases) > 0 && len(found) == 0; level++ {
-							var next []string
-							for _, base := range bases {
-								found = append(found, filterByParent(cands, base)...)
-								next = append(next, baseClassesFor(idx, symbol.Language, base, dirOf(symbol.FilePath))...)
-							}
-							bases = next
-						}
-						if len(found) == 0 {
-							found = csharpExtensionTargets(cands, ret)
-						}
-						byType = append(byType, found...)
+						byType = append(byType, csMemberTargets(idx, &symbol, cands, ret, cs, true, csArgTypesFor())...)
 					}
 					cands = byType
+					csMemberResolved = true
 				}
 			}
 			if tsFamilyLang(symbol.Language) && strings.HasSuffix(qualifier, "()") {
@@ -3596,6 +3581,25 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 				// $logger->info) whose method isn't ours — a same-name
 				// match is noise: drop. A resolvable type narrows by parent.
 				held, ok := localTypes[qualifier]
+				if symbol.Language == "csharp" && !ok && !strings.HasSuffix(qualifier, "[]") {
+					// A property chain (`ExpressionReflectionDelegateFactory
+					// .Instance.CreateSet`, `writer.Token.ToString()`) is
+					// typed hop by hop through declared member types; a lone
+					// field of another class (`_contractResolver` from
+					// `Serializer._contractResolver`) by the one type every
+					// same-named field declares.
+					chain := fullChain
+					if !strings.Contains(chain, ".") {
+						chain = csReceiverChainAt(&symbol, cs, calleeName)
+					}
+					if t := csChainType(idx, &symbol, localTypes, chain); t != "" {
+						held, ok = t, true
+					} else if fullChain == qualifier && !typeSymbolExists(idx, qualifier) {
+						if t := csFieldTypeByName(idx, qualifier); t != "" {
+							held, ok = t, true
+						}
+					}
+				}
 				if symbol.Language == "csharp" && strings.HasSuffix(qualifier, "[]") {
 					// `o["x"].Children()`: the receiver is an element of
 					// o — typed by o's array element type or indexer
@@ -3607,11 +3611,13 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 						cands = nil
 					}
 				}
-				if ok {
+				if ok && symbol.Language == "csharp" {
+					// Member lookup over held's hierarchy, overloads chosen
+					// across it, extensions when no member applies.
+					cands = csMemberTargets(idx, &symbol, cands, held, cs, true, csArgTypesFor())
+					csMemberResolved = true
+				} else if ok {
 					byType := filterByParent(cands, held)
-					if symbol.Language == "csharp" && len(byType) == 0 {
-						byType = csharpExtensionTargets(cands, held)
-					}
 					// Inherited: `BsonReader reader; reader.ReadAsBytes()`
 					// runs JsonReader's. Walk the declared type's bases
 					// before concluding the method is not ours.
@@ -3629,6 +3635,12 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					} else {
 						cands = nil
 					}
+				} else if symbol.Language == "csharp" && typeSymbolExists(idx, qualifier) {
+					// A type name: its static members and its bases'
+					// (`NamingStrategy.GetType()` with no member of ours on
+					// the chain is object.GetType: nil).
+					cands = csMemberTargets(idx, &symbol, cands, qualifier, cs, false, csArgTypesFor())
+					csMemberResolved = true
 				} else if byQual := filterByParent(cands, qualifier); len(byQual) > 0 {
 					cands = byQual
 				} else if symbol.Language == "csharp" && (csIsPrimitive(qualifier) || qualifier == "string" || qualifier == "object") {
@@ -3656,6 +3668,19 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					}
 					cands = byBase
 				}
+			}
+			if symbol.Language == "csharp" && qualifier != "" && len(cands) > 0 {
+				// `x.Single()` reaches an extension method only when its
+				// namespace is in scope, whatever x's type; a static call
+				// names the class (`Enumerable.Single(x)`) and is exempt.
+				var kept []*core.SymbolRecord
+				for _, c := range cands {
+					if c.ParentSymbol != qualifier && csIsExtensionMethod(c) && !idx.csExtensionVisible(&symbol, c) {
+						continue
+					}
+					kept = append(kept, c)
+				}
+				cands = kept
 			}
 			if symbol.Language == "rust" && qualifier != "" && len(cands) > 1 {
 				cands = rustPinByPath(idx, &symbol, codeBody(), cs, qualifier, cands)
@@ -3983,6 +4008,13 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					// cannot see `driver` because it is a field of the chain's
 					// intermediate type, not of the enclosing class.
 					kept, dispatch, decided = narrowByChainType(idx, sat, localTypes, &symbol, fullChain, calleeName, cands)
+				}
+				if csMemberResolved {
+					// csMemberTargets already chose the members (across the
+					// hierarchy, extensions included); the type pass adds
+					// only the overriding implementations as dispatch.
+					decided = true
+					kept = cands
 				}
 				if decided {
 					// The receiver type was known: this call site is resolved
@@ -5544,7 +5576,13 @@ func csProducerReturnTypes(idx *edgeIndex, producer string) ([]string, bool) {
 		}
 		exists = true
 		ret := csDeclaredReturnType(f.Signature, producer)
-		if ret == "" || ret == "void" || len(ret) <= 2 && strings.ToUpper(ret) == ret {
+		if ret == "void" {
+			// A call used as a receiver or an argument has a value: a
+			// void method of this name (a [Test] named Children) is not
+			// the producer.
+			continue
+		}
+		if ret == "" || len(ret) <= 2 && strings.ToUpper(ret) == ret {
 			return nil, true // unknown or a type parameter (T, TKey)
 		}
 		if !seen[ret] {

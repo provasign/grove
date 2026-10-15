@@ -244,7 +244,7 @@ func csNarrowBareCall(idx *edgeIndex, caller *core.SymbolRecord, cands []*core.S
 		// A receiver the extractor could not name (a call-chain element,
 		// a query expression) still reaches an in-repo extension method
 		// by name: `rss[..].Children()["category"].Values<string>()`.
-		if csIsExtensionMethod(cand) {
+		if csIsExtensionMethod(cand) && idx.csExtensionVisible(caller, cand) {
 			kept = append(kept, cand)
 		}
 	}
