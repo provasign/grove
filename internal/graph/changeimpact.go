@@ -124,7 +124,10 @@ type callerLines map[string]map[string]bool
 // note records a compiler edge's positions into c and any other edge's
 // into resolved.
 func (c callerLines) note(e core.Edge, resolved callerLines) {
-	if e.Type != core.EdgeCalls || e.Lines == "" {
+	// A compiler-resolved value reference (`f := pkg.Do`) is an edit site
+	// like a call.
+	nativeRef := e.Source == core.EvidenceSourceNative && (e.Type == core.EdgeReads || e.Type == core.EdgeWrites)
+	if e.Type != core.EdgeCalls && !nativeRef || e.Lines == "" {
 		return
 	}
 	if e.Source != core.EvidenceSourceNative {
@@ -1194,7 +1197,28 @@ func (g *CodeGraph) resolveLooseQueryScopedLocked(query, file string) (string, e
 			return head, nil
 		}
 	}
-	sort.Strings(order)
+	// Production declarations first, anonymous and test-file ones last: the
+	// list is capped at ten, and commons-lang's `accept` showed ten
+	// anonymous FailableTest classes while the Failable* interfaces were
+	// among the "35 more".
+	weak := func(q string) bool {
+		syms := canonical[q]
+		if strings.Contains(q, "<anonymous") {
+			return true
+		}
+		for _, s := range syms {
+			if !core.IsTestPath(s.FilePath) {
+				return false
+			}
+		}
+		return len(syms) > 0
+	}
+	sort.SliceStable(order, func(i, j int) bool {
+		if wi, wj := weak(order[i]), weak(order[j]); wi != wj {
+			return !wi
+		}
+		return order[i] < order[j]
+	})
 	return "", fmt.Errorf("change-impact: %q is ambiguous — %d candidates:%s\nre-run with one of these",
 		query, len(order), formatCandidates(order, canonical))
 }
@@ -1247,7 +1271,10 @@ func (g *CodeGraph) freeFunctionImpactLocked(query, file string) *ChangeImpactRe
 	for id := range declIDs {
 		for _, ei := range g.inbound[id] {
 			edge := g.edges[ei]
-			accept := edge.Type == core.EdgeCalls ||
+			// A compiler-resolved value reference to a function
+			// (`apply(Handle)`) breaks under a signature change like a call.
+			nativeRef := edge.Source == core.EvidenceSourceNative && (edge.Type == core.EdgeReads || edge.Type == core.EdgeWrites)
+			accept := edge.Type == core.EdgeCalls || nativeRef ||
 				(dataAnchor && (edge.Type == core.EdgeReads || edge.Type == core.EdgeWrites || edge.Type == core.EdgeRedefines))
 			if !accept {
 				continue

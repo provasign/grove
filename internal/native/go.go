@@ -548,9 +548,16 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 			if !ok || fn.Body == nil {
 				return false
 			}
+			// called holds the identifiers a call names; any other use of
+			// a function or method is a value reference (`f := pkg.Do`,
+			// `http.HandlerFunc(h)`, `s.Do` passed as a func), which a
+			// signature change breaks just like a call. Inspect visits the
+			// CallExpr before its Fun, so the set is filled in time.
+			called := map[token.Pos]bool{}
 			ast.Inspect(fn.Body, func(inner ast.Node) bool {
 				switch n := inner.(type) {
 				case *ast.CallExpr:
+					called[goCalledName(n.Fun)] = true
 					// The called name's position: an edit list names that
 					// token (javac/tsc do the same).
 					line, col := lines(goCalledName(n.Fun))
@@ -575,6 +582,14 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 						})
 					}
 				case *ast.Ident:
+					if fnObj, ok := info.Uses[n].(*types.Func); ok && !called[n.Pos()] {
+						if target, ok := goSymbolForFunc(dir, fnObj, symbolIdx, pkgDirsByImport, pkg); ok && target.ID != caller.ID {
+							line, col := lines(n.Pos())
+							pe.add(core.Edge{From: caller.ID, To: target.ID, Type: core.EdgeReads,
+								Confidence: 0.99, Source: core.EvidenceSourceNative}, line, col)
+						}
+						return true
+					}
 					if qualified, ok := localTypes[info.Uses[n]]; ok {
 						// A function-local type is declared in this function's
 						// own file: its compiler-declared record shares the

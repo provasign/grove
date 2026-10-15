@@ -1415,3 +1415,33 @@ func TestPyClickReceiverShapes(t *testing.T) {
 		}
 	}
 }
+
+// A call-result receiver (`NewB().Send()`) without the compiler binds by
+// the producer's declared result type, not to every same-named method.
+func TestGoCallResultReceiverUsesProducerType(t *testing.T) {
+	g := func(id string, kind core.SymbolKind, name, parent, sig string, calls ...core.CallSite) core.SymbolRecord {
+		qn := name
+		if parent != "" {
+			qn = parent + "." + name
+		}
+		return core.SymbolRecord{ID: id, FilePath: "main.go", BlobSHA: "1", Language: "go", Kind: kind, Name: name, QualifiedName: qn,
+			ParentSymbol: parent, Signature: sig, RawText: sig + " {}", CallSites: calls}
+	}
+	syms := []core.SymbolRecord{
+		g("A", core.KindStruct, "A", "", "type A struct{}"),
+		g("B", core.KindStruct, "B", "", "type B struct{}"),
+		g("A.Send", core.KindMethod, "Send", "A", "func (A) Send()"),
+		g("B.Send", core.KindMethod, "Send", "B", "func (*B) Send()"),
+		g("NewB", core.KindFunction, "NewB", "", "func NewB() *B"),
+		g("Work", core.KindFunction, "Work", "", "func Work()", core.CallSite{Callee: "NewB().Send", Line: 1, Col: 9}),
+	}
+	got := map[string]bool{}
+	for _, e := range BuildEdges(syms) {
+		if e.Type == core.EdgeCalls && e.From == "Work" {
+			got[e.To] = true
+		}
+	}
+	if !got["B.Send"] || got["A.Send"] {
+		t.Fatalf("NewB().Send() must bind to B.Send only: %v", got)
+	}
+}

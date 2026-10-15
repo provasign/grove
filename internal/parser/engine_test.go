@@ -1700,3 +1700,25 @@ func TestExtractJavaMidEditKeepsClassMembers(t *testing.T) {
 		t.Errorf("%d methods lost their class", orphans)
 	}
 }
+
+// Methods of an object literal passed as an argument have no symbol of
+// their own; their calls belong to the module body instead of vanishing
+// (zod: meta()/get description() inside core.$constructor(..., {...})).
+func TestExtractTSObjectLiteralArgumentMethodCalls(t *testing.T) {
+	src := "import { reg } from './r'\n\nexport const T = make(\"T\", (inst) => inst, {\n  meta() {\n    return reg.get(this)\n  },\n  get description() {\n    return reg.lookup(this)\n  },\n})\n"
+	syms, err := NewEngine().ExtractContent("schemas.ts", []byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := map[string]int{}
+	for _, s := range syms {
+		if s.Name == "<top-level>" {
+			for _, cs := range s.CallSites {
+				found[cs.Callee] = cs.Line
+			}
+		}
+	}
+	if found["reg.get"] != 5 || found["reg.lookup"] != 8 {
+		t.Fatalf("object-literal argument methods' calls missing from <top-level>: %v", found)
+	}
+}

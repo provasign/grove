@@ -3142,6 +3142,13 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 					cands = filterByParent(cands, producer)
 				} else if !goProducerSymbolExists(idx, producer) {
 					cands = nil
+				} else if ret := goProducerReturnType(idx, producer); ret != "" {
+					// NewB().Send(): the producer's declared result type
+					// picks the method; without it the call bound to A.Send
+					// and B.Send alike.
+					if byRet := filterByParent(cands, ret); len(byRet) > 0 || typeSymbolExists(idx, ret) {
+						cands = byRet
+					}
 				}
 			}
 			if symbol.Language == "php" && strings.HasSuffix(qualifier, "()") && len(cands) > 0 {
@@ -5034,4 +5041,21 @@ func pyClassBodyMethodRefs(idx *edgeIndex, symbol core.SymbolRecord) []core.Edge
 		}
 	}
 	return out
+}
+
+// goProducerReturnType is the declared first result type of the Go
+// functions named producer, when they all agree.
+func goProducerReturnType(idx *edgeIndex, producer string) string {
+	typ := ""
+	for _, f := range idx.byName[strings.ToLower(producer)] {
+		if f.Name != producer || f.Language != "go" || f.Kind != core.KindFunction {
+			continue
+		}
+		t := goReturnType(idx, f)
+		if t == "" || typ != "" && t != typ {
+			return ""
+		}
+		typ = t
+	}
+	return typ
 }

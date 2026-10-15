@@ -367,3 +367,23 @@ func TestChangeImpactKeepsMembersOwnCallPositions(t *testing.T) {
 		t.Fatalf("Sub.draw's super().draw() position = %v (all %v)", got, r.ResolvedCallerLines)
 	}
 }
+
+// An ambiguity list names production declarations before anonymous and
+// test-file ones: it is capped, and test doubles crowded out the contracts.
+func TestAmbiguityListsProductionCandidatesFirst(t *testing.T) {
+	syms := []core.SymbolRecord{
+		{ID: "z1", FilePath: "src/test/java/a/ATest.java", Language: "java", Kind: core.KindMethod, Name: "accept", QualifiedName: "ATest.<anonymous@3:1>.accept", ParentSymbol: "ATest.<anonymous@3:1>"},
+		{ID: "z2", FilePath: "src/test/java/a/ATest.java", Language: "java", Kind: core.KindMethod, Name: "accept", QualifiedName: "Stub.accept", ParentSymbol: "Stub"},
+		{ID: "p1", FilePath: "src/main/java/a/Zeta.java", Language: "java", Kind: core.KindMethod, Name: "accept", QualifiedName: "Zeta.accept", ParentSymbol: "Zeta"},
+	}
+	g := New()
+	g.Replace(syms, 1)
+	_, err := g.ChangeImpact("accept")
+	if err == nil {
+		t.Fatal("want an ambiguity error")
+	}
+	msg := err.Error()
+	if strings.Index(msg, "Zeta.accept") > strings.Index(msg, "Stub.accept") {
+		t.Fatalf("production candidate must come first:\n%s", msg)
+	}
+}

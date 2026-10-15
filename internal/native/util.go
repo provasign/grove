@@ -105,8 +105,8 @@ func newPositionedEdges() *positionedEdges {
 	return &positionedEdges{idx: map[string]int{}, pos: map[int]map[[2]int]bool{}}
 }
 
-// add records e (once per from/type/to) and, for a call with line > 0, the
-// call's position; col 0 means unknown.
+// add records e (once per from/type/to) and, for a call or a value
+// reference (reads/writes) with line > 0, its position; col 0 means unknown.
 func (p *positionedEdges) add(e core.Edge, line, col int) {
 	key := e.From + "\x00" + string(e.Type) + "\x00" + e.To
 	i, ok := p.idx[key]
@@ -115,7 +115,7 @@ func (p *positionedEdges) add(e core.Edge, line, col int) {
 		p.idx[key] = i
 		p.edges = append(p.edges, e)
 	}
-	if e.Type == core.EdgeCalls && line > 0 {
+	if (e.Type == core.EdgeCalls || e.Type == core.EdgeReads || e.Type == core.EdgeWrites) && line > 0 {
 		if p.pos[i] == nil {
 			p.pos[i] = map[[2]int]bool{}
 		}
