@@ -126,7 +126,8 @@ type callerLines map[string]map[string]bool
 func (c callerLines) note(e core.Edge, resolved callerLines) {
 	// A compiler-resolved value reference (`f := pkg.Do`) is an edit site
 	// like a call.
-	nativeRef := e.Source == core.EvidenceSourceNative && (e.Type == core.EdgeReads || e.Type == core.EdgeWrites)
+	nativeRef := e.Source == core.EvidenceSourceNative && (e.Type == core.EdgeReads || e.Type == core.EdgeWrites) ||
+		e.Reason == core.ReasonMemberRef
 	if e.Type != core.EdgeCalls && !nativeRef || e.Lines == "" {
 		return
 	}
@@ -596,7 +597,8 @@ func (g *CodeGraph) changeImpactScoped(query, file string) (*ChangeImpactResult,
 			// rename/signature change: this.match = match, Router<T>['match'],
 			// an object literal's match: (m, p) => ... typed as Router.
 			nativeRef := edge.Source == core.EvidenceSourceNative &&
-				(edge.Type == core.EdgeReads || edge.Type == core.EdgeWrites)
+				(edge.Type == core.EdgeReads || edge.Type == core.EdgeWrites) ||
+				edge.Reason == core.ReasonMemberRef // inst._zod.parse = ...
 			if edge.Type != core.EdgeCalls && !nativeRef {
 				continue
 			}
@@ -1289,7 +1291,8 @@ func (g *CodeGraph) freeFunctionImpactLocked(query, file string) *ChangeImpactRe
 			edge := g.edges[ei]
 			// A compiler-resolved value reference to a function
 			// (`apply(Handle)`) breaks under a signature change like a call.
-			nativeRef := edge.Source == core.EvidenceSourceNative && (edge.Type == core.EdgeReads || edge.Type == core.EdgeWrites)
+			nativeRef := edge.Source == core.EvidenceSourceNative && (edge.Type == core.EdgeReads || edge.Type == core.EdgeWrites) ||
+				edge.Reason == core.ReasonMemberRef
 			accept := edge.Type == core.EdgeCalls || nativeRef ||
 				(dataAnchor && (edge.Type == core.EdgeReads || edge.Type == core.EdgeWrites || edge.Type == core.EdgeRedefines))
 			if !accept {

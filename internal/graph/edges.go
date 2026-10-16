@@ -81,6 +81,14 @@ type edgeIndex struct {
 	// (phpClassTraitRules) under a "php-traits\x00" key prefix.
 	classBodies sync.Map
 	maskedLines sync.Map
+	// tsPropMembers memoizes tspropertytypes.go lookups, each a function of
+	// the index alone: member targets ("m\x00prop\x00member"), property
+	// declarations ("d\x00prop"), masked type bodies ("b\x00id").
+	tsPropMembers sync.Map
+	// tsTypeContainersList: the TS/JS interfaces and type aliases, built
+	// once by tsTypeContainers.
+	tsTypeContainersOnce sync.Once
+	tsTypeContainersList []*core.SymbolRecord
 
 	// Rust crate topology: visibility in Rust is crate-wide (any item is
 	// reachable through crate:: paths without a per-file use), so scope is
@@ -2485,6 +2493,10 @@ func buildCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSatis
 // resolveCallEdges resolves one caller's outgoing call/property edges.
 func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSatisfaction) []core.Edge {
 	edges := resolveSymbolCallEdges(idx, symbol, sat)
+	if tsFamilyLang(symbol.Language) {
+		// Non-call references to a method member (`inst._zod.parse = ...`).
+		edges = append(edges, tsMemberRefEdges(idx, &symbol)...)
+	}
 	if symbol.Language == "python" {
 		// Function values flowing through this symbol (pyvalueflow.go),
 		// whether or not it has call sites of its own.
