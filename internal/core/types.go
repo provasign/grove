@@ -319,6 +319,11 @@ const (
 	ReasonFunctionRef    EdgeReason = "function-ref"    // C/C++ function passed as an argument (function-pointer reach)
 	ReasonFuncField      EdgeReason = "func-field"      // a call through a function-valued field reaches a function stored in it
 	ReasonImplicitDunder EdgeReason = "implicit-dunder" // language-implicit protocol method (e.g. Python __setattr__ on "x.y = v") with no call site in source
+	// ReasonMemberRef: a non-call reference to a method member through a
+	// resolved receiver (`inst._zod.parse = ...`, `const base =
+	// inst._zod.parse`), recorded as a writes/reads edge to the member's
+	// declaration: a rename or signature change breaks it.
+	ReasonMemberRef EdgeReason = "member-ref"
 )
 
 type EvidenceRef struct {

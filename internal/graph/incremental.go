@@ -223,8 +223,8 @@ func BuildEdgesDeltaMetaWith(prevEdges []core.Edge, prevSymbols, symbols []core.
 
 	var prevCalls []core.Edge
 	for _, e := range prevEdges {
-		if e.Type != core.EdgeCalls && !resolverMarker(idx, e) {
-			continue
+		if e.Type != core.EdgeCalls && !resolverMarker(idx, e) && e.Reason != core.ReasonMemberRef {
+			continue // member refs come from the call pass (tsMemberRefEdges)
 		}
 		if e.Type == core.EdgeCalls && (e.Reason == core.ReasonFuncField ||
 			e.Reason == core.ReasonDispatch && e.Source == core.EvidenceSourceNative) {

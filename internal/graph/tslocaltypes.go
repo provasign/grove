@@ -185,9 +185,20 @@ func rustBaseClasses(chosen *core.SymbolRecord) []string {
 // inheritanceClauseTypes returns every top-level type in one extends or
 // implements clause. Commas inside generic arguments do not split the list.
 func inheritanceClauseTypes(sig, keyword string, stopKeywords ...string) []string {
+	clause, ok := inheritanceClauseText(sig, keyword, stopKeywords...)
+	if !ok {
+		return nil
+	}
+	return nominalTypeList(clause, false)
+}
+
+// inheritanceClauseText is the raw text of sig's keyword clause (after the
+// keyword, up to a top-level stop keyword or '{'); ok is false when sig has
+// no such clause.
+func inheritanceClauseText(sig, keyword string, stopKeywords ...string) (string, bool) {
 	start := inheritanceKeyword(sig, keyword)
 	if start < 0 {
-		return nil
+		return "", false
 	}
 	rest := sig[start+len(keyword):]
 	end := len(rest)
@@ -218,7 +229,7 @@ func inheritanceClauseTypes(sig, keyword string, stopKeywords ...string) []strin
 			}
 		}
 	}
-	return nominalTypeList(rest[:end], false)
+	return rest[:end], true
 }
 
 func inheritanceKeyword(sig, keyword string) int {
@@ -965,6 +976,14 @@ func javaClassFieldTypes(idx *edgeIndex, className, preferFile string, out map[s
 func narrowByChainType(idx *edgeIndex, sat *interfaceSatisfaction, localTypes map[string]string, symbol *core.SymbolRecord, fullChain, calleeName string, cands []*core.SymbolRecord) (kept, dispatch []*core.SymbolRecord, decided bool) {
 	typ := tsResolveReceiverChain(idx, localTypes, fullChain, symbol.FilePath, symbol.Language)
 	if typ == "" {
+		if tsFamilyLang(symbol.Language) {
+			// `inst._zod.parse(...)` with inst untyped: the property's
+			// project-wide declarations may still pin the member
+			// (tspropertytypes.go).
+			if targets := tsUntypedPropertyChainTargets(idx, symbol, localTypes, fullChain, calleeName); len(targets) > 0 {
+				return targets, nil, true
+			}
+		}
 		return cands, nil, false
 	}
 	if bare := strings.TrimPrefix(typ, "extern:"); tsFamilyLang(symbol.Language) &&
