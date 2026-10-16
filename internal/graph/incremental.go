@@ -720,9 +720,33 @@ func affectedCallers(idx *edgeIndex, symbols []core.SymbolRecord, changedFiles m
 		// even when the changed file is out of scope.
 		if callSitesTouchNames(s.CallSites, nameDelta) || callSitesTouchNames(s.AttrSites, nameDelta) {
 			affected[s.ID] = true
+			continue
+		}
+		// TS member reads/writes (tsMemberRefEdges) come from the body text,
+		// not from sites: `inst._zod.parse = wrapped` re-binds when a `_zod`
+		// or `parse` declaration changes anywhere (fuzz 2026-10-16: a new
+		// file declaring another `_zod` left zod memoizer's write edges stale).
+		if tsFamilyLang(s.Language) && dottedTextTouchesNames(s.RawText, nameDelta) {
+			affected[s.ID] = true
 		}
 	}
 	return affected, true
+}
+
+// dottedTextTouchesNames reports whether any segment of a dotted chain in
+// text (`a.b.c`) is in the lowercased name-delta set.
+func dottedTextTouchesNames(text string, nameDelta map[string]bool) bool {
+	if len(nameDelta) == 0 || !strings.Contains(text, ".") {
+		return false
+	}
+	for _, chain := range tsDottedChainRe.FindAllString(text, -1) {
+		for _, seg := range strings.Split(chain, ".") {
+			if nameDelta[strings.ToLower(strings.TrimSpace(seg))] {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // callSitesTouchNames reports whether any site's callee (bare name, method
