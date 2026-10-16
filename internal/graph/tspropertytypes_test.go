@@ -165,3 +165,55 @@ func TestTSPropertyRule_GenericConstraintAlone(t *testing.T) {
 		t.Errorf("`_zod: I` with I extends $SubInternals must reach _$Internals.parse")
 	}
 }
+
+// The member reads/writes come from the caller's text, not its sites, so the
+// incremental name rule must look at the text: a new file declaring another
+// `_zod` (whose type has its own parse) makes the binding ambiguous, and a
+// caller in an untouched file must drop its write edge as a full build does.
+func TestTSPropertyRule_DeltaRebindsMemberRefsOnNewDeclaration(t *testing.T) {
+	prev := tsPropFixture()
+	for i := range prev {
+		if prev[i].ID == "s::top" {
+			prev[i].ID, prev[i].FilePath = "w::top", "w.ts"
+			prev[i].CallSites = prev[i].CallSites[:1] // reads/writes only: no `.parse(` call site
+		}
+	}
+	add := func(id string, kind core.SymbolKind, name, parent, sig, raw string, line int) core.SymbolRecord {
+		qn := name
+		if parent != "" {
+			qn = parent + "." + name
+		}
+		return core.SymbolRecord{ID: id, FilePath: "fz.ts", BlobSHA: "2", Language: "typescript", Kind: kind,
+			Name: name, QualifiedName: qn, ParentSymbol: parent, Signature: sig, RawText: raw,
+			Span: core.LineRange{Start: line, End: line}}
+	}
+	next := append(append([]core.SymbolRecord{}, prev...),
+		add("fz::Fz", core.KindInterface, "Fz", "", "interface Fz", "interface Fz { _zod: Fz2 }", 1),
+		add("fz::Fz._zod", core.KindField, "_zod", "Fz", "_zod: Fz2", "_zod: Fz2", 1),
+		add("fz::Fz2", core.KindInterface, "Fz2", "", "interface Fz2", "interface Fz2 { parse(x: number): void }", 2),
+		add("fz::Fz2.parse", core.KindMethod, "parse", "Fz2", "parse(x: number): void", "parse(x: number): void", 2),
+	)
+	memberRefs := func(edges []core.Edge) map[string]bool {
+		out := map[string]bool{}
+		for _, e := range edges {
+			if e.From == "w::top" && e.Reason == core.ReasonMemberRef {
+				out[string(e.Type)+" "+e.To+" "+e.Lines] = true
+			}
+		}
+		return out
+	}
+	prevEdges := BuildEdges(prev)
+	if len(memberRefs(prevEdges)) == 0 {
+		t.Fatal("fixture: the caller should have member-ref edges before the edit")
+	}
+	full := memberRefs(BuildEdges(next))
+	delta := memberRefs(BuildEdgesDelta(prevEdges, prev, next, map[string]bool{"fz.ts": true}, nil))
+	if len(full) != len(delta) {
+		t.Fatalf("delta member-ref edges %v, full build %v", delta, full)
+	}
+	for k := range full {
+		if !delta[k] {
+			t.Fatalf("delta member-ref edges %v, full build %v", delta, full)
+		}
+	}
+}
