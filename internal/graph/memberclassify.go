@@ -48,6 +48,16 @@ type memberClassifier struct {
 	// a same-named member of another declarer. Compiler facts outrank the
 	// receiver heuristics below.
 	nativeOurs, nativeOthers map[string]bool
+	// nativeOursLines: per enclosing-symbol ID, the lines of its native
+	// edges to this member that carry positions (TypeScript's checker). A
+	// symbol listed here confirms only occurrences on those lines: hono
+	// Context.header reads options?.append (ours) and calls
+	// headers.append(...) (Headers.append) a line later.
+	nativeOursLines map[string]map[int]bool
+	// nativeOthersLines: the same for edges to other declarers' members (h3
+	// tracing.test.ts builds H3Route and RouteDefinition literals, each with
+	// a handler: key, in one <top-level>).
+	nativeOthersLines map[string]map[int]bool
 
 	confirmed, ambiguous []MemberAccess
 	excluded             int
@@ -62,6 +72,7 @@ func newMemberClassifier(g *CodeGraph, a *memberAnchor) *memberClassifier {
 		decl[d.ID] = true
 	}
 	c.nativeOurs, c.nativeOthers = map[string]bool{}, map[string]bool{}
+	c.nativeOursLines, c.nativeOthersLines = map[string]map[int]bool{}, map[string]map[int]bool{}
 	for _, id := range g.idsNamed(a.name) {
 		s := g.symbols[id]
 		if s.ParentSymbol != "" && !a.owners[s.ParentSymbol] {
@@ -75,21 +86,44 @@ func newMemberClassifier(g *CodeGraph, a *memberAnchor) *memberClassifier {
 			}
 			if decl[id] {
 				c.nativeOurs[e.From] = true
+				noteEdgeLines(c.nativeOursLines, e)
 			} else if s.ParentSymbol != "" {
 				c.nativeOthers[e.From] = true
+				noteEdgeLines(c.nativeOthersLines, e)
 			}
 		}
 	}
 	return c
 }
 
+// noteEdgeLines records a positioned edge's lines under its source.
+func noteEdgeLines(into map[string]map[int]bool, e core.Edge) {
+	if e.Lines == "" {
+		return
+	}
+	if into[e.From] == nil {
+		into[e.From] = map[int]bool{}
+	}
+	for _, p := range strings.Split(e.Lines, ",") {
+		if l, _ := splitPosition(p); l > 0 {
+			into[e.From][l] = true
+		}
+	}
+}
+
 // compilerVerdict applies compiler-resolved member facts to a heuristic
 // verdict for an occurrence inside enclosing symbol e.
-func (c *memberClassifier) compilerVerdict(e *core.SymbolRecord, v verdict, evidence string) (verdict, string) {
+func (c *memberClassifier) compilerVerdict(e *core.SymbolRecord, line int, v verdict, evidence string) (verdict, string) {
 	if e == nil {
 		return v, evidence
 	}
 	ours, others := c.nativeOurs[e.ID], c.nativeOthers[e.ID]
+	if lines, ok := c.nativeOursLines[e.ID]; ok && !lines[line] {
+		ours = false
+	}
+	if lines, ok := c.nativeOthersLines[e.ID]; ok && !lines[line] {
+		others = false
+	}
 	switch {
 	case ours && !others:
 		return vConfirm, "compiler-resolved"
@@ -195,7 +229,7 @@ func (c *memberClassifier) classify(occs []core.MemberOccurrence) {
 			if o.Form == "access" || o.Form == "key" {
 				// member-shaped occurrences only: a same-named local in the
 				// same function is not the property
-				v, evidence = c.compilerVerdict(e, v, evidence)
+				v, evidence = c.compilerVerdict(e, o.Line, v, evidence)
 			}
 		}
 		if v == vSkip {

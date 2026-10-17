@@ -269,6 +269,8 @@ func (jsTSAnalyzer) Analyze(ctx context.Context, req Request) Result {
 			ToName   string `json:"toName"`
 			ToLine   int    `json:"toLine"`
 			Write    bool   `json:"write"`
+			Line     int    `json:"line"`
+			Col      int    `json:"col"`
 		} `json:"members"`
 		Decls []compilerDecl `json:"decls"`
 	}
@@ -308,6 +310,11 @@ func (jsTSAnalyzer) Analyze(ctx context.Context, req Request) Result {
 		to, okTo := symbols.at(edge.To, edge.ToName, edge.ToLine)
 		if okFrom && okTo && from.ID == to.ID {
 			marks.add(from.ID, to.Name, edge.Line, edge.Col)
+			if edge.Line > 0 {
+				// Direct recursion (`this.get(p)` inside get): a rename or
+				// signature change edits it, as the resolver's self edge says.
+				calls.add(symbolEdge(from, to, core.EdgeCalls, 0.98), edge.Line, edge.Col)
+			}
 			continue
 		}
 		if okFrom && okTo {
@@ -326,18 +333,23 @@ func (jsTSAnalyzer) Analyze(ctx context.Context, req Request) Result {
 	// Member references: property reads/writes and object-literal properties
 	// resolved by the checker (the literal's contextual type names the
 	// member). Field-rename impact confirms occurrences through these.
+	// Each edge carries the member name's positions. A member's reference
+	// to itself (`this.match = router.match.bind(router)` inside
+	// SmartRouter.match) is kept as a self edge: a rename edits it too.
+	refs := newPositionedEdges()
 	for _, m := range payload.Members {
 		from, okFrom := symbols.atOrTopLevel(m.From, m.FromName, m.FromLine)
 		to, okTo := symbols.at(m.To, m.ToName, m.ToLine)
-		if !okFrom || !okTo || from.ID == to.ID {
+		if !okFrom || !okTo || (from.ID == to.ID && m.Line <= 0) {
 			continue
 		}
 		edgeType := core.EdgeReads
 		if m.Write {
 			edgeType = core.EdgeWrites
 		}
-		edges = append(edges, symbolEdge(from, to, edgeType, 0.97))
+		refs.add(symbolEdge(from, to, edgeType, 0.97), m.Line, m.Col)
 	}
+	edges = append(edges, refs.finish()...)
 	res := Result{
 		Edges: edges,
 		Diagnostics: append([]string{
@@ -940,11 +952,12 @@ function visit(checker, options, host, sf, node, stack) {
     }
   }
   if (fromName) {
-    let target, write = false;
+    let target, write = false, nameNode;
     if (ts.isPropertyAccessExpression(node) &&
         !(ts.isCallExpression(node.parent) && node.parent.expression === node)) {
       target = memberDeclInfo(checker, checker.getSymbolAtLocation(node.name));
       write = isWriteTarget(node);
+      nameNode = node.name;
     } else if ((ts.isPropertyAssignment(node) || ts.isShorthandPropertyAssignment(node) || ts.isMethodDeclaration(node)) &&
                node.parent && ts.isObjectLiteralExpression(node.parent) && node.name &&
                (ts.isIdentifier(node.name) || ts.isStringLiteral(node.name))) {
@@ -964,6 +977,7 @@ function visit(checker, options, host, sf, node, stack) {
         }
       }
       write = true;
+      nameNode = node.name;
     }
     else if (ts.isIndexedAccessTypeNode(node) && ts.isLiteralTypeNode(node.indexType) &&
              ts.isStringLiteral(node.indexType.literal)) {
@@ -971,9 +985,17 @@ function visit(checker, options, host, sf, node, stack) {
       const objType = checker.getTypeFromTypeNode(node.objectType);
       const p = objType && checker.getPropertyOfType(checker.getApparentType(objType), node.indexType.literal.text);
       if (p) target = memberDeclInfo(checker, p);
+      nameNode = node.indexType.literal;
     }
     if (target) {
       const m = {from: rel(sf.fileName), fromName, fromLine, to: target.file, toName: target.name, toLine: target.line, write};
+      // The member name's position (1-based line, UTF-16 column; inside the
+      // quotes for Router<T>['match']), so a rename lists the token.
+      if (nameNode) {
+        const at = sf.getLineAndCharacterOfPosition(nameNode.getStart(sf));
+        m.line = at.line + 1;
+        m.col = at.character + 1 + (ts.isStringLiteral(nameNode) ? 1 : 0);
+      }
       const key = JSON.stringify(m);
       if (!memberKeys.has(key)) { memberKeys.add(key); members.push(m); }
     }

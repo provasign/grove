@@ -572,9 +572,28 @@ func (m callMarks) covers(e core.Edge) bool {
 		if hasCol && set[line] {
 			continue // the compiler gave no column
 		}
+		if !hasCol && markedOnLine(set, line) {
+			// The guess gave no column (zod default.test.ts: result1.get
+			// guessed $ZodRegistry.get at 358; tsc resolved Map.get at 358:18).
+			continue
+		}
 		return false
 	}
 	return true
+}
+
+// markedOnLine reports whether set holds a position on line ("line" or
+// "line:col").
+func markedOnLine(set map[string]bool, line string) bool {
+	if set[line] {
+		return true
+	}
+	for p := range set {
+		if l, _, ok := strings.Cut(p, ":"); ok && l == line {
+			return true
+		}
+	}
+	return false
 }
 
 // qualOwner is the type part of a qualified member name ("" for a function).
