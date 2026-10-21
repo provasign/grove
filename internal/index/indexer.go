@@ -27,6 +27,8 @@ type Indexer struct {
 	parser       *parser.Engine
 	store        *store.Store
 	nativeConfig native.Config
+	// now is the clock for native retry scheduling (tests); nil = time.Now.
+	now func() time.Time
 
 	// pendingSpliceCheck is the store fingerprint check of the last splice
 	// write when Options.DeferSpliceCheck was set; see TakeSpliceCheck.
@@ -562,6 +564,15 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 			return nil, result, err
 		}
 		native.InvalidateResident(root, names)
+		// Due now, and durable: a run interrupted before the analyzer
+		// completes leaves it retried by the next index, changes or not.
+		retryState := i.loadNativeRetry(ctx)
+		for _, name := range names {
+			retryState[name] = nativeRetry{Reason: "compiler inputs changed"}
+		}
+		if err := i.saveNativeRetry(ctx, retryState); err != nil {
+			return nil, result, err
+		}
 		for _, name := range names {
 			result.Native = append(result.Native, fmt.Sprintf("%s: compiler inputs changed (%s); running a full pass",
 				name, strings.Join(invalidated[name], ", ")))
@@ -707,7 +718,26 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 	// The check runs BEFORE AllSymbols so a no-op never pays the full symbol
 	// load; counts come from COUNT(*) queries instead of loaded slices.
 	recoverMissingEdges := false
+	completed := i.loadNativeComplete(ctx)
+	retryState := i.loadNativeRetry(ctx)
+	var retryNow map[string]bool
 	if !forceExtract && result.FilesUpdated == 0 && result.FilesPruned == 0 && len(invalidated) == 0 {
+		var pending []string
+		retryNow, pending, err = i.noopRetries(ctx, root, completed, retryState)
+		if err != nil {
+			return nil, result, err
+		}
+		if len(retryNow) == 0 {
+			msg := "skipped: no file changes since last index"
+			if len(pending) > 0 {
+				msg += "; " + strings.Join(pending, "; ")
+			} else {
+				msg += " (use --force to re-run analyzers)"
+			}
+			result.Native = append(result.Native, msg)
+		}
+	}
+	if len(retryNow) == 0 && !forceExtract && result.FilesUpdated == 0 && result.FilesPruned == 0 && len(invalidated) == 0 {
 		status, err := i.store.Status(ctx)
 		if err != nil {
 			return nil, result, err
@@ -718,7 +748,6 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 		if status.EdgeCount > 0 || status.SymbolCount == 0 {
 			result.SymbolCount = status.SymbolCount
 			result.EdgeCount = status.EdgeCount
-			result.Native = append(result.Native, "skipped: no file changes since last index (use --force to re-run analyzers)")
 			if opts.SkipNoopGraph {
 				return nil, result, nil
 			}
@@ -798,20 +827,29 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 		}
 		sort.Strings(nativeCfg.CallerFiles)
 	}
-	completed := map[string]bool{}
-	if raw, ok, err := i.store.GetMeta(ctx, core.MetaNativeComplete); err == nil && ok && raw != "" {
-		var names []string
-		if json.Unmarshal([]byte(raw), &names) == nil {
-			for _, n := range names {
-				completed[n] = true
-			}
-		}
-	}
+	// An analyzer without a completed pass gets a full pass when its
+	// languages changed, when its retry is due, or when the no-change
+	// check above chose to retry it. Otherwise it is skipped like a
+	// completed one, its stored edges carried, until the retry is due —
+	// a failing 30-minute compiler pass is not re-launched by every edit
+	// in another language.
 	nativeCfg.RunToCompletion = map[string]bool{}
 	for _, a := range native.PriorityAnalyzers() {
-		if !completed[a.Name()] {
-			nativeCfg.RunToCompletion[a.Name()] = true
+		name := a.Name()
+		if completed[name] {
+			continue
 		}
+		touched := false
+		for _, lang := range a.Languages() {
+			touched = touched || changedLanguages[lang]
+		}
+		if retryNow[name] || touched || (retryNow == nil && i.retryDue(retryState, name)) {
+			nativeCfg.RunToCompletion[name] = true
+		}
+	}
+	for _, name := range sortedKeys(retryNow) {
+		r := retryState[name]
+		result.Native = append(result.Native, fmt.Sprintf("%s: retrying its incomplete full pass (last attempt: %s)", name, r.Reason))
 	}
 	nativeResult := native.AnalyzeChangedFiles(ctx, root, symbols, nativeCfg, scope, changedRel, allFiles)
 	if len(nativeResult.Completed) > 0 {
@@ -828,6 +866,9 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 		}
 	}
 	result.Native = append(result.Native, nativeResult.Diagnostics...)
+	if err := i.recordNativeAttempts(ctx, retryState, nativeResult); err != nil {
+		return nil, result, err
+	}
 	if len(nativeResult.Symbols) > 0 {
 		// Compiler-declared symbols (native.Result.Symbols) join the parsed
 		// ones in the store and in this run's symbol set, in store order, so
@@ -1485,4 +1526,13 @@ func (i *Indexer) invalidateNativeComplete(ctx context.Context, names []string) 
 		return err
 	}
 	return i.store.SetMeta(ctx, core.MetaNativeComplete, string(encoded))
+}
+
+func sortedKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
