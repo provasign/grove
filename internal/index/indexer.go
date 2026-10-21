@@ -2,6 +2,8 @@ package index
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -416,8 +418,9 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 		return nil, result, err
 	}
 	forceExtract := opts.Force || storedExtractor != parser.ExtractorVersion || storedResolver != graph.ResolverVersion
-	statRefresh := map[string][2]int64{} // touched but content-identical
-	var walkFailed []string              // relPaths whose subtree could not be read this run
+	statRefresh := map[string][2]int64{}       // touched but content-identical
+	var walkFailed []string                    // relPaths whose subtree could not be read this run
+	compilerInputs := map[string]os.FileInfo{} // build-configuration files, see native.CompilerInputAnalyzers
 	err = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			// A failed subtree contributes nothing to currentFiles, so the
@@ -453,7 +456,18 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 			}
 			return nil
 		}
-		if isSensitivePath(relPath) || ignore.Ignored(relPath, false) {
+		if isSensitivePath(relPath) {
+			return nil
+		}
+		// Compiler inputs are fingerprinted even when gitignored (a
+		// generated compile_commands.json usually is): the toolchain reads
+		// them either way. Only their stat is recorded here.
+		if native.CompilerInputAnalyzers(relPath) != nil {
+			if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() {
+				compilerInputs[relPath] = info
+			}
+		}
+		if ignore.Ignored(relPath, false) {
 			return nil
 		}
 		// A symlinked FILE entry inside root can point anywhere; WalkDir
@@ -530,6 +544,29 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 		return nil, result, err
 	}
 	tick("walk+sha-scan")
+	// A changed compiler input (tsconfig.json, go.mod, pom.xml, ...)
+	// invalidates its analyzer's completed pass: it runs in full on this
+	// run even when none of its source files changed, and its resident
+	// worker state is dropped.
+	invalidated, err := i.syncCompilerInputs(ctx, root, compilerInputs, walkFailed)
+	if err != nil {
+		return nil, result, err
+	}
+	if len(invalidated) > 0 {
+		names := make([]string, 0, len(invalidated))
+		for name := range invalidated {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		if err := i.invalidateNativeComplete(ctx, names); err != nil {
+			return nil, result, err
+		}
+		native.InvalidateResident(root, names)
+		for _, name := range names {
+			result.Native = append(result.Native, fmt.Sprintf("%s: compiler inputs changed (%s); running a full pass",
+				name, strings.Join(invalidated[name], ", ")))
+		}
+	}
 	prog.phase("parsing", fmt.Sprintf("0/%d changed files parsed", len(tasks)))
 
 	// Phase 2 (parallel): parse changed files. Tree-sitter parsing is the
@@ -670,7 +707,7 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 	// The check runs BEFORE AllSymbols so a no-op never pays the full symbol
 	// load; counts come from COUNT(*) queries instead of loaded slices.
 	recoverMissingEdges := false
-	if !forceExtract && result.FilesUpdated == 0 && result.FilesPruned == 0 {
+	if !forceExtract && result.FilesUpdated == 0 && result.FilesPruned == 0 && len(invalidated) == 0 {
 		status, err := i.store.Status(ctx)
 		if err != nil {
 			return nil, result, err
@@ -1315,4 +1352,137 @@ func loadLastGood(ctx context.Context, st *store.Store) map[string][]string {
 		out[name] = append(out[name], line)
 	}
 	return out
+}
+
+// compilerInputState is the stored fingerprint of one compiler input.
+type compilerInputState struct {
+	Size  int64  `json:"size"`
+	Mtime int64  `json:"mtime"`
+	SHA   string `json:"sha"`
+}
+
+// metaNativeInputs: JSON object relPath -> compilerInputState.
+const metaNativeInputs = "native-inputs"
+
+// syncCompilerInputs compares the walked compiler inputs with the stored
+// fingerprints and returns, per analyzer, the inputs that were added,
+// removed or changed in content (sorted). A file whose size and mtime match
+// keeps its stored hash; a touched but identical file is not a change. The
+// first run that records fingerprints reports nothing: there is no earlier
+// state to differ from, and a cold index runs every analyzer anyway. Inputs
+// under a subtree the walk could not read keep their stored state.
+func (i *Indexer) syncCompilerInputs(ctx context.Context, root string, inputs map[string]os.FileInfo, walkFailed []string) (map[string][]string, error) {
+	raw, haveStored, err := i.store.GetMeta(ctx, metaNativeInputs)
+	if err != nil {
+		return nil, err
+	}
+	stored := map[string]compilerInputState{}
+	if haveStored && raw != "" && json.Unmarshal([]byte(raw), &stored) != nil {
+		stored = map[string]compilerInputState{}
+		haveStored = false
+	}
+	current := make(map[string]compilerInputState, len(inputs))
+	changed := map[string]bool{}
+	for rel, info := range inputs {
+		state := compilerInputState{Size: info.Size(), Mtime: info.ModTime().UnixNano()}
+		prev, ok := stored[rel]
+		if ok && prev.Size == state.Size && prev.Mtime == state.Mtime {
+			state.SHA = prev.SHA
+		} else {
+			state.SHA = compilerInputHash(filepath.Join(root, filepath.FromSlash(rel)), state)
+		}
+		current[rel] = state
+		if !ok || prev.SHA != state.SHA {
+			changed[rel] = true
+		}
+	}
+	for rel, prev := range stored {
+		if _, ok := current[rel]; ok {
+			continue
+		}
+		shielded := false
+		for _, failed := range walkFailed {
+			if rel == failed || strings.HasPrefix(rel, failed+"/") {
+				shielded = true
+				break
+			}
+		}
+		if shielded {
+			current[rel] = prev
+			continue
+		}
+		changed[rel] = true
+	}
+	same := len(current) == len(stored)
+	if same {
+		for rel, state := range current {
+			if stored[rel] != state {
+				same = false
+				break
+			}
+		}
+	}
+	if !same || !haveStored {
+		encoded, err := json.Marshal(current)
+		if err != nil {
+			return nil, err
+		}
+		if err := i.store.SetMeta(ctx, metaNativeInputs, string(encoded)); err != nil {
+			return nil, err
+		}
+	}
+	if !haveStored || len(changed) == 0 {
+		return nil, nil
+	}
+	out := map[string][]string{}
+	for rel := range changed {
+		for _, name := range native.CompilerInputAnalyzers(rel) {
+			out[name] = append(out[name], rel)
+		}
+	}
+	for name := range out {
+		sort.Strings(out[name])
+	}
+	return out, nil
+}
+
+// compilerInputHash hashes a compiler input's content. Inputs are small;
+// one past the indexer's size cap (or unreadable) is fingerprinted by its
+// stat alone.
+func compilerInputHash(path string, state compilerInputState) string {
+	if state.Size <= parser.MaxFileSizeBytes {
+		if data, err := os.ReadFile(path); err == nil && int64(len(data)) <= parser.MaxFileSizeBytes {
+			sum := sha1.Sum(data)
+			return hex.EncodeToString(sum[:])
+		}
+	}
+	return fmt.Sprintf("stat:%d:%d", state.Size, state.Mtime)
+}
+
+// invalidateNativeComplete removes analyzers from the completed-pass list,
+// so the next native run gives them a full pass (RunToCompletion).
+func (i *Indexer) invalidateNativeComplete(ctx context.Context, names []string) error {
+	raw, ok, err := i.store.GetMeta(ctx, core.MetaNativeComplete)
+	if err != nil || !ok || raw == "" {
+		return err
+	}
+	var completed []string
+	if json.Unmarshal([]byte(raw), &completed) != nil {
+		return nil
+	}
+	drop := map[string]bool{}
+	for _, n := range names {
+		drop[n] = true
+	}
+	kept := completed[:0]
+	for _, n := range completed {
+		if !drop[n] {
+			kept = append(kept, n)
+		}
+	}
+	encoded, err := json.Marshal(kept)
+	if err != nil {
+		return err
+	}
+	return i.store.SetMeta(ctx, core.MetaNativeComplete, string(encoded))
 }

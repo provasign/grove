@@ -80,6 +80,18 @@ func rustLSPFor(root, bin string) (*rustLSP, error) {
 	return w, nil
 }
 
+// stopRustLSP stops root's resident rust-analyzer server, if any; the next
+// incremental run that needs one starts it fresh.
+func stopRustLSP(root string) {
+	rustLSPs.Lock()
+	w := rustLSPs.m[root]
+	delete(rustLSPs.m, root)
+	rustLSPs.Unlock()
+	if w != nil && w.alive() {
+		w.stop()
+	}
+}
+
 func (w *rustLSP) alive() bool {
 	select {
 	case <-w.done:
