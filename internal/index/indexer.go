@@ -1190,36 +1190,129 @@ func remapEdgeEndpoints(edges []core.Edge, remap map[string]string) {
 	}
 }
 
-// carryForwardVerdict keeps the stored per-analyzer verdict for every
-// analyzer this run skipped with "previous edges carried forward". The
-// persisted verdict describes the native edges in the database, and those
-// edges did not change. Without this, editing a README after a full Java
-// index rewrote the verdict to "java: skipped: no changed files", and prism
-// then marked every change-impact answer on the untouched Java graph as
-// unconfirmed (all compiled-language cells in the 2026-10-11 bench).
+// carryForwardVerdict builds the per-analyzer verdict this run persists.
+// The persisted verdict describes the native edges in the database. An
+// analyzer that ran and produced edges reports its current lines. An
+// analyzer whose stored edges were carried forward (skipped because nothing
+// of its changed, unavailable, failed, timed out) reports the lines of its
+// last pass that produced edges — the pass those carried edges come from —
+// once, followed by this run's lines saying why nothing replaced them.
+// Without the carry, editing a README after a full Java index rewrote the
+// verdict to "java: skipped: no changed files", and prism then marked every
+// change-impact answer on the untouched Java graph as unconfirmed (all
+// compiled-language cells in the 2026-10-11 bench).
+//
+// The last-good lines live in their own meta key, so a carry never re-reads
+// its own output: re-carrying the previous merged verdict appended the
+// whole history again each run, and one two-line diagnostic grew to 4, 6,
+// 8, 10 lines (stack audit 2026-10-20 #10).
 func carryForwardVerdict(ctx context.Context, st *store.Store, current []string) []string {
-	raw, ok, err := st.GetMeta(ctx, core.MetaIndexNative)
-	if err != nil || !ok || raw == "" {
-		return current
+	lastGood := loadLastGood(ctx, st)
+	type group struct {
+		name  string
+		lines []string
 	}
-	var previous []string
-	if json.Unmarshal([]byte(raw), &previous) != nil || len(previous) == 0 {
-		return current
-	}
-	var merged []string
+	var groups []*group
+	byName := map[string]*group{}
 	for _, line := range current {
-		name, rest, found := strings.Cut(line, ": ")
-		carried := found && strings.Contains(rest, "carried forward") &&
-			(strings.HasPrefix(rest, "skipped:") || strings.Contains(rest, "previous native edges carried forward"))
-		if carried {
-			for _, prev := range previous {
-				prevName, prevRest, prevFound := strings.Cut(prev, ": ")
-				if prevFound && prevName == name && !strings.HasPrefix(prevRest, "skipped:") {
-					merged = append(merged, prev)
-				}
+		name, _, found := strings.Cut(line, ": ")
+		if !found {
+			name = "" // "native analyzers disabled": not one analyzer's line
+		}
+		g := byName[name]
+		if g == nil || name == "" {
+			g = &group{name: name}
+			groups = append(groups, g)
+			if name != "" {
+				byName[name] = g
 			}
 		}
-		merged = append(merged, line)
+		g.lines = append(g.lines, line)
+	}
+	var merged []string
+	for _, g := range groups {
+		if g.name == "" {
+			merged = append(merged, g.lines...)
+			continue
+		}
+		carried, disabled := false, false
+		for _, line := range g.lines {
+			_, rest, _ := strings.Cut(line, ": ")
+			carried = carried || carriedVerdictLine(rest)
+			disabled = disabled || rest == "skipped: disabled by config"
+		}
+		switch {
+		case carried:
+			inCurrent := map[string]bool{}
+			for _, line := range g.lines {
+				inCurrent[line] = true
+			}
+			for _, line := range lastGood[g.name] {
+				if !inCurrent[line] {
+					merged = append(merged, line)
+				}
+			}
+		case disabled:
+			delete(lastGood, g.name) // its edges are not carried
+		default:
+			lastGood[g.name] = append([]string(nil), g.lines...)
+		}
+		merged = append(merged, g.lines...)
+	}
+	// An analyzer with no lines at all had no files of its languages: it
+	// has no edges left to carry.
+	for name := range lastGood {
+		if byName[name] == nil {
+			delete(lastGood, name)
+		}
+	}
+	if raw, err := json.Marshal(lastGood); err == nil {
+		_ = st.SetMeta(ctx, core.MetaNativeLastGood, string(raw))
 	}
 	return merged
+}
+
+// carriedVerdictLine reports whether an analyzer diagnostic (without its
+// "name: " prefix) says the analyzer's stored edges were carried forward
+// instead of replaced this run.
+func carriedVerdictLine(rest string) bool {
+	return strings.Contains(rest, "carried forward") &&
+		(strings.HasPrefix(rest, "skipped:") || strings.Contains(rest, "previous native edges carried forward"))
+}
+
+// loadLastGood returns the stored last-good lines per analyzer. An index
+// written before the key existed derives them from its stored verdict: each
+// analyzer's lines minus skip/carry lines and pass timings (which may
+// belong to a failed attempt), deduplicated — the earlier carry format
+// repeated them.
+func loadLastGood(ctx context.Context, st *store.Store) map[string][]string {
+	out := map[string][]string{}
+	if raw, ok, err := st.GetMeta(ctx, core.MetaNativeLastGood); err == nil && ok && raw != "" {
+		if json.Unmarshal([]byte(raw), &out) == nil {
+			if out == nil {
+				out = map[string][]string{}
+			}
+			return out
+		}
+		out = map[string][]string{}
+	}
+	raw, ok, err := st.GetMeta(ctx, core.MetaIndexNative)
+	if err != nil || !ok || raw == "" {
+		return out
+	}
+	var previous []string
+	if json.Unmarshal([]byte(raw), &previous) != nil {
+		return out
+	}
+	seen := map[string]bool{}
+	for _, line := range previous {
+		name, rest, found := strings.Cut(line, ": ")
+		if !found || seen[line] || strings.HasPrefix(rest, "skipped:") || carriedVerdictLine(rest) ||
+			(strings.Contains(rest, " pass over ") && strings.Contains(rest, " took ")) {
+			continue
+		}
+		seen[line] = true
+		out[name] = append(out[name], line)
+	}
+	return out
 }
