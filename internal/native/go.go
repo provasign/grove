@@ -49,9 +49,15 @@ func (goAnalyzer) Available(_ context.Context, root string) Availability {
 }
 
 type goListPackage struct {
-	Dir         string
-	ImportPath  string
-	GoFiles     []string
+	Dir        string
+	ImportPath string
+	GoFiles    []string
+	// CgoFiles are the package's files that import "C". They are ordinary
+	// Go source for everything but C.x references: a package whose files
+	// all use cgo has GoFiles=[] and only CgoFiles (astkit's
+	// thirdparty/tsobjc), and loading GoFiles alone made it an empty
+	// package named "" (stack audit 2026-10-20 #4).
+	CgoFiles    []string
 	TestGoFiles []string
 	Imports     []string
 	// Test-file imports are reported separately by go list; the scoped-delta
@@ -357,7 +363,7 @@ func CleanupLegacyCaches(root string) {
 }
 
 func packageFiles(root string, pkg goListPackage) []string {
-	names := append(append([]string{}, pkg.GoFiles...), pkg.TestGoFiles...)
+	names := append(append(append([]string{}, pkg.GoFiles...), pkg.CgoFiles...), pkg.TestGoFiles...)
 	out := make([]string, 0, len(names))
 	for _, name := range names {
 		rel, ok := relFile(root, filepath.Join(pkg.Dir, name))
@@ -543,6 +549,11 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 	conf := types.Config{
 		Importer: projectImporter,
 		Error:    func(error) {},
+		// cgo files are checked as written, so positions stay those of the
+		// user's source (no cgo-generated files): `import "C"` declares an
+		// empty package and C.x references are untyped, as the dependency
+		// source importer already does. Everything else type-checks.
+		FakeImportC: true,
 	}
 	pkg, _ := conf.Check(pkgPath, fset, parsed, info)
 	dispatch := newGoInterfaceDispatch(pkg, root, dir, fset, symbolIdx, pkgDirsByImport)

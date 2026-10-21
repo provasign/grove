@@ -128,8 +128,11 @@ func (p *goProjectImporter) load(path string) (loaded *types.Package, err error)
 		}
 	}
 	fset := token.NewFileSet()
-	files := make([]*ast.File, 0, len(meta.GoFiles))
-	for _, name := range meta.GoFiles {
+	// cgo files join the ordinary Go files (the dependency source importer
+	// below does the same); FakeImportC handles their `import "C"`.
+	names := append(append([]string(nil), meta.GoFiles...), meta.CgoFiles...)
+	files := make([]*ast.File, 0, len(names))
+	for _, name := range names {
 		file, err := parser.ParseFile(fset, filepath.Join(meta.Dir, name), nil, parser.SkipObjectResolution)
 		if file == nil {
 			return nil, err
@@ -139,11 +142,28 @@ func (p *goProjectImporter) load(path string) (loaded *types.Package, err error)
 		}
 		files = append(files, file)
 	}
-	conf := types.Config{Importer: p, Error: func(error) {}}
+	// Under FakeImportC every C.x is untyped, so expressions using one
+	// (int(t.n) for a C.int field) report type errors that only say cgo
+	// was not run. Those are expected and do not make the package partial;
+	// the first error elsewhere does.
+	cgoFiles := map[string]bool{}
+	for _, name := range meta.CgoFiles {
+		cgoFiles[filepath.Join(meta.Dir, name)] = true
+	}
+	var firstErr error
+	conf := types.Config{Importer: p, FakeImportC: true, Error: func(e error) {
+		if te, ok := e.(types.Error); ok && cgoFiles[te.Fset.Position(te.Pos).Filename] {
+			return
+		}
+		if firstErr == nil {
+			firstErr = e
+		}
+	}}
 	pkg, err := conf.Check(path, fset, files, nil)
 	if pkg == nil {
 		return nil, err
 	}
+	err = firstErr
 	// A type error (typically one unresolvable third-party import: gin's
 	// binding imports go.mongodb.org/mongo-driver, absent from a fresh
 	// module cache) does not void the package. go/types checked everything
