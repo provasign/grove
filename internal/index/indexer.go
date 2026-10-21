@@ -497,6 +497,14 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 		blobSHA, err := parser.FileBlobSHA(path)
 		if err != nil {
 			result.Errors = append(result.Errors, fmt.Sprintf("%s: %v", relPath, err))
+			// The stat cache above did not match, so the bytes on disk are
+			// not the ones indexed (or cannot be read at all: over the size
+			// cap, no longer a regular file, permission denied). As with a
+			// parse failure, the stored symbols would describe content that
+			// no longer exists, presented as current — drop the file from
+			// currentFiles so the prune pass removes them. The error stays
+			// in result.Errors on every run until the file indexes again.
+			delete(currentFiles, relPath)
 			return nil
 		}
 		var size, mtime int64 = -1, -1
