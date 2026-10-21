@@ -199,6 +199,11 @@ const (
 	// MetaNativeComplete: JSON list of native analyzers that have completed
 	// a full pass on this index (later passes may be incremental).
 	MetaNativeComplete = "native-complete"
+	// MetaNativeLastGood: JSON object analyzer -> the diagnostic lines of
+	// its last pass that produced edges. A run that carries an analyzer's
+	// stored edges forward reports these lines once, followed by the
+	// current attempt's lines (see index.carryForwardVerdict).
+	MetaNativeLastGood = "native-last-good"
 )
 
 type IndexResult struct {

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"strconv"
+	"strings"
 	"time"
 
 	"fmt"
@@ -90,10 +91,16 @@ func tsWorkerFor(root, dir string) *residentWorker {
 // repository root, or of every root when root is "". Engines call it on
 // Close.
 func StopTSWorkers(root string) {
+	stopResidentWorkers(root, "")
+}
+
+// stopResidentWorkers stops the resident workers of root ("" = every root)
+// whose registry key starts with prefix ("" = every kind).
+func stopResidentWorkers(root, prefix string) {
 	residentWorkers.Lock()
 	defer residentWorkers.Unlock()
 	for key, w := range residentWorkers.m {
-		if root == "" || w.root == root {
+		if (root == "" || w.root == root) && strings.HasPrefix(key, prefix) {
 			w.mu.Lock()
 			w.stopLocked()
 			w.mu.Unlock()

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/provasign/grove/internal/parser"
@@ -99,5 +100,61 @@ func TestIndexerShieldsUnreadableSubtreeFromPruning(t *testing.T) {
 	}
 	if !stored["sub/sub.go"] {
 		t.Fatalf("sub/sub.go missing from store after unreadable walk: %v", files)
+	}
+}
+
+// TestIndexerDropsSymbolsOfUnreadableChangedFile (stack audit 2026-10-20 #1):
+// a file whose new content cannot be read (here: over the size cap) must
+// not keep serving the symbols of its last indexed version as current. Same
+// contract as a parse failure: the stored facts are pruned, and the error is
+// reported in result.Errors on every run until the file indexes again.
+func TestIndexerDropsSymbolsOfUnreadableChangedFile(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "a.go")
+	if err := os.WriteFile(path, []byte("package a\n\nfunc Target() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	idx := New(parser.NewEngine(), st)
+	ctx := context.Background()
+	if _, res, err := idx.Index(ctx, root); err != nil || res.FilesUpdated != 1 {
+		t.Fatalf("seed index: %v %#v", err, res)
+	}
+	big := make([]byte, parser.MaxFileSizeBytes+1)
+	copy(big, "package a\n\n// no Target here\n")
+	for i := len("package a\n\n// no Target here\n"); i < len(big); i++ {
+		big[i] = '\n'
+	}
+	if err := os.WriteFile(path, big, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for run := 1; run <= 2; run++ {
+		_, res, err := idx.Index(ctx, root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(res.Errors) == 0 || !strings.Contains(strings.Join(res.Errors, "\n"), "a.go") {
+			t.Fatalf("run %d: oversize file not reported: %#v", run, res.Errors)
+		}
+		syms, err := st.SymbolsForFiles(ctx, []string{"a.go"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, s := range syms {
+			if s.Name == "Target" {
+				t.Fatalf("run %d: removed Target still indexed from the last readable version", run)
+			}
+		}
+	}
+	// Readable again: indexed again.
+	if err := os.WriteFile(path, []byte("package a\n\nfunc Target() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, res, err := idx.Index(ctx, root); err != nil || len(res.Errors) != 0 || res.FilesUpdated != 1 {
+		t.Fatalf("recovery index: %v %#v", err, res)
 	}
 }

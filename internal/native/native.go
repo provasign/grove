@@ -159,6 +159,44 @@ type Result struct {
 	Partial map[string][]string
 	// Completed names analyzers that finished a full pass this run.
 	Completed []string
+	// Incomplete names analyzers that were due a full pass this run, had
+	// files to analyze, and did not complete it: unavailable, failed, timed
+	// out, or produced no edges. The indexer schedules their retry.
+	Incomplete map[string]Incomplete
+}
+
+// Incomplete describes why an analyzer's full pass did not complete.
+type Incomplete struct {
+	// Unavailable: the analyzer never started (toolchain or project
+	// configuration missing), so a cheap availability check decides
+	// whether a retry can succeed.
+	Unavailable bool
+	Reason      string
+}
+
+func (r *Result) incomplete(name string, why Incomplete) {
+	if r.Incomplete == nil {
+		r.Incomplete = map[string]Incomplete{}
+	}
+	r.Incomplete[name] = why
+}
+
+// AnalyzerAvailable runs the named analyzer's availability check for root.
+// ok is false when no such analyzer exists or cfg disables it (natively
+// disabled analyzers are never retried).
+func AnalyzerAvailable(ctx context.Context, root, name string, cfg Config) (avail Availability, ok bool) {
+	if !cfg.Enabled {
+		return Availability{}, false
+	}
+	for _, a := range PriorityAnalyzers() {
+		if a.Name() == name {
+			if !analyzerEnabled(a, cfg) {
+				return Availability{}, false
+			}
+			return a.Available(ctx, root), true
+		}
+	}
+	return Availability{}, false
 }
 
 func PriorityAnalyzers() []Analyzer {
@@ -227,6 +265,9 @@ func AnalyzeChangedFiles(ctx context.Context, root string, symbols []core.Symbol
 			combined.Diagnostics = append(combined.Diagnostics,
 				analyzer.Name()+": skipped: "+avail.Reason+" (previous native edges carried forward)")
 			combined.SkippedLanguages = append(combined.SkippedLanguages, analyzer.Languages()...)
+			if full {
+				combined.incomplete(analyzer.Name(), Incomplete{Unavailable: true, Reason: avail.Reason})
+			}
 			continue
 		}
 		// Budget scales with input size unless the user pinned a timeout:
@@ -288,12 +329,21 @@ func AnalyzeChangedFiles(ctx context.Context, root string, symbols []core.Symbol
 			combined.Diagnostics = append(combined.Diagnostics,
 				analyzer.Name()+": "+reason+" — previous native edges carried forward")
 			combined.SkippedLanguages = append(combined.SkippedLanguages, analyzer.Languages()...)
+			if full {
+				combined.incomplete(analyzer.Name(), Incomplete{Reason: reason})
+			}
 			continue
 		}
 		combined.Edges = append(combined.Edges, result.Edges...)
 		combined.Symbols = append(combined.Symbols, result.Symbols...)
 		if full && !timedOut && len(result.Partial) == 0 {
 			combined.Completed = append(combined.Completed, analyzer.Name())
+		} else if full {
+			reason := "partial result"
+			if timedOut {
+				reason = "timed out after " + timeout.String()
+			}
+			combined.incomplete(analyzer.Name(), Incomplete{Reason: reason})
 		}
 		for lang, dirs := range result.Partial {
 			if combined.Partial == nil {

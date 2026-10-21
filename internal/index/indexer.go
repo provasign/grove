@@ -2,6 +2,8 @@ package index
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -25,6 +27,8 @@ type Indexer struct {
 	parser       *parser.Engine
 	store        *store.Store
 	nativeConfig native.Config
+	// now is the clock for native retry scheduling (tests); nil = time.Now.
+	now func() time.Time
 
 	// pendingSpliceCheck is the store fingerprint check of the last splice
 	// write when Options.DeferSpliceCheck was set; see TakeSpliceCheck.
@@ -416,8 +420,9 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 		return nil, result, err
 	}
 	forceExtract := opts.Force || storedExtractor != parser.ExtractorVersion || storedResolver != graph.ResolverVersion
-	statRefresh := map[string][2]int64{} // touched but content-identical
-	var walkFailed []string              // relPaths whose subtree could not be read this run
+	statRefresh := map[string][2]int64{}       // touched but content-identical
+	var walkFailed []string                    // relPaths whose subtree could not be read this run
+	compilerInputs := map[string]os.FileInfo{} // build-configuration files, see native.CompilerInputAnalyzers
 	err = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			// A failed subtree contributes nothing to currentFiles, so the
@@ -453,7 +458,18 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 			}
 			return nil
 		}
-		if isSensitivePath(relPath) || ignore.Ignored(relPath, false) {
+		if isSensitivePath(relPath) {
+			return nil
+		}
+		// Compiler inputs are fingerprinted even when gitignored (a
+		// generated compile_commands.json usually is): the toolchain reads
+		// them either way. Only their stat is recorded here.
+		if native.CompilerInputAnalyzers(relPath) != nil {
+			if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() {
+				compilerInputs[relPath] = info
+			}
+		}
+		if ignore.Ignored(relPath, false) {
 			return nil
 		}
 		// A symlinked FILE entry inside root can point anywhere; WalkDir
@@ -497,6 +513,14 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 		blobSHA, err := parser.FileBlobSHA(path)
 		if err != nil {
 			result.Errors = append(result.Errors, fmt.Sprintf("%s: %v", relPath, err))
+			// The stat cache above did not match, so the bytes on disk are
+			// not the ones indexed (or cannot be read at all: over the size
+			// cap, no longer a regular file, permission denied). As with a
+			// parse failure, the stored symbols would describe content that
+			// no longer exists, presented as current — drop the file from
+			// currentFiles so the prune pass removes them. The error stays
+			// in result.Errors on every run until the file indexes again.
+			delete(currentFiles, relPath)
 			return nil
 		}
 		var size, mtime int64 = -1, -1
@@ -522,6 +546,38 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 		return nil, result, err
 	}
 	tick("walk+sha-scan")
+	// A changed compiler input (tsconfig.json, go.mod, pom.xml, ...)
+	// invalidates its analyzer's completed pass: it runs in full on this
+	// run even when none of its source files changed, and its resident
+	// worker state is dropped.
+	invalidated, err := i.syncCompilerInputs(ctx, root, compilerInputs, walkFailed)
+	if err != nil {
+		return nil, result, err
+	}
+	if len(invalidated) > 0 {
+		names := make([]string, 0, len(invalidated))
+		for name := range invalidated {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		if err := i.invalidateNativeComplete(ctx, names); err != nil {
+			return nil, result, err
+		}
+		native.InvalidateResident(root, names)
+		// Due now, and durable: a run interrupted before the analyzer
+		// completes leaves it retried by the next index, changes or not.
+		retryState := i.loadNativeRetry(ctx)
+		for _, name := range names {
+			retryState[name] = nativeRetry{Reason: "compiler inputs changed"}
+		}
+		if err := i.saveNativeRetry(ctx, retryState); err != nil {
+			return nil, result, err
+		}
+		for _, name := range names {
+			result.Native = append(result.Native, fmt.Sprintf("%s: compiler inputs changed (%s); running a full pass",
+				name, strings.Join(invalidated[name], ", ")))
+		}
+	}
 	prog.phase("parsing", fmt.Sprintf("0/%d changed files parsed", len(tasks)))
 
 	// Phase 2 (parallel): parse changed files. Tree-sitter parsing is the
@@ -662,7 +718,26 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 	// The check runs BEFORE AllSymbols so a no-op never pays the full symbol
 	// load; counts come from COUNT(*) queries instead of loaded slices.
 	recoverMissingEdges := false
-	if !forceExtract && result.FilesUpdated == 0 && result.FilesPruned == 0 {
+	completed := i.loadNativeComplete(ctx)
+	retryState := i.loadNativeRetry(ctx)
+	var retryNow map[string]bool
+	if !forceExtract && result.FilesUpdated == 0 && result.FilesPruned == 0 && len(invalidated) == 0 {
+		var pending []string
+		retryNow, pending, err = i.noopRetries(ctx, root, completed, retryState)
+		if err != nil {
+			return nil, result, err
+		}
+		if len(retryNow) == 0 {
+			msg := "skipped: no file changes since last index"
+			if len(pending) > 0 {
+				msg += "; " + strings.Join(pending, "; ")
+			} else {
+				msg += " (use --force to re-run analyzers)"
+			}
+			result.Native = append(result.Native, msg)
+		}
+	}
+	if len(retryNow) == 0 && !forceExtract && result.FilesUpdated == 0 && result.FilesPruned == 0 && len(invalidated) == 0 {
 		status, err := i.store.Status(ctx)
 		if err != nil {
 			return nil, result, err
@@ -673,7 +748,6 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 		if status.EdgeCount > 0 || status.SymbolCount == 0 {
 			result.SymbolCount = status.SymbolCount
 			result.EdgeCount = status.EdgeCount
-			result.Native = append(result.Native, "skipped: no file changes since last index (use --force to re-run analyzers)")
 			if opts.SkipNoopGraph {
 				return nil, result, nil
 			}
@@ -753,20 +827,29 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 		}
 		sort.Strings(nativeCfg.CallerFiles)
 	}
-	completed := map[string]bool{}
-	if raw, ok, err := i.store.GetMeta(ctx, core.MetaNativeComplete); err == nil && ok && raw != "" {
-		var names []string
-		if json.Unmarshal([]byte(raw), &names) == nil {
-			for _, n := range names {
-				completed[n] = true
-			}
-		}
-	}
+	// An analyzer without a completed pass gets a full pass when its
+	// languages changed, when its retry is due, or when the no-change
+	// check above chose to retry it. Otherwise it is skipped like a
+	// completed one, its stored edges carried, until the retry is due —
+	// a failing 30-minute compiler pass is not re-launched by every edit
+	// in another language.
 	nativeCfg.RunToCompletion = map[string]bool{}
 	for _, a := range native.PriorityAnalyzers() {
-		if !completed[a.Name()] {
-			nativeCfg.RunToCompletion[a.Name()] = true
+		name := a.Name()
+		if completed[name] {
+			continue
 		}
+		touched := false
+		for _, lang := range a.Languages() {
+			touched = touched || changedLanguages[lang]
+		}
+		if retryNow[name] || touched || (retryNow == nil && i.retryDue(retryState, name)) {
+			nativeCfg.RunToCompletion[name] = true
+		}
+	}
+	for _, name := range sortedKeys(retryNow) {
+		r := retryState[name]
+		result.Native = append(result.Native, fmt.Sprintf("%s: retrying its incomplete full pass (last attempt: %s)", name, r.Reason))
 	}
 	nativeResult := native.AnalyzeChangedFiles(ctx, root, symbols, nativeCfg, scope, changedRel, allFiles)
 	if len(nativeResult.Completed) > 0 {
@@ -783,6 +866,9 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 		}
 	}
 	result.Native = append(result.Native, nativeResult.Diagnostics...)
+	if err := i.recordNativeAttempts(ctx, retryState, nativeResult); err != nil {
+		return nil, result, err
+	}
 	if len(nativeResult.Symbols) > 0 {
 		// Compiler-declared symbols (native.Result.Symbols) join the parsed
 		// ones in the store and in this run's symbol set, in store order, so
@@ -1182,36 +1268,271 @@ func remapEdgeEndpoints(edges []core.Edge, remap map[string]string) {
 	}
 }
 
-// carryForwardVerdict keeps the stored per-analyzer verdict for every
-// analyzer this run skipped with "previous edges carried forward". The
-// persisted verdict describes the native edges in the database, and those
-// edges did not change. Without this, editing a README after a full Java
-// index rewrote the verdict to "java: skipped: no changed files", and prism
-// then marked every change-impact answer on the untouched Java graph as
-// unconfirmed (all compiled-language cells in the 2026-10-11 bench).
+// carryForwardVerdict builds the per-analyzer verdict this run persists.
+// The persisted verdict describes the native edges in the database. An
+// analyzer that ran and produced edges reports its current lines. An
+// analyzer whose stored edges were carried forward (skipped because nothing
+// of its changed, unavailable, failed, timed out) reports the lines of its
+// last pass that produced edges — the pass those carried edges come from —
+// once, followed by this run's lines saying why nothing replaced them.
+// Without the carry, editing a README after a full Java index rewrote the
+// verdict to "java: skipped: no changed files", and prism then marked every
+// change-impact answer on the untouched Java graph as unconfirmed (all
+// compiled-language cells in the 2026-10-11 bench).
+//
+// The last-good lines live in their own meta key, so a carry never re-reads
+// its own output: re-carrying the previous merged verdict appended the
+// whole history again each run, and one two-line diagnostic grew to 4, 6,
+// 8, 10 lines (stack audit 2026-10-20 #10).
 func carryForwardVerdict(ctx context.Context, st *store.Store, current []string) []string {
-	raw, ok, err := st.GetMeta(ctx, core.MetaIndexNative)
-	if err != nil || !ok || raw == "" {
-		return current
+	lastGood := loadLastGood(ctx, st)
+	type group struct {
+		name  string
+		lines []string
 	}
-	var previous []string
-	if json.Unmarshal([]byte(raw), &previous) != nil || len(previous) == 0 {
-		return current
-	}
-	var merged []string
+	var groups []*group
+	byName := map[string]*group{}
 	for _, line := range current {
-		name, rest, found := strings.Cut(line, ": ")
-		carried := found && strings.Contains(rest, "carried forward") &&
-			(strings.HasPrefix(rest, "skipped:") || strings.Contains(rest, "previous native edges carried forward"))
-		if carried {
-			for _, prev := range previous {
-				prevName, prevRest, prevFound := strings.Cut(prev, ": ")
-				if prevFound && prevName == name && !strings.HasPrefix(prevRest, "skipped:") {
-					merged = append(merged, prev)
-				}
+		name, _, found := strings.Cut(line, ": ")
+		if !found {
+			name = "" // "native analyzers disabled": not one analyzer's line
+		}
+		g := byName[name]
+		if g == nil || name == "" {
+			g = &group{name: name}
+			groups = append(groups, g)
+			if name != "" {
+				byName[name] = g
 			}
 		}
-		merged = append(merged, line)
+		g.lines = append(g.lines, line)
+	}
+	var merged []string
+	for _, g := range groups {
+		if g.name == "" {
+			merged = append(merged, g.lines...)
+			continue
+		}
+		carried, disabled := false, false
+		for _, line := range g.lines {
+			_, rest, _ := strings.Cut(line, ": ")
+			carried = carried || carriedVerdictLine(rest)
+			disabled = disabled || rest == "skipped: disabled by config"
+		}
+		switch {
+		case carried:
+			inCurrent := map[string]bool{}
+			for _, line := range g.lines {
+				inCurrent[line] = true
+			}
+			for _, line := range lastGood[g.name] {
+				if !inCurrent[line] {
+					merged = append(merged, line)
+				}
+			}
+		case disabled:
+			delete(lastGood, g.name) // its edges are not carried
+		default:
+			lastGood[g.name] = append([]string(nil), g.lines...)
+		}
+		merged = append(merged, g.lines...)
+	}
+	// An analyzer with no lines at all had no files of its languages: it
+	// has no edges left to carry.
+	for name := range lastGood {
+		if byName[name] == nil {
+			delete(lastGood, name)
+		}
+	}
+	if raw, err := json.Marshal(lastGood); err == nil {
+		_ = st.SetMeta(ctx, core.MetaNativeLastGood, string(raw))
 	}
 	return merged
+}
+
+// carriedVerdictLine reports whether an analyzer diagnostic (without its
+// "name: " prefix) says the analyzer's stored edges were carried forward
+// instead of replaced this run.
+func carriedVerdictLine(rest string) bool {
+	return strings.Contains(rest, "carried forward") &&
+		(strings.HasPrefix(rest, "skipped:") || strings.Contains(rest, "previous native edges carried forward"))
+}
+
+// loadLastGood returns the stored last-good lines per analyzer. An index
+// written before the key existed derives them from its stored verdict: each
+// analyzer's lines minus skip/carry lines and pass timings (which may
+// belong to a failed attempt), deduplicated — the earlier carry format
+// repeated them.
+func loadLastGood(ctx context.Context, st *store.Store) map[string][]string {
+	out := map[string][]string{}
+	if raw, ok, err := st.GetMeta(ctx, core.MetaNativeLastGood); err == nil && ok && raw != "" {
+		if json.Unmarshal([]byte(raw), &out) == nil {
+			if out == nil {
+				out = map[string][]string{}
+			}
+			return out
+		}
+		out = map[string][]string{}
+	}
+	raw, ok, err := st.GetMeta(ctx, core.MetaIndexNative)
+	if err != nil || !ok || raw == "" {
+		return out
+	}
+	var previous []string
+	if json.Unmarshal([]byte(raw), &previous) != nil {
+		return out
+	}
+	seen := map[string]bool{}
+	for _, line := range previous {
+		name, rest, found := strings.Cut(line, ": ")
+		if !found || seen[line] || strings.HasPrefix(rest, "skipped:") || carriedVerdictLine(rest) ||
+			(strings.Contains(rest, " pass over ") && strings.Contains(rest, " took ")) {
+			continue
+		}
+		seen[line] = true
+		out[name] = append(out[name], line)
+	}
+	return out
+}
+
+// compilerInputState is the stored fingerprint of one compiler input.
+type compilerInputState struct {
+	Size  int64  `json:"size"`
+	Mtime int64  `json:"mtime"`
+	SHA   string `json:"sha"`
+}
+
+// metaNativeInputs: JSON object relPath -> compilerInputState.
+const metaNativeInputs = "native-inputs"
+
+// syncCompilerInputs compares the walked compiler inputs with the stored
+// fingerprints and returns, per analyzer, the inputs that were added,
+// removed or changed in content (sorted). A file whose size and mtime match
+// keeps its stored hash; a touched but identical file is not a change. The
+// first run that records fingerprints reports nothing: there is no earlier
+// state to differ from, and a cold index runs every analyzer anyway. Inputs
+// under a subtree the walk could not read keep their stored state.
+func (i *Indexer) syncCompilerInputs(ctx context.Context, root string, inputs map[string]os.FileInfo, walkFailed []string) (map[string][]string, error) {
+	raw, haveStored, err := i.store.GetMeta(ctx, metaNativeInputs)
+	if err != nil {
+		return nil, err
+	}
+	stored := map[string]compilerInputState{}
+	if haveStored && raw != "" && json.Unmarshal([]byte(raw), &stored) != nil {
+		stored = map[string]compilerInputState{}
+		haveStored = false
+	}
+	current := make(map[string]compilerInputState, len(inputs))
+	changed := map[string]bool{}
+	for rel, info := range inputs {
+		state := compilerInputState{Size: info.Size(), Mtime: info.ModTime().UnixNano()}
+		prev, ok := stored[rel]
+		if ok && prev.Size == state.Size && prev.Mtime == state.Mtime {
+			state.SHA = prev.SHA
+		} else {
+			state.SHA = compilerInputHash(filepath.Join(root, filepath.FromSlash(rel)), state)
+		}
+		current[rel] = state
+		if !ok || prev.SHA != state.SHA {
+			changed[rel] = true
+		}
+	}
+	for rel, prev := range stored {
+		if _, ok := current[rel]; ok {
+			continue
+		}
+		shielded := false
+		for _, failed := range walkFailed {
+			if rel == failed || strings.HasPrefix(rel, failed+"/") {
+				shielded = true
+				break
+			}
+		}
+		if shielded {
+			current[rel] = prev
+			continue
+		}
+		changed[rel] = true
+	}
+	same := len(current) == len(stored)
+	if same {
+		for rel, state := range current {
+			if stored[rel] != state {
+				same = false
+				break
+			}
+		}
+	}
+	if !same || !haveStored {
+		encoded, err := json.Marshal(current)
+		if err != nil {
+			return nil, err
+		}
+		if err := i.store.SetMeta(ctx, metaNativeInputs, string(encoded)); err != nil {
+			return nil, err
+		}
+	}
+	if !haveStored || len(changed) == 0 {
+		return nil, nil
+	}
+	out := map[string][]string{}
+	for rel := range changed {
+		for _, name := range native.CompilerInputAnalyzers(rel) {
+			out[name] = append(out[name], rel)
+		}
+	}
+	for name := range out {
+		sort.Strings(out[name])
+	}
+	return out, nil
+}
+
+// compilerInputHash hashes a compiler input's content. Inputs are small;
+// one past the indexer's size cap (or unreadable) is fingerprinted by its
+// stat alone.
+func compilerInputHash(path string, state compilerInputState) string {
+	if state.Size <= parser.MaxFileSizeBytes {
+		if data, err := os.ReadFile(path); err == nil && int64(len(data)) <= parser.MaxFileSizeBytes {
+			sum := sha1.Sum(data)
+			return hex.EncodeToString(sum[:])
+		}
+	}
+	return fmt.Sprintf("stat:%d:%d", state.Size, state.Mtime)
+}
+
+// invalidateNativeComplete removes analyzers from the completed-pass list,
+// so the next native run gives them a full pass (RunToCompletion).
+func (i *Indexer) invalidateNativeComplete(ctx context.Context, names []string) error {
+	raw, ok, err := i.store.GetMeta(ctx, core.MetaNativeComplete)
+	if err != nil || !ok || raw == "" {
+		return err
+	}
+	var completed []string
+	if json.Unmarshal([]byte(raw), &completed) != nil {
+		return nil
+	}
+	drop := map[string]bool{}
+	for _, n := range names {
+		drop[n] = true
+	}
+	kept := completed[:0]
+	for _, n := range completed {
+		if !drop[n] {
+			kept = append(kept, n)
+		}
+	}
+	encoded, err := json.Marshal(kept)
+	if err != nil {
+		return err
+	}
+	return i.store.SetMeta(ctx, core.MetaNativeComplete, string(encoded))
+}
+
+func sortedKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
