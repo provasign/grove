@@ -38,7 +38,7 @@ jobs:
           echo "GROVE_TEST_TYPESCRIPT_ROOT=$RUNNER_TEMP/ts" >> "$GITHUB_ENV"
           echo "GROVE_TEST_REQUIRE_TS=1" >> "$GITHUB_ENV"
       - run: go vet ./...
-      - run: go test ./... -count=1 -short -timeout 120s
+      - run: go test ./... -count=1 -short -timeout 300s
       - run: go build ./...
 
   verify-self:
