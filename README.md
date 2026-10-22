@@ -6,7 +6,7 @@ Grove is the graph engine embedded by [Prism](https://github.com/provasign/prism
 
 ## What it provides
 
-- Tree-sitter extraction across sixteen languages, with native semantic enrichment when the local toolchain is available
+- Tree-sitter extraction across fourteen languages (the table under Language support), with native semantic enrichment when the local toolchain is available
 - Type-resolved calls, imports, inheritance, implementation, type-use, and test relationships
 - Incremental indexing by content hash
 - Deterministic change-impact, rename, missing-implementation, and dead-code operations
@@ -25,7 +25,7 @@ curl -fsSL https://raw.githubusercontent.com/provasign/grove/main/install.sh | b
 irm https://raw.githubusercontent.com/provasign/grove/main/install.ps1 | iex
 
 # Pin the current release
-VERSION=v0.45.0 curl -fsSL https://raw.githubusercontent.com/provasign/grove/main/install.sh | bash
+VERSION=v0.63.25 curl -fsSL https://raw.githubusercontent.com/provasign/grove/main/install.sh | bash
 ```
 
 The installer writes to `~/bin` by default. Set `INSTALL_DIR` to choose another location.
@@ -151,19 +151,19 @@ The package also exposes snapshots and structural diffs for integrations that ne
 | Language | Extensions |
 |---|---|
 | Go | `.go` |
-| TypeScript / TSX | `.ts`, `.tsx` |
+| TypeScript / TSX | `.ts`, `.mts`, `.cts`, `.tsx` |
 | JavaScript / JSX | `.js`, `.jsx`, `.mjs`, `.cjs` |
 | Python | `.py` |
 | Java | `.java` |
 | Rust | `.rs` |
-| C / C++ | `.c`, `.h`, `.cc`, `.cpp`, `.cxx`, `.hh`, `.hpp` |
+| C / C++ | `.c`, `.h`, `.cc`, `.cpp`, `.cxx`, `.c++`, `.hh`, `.hpp`, `.hxx` |
 | C# | `.cs` |
-| PHP | `.php`, `.phtml` |
+| PHP | `.php`, `.php3`, `.php4`, `.php5`, `.phtml` |
 | Swift | `.swift` |
 | Kotlin | `.kt`, `.kts` |
 | Objective-C | `.m`, `.mm`, `.h` (content-sniffed) |
-| COBOL | `.cbl`, `.cob`, `.cpy` and copybook variants |
-| JCL | `.jcl`, `.prc` |
+| COBOL | `.cbl`, `.cob`, `.cobol`; copybooks `.cpy`, `.ccp`, `.cpb`, `.copy` (any case) |
+| JCL | `.jcl`, `.prc` (any case) |
 
 Common non-code files are indexed as document symbols for lexical retrieval. Native analyzers can enrich the graph when the relevant language tooling is available. `grove doctor` reports each language's resolution tier and known limitations.
 
@@ -177,36 +177,41 @@ go test ./internal/parser/... -v
 ```
 
 Current call-edge accuracy against each language's compiler or runtime oracle
-(pinned corpora, CI-gated floors in `eval/baseline.json`; 2026-09-19):
+(pinned corpora, CI-gated floors in `eval/baseline.json`; 2026-10-22, Grove v0.63.25):
 
 | Language | Corpus | Oracle | Precision | Recall |
 |---|---|---|---|---|
-| Go | gin | SSA + VTA | 0.952 | 0.951 |
-| Java | commons-lang | javac + javap | 0.938 | 0.952 |
-| C# | Newtonsoft.Json | Roslyn | 0.935 | 0.947 |
-| TypeScript | socket.io | TypeScript checker | 0.903 | 0.992 |
-| JavaScript | express | TypeScript checker (`checkJs`) | 0.840 | 1.000 |
-| Rust | ripgrep | rust-analyzer SCIP | 0.936 | 0.905 |
-| C | jansson | clang AST | 0.999 | 0.984 |
-| Swift | SwiftyJSON | SourceKit index | 0.936 | 1.000 |
-| Kotlin | turtle | kotlinc + javap | 1.000 | 0.988 |
-| Objective-C | SBJson | clang AST | 1.000 | 0.991 |
-| Python | flask | pytest trace (dynamic) | 0.852 | 0.716 |
-| PHP | PHP-Parser | Xdebug trace (dynamic) | 0.918 | 0.647 |
+| Go | gin | SSA + VTA | 0.979 | 0.997 |
+| Java | commons-lang | javac + javap | 1.000 | 1.000 |
+| C# | Newtonsoft.Json | Roslyn | 0.971 | 0.977 |
+| TypeScript | socket.io | TypeScript checker | 0.937 | 0.992 |
+| JavaScript | express | TypeScript checker (`checkJs`) | 0.885 | 1.000 |
+| Rust | ripgrep | rust-analyzer SCIP | 0.965 | 0.906 |
+| C | jansson | clang AST | 1.000 | 0.998 |
+| Swift | SwiftyJSON | SourceKit index | 1.000 | 1.000 |
+| Kotlin | turtle | kotlinc + javap | 1.000 | 1.000 |
+| Objective-C | SBJson (json-framework) | clang AST | 1.000 | 1.000 |
+| Python | flask | pytest trace (dynamic) | 0.896 | 0.787 |
+| PHP | PHP-Parser | Xdebug trace (dynamic) | 0.922 | 0.683 |
 
 A second, untuned corpus per language guards against rules that only fit
 the first (also gated):
 
 | Language | Second corpus | Precision | Recall |
 |---|---|---|---|
-| Go | cobra | 0.983 | 0.952 |
-| Java | commons-io | 0.893 | 0.912 |
+| Go | cobra | 0.995 | 1.000 |
+| Java | commons-io | 1.000 | 1.000 |
 | C | cJSON | 0.998 | 0.999 |
 | Rust | fd | 0.952 | 0.913 |
 | TypeScript | p-queue | 0.959 | 1.000 |
-| Swift | Files | 0.988 | 0.922 |
-| Objective-C | CocoaLumberjack | 0.956 | 0.799 (property reads) |
-| PHP | league/csv (dynamic) | 0.889 | 0.702 |
+| Swift | Files | 1.000 | 1.000 |
+| Objective-C | CocoaLumberjack | 0.975 | 0.957 |
+| PHP | league/csv (dynamic) | 0.947 | 0.837 |
+
+C#, JavaScript, Kotlin and Python have one scored corpus each.
+
+COBOL and JCL are supported with a regression-tested graph; their accuracy is
+not yet independently scored.
 
 The dynamic oracles record only paths the test suites execute and count
 reflection-driven dispatch a static graph cannot name, so their recall is a
