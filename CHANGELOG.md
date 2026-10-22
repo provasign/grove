@@ -1,5 +1,52 @@
 # Changelog
 
+## v0.63.25 - 2026-10-21
+
+Index correctness fixes from the 2026-10-20 stack audit.
+
+**Fixes (results)**
+- **Unreadable changed files are pruned**: a file whose stat changed but
+  whose content can no longer be hashed (over the 10 MiB cap, not a regular
+  file, unreadable) kept the symbols of its last readable version, served as
+  current. Its stored symbols are now dropped, as for a changed file that
+  fails to parse. The error stays in `IndexResult.Errors` and is reported on
+  every run until the file indexes. Unreadable directories are unchanged:
+  their files are not seen, so their stored state is kept.
+- **Compiler inputs are fingerprinted per analyzer**: editing only build
+  configuration (`go.mod`/`go.sum`/`go.work`, `tsconfig*.json`,
+  `jsconfig*.json`, `package.json`, Maven/Gradle files, `Cargo.toml`/
+  `Cargo.lock`, `compile_commands.json`, `*.csproj`/`Directory.Build.props`,
+  `composer.json`, Python project files) used to leave the graph resolved
+  under the old configuration. These files are now content-hashed (even when
+  gitignored); a change gives the analyzer that reads them a full pass and
+  drops only that analyzer's resident worker state. A touch without a content
+  change is not a change.
+- **cgo files in project packages**: a local Go package whose files all
+  import `"C"` loaded as an empty package. cgo files are now parsed and
+  type-checked with the package (`FakeImportC`), keep positions in the
+  user's source, and no longer mark the package as partially checked.
+- **Bounded retries for incomplete native analysis**: a no-change index
+  returned before giving an analyzer without a completed pass another run,
+  so installing a missing compiler had no effect until `--force`. An
+  unavailable analyzer is now rechecked after 15s, doubling to at most
+  10 min; a pass that ran and failed is retried after 1 min, doubling to at
+  most 6 h. The no-change message says which analyzer is pending, why, and
+  when the next retry is due.
+- **One current native verdict per analyzer**: carried-forward verdict lines
+  were re-carried on every run, so one diagnostic grew by two lines per
+  index. Each analyzer's last pass that produced edges is now kept in its
+  own meta key; the stored verdict is that last good pass once plus this
+  run's lines. Line formats are unchanged.
+
+**Dependencies**
+- astkit v0.16.10: call columns count characters when multibyte text
+  precedes a call, `Engine.Validate` rejects syntax errors, and `.mts`/`.cts`
+  are detected as TypeScript. Call-edge scores on gin, cobra, socket.io and
+  flask are identical with it.
+
+Entries for v0.62.3 through v0.63.24 are not written up here; see the git
+history for those releases.
+
 ## v0.62.2 - 2026-10-05
 
 Python receivers that hold objects built elsewhere now resolve. Flask's
