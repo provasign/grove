@@ -45,27 +45,32 @@ capped false-positive/false-negative examples for debugging
 (`GROVE_EVAL_MAX_EXAMPLES=100000` lists every one; `GROVE_TRACE_CALLS=1`
 traces candidate narrowing per call site to stderr).
 
-## Current scores (2026-10-10, grove v0.63.0, calls edges)
+## Current scores (2026-10-22, grove v0.63.25, calls edges)
 
 | Corpus (pin) | Language | Oracle (`--lang`) | Universe | P | R | F1 |
 |---|---|---|---|---|---|---|
-| gin (`d75fcd4`) | Go | SSA + VTA (default) | 99.7% | 0.9599 | 0.9735 | 0.9667 |
-| commons-lang (`44298fe`) | Java | javac + javap (`java`) | 97.0% | 0.9631 | 0.9807 | 0.9718 |
-| newtonsoft (`0a2e291`) | C# | Roslyn (`csharp`) | 99.7% | 0.9350 | 0.9467 | 0.9408 |
-| socket.io (`3ad4e1f2`) | TypeScript | tsc checker (`tstruth/gen_truth.mjs`) | 98.3% | 0.9156 | 0.9917 | 0.9521 |
-| express (`dae209ae`) | JavaScript | tsc `checkJs` (`tstruth/gen_truth.mjs`) | 90.3% | 0.8400 | 1.0000 | 0.9130 |
-| ripgrep (`82313cf`) | Rust | rust-analyzer SCIP (`rust`) | 100% | 0.9366 | 0.9047 | 0.9204 |
-| jansson (`684e18c`) | C | clang AST (`clang`) | 97.7% | 0.9991 | 0.9837 | 0.9913 |
-| SwiftyJSON (`3d25441`) | Swift | SourceKit index (`swift`) | 100% | 0.9355 | 1.0000 | 0.9667 |
-| turtle (`3cfc963`) | Kotlin | kotlinc + javap (`kotlin`) | 76.8% | 1.0000 | 0.9881 | 0.9940 |
-| json-framework (`93e4ca5`) | Objective-C | clang AST (`objc`) | 98.7% | 1.0000 | 0.9914 | 0.9957 |
-| flask (`36e4a824`) | Python | pytest trace (`pytruth`, dynamic) | 97.9% | 0.8544 | 0.7288 | 0.7866 |
-| php-parser (`8eea230`) | PHP | Xdebug trace (`php`, dynamic) | 100% | 0.9177 | 0.6487 | 0.7601 |
+| gin (`d75fcd4`) | Go | SSA + VTA (default) | 99.7% | 0.9792 | 0.9965 | 0.9878 |
+| commons-lang (`44298fe`) | Java | javac + javap (`java`) | 99.3% | 1.0000 | 1.0000 | 1.0000 |
+| newtonsoft (`0a2e291`) | C# | Roslyn (`csharp`) | 99.7% | 0.9709 | 0.9774 | 0.9741 |
+| socket.io (`3ad4e1f2`) | TypeScript | tsc checker (`tstruth/gen_truth.mjs`) | 99.5% | 0.9367 | 0.9918 | 0.9635 |
+| express (`dae209ae`) | JavaScript | tsc `checkJs` (`tstruth/gen_truth.mjs`) | 100% | 0.8846 | 1.0000 | 0.9388 |
+| ripgrep (`82313cf`) | Rust | rust-analyzer SCIP (`rust`) | 100% | 0.9650 | 0.9055 | 0.9343 |
+| jansson (`684e18c`) | C | clang AST (`clang`) | 100% | 1.0000 | 0.9983 | 0.9991 |
+| SwiftyJSON (`3d25441`) | Swift | SourceKit index (`swift`) | 100% | 1.0000 | 1.0000 | 1.0000 |
+| turtle (`3cfc963`) | Kotlin | kotlinc + javap (`kotlin`) | 76.8% | 1.0000 | 1.0000 | 1.0000 |
+| json-framework (`93e4ca5`) | Objective-C | clang AST (`objc`) | 98.7% | 1.0000 | 1.0000 | 1.0000 |
+| flask (`36e4a824`) | Python | pytest trace (`pytruth`, dynamic) | 97.9% | 0.8962 | 0.7867 | 0.8379 |
+| php-parser (`8eea230`) | PHP | Xdebug trace (`php`, dynamic) | 100% | 0.9218 | 0.6825 | 0.7843 |
+
+Rows for gin through jansson, flask and php-parser come from the v0.63.25
+release CI ("Edge accuracy"). SwiftyJSON, turtle and json-framework need
+macOS toolchains, so they are not in CI; they were scored locally with the
+same binary against the committed truth snapshots in `testdata/`.
 
 Every row is gated in `baseline.json`; the per-language sections below hold
 the progression that produced each number and what remains.
 
-### Second corpus per language (2026-09-19)
+### Second corpus per language (2026-10-22, grove v0.63.25)
 
 Every rule above was tuned against one repository per language. A second
 pin per language is the overfitting check: the same binary, a repository
@@ -74,14 +79,17 @@ sit beside the first corpus's under `testdata/`.
 
 | Corpus (pin) | Language | Oracle | Universe | P | R | First corpus P / R |
 |---|---|---|---|---|---|---|
-| cobra (`adbc881`) | Go | SSA + VTA | 100% | 0.9834 | 0.9870 | 0.9599 / 0.9735 |
-| commons-io (`8ad9867d`) | Java | javac + javap | 94.6% | 0.9317 | 0.9776 | 0.9631 / 0.9807 |
-| cJSON (`6d9f244`) | C | clang AST | 100% | 0.9982 | 0.9991 | 0.9991 / 0.9837 |
-| fd (`5bbfa3e`) | Rust | rust-analyzer SCIP | 100% | 0.9516 | 0.9130 | 0.9366 / 0.9047 |
-| p-queue (`180ab9e`) | TypeScript | tsc checker | 100% | 0.9592 | 1.0000 | 0.9156 / 0.9917 |
-| Files (`e85f2b4`) | Swift | SourceKit index | 97.0% | 0.9881 | 0.9222 | 0.9355 / 1.0000 |
-| CocoaLumberjack (`f54de25f`) | Objective-C | clang AST | 99.6% | 0.9414 | 0.5679 | 1.0000 / 0.9914 |
-| csv (`89ac08c`) | PHP | Xdebug trace (dynamic) | 100% | 0.8888 | 0.7068 | 0.9177 / 0.6487 |
+| cobra (`adbc881`) | Go | SSA + VTA | 100% | 0.9945 | 1.0000 | 0.9792 / 0.9965 |
+| commons-io (`8ad9867d`) | Java | javac + javap | 99.6% | 1.0000 | 1.0000 | 1.0000 / 1.0000 |
+| cJSON (`6d9f244`) | C | clang AST | 100% | 0.9982 | 0.9991 | 1.0000 / 0.9983 |
+| fd (`5bbfa3e`) | Rust | rust-analyzer SCIP | 100% | 0.9593 | 0.9130 | 0.9650 / 0.9055 |
+| p-queue (`180ab9e`) | TypeScript | tsc checker | 100% | 0.9592 | 1.0000 | 0.9367 / 0.9918 |
+| Files (`e85f2b4`) | Swift | SourceKit index | 97.0% | 1.0000 | 1.0000 | 1.0000 / 1.0000 |
+| CocoaLumberjack (`f54de25f`) | Objective-C | clang AST | 99.6% | 0.9751 | 0.9565 | 1.0000 / 1.0000 |
+| csv (`89ac08c`) | PHP | Xdebug trace (dynamic) | 100% | 0.9472 | 0.8367 | 0.9218 / 0.6825 |
+
+Scores as of 2026-10-22, grove v0.63.25. Files and CocoaLumberjack were
+scored locally (macOS toolchains); the rest come from the release CI.
 
 CocoaLumberjack, 2026-10-10 (grove v0.63.0): the universe went from 79.2% to
 99.6% because Objective-C containers inside `#if` blocks and files whose
