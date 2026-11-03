@@ -67,6 +67,9 @@ type edgeIndex struct {
 	rustCrateScope map[string]map[string]struct{}
 	// importedFilesCache memoizes the result of importedFiles() per file.
 	importedFilesCache map[string]map[string]struct{}
+	// pyReexportCache memoizes pyReexportFiles; like importedFilesCache it
+	// is written only while importedFiles is warmed, serially.
+	pyReexportCache map[pyReexportKey][]string
 
 	// qualifierFiles memoizes importFilesForQualifier per (file, qualifier).
 	// Unlike importedFilesCache it cannot be pre-warmed — the qualifier set

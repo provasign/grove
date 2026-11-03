@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.63.26 - 2026-11-03
+
+**Fixes (performance)**
+- **Python re-export walk is memoized**: a package import names every file
+  of the package's directory, and following re-exports recursed into each
+  of them for up to three hops with no memo and no deduplication, so the
+  work grew as the cube of the directory size. Indexing a 10,000-file
+  Python project ran past 500s without finishing; it now finishes in 216s.
+  Each step is computed once and each file listed once; the files found
+  are unchanged.
+
 ## v0.63.25 - 2026-10-21
 
 Index correctness fixes from the 2026-10-20 stack audit.
