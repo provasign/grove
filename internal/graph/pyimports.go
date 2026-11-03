@@ -79,11 +79,30 @@ func (idx *edgeIndex) pyImportBinding(symbol *core.SymbolRecord, local string) (
 // import of member at module level, `from ._base import X as X` or plain
 // `from ._base import X`) to the files of the module it comes from, up to
 // hops levels.
+//
+// A package import names every file of the package's directory, so each hop
+// can fan out to a whole directory: unmemoized, the walk grew as the cube of
+// the directory size, with every file repeated many times over (a
+// 10,000-file Python project ran for minutes and 1.6 GB without finishing).
+// Results are memoized per (file, member, hops), on the index like
+// importedFilesCache, and each list holds a file once; the set of files is
+// the one the plain walk returns.
 func (idx *edgeIndex) pyReexportFiles(file, member string, hops int) []string {
 	if member == "" || member == "*" || hops <= 0 {
 		return nil
 	}
+	key := pyReexportKey{file, member, hops}
+	if cached, ok := idx.pyReexportCache[key]; ok {
+		return cached
+	}
+	seen := map[string]bool{}
 	var out []string
+	add := func(f string) {
+		if !seen[f] {
+			seen[f] = true
+			out = append(out, f)
+		}
+	}
 	for _, b := range idx.pyImportBindings[file][member] {
 		if b.owner != "" {
 			continue // a function-local import re-exports nothing
@@ -96,9 +115,21 @@ func (idx *edgeIndex) pyReexportFiles(file, member string, hops int) []string {
 			if g == file {
 				continue
 			}
-			out = append(out, g)
-			out = append(out, idx.pyReexportFiles(g, imported, hops-1)...)
+			add(g)
+			for _, h := range idx.pyReexportFiles(g, imported, hops-1) {
+				add(h)
+			}
 		}
 	}
+	if idx.pyReexportCache == nil {
+		idx.pyReexportCache = map[pyReexportKey][]string{}
+	}
+	idx.pyReexportCache[key] = out
 	return out
+}
+
+// pyReexportKey is one step of a re-export walk.
+type pyReexportKey struct {
+	file, member string
+	hops         int
 }

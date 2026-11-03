@@ -3,6 +3,7 @@
 package graph
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -1507,5 +1508,43 @@ func TestRustExpressionAndTryReceivers(t *testing.T) {
 	}
 	if !got["Path.is_link"] || !got["Walk.build"] || got["Other.build"] {
 		t.Fatalf("want is_link (expression receiver) and Walk.build only: %v", got)
+	}
+}
+
+// A package import names every file of the package's directory, so a
+// re-export chain through three packages fans out to whole directories at
+// each hop. The walk lists each file once and is memoized: unmemoized, a
+// 10,000-file Python project ran for minutes and 1.6 GB (2026-11-02).
+func TestPyReexportFanOutIsBounded(t *testing.T) {
+	const n = 30
+	var syms []core.SymbolRecord
+	top := func(file, imp string) core.SymbolRecord {
+		return core.SymbolRecord{ID: file + "::top", FilePath: file, BlobSHA: "1", Language: "python", Kind: core.KindFunction,
+			Name: "<top-level>", QualifiedName: "<top-level>", Span: core.LineRange{Start: 1, End: 1},
+			Imports: []string{imp, imp + "#X", "@python-binding:1:X=" + imp + "#X"}}
+	}
+	for i := 0; i < n; i++ {
+		syms = append(syms,
+			top(fmt.Sprintf("src/a/m%d.py", i), "b"),
+			top(fmt.Sprintf("src/b/m%d.py", i), "c"),
+			top(fmt.Sprintf("src/c/m%d.py", i), "d"))
+	}
+	syms = append(syms, core.SymbolRecord{ID: "d::X", FilePath: "src/d/x.py", BlobSHA: "1", Language: "python", Kind: core.KindClass,
+		Name: "X", QualifiedName: "X", RawText: "class X:\n    pass\n", Span: core.LineRange{Start: 1, End: 2}})
+	idx := newEdgeIndex(syms)
+	got := idx.pyReexportFiles("src/a/m0.py", "X", 3)
+	seen := map[string]bool{}
+	for _, f := range got {
+		if seen[f] {
+			t.Fatalf("%s listed twice", f)
+		}
+		seen[f] = true
+	}
+	// Every b and c file, and X's own file: the set the plain walk finds.
+	if len(got) != 2*n+1 || !seen["src/d/x.py"] {
+		t.Fatalf("got %d files, want %d including src/d/x.py", len(got), 2*n+1)
+	}
+	if len(idx.pyReexportCache) == 0 {
+		t.Fatal("the walk was not memoized")
 	}
 }
