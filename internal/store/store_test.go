@@ -2,6 +2,9 @@ package store
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -156,5 +159,31 @@ func must(t *testing.T, err error) {
 	t.Helper()
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+// The index folder ignores itself, so `git add -A` never commits it, and a
+// .gitignore someone wrote there is left alone.
+func TestOpenIgnoresTheIndexFolder(t *testing.T) {
+	root := t.TempDir()
+	st, err := Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = st.Close()
+	p := filepath.Join(root, ".grove", ".gitignore")
+	src, err := os.ReadFile(p)
+	if err != nil || !strings.Contains(string(src), "\n*\n") {
+		t.Fatalf(".gitignore = %q, %v; want *", src, err)
+	}
+	if err := os.WriteFile(p, []byte("mine\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if st, err = Open(root); err != nil {
+		t.Fatal(err)
+	}
+	_ = st.Close()
+	if src, _ := os.ReadFile(p); string(src) != "mine\n" {
+		t.Fatalf("rewrote the .gitignore: %q", src)
 	}
 }

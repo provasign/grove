@@ -75,6 +75,7 @@ func Open(root string) (*Store, error) {
 	if runtime.GOOS != "windows" {
 		_ = os.Chmod(groveDir, 0o700)
 	}
+	ignoreItself(groveDir)
 	dbPath := filepath.Join(groveDir, "grove.db")
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
@@ -1517,3 +1518,16 @@ CREATE TABLE IF NOT EXISTS icr_locks (
     expires_at  TEXT NOT NULL
 );
 `
+
+// ignoreItself keeps the index out of version control: a .gitignore of "*"
+// inside .grove ignores the folder, itself included, with no edit to the
+// project's own .gitignore. Without it an agent's `git add -A` committed the
+// database (a developer trial, 2026-11-03). A file someone wrote there is
+// kept; a failure to write it is ignored, as it only affects git.
+func ignoreItself(groveDir string) {
+	p := filepath.Join(groveDir, ".gitignore")
+	if _, err := os.Stat(p); err == nil {
+		return
+	}
+	_ = os.WriteFile(p, []byte("# The index Grove keeps for this project; never commit it.\n*\n"), 0o600)
+}
