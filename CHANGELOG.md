@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.63.27 - 2026-11-05
+
+**Fixes**
+- **The index folder ignores itself**: `.grove/` now holds a `.gitignore`
+  of `*`, so `git add -A` no longer commits the index database. The
+  project's own `.gitignore` is not edited, and a `.grove/.gitignore`
+  already there is kept.
+
 ## v0.63.26 - 2026-11-03
 
 **Fixes (performance)**
