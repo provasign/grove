@@ -124,7 +124,16 @@ func GoSymbolKey(root string, sym Symbol) (key string, ok bool) {
 	if sym.Language != "go" || (sym.Kind != "function" && sym.Kind != "method") {
 		return "", false
 	}
-	dir := path.Dir(filepath.ToSlash(sym.FilePath))
+	return GoKey(root, sym.FilePath, sym.QualifiedName)
+}
+
+// GoKey is GoSymbolKey for a Go function or method given by its
+// repository-relative file and qualified name.
+func GoKey(root, filePath, qualifiedName string) (key string, ok bool) {
+	if qualifiedName == "" || !strings.HasSuffix(filePath, ".go") {
+		return "", false
+	}
+	dir := path.Dir(filepath.ToSlash(filePath))
 	for d := dir; ; d = path.Dir(d) {
 		data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(d), "go.mod"))
 		if err == nil {
@@ -138,7 +147,7 @@ func GoSymbolKey(root string, sym Symbol) (key string, ok bool) {
 			} else if d != "." && rel != "" {
 				pkg = mod + "/" + rel
 			}
-			return "go:" + pkg + "#" + sym.QualifiedName, true
+			return "go:" + pkg + "#" + qualifiedName, true
 		}
 		if d == "." || d == "/" {
 			return "", false
