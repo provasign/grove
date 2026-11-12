@@ -563,6 +563,7 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 	marks := resolvedMarks{}
 	fieldCalls := resolvedMarks{} // caller -> "dir:Type.Field@line:col" (core.EdgeFuncFieldCall)
 	ifaceCalls := resolvedMarks{} // caller -> "pkg.Iface.Method@line:col" (core.EdgeExternalIfaceCall)
+	extRefs := resolvedMarks{}    // caller -> "go:path#Type.Method@line:col" (core.EdgeExternalRef)
 	var fieldStores []core.Edge
 	add := func(edge core.Edge) { pe.add(edge, 0, 0) }
 	lines := goLineReader(fset)
@@ -616,6 +617,9 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 					}
 					if key, ok := goExternalIfaceCallKey(n.Fun, info, pkgDirsByImport); ok {
 						ifaceCalls.add(caller.ID, key, line, col)
+					}
+					if key, ok := goExternalRefKey(dir, goCalledFunc(n.Fun, info), pkgDirsByImport, pkg); ok {
+						extRefs.add(caller.ID, key, line, col)
 					}
 					for _, key := range flow.callKeys(n.Fun, info, dir, pkgDirsByImport, pkg) {
 						fieldCalls.add(caller.ID, key, line, col)
@@ -747,6 +751,7 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 		out = append(out, e)
 	}
 	out = append(out, ifaceCalls.edgesOf(core.EdgeExternalIfaceCall)...)
+	out = append(out, extRefs.edgesOf(core.EdgeExternalRef)...)
 	return append(out, groupFieldStores(fieldStores)...), decls, pkg, nil
 }
 
@@ -1125,6 +1130,28 @@ func goObjectDirs(currentDir string, pkg *types.Package, pkgDirsByImport map[str
 		return []string{currentDir}
 	}
 	return nil
+}
+
+// goExternalRefKey names a called function or method of another module:
+// "go:<import path>#<Name>" or "go:<import path>#<Type>.<Method>". It is
+// the same key GoSymbolKey derives for the declaration in that module's own
+// repository. A project package, a builtin, and the standard library give
+// no key: nothing links a workspace to the standard library, and recording
+// every fmt.Println would swamp the records that matter.
+func goExternalRefKey(currentDir string, fn *types.Func, pkgDirsByImport map[string][]string, selfPkg *types.Package) (string, bool) {
+	if fn == nil || fn.Pkg() == nil || goObjectDirs(currentDir, fn.Pkg(), pkgDirsByImport, selfPkg) != nil {
+		return "", false
+	}
+	path := fn.Pkg().Path()
+	first, _, _ := strings.Cut(path, "/")
+	if !strings.Contains(first, ".") {
+		return "", false // standard library
+	}
+	name := fn.Name()
+	if recv := goFuncReceiverName(fn); recv != "" {
+		name = recv + "." + name
+	}
+	return "go:" + path + "#" + name, true
 }
 
 func goReceiverName(fn *ast.FuncDecl) string {

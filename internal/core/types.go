@@ -125,12 +125,19 @@ const (
 	// function-field keys (a Python `self.get_converter = get_converter`
 	// links the attribute slot to the parameter slot).
 	EdgeFuncSlotFlow EdgeType = "func-slot-flow"
+	// EdgeExternalRef records, on a caller (From == To), its calls a
+	// compiler resolved to a function or method of another module: Lines
+	// "go:example.com/lib/pkg#Type.Method@line:col,...". The key names the
+	// target independent of where that module is checked out, so a second
+	// repository that declares it can find its callers here. Standard
+	// library targets are not recorded.
+	EdgeExternalRef EdgeType = "external-ref"
 )
 
 // IsMarkerEdge reports the stored per-symbol records that are not graph edges.
 func IsMarkerEdge(t EdgeType) bool {
 	return t == EdgeResolvedCalls || t == EdgeExternalContract || t == EdgeFuncFieldCall || t == EdgeFuncFieldStore ||
-		t == EdgeExternalIfaceCall || t == EdgeFuncSlotFlow
+		t == EdgeExternalIfaceCall || t == EdgeFuncSlotFlow || t == EdgeExternalRef
 }
 
 type Edge struct {
