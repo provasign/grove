@@ -124,6 +124,46 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// OpenReadOnly opens an existing index without creating, migrating, or
+// writing anything: no .grove directory is made, no permission is changed,
+// no schema statement runs. It is how one repository's index is consulted on
+// behalf of another, where the caller must leave the tree exactly as found.
+// It fails when the root has no index.
+func OpenReadOnly(root string) (*Store, error) {
+	dbPath := filepath.Join(root, ".grove", "grove.db")
+	if _, err := os.Stat(dbPath); err != nil {
+		return nil, fmt.Errorf("no index at %s: %w", dbPath, err)
+	}
+	dsn := "file:" + filepath.ToSlash(dbPath) + "?mode=ro&_pragma=busy_timeout(5000)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open %s read-only: %w", dbPath, err)
+	}
+	db.SetMaxOpenConns(1)
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("open %s read-only: %w", dbPath, err)
+	}
+	return &Store{db: db}, nil
+}
+
+// SymbolsNamed returns the symbols whose name or qualified name is one of
+// names, in store order.
+func (s *Store) SymbolsNamed(ctx context.Context, names []string) ([]core.SymbolRecord, error) {
+	if len(names) == 0 {
+		return nil, nil
+	}
+	marks := strings.TrimSuffix(strings.Repeat("?,", len(names)), ",")
+	args := make([]any, 0, 2*len(names))
+	for range 2 {
+		for _, n := range names {
+			args = append(args, n)
+		}
+	}
+	return s.querySymbols(ctx, len(names),
+		`WHERE name IN (`+marks+`) OR qualified_name IN (`+marks+`) ORDER BY file_path, span_start`, args...)
+}
+
 func (s *Store) Migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, schemaSQL); err != nil {
 		return err
