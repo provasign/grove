@@ -1,6 +1,8 @@
 package native
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io/fs"
 	"os"
@@ -46,6 +48,16 @@ func goWorkspaceFor(root string) (goWorkspace, bool) {
 			}
 			ws := goWorkspace{file: file}
 			member := false
+			// Only members this repository requires can change how it
+			// type-checks; the rest are not fingerprinted.
+			required := map[string]bool{}
+			if mod, err := os.ReadFile(filepath.Join(root, "go.mod")); err == nil {
+				if f, err := modfile.ParseLax("go.mod", mod, nil); err == nil {
+					for _, r := range f.Require {
+						required[r.Mod.Path] = true
+					}
+				}
+			}
 			for _, u := range w.Use {
 				p := u.Path
 				if !filepath.IsAbs(p) {
@@ -55,7 +67,9 @@ func goWorkspaceFor(root string) (goWorkspace, bool) {
 				if p == root {
 					member = true
 				} else if !isUnder(root, p) {
-					ws.members = append(ws.members, p)
+					if mod, err := os.ReadFile(filepath.Join(p, "go.mod")); err == nil && required[modfile.ModulePath(mod)] {
+						ws.members = append(ws.members, p)
+					}
 				}
 			}
 			return ws, member // the nearest go.work decides, as for the go command
@@ -116,4 +130,21 @@ func cleanResolved(p string) string {
 func isUnder(parent, child string) bool {
 	rel, err := filepath.Rel(parent, child)
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// goWorkspaceInput is the name under which the workspace fingerprint is
+// tracked with the other compiler inputs. It is not a file in the tree.
+const goWorkspaceInput = "@go-workspace"
+
+// ExternalCompilerInputs returns fingerprints of compiler inputs that live
+// outside the walked tree, by pseudo-name: today the go.work above the
+// repository and the sources of the workspace members it requires. A change
+// re-runs the analyzer exactly as a changed go.mod does.
+func ExternalCompilerInputs(root string) map[string]string {
+	ws, ok := goWorkspaceFor(root)
+	if !ok {
+		return nil
+	}
+	sum := sha256.Sum256([]byte(ws.fingerprint()))
+	return map[string]string{goWorkspaceInput: hex.EncodeToString(sum[:])}
 }

@@ -28,7 +28,7 @@ import (
 func CompilerInputAnalyzers(relPath string) []string {
 	base := path.Base(relPath)
 	switch base {
-	case "go.mod", "go.sum", "go.work", "go.work.sum":
+	case "go.mod", "go.sum", "go.work", "go.work.sum", goWorkspaceInput:
 		return []string{"go"}
 	case "package.json":
 		return []string{"js-ts"}
