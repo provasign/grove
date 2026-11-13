@@ -1440,7 +1440,7 @@ func (i *Indexer) syncCompilerInputs(ctx context.Context, root string, inputs ma
 	}
 	// Inputs outside the tree (a go.work above the repository and the
 	// workspace members it is built against), tracked by pseudo-name.
-	for name, fingerprint := range native.ExternalCompilerInputs(root) {
+	for name, fingerprint := range native.ExternalCompilerInputs(root, i.nativeConfig.LinkedRoots) {
 		current[name] = compilerInputState{SHA: fingerprint}
 		if prev, ok := stored[name]; !ok || prev.SHA != fingerprint {
 			changed[name] = true

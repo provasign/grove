@@ -5,7 +5,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
+
+	"github.com/provasign/grove/internal/native"
 )
 
 func writeTree(t *testing.T, root string, files map[string]string) {
@@ -426,3 +430,163 @@ def run():
 		}
 	}
 }
+
+func indexRepoLinked(t *testing.T, root string, linked ...string) {
+	t.Helper()
+	ctx := context.Background()
+	eng, err := Open(ctx, Config{RepoRoot: root, OneShot: true, LinkedRoots: linked})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.Index(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A Java library and an application in separate repositories. The
+// library's jar is not on the application's classpath; its sources are
+// read from the linked checkout, and javac's resolution gives each call
+// and type use the key the library derives for the declaration.
+func TestExternalRefsJava(t *testing.T) {
+	if !native.HasJDK() {
+		t.Skip("no JDK")
+	}
+	ctx := context.Background()
+	parent, _ := filepath.EvalSymlinks(t.TempDir())
+	lib, app := filepath.Join(parent, "lib"), filepath.Join(parent, "app")
+	pom := func(artifact string) string {
+		return "<project><modelVersion>4.0.0</modelVersion><groupId>com.acme</groupId><artifactId>" + artifact + "</artifactId><version>1.0</version></project>\n"
+	}
+	writeTree(t, lib, map[string]string{
+		"pom.xml": pom("lib"),
+		"src/main/java/com/acme/lib/Box.java": `package com.acme.lib;
+
+public class Box {
+    public Box() {}
+    public Box(int n) {}
+    public int open() { return 1; }
+    public static Box create() { return new Box(); }
+    public static class Lid {
+        public void lift() {}
+    }
+    public interface Opener { int open(); }
+}
+`,
+	})
+	writeTree(t, app, map[string]string{
+		"pom.xml": pom("app"),
+		"src/main/java/com/acme/app/Main.java": `package com.acme.app;
+
+import com.acme.lib.Box;
+import java.util.ArrayList;
+
+public class Main implements Box.Opener {
+    private Box held;
+    public int open() { return 0; }
+    static int run() {
+        Box b = Box.create();
+        Box.Lid lid = new Box.Lid();
+        lid.lift();
+        new ArrayList<String>().add("x");
+        return b.open() + new Box(3).open();
+    }
+}
+`,
+	})
+	indexRepo(t, lib)
+	indexRepoLinked(t, app, lib)
+
+	lr, err := OpenReader(lib)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lr.Close()
+	syms, err := lr.AllSymbols(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyOf := map[string]string{}
+	for _, s := range syms {
+		if k, ok := SymbolKey(lib, s); ok {
+			keyOf[string(s.Kind)+" "+s.QualifiedName] = k
+		}
+	}
+	for name, want := range map[string]string{
+		"class Box":            "jvm:com.acme.lib#Box",
+		"constructor Box.Box":  "jvm:com.acme.lib#Box.Box",
+		"method Box.open":      "jvm:com.acme.lib#Box.open",
+		"method Box.create":    "jvm:com.acme.lib#Box.create",
+		"class Box.Lid":        "jvm:com.acme.lib#Box.Lid",
+		"method Box.Lid.lift":  "jvm:com.acme.lib#Box.Lid.lift",
+		"interface Box.Opener": "jvm:com.acme.lib#Box.Opener",
+	} {
+		if keyOf[name] != want {
+			t.Fatalf("declaration key for %q = %q, want %q (all: %v)", name, keyOf[name], want, keyOf)
+		}
+	}
+
+	ar, err := OpenReader(app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ar.Close()
+	all, err := ar.AllExternalRefs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := map[string][]int{} // key -> lines
+	froms := map[string]string{}
+	for _, r := range all {
+		if r.File != "src/main/java/com/acme/app/Main.java" {
+			t.Fatalf("unexpected file in %+v", r)
+		}
+		lines[r.Key] = append(lines[r.Key], r.Line)
+		froms[r.Key+"@"+itoaTest(r.Line)] = r.From
+	}
+	has := func(key string, line int) bool {
+		for _, l := range lines[key] {
+			if l == line {
+				return true
+			}
+		}
+		return false
+	}
+	for _, want := range []struct {
+		key  string
+		line int
+	}{
+		{"jvm:com.acme.lib#Box.create", 10},   // static call
+		{"jvm:com.acme.lib#Box.Lid.Lid", 11},  // nested constructor
+		{"jvm:com.acme.lib#Box.Lid.lift", 12}, // method on a nested type
+		{"jvm:com.acme.lib#Box.open", 14},     // instance method
+		{"jvm:com.acme.lib#Box.Box", 14},      // overloaded constructor
+		{"jvm:com.acme.lib#Box.Opener", 6},    // implements clause
+		{"jvm:com.acme.lib#Box", 7},           // field type
+		{"jvm:com.acme.lib#Box", 10},          // local variable type and static receiver
+		{"jvm:com.acme.lib#Box.Lid", 11},      // nested type use
+	} {
+		if !has(want.key, want.line) {
+			t.Errorf("missing %s at line %d; recorded: %v", want.key, want.line, lines)
+		}
+	}
+	if froms["jvm:com.acme.lib#Box.create@10"] != "Main.run" {
+		t.Errorf("call attributed to %q, want Main.run", froms["jvm:com.acme.lib#Box.create@10"])
+	}
+	if froms["jvm:com.acme.lib#Box.Opener@6"] != "Main" {
+		t.Errorf("implements clause attributed to %q, want the class Main", froms["jvm:com.acme.lib#Box.Opener@6"])
+	}
+	for key := range lines {
+		if strings.HasPrefix(key, "jvm:java.") {
+			t.Errorf("a JDK reference was recorded: %s", key)
+		}
+	}
+	// The library's own index records nothing about itself.
+	if self, _ := lr.AllExternalRefs(ctx); len(self) != 0 {
+		t.Errorf("library recorded external references to its own types: %v", self)
+	}
+}
+
+func itoaTest(n int) string { return strconv.Itoa(n) }

@@ -104,6 +104,11 @@ type Config struct {
 	// instead, so an edit still takes the incremental edge path. Long-lived
 	// callers (MCP servers, watch) leave it false.
 	OneShot bool
+	// LinkedRoots are other repositories linked to this one (absolute
+	// paths): dependencies or consumers checked out on this machine. A
+	// compiler pass may read a dependency's declarations from their sources
+	// when the build does not provide them. They are never indexed here.
+	LinkedRoots []string
 }
 
 // Engine is the embedded Grove API consumed by Prism, Fuse, and Relay.
@@ -185,6 +190,7 @@ func nativeConfigFromPublic(cfg Config) native.Config {
 	if cfg.NativeTimeout > 0 {
 		nativeCfg.Timeout = cfg.NativeTimeout
 	}
+	nativeCfg.LinkedRoots = cfg.LinkedRoots
 	return nativeCfg
 }
 

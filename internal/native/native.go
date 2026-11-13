@@ -50,6 +50,10 @@ type Config struct {
 	// per-file results depend on which files exist (Python module
 	// resolution) run in full instead of scoping to the changed files.
 	FileSetChanged bool
+	// LinkedRoots: other repositories linked to this one (absolute paths).
+	// A compiler pass may read a dependency's declarations from their
+	// sources when the build does not otherwise provide them (Java).
+	LinkedRoots []string
 	// Resident: the caller is a long-lived engine (MCP, watch) that will
 	// index again, so analyzers may keep a worker process and its caches
 	// between runs. One-shot CLI runs leave it false.
@@ -132,6 +136,8 @@ type Request struct {
 	ChangedFiles []string
 	// FileSetChanged: see Config.FileSetChanged.
 	FileSetChanged bool
+	// LinkedRoots: see Config.LinkedRoots.
+	LinkedRoots []string
 	// Resident: see Config.Resident.
 	Resident bool
 	// PrevChanged: see Config.PrevChanged.
@@ -301,7 +307,7 @@ func AnalyzeChangedFiles(ctx context.Context, root string, symbols []core.Symbol
 			reqChanged = nil // a full pass analyzes every package
 		}
 		began := time.Now()
-		result := analyzer.Analyze(runCtx, Request{Root: root, Symbols: symbols, Files: reqFiles, ChangedFiles: reqChanged, FileSetChanged: cfg.FileSetChanged, Resident: cfg.Resident, PrevChanged: cfg.PrevChanged, CallerFiles: cfg.CallerFiles})
+		result := analyzer.Analyze(runCtx, Request{Root: root, Symbols: symbols, Files: reqFiles, ChangedFiles: reqChanged, FileSetChanged: cfg.FileSetChanged, LinkedRoots: cfg.LinkedRoots, Resident: cfg.Resident, PrevChanged: cfg.PrevChanged, CallerFiles: cfg.CallerFiles})
 		timedOut := errors.Is(runCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
 		cancel()
 		mode := "incremental"

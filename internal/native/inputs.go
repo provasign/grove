@@ -35,7 +35,7 @@ func CompilerInputAnalyzers(relPath string) []string {
 	case "pyproject.toml", "setup.cfg", "requirements.txt":
 		return []string{"python"}
 	case "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts",
-		"gradle.properties", "libs.versions.toml":
+		"gradle.properties", "libs.versions.toml", javaLinkedInput:
 		return []string{"java"}
 	case "Cargo.toml", "Cargo.lock":
 		return []string{"rust"}

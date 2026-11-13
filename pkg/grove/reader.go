@@ -6,6 +6,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -219,6 +220,8 @@ func SymbolKey(root string, sym Symbol) (key string, ok bool) {
 func KeyFor(root, language, kind, filePath, qualifiedName string) (key string, ok bool) {
 	if language == "" {
 		switch strings.ToLower(path.Ext(filePath)) {
+		case ".java":
+			language = "java"
 		case ".go":
 			language = "go"
 		case ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs":
@@ -243,8 +246,35 @@ func KeyFor(root, language, kind, filePath, qualifiedName string) (key string, o
 		if keys := PythonKeys(filePath, qualifiedName); len(keys) > 0 {
 			return keys[0], true
 		}
+	case "java":
+		switch kind {
+		case "function", "method", "constructor", "class", "interface", "enum", "annotation", "type":
+			return JavaKey(root, filePath, qualifiedName)
+		}
 	}
 	return "", false
+}
+
+var javaPackageDecl = regexp.MustCompile(`(?m)^\s*package\s+([A-Za-z_][\w.]*)\s*;`)
+
+// JavaKey is the key for a Java type or member: its file's package and its
+// qualified name within that package, "jvm:<package>#<Outer.Inner>.<member>".
+// javac reports the same two parts for a call's target, whichever jar or
+// source tree it was resolved from. Overloads share a key. ok is false for
+// a file with no package statement: the unnamed package cannot be imported.
+func JavaKey(root, filePath, qualifiedName string) (key string, ok bool) {
+	if qualifiedName == "" || !strings.HasSuffix(filePath, ".java") {
+		return "", false
+	}
+	data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(filePath)))
+	if err != nil {
+		return "", false
+	}
+	m := javaPackageDecl.FindSubmatch(data)
+	if m == nil {
+		return "", false
+	}
+	return "jvm:" + string(m[1]) + "#" + qualifiedName, true
 }
 
 // KeysFor returns every key other repositories may have recorded for a

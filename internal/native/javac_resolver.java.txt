@@ -26,6 +26,9 @@ public class GroveJavacResolver {
     static final StringBuilder calls = new StringBuilder();
     static final StringBuilder members = new StringBuilder();
     static final StringBuilder decls = new StringBuilder();
+    // Uses of types declared outside the project (a dependency's class named
+    // in a signature, a field, an extends clause, a body).
+    static final StringBuilder exts = new StringBuilder();
     static final Set<String> seen = new HashSet<>();
     static int nCalls = 0, nMembers = 0;
     static final Set<String> projectSources = new HashSet<>();
@@ -54,7 +57,7 @@ public class GroveJavacResolver {
             while ((line = in.readLine()) != null) {
                 String result;
                 try {
-                    calls.setLength(0); members.setLength(0); decls.setLength(0); seen.clear(); nCalls = 0; nMembers = 0;
+                    calls.setLength(0); members.setLength(0); decls.setLength(0); exts.setLength(0); seen.clear(); nCalls = 0; nMembers = 0;
                     result = run(line.split("\t", -1));
                 } catch (Throwable e) {
                     result = "{\"error\":" + q(String.valueOf(e)) + "}";
@@ -91,7 +94,13 @@ public class GroveJavacResolver {
         List<String> opts = new ArrayList<>(Arrays.asList("-proc:none", "-implicit:none", "-nowarn", "-Xprefer:source",
             "-XDshould-stop.ifError=FLOW", "-XDshould-stop.ifNoError=FLOW", "-Xmaxerrs", "100000"));
         if (!cp.isEmpty()) { opts.add("-classpath"); opts.add(cp); }
-        if (!sp.isEmpty()) { opts.add("-sourcepath"); opts.add(sp); }
+        // Optional: source roots of linked repositories (a dependency checked
+        // out beside this project). javac reads a dependency's declarations
+        // from them when its jar is not on the classpath. They are NOT added
+        // to sourceRoots: a type found there is still external to the project.
+        String lsp = args.length > 4 ? new String(Files.readAllBytes(Paths.get(args[4])), StandardCharsets.UTF_8).trim() : "";
+        String allSp = sp.isEmpty() ? lsp : (lsp.isEmpty() ? sp : sp + File.pathSeparator + lsp);
+        if (!allSp.isEmpty()) { opts.add("-sourcepath"); opts.add(allSp); }
         // A scoped run reads other classes from -sourcepath. A module-info.java
         // on that path (guava's source roots have one) switches javac into
         // module mode, where classpath packages are not visible: thousands of
@@ -123,7 +132,20 @@ public class GroveJavacResolver {
         int errors = 0;
         for (Diagnostic<?> d : diags.getDiagnostics()) if (d.getKind() == Diagnostic.Kind.ERROR) errors++;
         return "{\"files\":" + unitCount + ",\"errors\":" + errors +
-            ",\"calls\":[" + calls + "],\"members\":[" + members + "],\"decls\":[" + decls + "]}";
+            ",\"calls\":[" + calls + "],\"members\":[" + members + "],\"decls\":[" + decls + "],\"exts\":[" + exts + "]}";
+    }
+
+    // The package and the package-relative name ("Outer.Inner") of a type:
+    // together they name it independent of the jar or checkout it came from.
+    static String[] pkgType(Element t) {
+        if (!(t instanceof TypeElement)) return null;
+        String qn = ((TypeElement) t).getQualifiedName().toString();
+        if (qn.isEmpty()) return null; // anonymous or local
+        Element x = t;
+        while (x != null && !(x instanceof PackageElement)) x = x.getEnclosingElement();
+        String pkg = x == null ? "" : ((PackageElement) x).getQualifiedName().toString();
+        String nested = pkg.isEmpty() || !qn.startsWith(pkg + ".") ? qn : qn.substring(pkg.length() + 1);
+        return new String[]{pkg, nested};
     }
 
     static String q(String s) {
@@ -380,6 +402,7 @@ public class GroveJavacResolver {
             String target_ = to != null ? ",\"to\":" + q(to[0]) + ",\"toName\":" + q(to[1]) + ",\"toLine\":" + to[2]
                 : ",\"ext\":" + q(target.getKind() == ElementKind.CONSTRUCTOR ? target.getEnclosingElement().getSimpleName().toString() : target.getSimpleName().toString())
                   + ",\"extOwner\":" + q(target.getEnclosingElement().getSimpleName().toString())
+                  + extName(target.getEnclosingElement())
                   + (projectType(target.getEnclosingElement()) ? ",\"extProject\":true" : "");
             if (to == null && at <= 0) return;
             String json = "{\"from\":" + q(file) + ",\"fromName\":" + q(from[0]) + ",\"fromLine\":" + from[1] +
@@ -391,6 +414,31 @@ public class GroveJavacResolver {
             if (out.length() > 0) out.append(',');
             out.append(json);
             if (write == null) nCalls++; else nMembers++;
+        }
+        String extName(Element type) {
+            String[] pt = pkgType(type);
+            return pt == null ? "" : ",\"extPkg\":" + q(pt[0]) + ",\"extType\":" + q(pt[1]);
+        }
+        // A use of a type declared outside the project, at the name's own
+        // position, attributed like a call.
+        void typeUse(long pos) {
+            Element e = element();
+            if (e == null || pos < 0) return;
+            ElementKind k = e.getKind();
+            if (!(k.isClass() || k.isInterface())) return;
+            if (declared(e) != null || projectType(e)) return;
+            String[] pt = pkgType(e);
+            if (pt == null) return;
+            long ln = cu.getLineMap().getLineNumber(pos);
+            long col = pos - cu.getLineMap().getStartPosition(ln) + 1;
+            for (String[] from : callers()) {
+                if (from == null) continue;
+                String json = "{\"from\":" + q(file) + ",\"fromName\":" + q(from[0]) + ",\"fromLine\":" + from[1]
+                    + ",\"line\":" + ln + ",\"col\":" + col + ",\"extPkg\":" + q(pt[0]) + ",\"extType\":" + q(pt[1]) + "}";
+                if (!seen.add(json)) continue;
+                if (exts.length() > 0) exts.append(',');
+                exts.append(json);
+            }
         }
         Element element() { return trees.getElement(getCurrentPath()); }
         @Override public Void visitMethodInvocation(MethodInvocationTree t, Void v) {
@@ -472,6 +520,8 @@ public class GroveJavacResolver {
             boolean callee = parent != null && parent.getLeaf() instanceof MethodInvocationTree
                 && ((MethodInvocationTree) parent.getLeaf()).getMethodSelect() == t;
             if (!callee) field(v);
+            long end = trees.getSourcePositions().getEndPosition(cu, t);
+            if (end >= t.getIdentifier().length()) typeUse(end - t.getIdentifier().length());
             return super.visitMemberSelect(t, v);
         }
         @Override public Void visitIdentifier(IdentifierTree t, Void v) {
@@ -479,6 +529,7 @@ public class GroveJavacResolver {
             boolean callee = parent != null && parent.getLeaf() instanceof MethodInvocationTree
                 && ((MethodInvocationTree) parent.getLeaf()).getMethodSelect() == t;
             if (!callee) field(v);
+            typeUse(trees.getSourcePositions().getStartPosition(cu, t));
             return super.visitIdentifier(t, v);
         }
     }

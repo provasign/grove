@@ -560,6 +560,9 @@ func javacResolveScoped(ctx context.Context, req Request) ([]core.Edge, []string
 	if err := os.WriteFile(cpFile, []byte(cp), 0o600); err != nil {
 		return nil, []string{"javac resolver skipped: " + err.Error()}, nil, nil
 	}
+	// Linked repositories' sources: a dependency checked out beside this
+	// project is read from there when its jar is not on the classpath.
+	linkedSourcepath := strings.Join(javaLinkedSourceRoots(req.Root, req.LinkedRoots), string(os.PathListSeparator))
 	var payload javacPayload
 	batches := javaBatches(req.Root, files)
 	for bi, b := range batches {
@@ -579,7 +582,7 @@ func javacResolveScoped(ctx context.Context, req Request) ([]core.Edge, []string
 		if len(batchUnits) < len(b.files) {
 			sourcepath = strings.Join(b.roots, string(os.PathListSeparator))
 		}
-		part, err := runJavacResolver(ctx, j, req.Root, tmp, src, cpFile, batchUnits, sourcepath, bi, req.Resident)
+		part, err := runJavacResolver(ctx, j, req.Root, tmp, src, cpFile, batchUnits, sourcepath, linkedSourcepath, bi, req.Resident)
 		if err != nil {
 			return nil, []string{err.Error()}, nil, nil
 		}
@@ -588,6 +591,7 @@ func javacResolveScoped(ctx context.Context, req Request) ([]core.Edge, []string
 		payload.Calls = append(payload.Calls, part.Calls...)
 		payload.Members = append(payload.Members, part.Members...)
 		payload.Decls = append(payload.Decls, part.Decls...)
+		payload.Exts = append(payload.Exts, part.Exts...)
 	}
 	// The compiler's declarations are the universe. Whatever the parser did
 	// not index (gson TypeAdapters: 25 adapters in static field initializers,
@@ -644,11 +648,22 @@ func javacResolveScoped(ctx context.Context, req Request) ([]core.Edge, []string
 			}
 		}
 	}
+	extRefs := resolvedMarks{} // caller -> "jvm:pkg#Type.member@line:col" (core.EdgeExternalRef)
+	for _, c := range payload.Exts {
+		if from, ok := symbols.at(c.From, c.FromName, c.FromLine); ok {
+			if key, ok := javaExternalKey(c.ExtPkg, c.ExtType, ""); ok {
+				extRefs.add(from.ID, key, c.Line, c.Col)
+			}
+		}
+	}
 	for _, c := range payload.Calls {
 		from, okFrom := symbols.at(c.From, c.FromName, c.FromLine)
 		if c.Ext != "" {
 			if okFrom && !c.ExtProject {
 				mark(from, c.Ext, c)
+				if key, ok := javaExternalKey(c.ExtPkg, c.ExtType, c.Ext); ok {
+					extRefs.add(from.ID, key, c.Line, c.Col)
+				}
 			}
 			continue
 		}
@@ -714,6 +729,7 @@ func javacResolveScoped(ctx context.Context, req Request) ([]core.Edge, []string
 		edges[i].Lines = strings.Join(parts, ",")
 	}
 	edges = append(edges, marks.edges()...)
+	edges = append(edges, extRefs.edgesOf(core.EdgeExternalRef)...)
 	for _, m := range payload.Members {
 		from, okFrom := symbols.at(m.From, m.FromName, m.FromLine)
 		to, okTo := symbols.at(m.To, m.ToName, m.ToLine)
@@ -922,6 +938,11 @@ type javacRef struct {
 	// ExtOwner the type declaring it.
 	Ext      string `json:"ext"`
 	ExtOwner string `json:"extOwner"`
+	// ExtPkg, ExtType: the package and package-relative name ("Outer.Inner")
+	// of the type declaring an external call's target, or of an external
+	// type that is used (javacPayload.Exts).
+	ExtPkg  string `json:"extPkg"`
+	ExtType string `json:"extType"`
 	// ExtProject: the external target's type has a source file in the
 	// project (a stale compiled copy was loaded): not trusted as external.
 	ExtProject bool `json:"extProject"`
@@ -952,12 +973,44 @@ type javacPayload struct {
 	Calls   []javacRef     `json:"calls"`
 	Members []javacRef     `json:"members"`
 	Decls   []compilerDecl `json:"decls"`
+	// Exts: uses of types declared outside the project.
+	Exts []javacRef `json:"exts"`
 }
 
-func runJavacResolver(ctx context.Context, j *jdk, root, tmp, src, cpFile string, units []string, sourcepath string, batch int, resident bool) (javacPayload, error) {
+// javaPlatformPackage reports the JDK's own packages. A call into them is
+// the platform, not a dependency another repository declares.
+func javaPlatformPackage(pkg string) bool {
+	for _, prefix := range []string{"java.", "javax.", "jdk.", "sun.", "com.sun.", "org.w3c.dom", "org.xml.sax"} {
+		if strings.HasPrefix(pkg, prefix) || pkg == strings.TrimSuffix(prefix, ".") {
+			return true
+		}
+	}
+	return pkg == ""
+}
+
+// javaExternalKey names a member or type of another artifact:
+// "jvm:<package>#<Outer.Inner>" or "jvm:<package>#<Outer.Inner>.<member>".
+// It is the key JavaKey derives for the declaration in that artifact's own
+// repository, from its package statement and qualified name. Overloads
+// share a key.
+func javaExternalKey(pkg, typ, member string) (string, bool) {
+	if typ == "" || javaPlatformPackage(pkg) {
+		return "", false
+	}
+	if member != "" {
+		typ += "." + member
+	}
+	return "jvm:" + pkg + "#" + typ, true
+}
+
+func runJavacResolver(ctx context.Context, j *jdk, root, tmp, src, cpFile string, units []string, sourcepath, linkedSourcepath string, batch int, resident bool) (javacPayload, error) {
 	var payload javacPayload
 	list := filepath.Join(tmp, "files-"+itoa(batch)+".txt")
 	spFile := filepath.Join(tmp, "sourcepath-"+itoa(batch)+".txt")
+	lspFile := filepath.Join(tmp, "linked-sourcepath-"+itoa(batch)+".txt")
+	if err := os.WriteFile(lspFile, []byte(linkedSourcepath), 0o600); err != nil {
+		return payload, fmt.Errorf("javac resolver skipped: %v", err)
+	}
 	if err := os.WriteFile(list, []byte(strings.Join(units, "\n")), 0o600); err != nil {
 		return payload, fmt.Errorf("javac resolver skipped: %v", err)
 	}
@@ -965,7 +1018,7 @@ func runJavacResolver(ctx context.Context, j *jdk, root, tmp, src, cpFile string
 		return payload, fmt.Errorf("javac resolver skipped: %v", err)
 	}
 	if resident && javaWorkerEnabled() {
-		line, err := javaWorkerFor(root, j).call(ctx, []byte(strings.Join([]string{root, list, cpFile, spFile}, "\t")))
+		line, err := javaWorkerFor(root, j).call(ctx, []byte(strings.Join([]string{root, list, cpFile, spFile, lspFile}, "\t")))
 		if err == nil {
 			body := line[bytes.LastIndex(line, []byte(javaPayloadSentinel))+len(javaPayloadSentinel):]
 			if !bytes.HasPrefix(bytes.TrimSpace(body), []byte(`{"error"`)) {
@@ -979,7 +1032,7 @@ func runJavacResolver(ctx context.Context, j *jdk, root, tmp, src, cpFile string
 		}
 		// Any other worker failure: fall back to the one-shot process.
 	}
-	cmd := exec.CommandContext(ctx, j.java, "-Xss8m", src, root, list, cpFile, spFile)
+	cmd := exec.CommandContext(ctx, j.java, "-Xss8m", src, root, list, cpFile, spFile, lspFile)
 	cmd.Dir = tmp
 	cmd.Env = j.env()
 	var stderr strings.Builder
@@ -1169,7 +1222,7 @@ func WarmJavaWorker(ctx context.Context, root string, files []string) {
 	}
 	defer os.RemoveAll(tmp)
 	var paths []string
-	for _, name := range []string{"files.txt", "classpath.txt", "sourcepath.txt"} {
+	for _, name := range []string{"files.txt", "classpath.txt", "sourcepath.txt", "linked-sourcepath.txt"} {
 		p := filepath.Join(tmp, name)
 		if os.WriteFile(p, nil, 0o600) != nil {
 			return
@@ -1180,3 +1233,87 @@ func WarmJavaWorker(ctx context.Context, root string, files []string) {
 	defer cancel()
 	_, _ = javaWorkerFor(root, j).call(ctx, []byte(strings.Join(append([]string{root}, paths...), "\t")))
 }
+
+// javaLinkedSourceRoots finds the Java source roots of linked repositories:
+// directories that hold the top of a package tree. The conventional
+// src/main/java layout is found by name; otherwise the first .java file of
+// a directory tree gives its root through its package statement. Roots
+// under the project itself are left out, and the walk is bounded: this runs
+// on every Java pass.
+func javaLinkedSourceRoots(root string, linked []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(dir string) {
+		dir = filepath.Clean(dir)
+		if !seen[dir] && !isUnder(cleanResolved(root), cleanResolved(dir)) {
+			seen[dir] = true
+			out = append(out, dir)
+		}
+	}
+	for _, repo := range linked {
+		found, budget := 0, 20000
+		_ = filepath.WalkDir(repo, func(p string, d os.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			if budget--; budget < 0 {
+				return filepath.SkipAll
+			}
+			if d.IsDir() {
+				switch d.Name() {
+				case ".git", ".grove", "node_modules", "target", "build", "out", ".gradle", ".idea":
+					return filepath.SkipDir
+				}
+				if d.Name() == "java" && strings.HasSuffix(filepath.ToSlash(filepath.Dir(p)), "src/main") {
+					add(p)
+					found++
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			return nil
+		})
+		if found > 0 {
+			continue
+		}
+		// No conventional layout: derive a root from one source file.
+		budget = 20000
+		_ = filepath.WalkDir(repo, func(p string, d os.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			if budget--; budget < 0 {
+				return filepath.SkipAll
+			}
+			if d.IsDir() {
+				switch d.Name() {
+				case ".git", ".grove", "node_modules", "target", "build", "out", ".gradle", ".idea", "test", "tests":
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if !strings.HasSuffix(p, ".java") {
+				return nil
+			}
+			data, err := os.ReadFile(p)
+			if err != nil {
+				return nil
+			}
+			dir := filepath.Dir(p)
+			if pkg := javaPackageOf(data); pkg != "" {
+				suffix := filepath.FromSlash(strings.ReplaceAll(pkg, ".", "/"))
+				if !strings.HasSuffix(dir, suffix) {
+					return nil
+				}
+				dir = strings.TrimSuffix(strings.TrimSuffix(dir, suffix), string(filepath.Separator))
+			}
+			add(dir)
+			return filepath.SkipDir // one file per directory is enough
+		})
+	}
+	sort.Strings(out)
+	return out
+}
+
+// HasJDK reports whether a working JDK was found for the Java pass.
+func HasJDK() bool { return findJDK() != nil }

@@ -136,15 +136,56 @@ func isUnder(parent, child string) bool {
 // tracked with the other compiler inputs. It is not a file in the tree.
 const goWorkspaceInput = "@go-workspace"
 
+// javaLinkedInput is the pseudo-name for the linked repositories' Java
+// sources a Java pass may read declarations from.
+const javaLinkedInput = "@java-linked-sources"
+
 // ExternalCompilerInputs returns fingerprints of compiler inputs that live
-// outside the walked tree, by pseudo-name: today the go.work above the
-// repository and the sources of the workspace members it requires. A change
-// re-runs the analyzer exactly as a changed go.mod does.
-func ExternalCompilerInputs(root string) map[string]string {
-	ws, ok := goWorkspaceFor(root)
-	if !ok {
-		return nil
+// outside the walked tree, by pseudo-name: the go.work above the repository
+// with the sources of the workspace members it requires, and the Java
+// sources of linked repositories. A change re-runs the analyzer exactly as a
+// changed go.mod or pom.xml does.
+func ExternalCompilerInputs(root string, linked []string) map[string]string {
+	out := map[string]string{}
+	if ws, ok := goWorkspaceFor(root); ok {
+		sum := sha256.Sum256([]byte(ws.fingerprint()))
+		out[goWorkspaceInput] = hex.EncodeToString(sum[:])
 	}
-	sum := sha256.Sum256([]byte(ws.fingerprint()))
-	return map[string]string{goWorkspaceInput: hex.EncodeToString(sum[:])}
+	if roots := javaLinkedSourceRoots(root, linked); len(roots) > 0 {
+		var b strings.Builder
+		for _, r := range roots {
+			count, size, newest := sourceStats(r, ".java")
+			fmt.Fprintf(&b, "%s=%d/%d/%d;", r, count, size, newest)
+		}
+		sum := sha256.Sum256([]byte(b.String()))
+		out[javaLinkedInput] = hex.EncodeToString(sum[:])
+	}
+	return out
+}
+
+// sourceStats is a cheap fingerprint of the files with one extension under
+// dir: how many, their total size, and the newest modification time.
+func sourceStats(dir, ext string) (count int, size, newest int64) {
+	_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if d.Name() == ".git" || d.Name() == ".grove" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.HasSuffix(d.Name(), ext) {
+			if info, err := d.Info(); err == nil {
+				count++
+				size += info.Size()
+				if t := info.ModTime().UnixNano(); t > newest {
+					newest = t
+				}
+			}
+		}
+		return nil
+	})
+	return count, size, newest
 }
