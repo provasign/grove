@@ -338,6 +338,7 @@ func (i *Indexer) Index(ctx context.Context, root string) (*graph.CodeGraph, cor
 // consumer reading the database later sees which analyzer tier built it.
 func (i *Indexer) IndexWithOptions(ctx context.Context, root string, opts Options) (*graph.CodeGraph, core.IndexResult, error) {
 	prog := newIndexProgress(i.store)
+	prog.root = root
 	cg, result, err := i.indexWithOptions(ctx, root, opts, prog)
 	// SQLite keeps freed pages: after a full re-extract (an upgrade that
 	// changes the stored format) the file stays at its old size, mostly

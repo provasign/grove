@@ -202,7 +202,13 @@ const (
 	MetaIndexProgress = "index-progress"
 	MetaIndexStarted  = "index-started"
 	MetaIndexFinished = "index-finished"
-	MetaIndexNative   = "index-native"
+	// MetaIndexHead / MetaIndexRef: the git commit and branch checked out
+	// when the last run finished ("" outside a git work tree, or detached).
+	// An index describes a tree state; these say which one, so a reader of
+	// the index alone can tell it from the state now on disk.
+	MetaIndexHead   = "index-head"
+	MetaIndexRef    = "index-ref"
+	MetaIndexNative = "index-native"
 	// MetaNativeComplete: JSON list of native analyzers that have completed
 	// a full pass on this index (later passes may be incremental).
 	MetaNativeComplete = "native-complete"

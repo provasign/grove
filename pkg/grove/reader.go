@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/provasign/grove/internal/core"
 	"github.com/provasign/grove/internal/store"
 	"golang.org/x/mod/modfile"
 )
@@ -153,4 +154,27 @@ func GoKey(root, filePath, qualifiedName string) (key string, ok bool) {
 			return "", false
 		}
 	}
+}
+
+// IndexState says which tree state an index describes.
+type IndexState struct {
+	Head     string // commit checked out when the index was last written; "" if unknown
+	Ref      string // branch at that time; "" when detached or unknown
+	Finished string // RFC 3339 time the last run finished; "" while one is running
+}
+
+// State reports the tree state the index was built from. An index written
+// before these were recorded has an empty Head: unknown, not unchanged.
+func (r *Reader) State(ctx context.Context) IndexState {
+	var st IndexState
+	st.Head, _, _ = r.st.GetMeta(ctx, core.MetaIndexHead)
+	st.Ref, _, _ = r.st.GetMeta(ctx, core.MetaIndexRef)
+	st.Finished, _, _ = r.st.GetMeta(ctx, core.MetaIndexFinished)
+	return st
+}
+
+// FileStat returns the size and modification time (Unix nanoseconds) the
+// index recorded for a repository-relative file, and whether it is indexed.
+func (r *Reader) FileStat(ctx context.Context, relPath string) (size, mtime int64, ok bool) {
+	return r.st.FileStat(ctx, relPath)
 }

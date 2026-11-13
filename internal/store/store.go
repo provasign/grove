@@ -147,6 +147,13 @@ func OpenReadOnly(root string) (*Store, error) {
 	return &Store{db: db}, nil
 }
 
+// FileStat returns the size and mtime recorded for an indexed file.
+func (s *Store) FileStat(ctx context.Context, filePath string) (size, mtime int64, ok bool) {
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COALESCE(file_size, 0), COALESCE(file_mtime, 0) FROM file_index WHERE file_path = ?`, filePath).Scan(&size, &mtime)
+	return size, mtime, err == nil
+}
+
 // ExternalRefRecords returns the external-reference records (From, Lines)
 // that mention any of keys. Lines still holds every key of that caller; the
 // caller of this method picks out the ones it asked for.
