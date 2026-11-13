@@ -2,6 +2,7 @@ package grove
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path"
 	"path/filepath"
@@ -183,4 +184,70 @@ func (r *Reader) State(ctx context.Context) IndexState {
 // index recorded for a repository-relative file, and whether it is indexed.
 func (r *Reader) FileStat(ctx context.Context, relPath string) (size, mtime int64, ok bool) {
 	return r.st.FileStat(ctx, relPath)
+}
+
+// SymbolKey is the key other repositories record when they name sym,
+// declared under root. ok is false for a language or kind with no key.
+func SymbolKey(root string, sym Symbol) (key string, ok bool) {
+	return KeyFor(root, sym.Language, string(sym.Kind), sym.FilePath, sym.QualifiedName)
+}
+
+// KeyFor is SymbolKey for a symbol given by its fields, for one that is no
+// longer in the index. An empty language is inferred from the file
+// extension and an empty kind is taken to be a function.
+func KeyFor(root, language, kind, filePath, qualifiedName string) (key string, ok bool) {
+	if language == "" {
+		switch strings.ToLower(path.Ext(filePath)) {
+		case ".go":
+			language = "go"
+		case ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs":
+			language = "typescript"
+		}
+	}
+	if kind == "" {
+		kind = "function"
+	}
+	switch language {
+	case "go":
+		switch kind {
+		case "function", "method", "struct", "interface", "type", "class":
+			return GoKey(root, filePath, qualifiedName)
+		}
+	case "typescript", "tsx", "javascript":
+		switch kind {
+		case "function", "method", "class":
+			return NPMKey(root, filePath, qualifiedName)
+		}
+	}
+	return "", false
+}
+
+// NPMKey is the key for a JavaScript or TypeScript function, method or
+// class: the name of the nearest package.json at or above the file, and the
+// symbol's own name. The TypeScript pass records a call by the package that
+// declares the callee and the callee's name, without its owner type, so a
+// method is matched by package and method name: two classes of one package
+// with a same-named method share a key.
+func NPMKey(root, filePath, qualifiedName string) (key string, ok bool) {
+	name := qualifiedName
+	if i := strings.LastIndexByte(name, '.'); i >= 0 {
+		name = name[i+1:]
+	}
+	if name == "" {
+		return "", false
+	}
+	for d := path.Dir(filepath.ToSlash(filePath)); ; d = path.Dir(d) {
+		data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(d), "package.json"))
+		if err == nil {
+			var pkg struct {
+				Name string `json:"name"`
+			}
+			if json.Unmarshal(data, &pkg) == nil && pkg.Name != "" {
+				return "npm:" + pkg.Name + "#" + name, true
+			}
+		}
+		if d == "." || d == "/" {
+			return "", false
+		}
+	}
 }

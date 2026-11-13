@@ -233,3 +233,102 @@ func TestExternalRefsFollowParentGoWork(t *testing.T) {
 		t.Fatalf("call added after a workspace member changed not recorded: %v %v", refs, err)
 	}
 }
+
+// findTypeScript locates an installed typescript package to link into a
+// test project: $GROVE_TEST_TYPESCRIPT, else one next to the test binary's
+// working tree. The TypeScript pass needs it resolvable from the project.
+func findTypeScript() string {
+	candidates := []string{os.Getenv("GROVE_TEST_TYPESCRIPT")}
+	if home, err := os.UserHomeDir(); err == nil {
+		m, _ := filepath.Glob(filepath.Join(home, "*", "*", "node_modules", "typescript"))
+		candidates = append(candidates, m...)
+		m, _ = filepath.Glob(filepath.Join(home, "*", "node_modules", "typescript"))
+		candidates = append(candidates, m...)
+	}
+	for _, c := range candidates {
+		if c == "" {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(c, "lib", "typescript.js")); err == nil {
+			return c
+		}
+	}
+	return ""
+}
+
+func TestExternalRefsTypeScriptPackages(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("node not available")
+	}
+	tsDir := findTypeScript()
+	if tsDir == "" {
+		t.Skip("no typescript package found to link into the test project")
+	}
+	ctx := context.Background()
+	parent, _ := filepath.EvalSymlinks(t.TempDir())
+	lib, app := filepath.Join(parent, "lib"), filepath.Join(parent, "app")
+	writeTree(t, lib, map[string]string{
+		"package.json": `{"name":"@acme/lib","version":"1.0.0","main":"src/index.ts","types":"src/index.ts"}`,
+		"src/index.ts": "export function helper(): number { return 1 }\n\nexport class Box {\n  open(): number { return 2 }\n}\n",
+	})
+	writeTree(t, app, map[string]string{
+		"package.json":  `{"name":"app","devDependencies":{"typescript":"5"},"dependencies":{"@acme/lib":"file:../lib"}}`,
+		"tsconfig.json": `{"compilerOptions":{"strict":true,"module":"commonjs","target":"es2020","moduleResolution":"node"},"include":["src"]}`,
+		"src/main.ts":   "import { helper, Box } from '@acme/lib'\n\nexport function run(): number {\n  const b = new Box()\n  return helper() + b.open() + parseInt('1')\n}\n",
+	})
+	for link, target := range map[string]string{
+		filepath.Join(app, "node_modules", "typescript"):   tsDir,
+		filepath.Join(app, "node_modules", "@acme", "lib"): lib,
+	} {
+		if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, link); err != nil {
+			t.Skip("symlinks unavailable:", err)
+		}
+	}
+	indexRepo(t, lib)
+	indexRepo(t, app)
+
+	lr, err := OpenReader(lib)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lr.Close()
+	syms, err := lr.SymbolsNamed(ctx, []string{"helper", "Box.open"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := map[string]string{}
+	for _, s := range syms {
+		if k, ok := SymbolKey(lib, s); ok {
+			keys[s.QualifiedName] = k
+		}
+	}
+	if keys["helper"] != "npm:@acme/lib#helper" || keys["Box.open"] != "npm:@acme/lib#open" {
+		t.Fatalf("declaration keys = %v", keys)
+	}
+	ar, err := OpenReader(app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ar.Close()
+	refs, err := ar.ExternalRefs(ctx, []string{keys["helper"], keys["Box.open"]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]int{}
+	for _, r := range refs {
+		if r.File != "src/main.ts" || r.From != "run" {
+			t.Fatalf("unexpected site %+v", r)
+		}
+		got[r.Key] = r.Line
+	}
+	if got["npm:@acme/lib#helper"] != 5 || got["npm:@acme/lib#open"] != 5 || len(got) != 2 {
+		t.Fatalf("TypeScript external references = %v (want helper and open on line 5)", got)
+	}
+	// The platform (parseInt from TypeScript's lib) is not recorded.
+	if none, _ := ar.ExternalRefs(ctx, []string{"npm:typescript#parseInt"}); len(none) != 0 {
+		t.Fatalf("a platform call was recorded: %v", none)
+	}
+}

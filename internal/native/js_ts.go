@@ -250,8 +250,10 @@ func (jsTSAnalyzer) Analyze(ctx context.Context, req Request) Result {
 			ToLine   int    `json:"toLine"`
 			Line     int    `json:"line"`
 			Col      int    `json:"col"`
-			// Ext names a callee declared outside the project (no To).
-			Ext string `json:"ext"`
+			// Ext names a callee declared outside the project (no To), and
+			// ExtPkg the npm package declaring it (empty for the platform).
+			Ext    string `json:"ext"`
+			ExtPkg string `json:"extPkg"`
 		} `json:"calls"`
 		Types []struct {
 			From     string `json:"from"`
@@ -299,11 +301,15 @@ func (jsTSAnalyzer) Analyze(ctx context.Context, req Request) Result {
 	}
 	calls := newPositionedEdges()
 	marks := resolvedMarks{}
+	extRefs := resolvedMarks{} // caller -> "npm:pkg#name@line:col" (core.EdgeExternalRef)
 	for _, edge := range payload.Calls {
 		from, okFrom := symbols.atOrTopLevel(edge.From, edge.FromName, edge.FromLine)
 		if edge.Ext != "" {
 			if okFrom && jsIdentifierName(edge.Ext) {
 				marks.add(from.ID, edge.Ext, edge.Line, edge.Col)
+				if edge.ExtPkg != "" {
+					extRefs.add(from.ID, "npm:"+edge.ExtPkg+"#"+edge.Ext, edge.Line, edge.Col)
+				}
 			}
 			continue
 		}
@@ -323,6 +329,7 @@ func (jsTSAnalyzer) Analyze(ctx context.Context, req Request) Result {
 	}
 	edges = append(edges, calls.finish()...)
 	edges = append(edges, marks.edges()...)
+	edges = append(edges, extRefs.edgesOf(core.EdgeExternalRef)...)
 	for _, edge := range payload.Types {
 		from, okFrom := symbols.atOrTopLevel(edge.From, edge.FromName, edge.FromLine)
 		to, okTo := symbols.at(edge.To, edge.ToName, edge.ToLine)
@@ -769,6 +776,39 @@ function externalName(checker, sym) {
   // no call names it, and it would tie the index to the checkout location.
   return name && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name) ? name : undefined;
 }
+// externalPackage: the npm package that declares an external symbol, from
+// its first declaration's file: the path segment after the last
+// node_modules/, or, for a file outside the project that is not under
+// node_modules (a linked workspace package resolved to its real path), the
+// name in the nearest package.json. TypeScript's own lib files and Node's
+// type package are the platform, not a dependency another repository
+// declares: they give undefined.
+const pkgNameCache = new Map();
+function externalPackage(checker, sym) {
+  if (sym && sym.flags & ts.SymbolFlags.Alias) sym = checker.getAliasedSymbol(sym);
+  if (!sym || !sym.declarations || !sym.declarations.length) return undefined;
+  const file = sym.declarations[0].getSourceFile().fileName.replace(/\\/g, '/');
+  const marker = '/node_modules/';
+  const at = file.lastIndexOf(marker);
+  let name;
+  if (at >= 0) {
+    const parts = file.slice(at + marker.length).split('/');
+    name = parts[0].startsWith('@') ? parts[0] + '/' + parts[1] : parts[0];
+  } else {
+    let dir = path.dirname(file);
+    for (let i = 0; i < 40; i++) {
+      if (pkgNameCache.has(dir)) { name = pkgNameCache.get(dir); break; }
+      let found;
+      try { found = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')).name; } catch (e) {}
+      if (found) { pkgNameCache.set(dir, found); name = found; break; }
+      const up = path.dirname(dir);
+      if (up === dir) break;
+      dir = up;
+    }
+  }
+  if (!name || name === 'typescript' || name === '@types/node') return undefined;
+  return name;
+}
 function declInfo(checker, sym) {
   if (sym && sym.flags & ts.SymbolFlags.Alias) sym = checker.getAliasedSymbol(sym);
   if (!sym || !sym.declarations || !sym.declarations.length) return undefined;
@@ -925,6 +965,8 @@ function visit(checker, options, host, sf, node, stack) {
       // edge, but grove drops a name-based guess at this position.
       const at = sf.getLineAndCharacterOfPosition(expr.getStart(sf));
       const call = {from: rel(sf.fileName), fromName, fromLine, ext, line: at.line + 1, col: at.character + 1};
+      const extPkg = externalPackage(checker, sym);
+      if (extPkg) call.extPkg = extPkg;
       const key = JSON.stringify(call);
       if (!callKeys.has(key)) { callKeys.add(key); calls.push(call); }
     }
