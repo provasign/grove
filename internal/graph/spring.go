@@ -259,6 +259,14 @@ func splitDerivedProps(expr string) []string {
 // text renderer can say so explicitly rather than let an empty or partial
 // caller list read as "nothing depends on this."
 func (g *CodeGraph) typeImpactLocked(query string) *ChangeImpactResult {
+	return g.typeImpactScopedLocked(query, "")
+}
+
+// typeImpactScopedLocked is typeImpactLocked limited to types declared in a
+// file matching file (a path fragment), as ChangeImpactScoped's other paths
+// are. Unscoped, two same-named types picked whichever came last
+// (expfmt.Format answered as promslog.Format, 2026-11-13).
+func (g *CodeGraph) typeImpactScopedLocked(query, file string) *ChangeImpactResult {
 	q := strings.TrimSpace(query)
 	if q == "" || strings.ContainsRune(q, '.') || strings.ContainsRune(q, '(') {
 		return nil // dotted/parenthesized queries are Type.method — not this path
@@ -267,6 +275,9 @@ func (g *CodeGraph) typeImpactLocked(query string) *ChangeImpactResult {
 	var typeID string
 	for _, id := range g.idsNamed(q) {
 		s := g.symbols[id]
+		if file != "" && !strings.Contains(s.FilePath, file) {
+			continue
+		}
 		switch s.Kind {
 		case core.KindClass, core.KindInterface, core.KindType, core.KindStruct, core.KindTrait, core.KindEnum:
 			sc := s
@@ -280,10 +291,20 @@ func (g *CodeGraph) typeImpactLocked(query string) *ChangeImpactResult {
 	// Type.method machinery already answers a DIFFERENT, valid question for
 	// a DIFFERENT symbol — do not shadow it. containedMethods needs
 	// typeIDs, not just this one type, but self-shadowing (a type and a
-	// same-named top-level function) is what matters here.
+	// same-named top-level function) is what matters here. Scoped to a
+	// file, the query names a package-level declaration there (model.Time
+	// is the type, never its method Time.Time), so only a same-named
+	// function in that file competes.
 	if len(g.idsNamed(q)) > 1 {
 		for _, id := range g.idsNamed(q) {
-			if s := g.symbols[id]; s.Kind == core.KindMethod || s.Kind == core.KindFunction {
+			s := g.symbols[id]
+			if file != "" {
+				if s.Kind == core.KindFunction && s.ParentSymbol == "" && strings.Contains(s.FilePath, file) {
+					return nil
+				}
+				continue
+			}
+			if s.Kind == core.KindMethod || s.Kind == core.KindFunction {
 				return nil
 			}
 		}

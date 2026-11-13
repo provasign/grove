@@ -262,7 +262,7 @@ func (g *CodeGraph) changeImpactScoped(query, file string) (*ChangeImpactResult,
 	// name deserves the more useful type-level answer (all structural
 	// dependents), not a silent narrowing to just its constructor's
 	// callers — so this runs first and wins outright when it matches.
-	if ty := g.typeImpactLocked(query); ty != nil {
+	if ty := g.typeImpactScopedLocked(query, file); ty != nil {
 		return ty, nil
 	}
 

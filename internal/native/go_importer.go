@@ -1,6 +1,9 @@
 package native
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
 	"go/ast"
 	"go/importer"
@@ -9,8 +12,10 @@ import (
 	"go/types"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -38,7 +43,7 @@ func newGoProjectImporter(packages []goListPackage, deps goDeps) *goProjectImpor
 	var fallback types.Importer = importer.Default()
 	exports := deps.exports
 	if len(exports) > 0 {
-		fallback = exportDataImporter{exports: exports, fallback: fallback,
+		fallback = &exportDataImporter{exports: exports, fallback: fallback, root: deps.root, listed: map[string]bool{},
 			gc: importer.ForCompiler(token.NewFileSet(), "gc", func(path string) (io.ReadCloser, error) {
 				return os.Open(exports[path])
 			})}
@@ -177,20 +182,62 @@ func (p *goProjectImporter) load(path string) (loaded *types.Package, err error)
 }
 
 // exportDataImporter imports from `go list -export` data when the package was
-// listed, and from importer.Default otherwise.
+// listed, and from importer.Default otherwise. The listing covers the build
+// graph of ./..., which leaves out packages only tests import: a module
+// imported by nothing but an external test package (client_golang's
+// api/prometheus/v1/example_test.go importing prometheus/common/config,
+// 2026-11-13) left that test untyped. Such a path is listed on first use,
+// with its own dependencies; that compiles only what the tests add.
+// Not safe for concurrent use; the project importer calls it under a mutex.
 type exportDataImporter struct {
 	exports  map[string]string
 	gc       types.Importer
 	fallback types.Importer
+	root     string
+	listed   map[string]bool
 }
 
-func (e exportDataImporter) Import(path string) (*types.Package, error) {
+func (e *exportDataImporter) Import(path string) (*types.Package, error) {
+	if e.exports[path] == "" && e.root != "" && !e.listed[path] && strings.Contains(strings.SplitN(path, "/", 2)[0], ".") {
+		e.listed[path] = true
+		for p, file := range goListExportPaths(e.root, path) {
+			if e.exports[p] == "" {
+				e.exports[p] = file
+			}
+		}
+	}
 	if e.exports[path] != "" {
 		if pkg, err := e.gc.Import(path); err == nil {
 			return pkg, nil
 		}
 	}
 	return e.fallback.Import(path)
+}
+
+// goListExportPaths lists one import path and its dependencies with
+// compiler export data, bounded by goExportTimeout. Failure lists nothing.
+func goListExportPaths(root, path string) map[string]string {
+	ctx, cancel := context.WithTimeout(context.Background(), goExportTimeout())
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "go", "list", "-e", "-deps", "-export", "-json=ImportPath,Export", "--", path)
+	cmd.Dir = root
+	cmd.Env = goAnalyzerEnv(root)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+	found := map[string]string{}
+	dec := json.NewDecoder(bytes.NewReader(out))
+	for {
+		var pkg struct{ ImportPath, Export string }
+		if dec.Decode(&pkg) != nil {
+			break
+		}
+		if pkg.Export != "" {
+			found[pkg.ImportPath] = pkg.Export
+		}
+	}
+	return found
 }
 
 // goDeps is how dependency packages (standard library, modules) get their
@@ -200,6 +247,7 @@ func (e exportDataImporter) Import(path string) (*types.Package, error) {
 type goDeps struct {
 	exports map[string]string
 	source  types.Importer
+	root    string // where test-only imports missing from exports are listed
 }
 
 // goDepPackage is one dependency's source, as `go list -deps -json` lists it.

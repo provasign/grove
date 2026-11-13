@@ -680,3 +680,47 @@ public class Main implements Box.Opener {
 }
 
 func itoaTest(n int) string { return strconv.Itoa(n) }
+
+// A directory holds its package and its external test package. Checked as
+// one package, go/types rejected every file whose clause differed from the
+// first file's: with example_test.go (package push_test) first, push.go lost
+// all type information (client_golang prometheus/push, 2026-11-13). Both
+// packages must be checked, each on its own.
+func TestExternalRefsExternalTestPackageFirst(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go toolchain not available")
+	}
+	ctx := context.Background()
+	parent, _ := filepath.EvalSymlinks(t.TempDir())
+	lib, app := filepath.Join(parent, "lib"), filepath.Join(parent, "app")
+	writeTree(t, lib, map[string]string{
+		"go.mod": "module example.com/lib\n\ngo 1.22\n",
+		"lib.go": "package lib\n\nfunc Helper() int { return 1 }\n",
+	})
+	writeTree(t, app, map[string]string{
+		"go.mod": "module example.com/app\n\ngo 1.22\n\nrequire example.com/lib v0.0.0\n\nreplace example.com/lib => ../lib\n",
+		"push/a_example_test.go": "package push_test\n\nimport (\n\t\"example.com/app/push\"\n\t\"example.com/lib\"\n)\n\n" +
+			"func ExampleUse() { _ = push.Use(); _ = lib.Helper() }\n",
+		"push/push.go": "package push\n\nimport \"example.com/lib\"\n\nfunc Use() int { return lib.Helper() }\n",
+	})
+	indexRepo(t, lib)
+	indexRepo(t, app)
+	ar, err := OpenReader(app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ar.Close()
+	refs, err := ar.ExternalRefs(ctx, []string{"go:example.com/lib#Helper"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, r := range refs {
+		got[r.File+":"+strconv.Itoa(r.Line)] = true
+	}
+	for _, w := range []string{"push/push.go:5", "push/a_example_test.go:8"} {
+		if !got[w] {
+			t.Errorf("missing reference at %s; got %v", w, got)
+		}
+	}
+}

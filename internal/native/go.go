@@ -493,7 +493,33 @@ func goSemanticEdges(ctx context.Context, root string, files []string, symbols [
 		pkg   *types.Package
 		err   error
 	}
-	outcomes := make([]dirOutcome, len(dirs))
+	// One type-check per package, not per directory: a directory holds its
+	// package and, beside it, the external test package (package x_test)
+	// and sometimes a `//go:build ignore` main. Checked as one package,
+	// go/types rejects every file whose package clause differs from the
+	// first file's, so a directory whose first file was example_test.go
+	// lost all type information for its library files (client_golang
+	// prometheus/push, 2026-11-13), and otherwise the external tests lost
+	// theirs.
+	type checkUnit struct {
+		dir, pkgPath string
+		files        []string
+	}
+	var units []checkUnit
+	for _, dir := range dirs {
+		pkgPath := importPathByDir[dir]
+		if pkgPath == "" {
+			pkgPath = dir
+		}
+		for _, group := range goPackageGroups(root, filesByDir[dir]) {
+			path := pkgPath
+			if group.suffix != "" {
+				path = pkgPath + group.suffix
+			}
+			units = append(units, checkUnit{dir: dir, pkgPath: path, files: group.files})
+		}
+	}
+	outcomes := make([]dirOutcome, len(units))
 	workers := runtime.GOMAXPROCS(0)
 	if workers < 1 {
 		workers = 1
@@ -511,32 +537,101 @@ func goSemanticEdges(ctx context.Context, root string, files []string, symbols [
 					outcomes[di] = dirOutcome{err: err}
 					continue
 				}
-				pkgPath := importPathByDir[dirs[di]]
-				if pkgPath == "" {
-					pkgPath = dirs[di]
-				}
-				e, d, pkg, err := goSemanticPackageEdges(root, pkgPath, dirs[di], filesByDir[dirs[di]], symbolIdx, pkgDirsByImport, projectImporter)
+				u := units[di]
+				e, d, pkg, err := goSemanticPackageEdges(root, u.pkgPath, u.dir, u.files, symbolIdx, pkgDirsByImport, projectImporter)
 				outcomes[di] = dirOutcome{edges: e, decls: d, pkg: pkg, err: err}
 			}
 		}()
 	}
-	for di := range dirs {
+	for di := range units {
 		dirCh <- di
 	}
 	close(dirCh)
 	wg.Wait()
 	for di, o := range outcomes {
 		if o.err != nil {
-			diagnostics = append(diagnostics, "semantic package "+dirs[di]+" skipped: "+o.err.Error())
+			diagnostics = append(diagnostics, "semantic package "+units[di].dir+" skipped: "+o.err.Error())
 			continue
 		}
 		edges = append(edges, o.edges...)
 		decls = append(decls, o.decls...)
-		edges = append(edges, goExternalContracts(o.pkg, dirs[di], symbolIdx, pkgDirsByImport)...)
+		edges = append(edges, goExternalContracts(o.pkg, units[di].dir, symbolIdx, pkgDirsByImport)...)
 	}
 	diagnostics = append(diagnostics, "resolved "+itoa(countEdgesOfType(edges, core.EdgeCalls))+" native call edge(s)")
 	diagnostics = append(diagnostics, "resolved "+itoa(countEdgesOfType(edges, core.EdgeUsesType))+" native type-use edge(s)")
 	return edges, decls, diagnostics
+}
+
+// goPackageGroup is the files of one package clause in a directory.
+type goPackageGroup struct {
+	suffix string // "" for the directory's package, "_test" for its external tests
+	files  []string
+}
+
+// goPackageGroups splits a directory's files by package clause. The group
+// with the most non-test files is the directory's package; its external
+// test package gets the "_test" suffix go uses for it, and any other
+// package (a `//go:build ignore` main) a suffix of its own. A file whose
+// clause cannot be read stays with the directory's package, as before.
+// Files keep their order inside a group, so output stays deterministic.
+func goPackageGroups(root string, files []string) []goPackageGroup {
+	if len(files) < 2 {
+		return []goPackageGroup{{files: files}}
+	}
+	names := make([]string, len(files))
+	nonTest := map[string]int{}
+	var order []string
+	for i, file := range files {
+		f, err := parser.ParseFile(token.NewFileSet(), filepath.Join(root, file), nil, parser.PackageClauseOnly)
+		if err == nil && f != nil && f.Name != nil {
+			names[i] = f.Name.Name
+		}
+		if _, seen := nonTest[names[i]]; !seen {
+			order = append(order, names[i])
+			nonTest[names[i]] = 0
+		}
+		if !strings.HasSuffix(file, "_test.go") {
+			nonTest[names[i]]++
+		}
+	}
+	if len(order) == 1 {
+		return []goPackageGroup{{files: files}}
+	}
+	primary := ""
+	best := -1
+	for _, name := range order {
+		if name != "" && nonTest[name] > best {
+			primary, best = name, nonTest[name]
+		}
+	}
+	groups := map[string]*goPackageGroup{}
+	var out []*goPackageGroup
+	for i, file := range files {
+		name := names[i]
+		if name == "" {
+			name = primary
+		}
+		g := groups[name]
+		if g == nil {
+			g = &goPackageGroup{}
+			switch {
+			case name == primary:
+			case name == primary+"_test":
+				g.suffix = "_test"
+			default:
+				g.suffix = "#" + name
+			}
+			groups[name] = g
+			out = append(out, g)
+		}
+		g.files = append(g.files, file)
+	}
+	result := make([]goPackageGroup, 0, len(out))
+	for _, g := range out {
+		result = append(result, *g)
+	}
+	sort.SliceStable(result, func(i, j int) bool { return result[i].suffix < result[j].suffix })
+	return result
 }
 
 // The checked package is returned for the contracts pass
@@ -1778,7 +1873,7 @@ func goExportData(ctx context.Context, root, topoKey string) (goDeps, string) {
 		if !hit {
 			saveGoListCache(cachePath, topoKey, out)
 		}
-		return goDeps{exports: exports}, ""
+		return goDeps{exports: exports, root: root}, ""
 	}
 	return goDeps{}, ""
 }
