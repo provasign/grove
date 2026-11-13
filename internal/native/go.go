@@ -119,6 +119,19 @@ func (goAnalyzer) Analyze(ctx context.Context, req Request) Result {
 		cmd.Stderr = &stderr
 		var err error
 		out, err = cmd.Output()
+		if _, inWorkspace := goWorkspaceFor(req.Root); err != nil && inWorkspace {
+			// The workspace does not load (a member that no longer builds,
+			// a go directive newer than the toolchain). Analyze the
+			// repository alone, as before workspaces were followed.
+			goWorkDisabled.Store(cleanResolved(req.Root), true)
+			topoKey = goListTopologyKey(req.Root, req.Files, req.Symbols)
+			retry := exec.CommandContext(ctx, "go", "list", "-mod=readonly", "-json", "./...")
+			retry.Dir = req.Root
+			retry.Env = goAnalyzerEnv(req.Root)
+			stderr.Reset()
+			retry.Stderr = &stderr
+			out, err = retry.Output()
+		}
 		if err != nil {
 			diagnostic := "go list failed: " + err.Error()
 			if detail := strings.TrimSpace(stderr.String()); detail != "" {
@@ -324,13 +337,20 @@ func filterSymbolsByDirs(symbols []core.SymbolRecord, dirs map[string]bool) []co
 // GOMODCACHE/GOCACHE/GOPATH are carried through the allowlist so the shared
 // module cache and build cache still work; module downloads are simply
 // disabled for this side-effect-free analysis pass.
-func goAnalyzerEnv(_ string) []string {
+func goAnalyzerEnv(root string) []string {
 	// GOTOOLCHAIN=local always: a `toolchain goX.Y.Z` directive in go.mod
 	// otherwise makes `go list` download and re-exec a different toolchain over
 	// the network — a surprise even for trusted repos, and arbitrary-code from
 	// repo content for untrusted ones. -mod=readonly always: analysis never
 	// edits go.mod. These do not degrade a normal `go list`.
-	env := scrubbedEnv("GOTOOLCHAIN=local", "GOFLAGS=-mod=readonly", "GOWORK=off")
+	// GOWORK: a go.work above the repository that lists it is how this
+	// repository is actually built, so analysis follows it (goWorkspaceFor);
+	// otherwise off, so a stray workspace cannot change the answer.
+	gowork := "GOWORK=off"
+	if ws, ok := goWorkspaceFor(root); ok {
+		gowork = "GOWORK=" + ws.file
+	}
+	env := scrubbedEnv("GOTOOLCHAIN=local", "GOFLAGS=-mod=readonly", gowork)
 	if untrustedMode() {
 		// Cut network module fetches so a hostile go.mod cannot drive egress to
 		// attacker-named modules. In trusted mode the operator's GOPROXY (from
@@ -1476,6 +1496,9 @@ func goListTopologyKey(root string, files []string, symbols []core.SymbolRecord)
 			h.Write([]byte(mod))
 			h.Write(b)
 		}
+	}
+	if ws, ok := goWorkspaceFor(root); ok {
+		h.Write([]byte("gowork=" + ws.file + ";" + ws.fingerprint()))
 	}
 	importsByFile := map[string][]string{}
 	for i := range symbols {

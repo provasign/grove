@@ -146,3 +146,50 @@ func main() { run(nil); _ = lib.Helper() }
 		t.Fatalf("library recorded an external reference to its own function: %v", self)
 	}
 }
+
+// A go.work above two checkouts is how they are built together. The
+// application's go.mod pins a published version of the library; the call it
+// makes exists only in the checkout. Analysis must follow the workspace, or
+// that call is invisible.
+func TestExternalRefsFollowParentGoWork(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go toolchain not available")
+	}
+	ctx := context.Background()
+	parent, _ := filepath.EvalSymlinks(t.TempDir())
+	lib, app := filepath.Join(parent, "lib"), filepath.Join(parent, "app")
+	writeTree(t, parent, map[string]string{"go.work": "go 1.22\n\nuse (\n\t./app\n\t./lib\n)\n"})
+	writeTree(t, lib, map[string]string{
+		"go.mod": "module example.com/wslib\n\ngo 1.22\n",
+		"lib.go": "package wslib\n\nfunc OnlyInCheckout() int { return 1 }\n",
+	})
+	writeTree(t, app, map[string]string{
+		"go.mod":  "module example.com/wsapp\n\ngo 1.22\n\nrequire example.com/wslib v0.1.0\n",
+		"main.go": "package main\n\nimport \"example.com/wslib\"\n\nfunc main() {\n\tprintln(wslib.OnlyInCheckout())\n}\n",
+	})
+	indexRepo(t, app)
+	r, err := OpenReader(app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refs, err := r.ExternalRefs(ctx, []string{"go:example.com/wslib#OnlyInCheckout"})
+	r.Close()
+	if err != nil || len(refs) != 1 || refs[0].File != "main.go" || refs[0].Line != 6 {
+		t.Fatalf("call into the workspace checkout not recorded: %v %v", refs, err)
+	}
+
+	// The library gains a function and the application starts calling it:
+	// the cached listing must not hide the new call.
+	writeTree(t, lib, map[string]string{"more.go": "package wslib\n\nfunc AddedLater() int { return 2 }\n"})
+	writeTree(t, app, map[string]string{"more.go": "package main\n\nimport \"example.com/wslib\"\n\nfunc later() int { return wslib.AddedLater() }\n"})
+	indexRepo(t, app)
+	r, err = OpenReader(app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	refs, err = r.ExternalRefs(ctx, []string{"go:example.com/wslib#AddedLater"})
+	if err != nil || len(refs) != 1 || refs[0].From != "later" {
+		t.Fatalf("call added after a workspace member changed not recorded: %v %v", refs, err)
+	}
+}
