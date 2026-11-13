@@ -201,6 +201,60 @@ func hold(b *store.Box) func() int {
 		}
 	}
 
+	// Variables, constants and struct fields: a sentinel error compared, a
+	// constant read, a config struct filled by field name and read back.
+	writeTree(t, lib, map[string]string{"conf.go": "package lib\n\nimport \"errors\"\n\nvar ErrGone = errors.New(\"gone\")\n\nconst Limit = 3\n\ntype Config struct {\n\tRoot string\n}\n"})
+	writeTree(t, app, map[string]string{"conf.go": `package main
+
+import "example.com/lib"
+
+func configured(err error) string {
+	if err == lib.ErrGone {
+		return ""
+	}
+	c := lib.Config{Root: "x"}
+	_ = lib.Limit
+	return c.Root
+}
+`})
+	indexRepo(t, lib)
+	indexRepo(t, app)
+	lr2, err := OpenReader(lib)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lr2.Close()
+	valSyms, _ := lr2.SymbolsNamed(ctx, []string{"ErrGone", "Limit", "Config.Root"})
+	valKeys := map[string]string{}
+	for _, s := range valSyms {
+		if k, ok := SymbolKey(lib, s); ok {
+			valKeys[s.QualifiedName] = k
+		}
+	}
+	if valKeys["ErrGone"] != "go:example.com/lib#ErrGone" || valKeys["Limit"] != "go:example.com/lib#Limit" || valKeys["Config.Root"] != "go:example.com/lib#Config.Root" {
+		t.Fatalf("declaration keys for values and fields = %v (symbols %d)", valKeys, len(valSyms))
+	}
+	ar3, err := OpenReader(app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ar3.Close()
+	vals, err := ar3.ExternalRefs(ctx, []string{valKeys["ErrGone"], valKeys["Limit"], valKeys["Config.Root"]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	valAt := map[string][]int{}
+	for _, r := range vals {
+		if r.File == "conf.go" {
+			valAt[r.Key] = append(valAt[r.Key], r.Line)
+		}
+	}
+	if len(valAt["go:example.com/lib#ErrGone"]) != 1 || valAt["go:example.com/lib#ErrGone"][0] != 6 ||
+		len(valAt["go:example.com/lib#Limit"]) != 1 || valAt["go:example.com/lib#Limit"][0] != 10 ||
+		len(valAt["go:example.com/lib#Config.Root"]) != 2 {
+		t.Fatalf("variable, constant and field references = %v", valAt)
+	}
+
 	// Standard library and in-repository calls are not recorded.
 	none, err := ar.ExternalRefs(ctx, []string{"go:fmt#Println", "go:example.com/app#local"})
 	if err != nil || len(none) != 0 {

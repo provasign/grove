@@ -187,7 +187,7 @@ func GoSymbolKey(root string, sym Symbol) (key string, ok bool) {
 		return "", false
 	}
 	switch sym.Kind {
-	case "function", "method", "struct", "interface", "type", "class":
+	case "function", "method", "struct", "interface", "type", "class", "variable", "const", "field":
 		return GoKey(root, sym.FilePath, sym.QualifiedName)
 	}
 	return "", false
@@ -291,7 +291,7 @@ func KeyFor(root, language, kind, filePath, qualifiedName string) (key string, o
 	switch language {
 	case "go":
 		switch kind {
-		case "function", "method", "struct", "interface", "type", "class":
+		case "function", "method", "struct", "interface", "type", "class", "variable", "const", "field":
 			return GoKey(root, filePath, qualifiedName)
 		}
 	case "typescript", "tsx", "javascript":

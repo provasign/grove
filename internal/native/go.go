@@ -729,6 +729,14 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 							continue
 						}
 						fieldObj := info.Uses[keyIdent]
+						// lib.Config{Name: v}: a field of another module's
+						// struct, set by name.
+						if litType != nil {
+							if key, ok := goExternalFieldKey(dir, fieldObj, litType, pkgDirsByImport, pkg); ok {
+								line, col := lines(keyIdent.Pos())
+								extRefs.add(caller.ID, key, line, col)
+							}
+						}
 						if fieldObj == nil && litType != nil {
 							if st, ok := litType.Underlying().(*types.Struct); ok {
 								for fi := 0; fi < st.NumFields(); fi++ {
@@ -782,6 +790,10 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 						line, col := lines(n.Pos())
 						extRefs.add(caller.ID, key, line, col)
 					}
+					if key, ok := goExternalValueKey(dir, info.Uses[n], pkgDirsByImport, pkg); ok {
+						line, col := lines(n.Pos())
+						extRefs.add(caller.ID, key, line, col)
+					}
 					if qualified, ok := localTypes[info.Uses[n]]; ok {
 						// A function-local type is declared in this function's
 						// own file: its compiler-declared record shares the
@@ -803,6 +815,14 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 							Confidence: 0.97,
 							Source:     core.EvidenceSourceNative,
 						})
+					}
+				case *ast.SelectorExpr:
+					// x.Field on another module's struct.
+					if sel := info.Selections[n]; sel != nil && sel.Kind() == types.FieldVal && len(sel.Index()) == 1 {
+						if key, ok := goExternalFieldKey(dir, sel.Obj(), sel.Recv(), pkgDirsByImport, pkg); ok {
+							line, col := lines(n.Sel.Pos())
+							extRefs.add(caller.ID, key, line, col)
+						}
 					}
 				}
 				return true
@@ -1233,6 +1253,48 @@ func goExternalTypeKey(currentDir string, obj types.Object, pkgDirsByImport map[
 		return "", false
 	}
 	return "go:" + path + "#" + tn.Name(), true
+}
+
+// goExternalValueKey names another module's package-level variable or
+// constant: "go:<import path>#<Name>". Exported sentinel errors and
+// constants are a large part of a library's surface.
+func goExternalValueKey(currentDir string, obj types.Object, pkgDirsByImport map[string][]string, selfPkg *types.Package) (string, bool) {
+	switch o := obj.(type) {
+	case *types.Var:
+		if o.IsField() {
+			return "", false
+		}
+	case *types.Const:
+	default:
+		return "", false
+	}
+	if obj.Pkg() == nil || obj.Parent() != obj.Pkg().Scope() || goObjectDirs(currentDir, obj.Pkg(), pkgDirsByImport, selfPkg) != nil {
+		return "", false
+	}
+	path := obj.Pkg().Path()
+	first, _, _ := strings.Cut(path, "/")
+	if !strings.Contains(first, ".") {
+		return "", false
+	}
+	return "go:" + path + "#" + obj.Name(), true
+}
+
+// goExternalFieldKey names a field of another module's struct, reached
+// directly through a value of type recv: "go:<import path>#<Type>.<Field>".
+// A field promoted from an embedded struct is not keyed: its owner is the
+// embedded type, which the selection does not name.
+func goExternalFieldKey(currentDir string, obj types.Object, recv types.Type, pkgDirsByImport map[string][]string, selfPkg *types.Package) (string, bool) {
+	field, ok := obj.(*types.Var)
+	if !ok || !field.IsField() || field.Pkg() == nil || goObjectDirs(currentDir, field.Pkg(), pkgDirsByImport, selfPkg) != nil {
+		return "", false
+	}
+	owner := goTypeBaseName(recv)
+	path := field.Pkg().Path()
+	first, _, _ := strings.Cut(path, "/")
+	if owner == "" || !strings.Contains(first, ".") {
+		return "", false
+	}
+	return "go:" + path + "#" + owner + "." + field.Name(), true
 }
 
 func goReceiverName(fn *ast.FuncDecl) string {
