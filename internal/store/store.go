@@ -150,7 +150,7 @@ func OpenReadOnly(root string) (*Store, error) {
 // AllExternalRefRecords returns every external-reference record.
 func (s *Store) AllExternalRefRecords(ctx context.Context) ([]core.Edge, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT from_node, lines FROM graph_edges WHERE edge_type = ? ORDER BY from_node`, string(core.EdgeExternalRef))
+		`SELECT from_node, lines FROM graph_edges WHERE edge_type = 'external-ref' ORDER BY from_node`)
 	if err != nil {
 		return nil, err
 	}
@@ -182,14 +182,16 @@ func (s *Store) ExternalRefRecords(ctx context.Context, keys []string) ([]core.E
 		return nil, nil
 	}
 	conds := make([]string, len(keys))
-	args := make([]any, 0, len(keys)+1)
-	args = append(args, string(core.EdgeExternalRef))
+	args := make([]any, 0, len(keys))
 	for i, k := range keys {
 		conds[i] = "instr(lines, ?) > 0"
 		args = append(args, k+"@")
 	}
+	// The edge type is written as a literal, not bound: SQLite uses the
+	// partial index idx_gedge_extref only when the query repeats its
+	// predicate verbatim.
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT from_node, lines FROM graph_edges WHERE edge_type = ? AND (`+strings.Join(conds, " OR ")+`) ORDER BY from_node`, args...)
+		`SELECT from_node, lines FROM graph_edges WHERE edge_type = 'external-ref' AND (`+strings.Join(conds, " OR ")+`) ORDER BY from_node`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1609,6 +1611,10 @@ CREATE INDEX IF NOT EXISTS idx_gedge_to     ON graph_edges(to_node);
 -- build. No index on edge_type: 7 distinct values over 600k rows, and its one
 -- caller (the legacy tests-edge purge) now runs once per database.
 CREATE INDEX IF NOT EXISTS idx_gedge_source ON graph_edges(source);
+-- External-reference records are a few percent of the edges and are read by
+-- a second repository asking "who names this symbol". Without this the
+-- question scans every edge: over a second on a 1.3M-edge index.
+CREATE INDEX IF NOT EXISTS idx_gedge_extref ON graph_edges(from_node) WHERE edge_type = 'external-ref';
 
 CREATE TABLE IF NOT EXISTS icr_locks (
     lock_key    TEXT PRIMARY KEY,
