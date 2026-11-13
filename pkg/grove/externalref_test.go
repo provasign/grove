@@ -69,6 +69,10 @@ import (
 
 func local() {}
 
+type FileBox struct{}
+
+func (f *FileBox) Open() error { return nil }
+
 func run(o store.Opener) {
 	fmt.Println(lib.Helper())
 	b := &store.Box{}
@@ -125,10 +129,10 @@ func main() { run(nil); _ = lib.Helper() }
 		got[site{r.Key, r.From, r.Line}] = true
 	}
 	want := []site{
-		{"go:example.com/lib#Helper", "run", 13},
-		{"go:example.com/lib#Helper", "main", 20},
-		{"go:example.com/lib/store#Box.Open", "run", 15},
-		{"go:example.com/lib/store#Opener.Open", "run", 16},
+		{"go:example.com/lib#Helper", "run", 17},
+		{"go:example.com/lib#Helper", "main", 24},
+		{"go:example.com/lib/store#Box.Open", "run", 19},
+		{"go:example.com/lib/store#Opener.Open", "run", 20},
 	}
 	for _, w := range want {
 		if !got[w] {
@@ -137,6 +141,13 @@ func main() { run(nil); _ = lib.Helper() }
 	}
 	if len(got) != len(want) {
 		t.Errorf("got %d sites, want %d: %v", len(got), len(want), got)
+	}
+
+	// A type in the application that implements the library's interface:
+	// the site that stops compiling when the interface changes.
+	impls, err := ar.ExternalImplementers(ctx, []string{"example.com/lib/store.Opener"})
+	if err != nil || len(impls) != 1 || impls[0].Method != "FileBox.Open" || impls[0].File != "main.go" || impls[0].Line != 14 {
+		t.Fatalf("implementers of store.Opener = %+v, %v", impls, err)
 	}
 
 	// Types named in a signature or a body, and a function used as a value.

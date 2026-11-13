@@ -147,6 +147,47 @@ func OpenReadOnly(root string) (*Store, error) {
 	return &Store{db: db}, nil
 }
 
+// ExternalContract is one method that fulfils a library interface's contract.
+type ExternalContract struct {
+	Interfaces string // "pkg/path.Iface,other/path.Other"
+	File       string
+	Method     string // qualified name: Type.Method
+	Line       int
+}
+
+// ExternalContracts returns the methods whose external-contract record
+// mentions any of ifaces ("import/path.Interface"). The caller matches the
+// names exactly; this narrows by substring.
+func (s *Store) ExternalContracts(ctx context.Context, ifaces []string) ([]ExternalContract, error) {
+	if len(ifaces) == 0 {
+		return nil, nil
+	}
+	conds := make([]string, len(ifaces))
+	args := make([]any, len(ifaces))
+	for i, name := range ifaces {
+		conds[i] = "instr(e.lines, ?) > 0"
+		args[i] = name
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT e.lines, y.file_path, y.qualified_name, y.span_start
+		FROM graph_edges e JOIN symbols y ON y.id = e.from_node
+		WHERE e.edge_type = 'external-contract' AND (`+strings.Join(conds, " OR ")+`)
+		ORDER BY y.file_path, y.span_start`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ExternalContract
+	for rows.Next() {
+		var c ExternalContract
+		if err := rows.Scan(&c.Interfaces, &c.File, &c.Method, &c.Line); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
 // AllExternalRefRecords returns every external-reference record.
 func (s *Store) AllExternalRefRecords(ctx context.Context) ([]core.Edge, error) {
 	rows, err := s.db.QueryContext(ctx,
@@ -1615,6 +1656,7 @@ CREATE INDEX IF NOT EXISTS idx_gedge_source ON graph_edges(source);
 -- a second repository asking "who names this symbol". Without this the
 -- question scans every edge: over a second on a 1.3M-edge index.
 CREATE INDEX IF NOT EXISTS idx_gedge_extref ON graph_edges(from_node) WHERE edge_type = 'external-ref';
+CREATE INDEX IF NOT EXISTS idx_gedge_extcontract ON graph_edges(from_node) WHERE edge_type = 'external-contract';
 
 CREATE TABLE IF NOT EXISTS icr_locks (
     lock_key    TEXT PRIMARY KEY,

@@ -116,6 +116,40 @@ func parseExternalRefs(records []core.Edge, want map[string]bool) []ExternalRef 
 	return out
 }
 
+// ExternalImpl is a method in this repository that implements a method of
+// an interface another module declares.
+type ExternalImpl struct {
+	Interface string `json:"interface"` // "import/path.Interface"
+	File      string `json:"file"`
+	Method    string `json:"method"` // Type.Method
+	Line      int    `json:"line"`
+}
+
+// ExternalImplementers returns this repository's methods that fulfil the
+// contract of any of ifaces ("import/path.Interface"). Go only: Go satisfies
+// interfaces implicitly, and the compiler pass records, per method, the
+// interfaces of directly imported packages it fulfils. A type that
+// implements an interface it never imports is not found.
+func (r *Reader) ExternalImplementers(ctx context.Context, ifaces []string) ([]ExternalImpl, error) {
+	rows, err := r.st.ExternalContracts(ctx, ifaces)
+	if err != nil {
+		return nil, err
+	}
+	want := map[string]bool{}
+	for _, name := range ifaces {
+		want[name] = true
+	}
+	var out []ExternalImpl
+	for _, c := range rows {
+		for _, name := range strings.Split(c.Interfaces, ",") {
+			if want[name] {
+				out = append(out, ExternalImpl{Interface: name, File: c.File, Method: c.Method, Line: c.Line})
+			}
+		}
+	}
+	return out, nil
+}
+
 // AllExternalRefs returns every external reference the index records, in
 // the order of ExternalRefs. It is what a link bundle is built from.
 func (r *Reader) AllExternalRefs(ctx context.Context) ([]ExternalRef, error) {
