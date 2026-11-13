@@ -89,3 +89,61 @@ func TestScanNPM(t *testing.T) {
 		t.Fatalf("registry dependency: %+v", l)
 	}
 }
+
+func TestScanCargoPythonMavenComposer(t *testing.T) {
+	root, _ := filepath.EvalSymlinks(t.TempDir())
+	write(t, filepath.Join(root, "Cargo.toml"), `[package]
+name = "appcrate"
+version = "0.2.0"
+
+[dependencies]
+serde = "1.0"
+corelib = { path = "../corelib", version = "0.4" }
+renamed = { package = "real-crate", version = "2" }
+`)
+	write(t, filepath.Join(root, "pyproject.toml"), `[project]
+name = "My_App"
+version = "1.0"
+dependencies = [
+  "Requests>=2.0",
+  "ext-lib[fast] ; python_version < '3.12'",
+]
+`)
+	write(t, filepath.Join(root, "pom.xml"), `<project><parent><groupId>org.acme</groupId><artifactId>parent</artifactId><version>3.1</version></parent>
+<artifactId>app</artifactId><dependencies><dependency><groupId>org.acme</groupId><artifactId>core</artifactId><version>3.0</version></dependency></dependencies></project>`)
+	write(t, filepath.Join(root, "composer.json"), `{"name":"acme/app","require":{"php":">=8.1","acme/core":"^2.0"},
+		"repositories":[{"type":"path","url":"../core"}]}`)
+	write(t, filepath.Join(filepath.Dir(root), "core", "composer.json"), `{"name":"acme/core"}`)
+
+	r := Scan(root)
+	declared := map[string]string{}
+	for _, p := range r.Packages {
+		declared[p.Ecosystem+":"+p.Name] = p.Version
+	}
+	for key, version := range map[string]string{"cargo:appcrate": "0.2.0", "pypi:my-app": "1.0", "maven:org.acme:app": "3.1", "composer:acme/app": ""} {
+		if v, ok := declared[key]; !ok || v != version {
+			t.Fatalf("package %s = %q, %v; all: %v", key, v, ok, declared)
+		}
+	}
+	if c := find(r.Requires, "corelib"); c == nil || c.LocalPath != filepath.Join(filepath.Dir(root), "corelib") || c.Version != "0.4" {
+		t.Fatalf("cargo path dependency: %+v", c)
+	}
+	if find(r.Requires, "real-crate") == nil || find(r.Requires, "renamed") != nil {
+		t.Fatal("a renamed cargo dependency must be reported under its real crate name")
+	}
+	if q := find(r.Requires, "requests"); q == nil || q.Version != ">=2.0" || q.Ecosystem != "pypi" {
+		t.Fatalf("python requirement: %+v", q)
+	}
+	if find(r.Requires, "ext-lib") == nil {
+		t.Fatal("python requirement with extras and a marker not read")
+	}
+	if m := find(r.Requires, "org.acme:core"); m == nil || m.Version != "3.0" {
+		t.Fatalf("maven dependency: %+v", m)
+	}
+	if c := find(r.Requires, "acme/core"); c == nil || c.LocalPath != filepath.Join(filepath.Dir(root), "core") {
+		t.Fatalf("composer path repository not matched to its package: %+v", c)
+	}
+	if find(r.Requires, "php") != nil {
+		t.Fatal("the PHP platform requirement was reported as a package")
+	}
+}

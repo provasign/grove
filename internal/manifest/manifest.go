@@ -20,7 +20,7 @@ import (
 // Package is something the repository declares.
 type Package struct {
 	Dir       string `json:"dir"`       // repo-relative directory of the manifest; "" is the root
-	Ecosystem string `json:"ecosystem"` // go | npm
+	Ecosystem string `json:"ecosystem"` // go | npm | cargo | pypi | maven | composer
 	Name      string `json:"name"`      // module path, package name
 	Version   string `json:"version,omitempty"`
 	Manifest  string `json:"manifest"` // repo-relative manifest path
@@ -50,12 +50,18 @@ type Result struct {
 	Requires []Require `json:"requires"`
 }
 
-// Scan reads the manifests at the repository root. A manifest that does not
-// parse is skipped: a broken go.mod must not hide a readable package.json.
+// Scan reads the manifests at the repository root: go.mod and go.work,
+// package.json, Cargo.toml, pyproject.toml, pom.xml and composer.json. A
+// manifest that does not parse is skipped: a broken go.mod must not hide a
+// readable package.json.
 func Scan(root string) Result {
 	var r Result
 	scanGo(root, &r)
 	scanNPM(root, &r)
+	scanCargo(root, &r)
+	scanPython(root, &r)
+	scanMaven(root, &r)
+	scanComposer(root, &r)
 	sort.SliceStable(r.Requires, func(i, j int) bool {
 		a, b := r.Requires[i], r.Requires[j]
 		if a.Ecosystem != b.Ecosystem {
