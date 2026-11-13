@@ -147,6 +147,26 @@ func OpenReadOnly(root string) (*Store, error) {
 	return &Store{db: db}, nil
 }
 
+// AllExternalRefRecords returns every external-reference record.
+func (s *Store) AllExternalRefRecords(ctx context.Context) ([]core.Edge, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT from_node, lines FROM graph_edges WHERE edge_type = ? ORDER BY from_node`, string(core.EdgeExternalRef))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []core.Edge
+	for rows.Next() {
+		e := core.Edge{Type: core.EdgeExternalRef}
+		if err := rows.Scan(&e.From, &e.Lines); err != nil {
+			return nil, err
+		}
+		e.To = e.From
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
 // FileStat returns the size and mtime recorded for an indexed file.
 func (s *Store) FileStat(ctx context.Context, filePath string) (size, mtime int64, ok bool) {
 	err := s.db.QueryRowContext(ctx,

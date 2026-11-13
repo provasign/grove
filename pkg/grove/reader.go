@@ -81,12 +81,18 @@ func (r *Reader) ExternalRefs(ctx context.Context, keys []string) ([]ExternalRef
 	for _, k := range keys {
 		want[k] = true
 	}
+	return parseExternalRefs(records, want), nil
+}
+
+// parseExternalRefs expands marker records into sites, keeping the keys in
+// want (all of them when want is nil), ordered by file, line and column.
+func parseExternalRefs(records []core.Edge, want map[string]bool) []ExternalRef {
 	var out []ExternalRef
 	for _, rec := range records {
 		file, from := splitSymbolID(rec.From)
 		for _, item := range strings.Split(rec.Lines, ",") {
 			at := strings.LastIndexByte(item, '@')
-			if at < 0 || !want[item[:at]] {
+			if at < 0 || (want != nil && !want[item[:at]]) {
 				continue
 			}
 			lineStr, colStr, _ := strings.Cut(item[at+1:], ":")
@@ -104,7 +110,22 @@ func (r *Reader) ExternalRefs(ctx context.Context, keys []string) ([]ExternalRef
 		}
 		return out[i].Col < out[j].Col
 	})
-	return out, nil
+	return out
+}
+
+// AllExternalRefs returns every external reference the index records, in
+// the order of ExternalRefs. It is what a link bundle is built from.
+func (r *Reader) AllExternalRefs(ctx context.Context) ([]ExternalRef, error) {
+	records, err := r.st.AllExternalRefRecords(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return parseExternalRefs(records, nil), nil
+}
+
+// AllSymbols returns every indexed symbol.
+func (r *Reader) AllSymbols(ctx context.Context) ([]Symbol, error) {
+	return r.st.AllSymbols(ctx)
 }
 
 // splitSymbolID takes "path::Qualified.Name@blob#N" apart.
