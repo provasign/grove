@@ -284,12 +284,12 @@ func TestExternalRefsTypeScriptPackages(t *testing.T) {
 	lib, app := filepath.Join(parent, "lib"), filepath.Join(parent, "app")
 	writeTree(t, lib, map[string]string{
 		"package.json": `{"name":"@acme/lib","version":"1.0.0","main":"src/index.ts","types":"src/index.ts"}`,
-		"src/index.ts": "export function helper(): number { return 1 }\n\nexport class Box {\n  open(): number { return 2 }\n}\n",
+		"src/index.ts": "export function helper(): number { return 1 }\n\nexport class Box {\n  open(): number { return 2 }\n}\n\nexport class Crate {\n  open(): number { return 3 }\n}\n\nexport interface Opener { open(): number }\n",
 	})
 	writeTree(t, app, map[string]string{
 		"package.json":  `{"name":"app","devDependencies":{"typescript":"5"},"dependencies":{"@acme/lib":"file:../lib"}}`,
 		"tsconfig.json": `{"compilerOptions":{"strict":true,"module":"commonjs","target":"es2020","moduleResolution":"node"},"include":["src"]}`,
-		"src/main.ts":   "import { helper, Box } from '@acme/lib'\n\nexport function run(): number {\n  const b = new Box()\n  return helper() + b.open() + parseInt('1')\n}\n",
+		"src/main.ts":   "import { helper, Box, Crate, Opener } from '@acme/lib'\n\nexport function run(): number {\n  const b = new Box()\n  return helper() + b.open() + parseInt('1')\n}\n\nexport class Mine extends Crate implements Opener {\n  open(): number { return 4 }\n}\n\nexport function take(o: Opener): number { return o.open() }\n",
 	})
 	for link, target := range map[string]string{
 		filepath.Join(app, "node_modules", "typescript"):   tsDir,
@@ -320,7 +320,7 @@ func TestExternalRefsTypeScriptPackages(t *testing.T) {
 			keys[s.QualifiedName] = k
 		}
 	}
-	if keys["helper"] != "npm:@acme/lib#helper" || keys["Box.open"] != "npm:@acme/lib#open" {
+	if keys["helper"] != "npm:@acme/lib#helper" || keys["Box.open"] != "npm:@acme/lib#Box.open" {
 		t.Fatalf("declaration keys = %v", keys)
 	}
 	ar, err := OpenReader(app)
@@ -339,8 +339,33 @@ func TestExternalRefsTypeScriptPackages(t *testing.T) {
 		}
 		got[r.Key] = r.Line
 	}
-	if got["npm:@acme/lib#helper"] != 5 || got["npm:@acme/lib#open"] != 5 || len(got) != 2 {
-		t.Fatalf("TypeScript external references = %v (want helper and open on line 5)", got)
+	if got["npm:@acme/lib#helper"] != 5 || got["npm:@acme/lib#Box.open"] != 5 || len(got) != 2 {
+		t.Fatalf("TypeScript external references = %v (want helper and Box.open on line 5)", got)
+	}
+	// Owner-qualified keys: a call to Box.open is not a call to Crate.open.
+	if crate, _ := ar.ExternalRefs(ctx, []string{"npm:@acme/lib#Crate.open"}); len(crate) != 0 {
+		t.Fatalf("Box.open was recorded as Crate.open: %v", crate)
+	}
+	// Construction, the extends and implements clauses, a parameter type,
+	// and a call through the interface.
+	all, err := ar.AllExternalRefs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := map[string]bool{}
+	for _, r := range all {
+		at[r.Key+"@"+strconv.Itoa(r.Line)+" in "+r.From] = true
+	}
+	for _, want := range []string{
+		"npm:@acme/lib#Box@4 in run",           // new Box()
+		"npm:@acme/lib#Crate@8 in Mine",        // extends
+		"npm:@acme/lib#Opener@8 in Mine",       // implements
+		"npm:@acme/lib#Opener@12 in take",      // parameter type
+		"npm:@acme/lib#Opener.open@12 in take", // call through the interface
+	} {
+		if !at[want] {
+			t.Errorf("missing %s; recorded: %v", want, at)
+		}
 	}
 	// The platform (parseInt from TypeScript's lib) is not recorded.
 	if none, _ := ar.ExternalRefs(ctx, []string{"npm:typescript#parseInt"}); len(none) != 0 {

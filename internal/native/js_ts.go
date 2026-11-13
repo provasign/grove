@@ -250,11 +250,24 @@ func (jsTSAnalyzer) Analyze(ctx context.Context, req Request) Result {
 			ToLine   int    `json:"toLine"`
 			Line     int    `json:"line"`
 			Col      int    `json:"col"`
-			// Ext names a callee declared outside the project (no To), and
-			// ExtPkg the npm package declaring it (empty for the platform).
-			Ext    string `json:"ext"`
-			ExtPkg string `json:"extPkg"`
+			// Ext names a callee declared outside the project (no To),
+			// ExtPkg the npm package declaring it (empty for the platform),
+			// and ExtOwner the class or interface it is a member of.
+			Ext      string `json:"ext"`
+			ExtPkg   string `json:"extPkg"`
+			ExtOwner string `json:"extOwner"`
 		} `json:"calls"`
+		// Exts: constructions and type uses of another package's class,
+		// interface or type.
+		Exts []struct {
+			From     string `json:"from"`
+			FromName string `json:"fromName"`
+			FromLine int    `json:"fromLine"`
+			Line     int    `json:"line"`
+			Col      int    `json:"col"`
+			Ext      string `json:"ext"`
+			ExtPkg   string `json:"extPkg"`
+		} `json:"exts"`
 		Types []struct {
 			From     string `json:"from"`
 			FromName string `json:"fromName"`
@@ -308,7 +321,11 @@ func (jsTSAnalyzer) Analyze(ctx context.Context, req Request) Result {
 			if okFrom && jsIdentifierName(edge.Ext) {
 				marks.add(from.ID, edge.Ext, edge.Line, edge.Col)
 				if edge.ExtPkg != "" {
-					extRefs.add(from.ID, "npm:"+edge.ExtPkg+"#"+edge.Ext, edge.Line, edge.Col)
+					name := edge.Ext
+					if edge.ExtOwner != "" {
+						name = edge.ExtOwner + "." + name
+					}
+					extRefs.add(from.ID, "npm:"+edge.ExtPkg+"#"+name, edge.Line, edge.Col)
 				}
 			}
 			continue
@@ -328,6 +345,11 @@ func (jsTSAnalyzer) Analyze(ctx context.Context, req Request) Result {
 		}
 	}
 	edges = append(edges, calls.finish()...)
+	for _, use := range payload.Exts {
+		if from, ok := symbols.atOrTopLevel(use.From, use.FromName, use.FromLine); ok && use.ExtPkg != "" && jsIdentifierName(use.Ext) {
+			extRefs.add(from.ID, "npm:"+use.ExtPkg+"#"+use.Ext, use.Line, use.Col)
+		}
+	}
 	edges = append(edges, marks.edges()...)
 	edges = append(edges, extRefs.edgesOf(core.EdgeExternalRef)...)
 	for _, edge := range payload.Types {
@@ -586,6 +608,10 @@ const input = new Set(inputFiles.map(f => path.resolve(root, f)));
 const edges = [];
 const calls = [];
 const types = [];
+// Uses of a type another npm package declares (annotations, extends and
+// implements clauses).
+const exts = [];
+const extKeys = new Set();
 const members = [];
 const decls = [];
 const memberKeys = new Set();
@@ -664,7 +690,7 @@ addConfig(exactConfig(rootAbs));
 for (const relPath of inputFiles) addConfig(nearestConfig(path.resolve(rootAbs, relPath)));
 if (configs.length === 0) {
   return {files: 0, configs: 0, solutionConfigs: 0, configErrors,
-    edges: [], calls: [], types: [], members: []};
+    edges: [], calls: [], types: [], exts: [], members: []};
 }
 const projectByInput = new Map();
 for (const project of configs) {
@@ -807,7 +833,32 @@ function externalPackage(checker, sym) {
     }
   }
   if (!name || name === 'typescript' || name === '@types/node') return undefined;
+  // DefinitelyTyped: @types/express describes express, and
+  // @types/scope__name describes @scope/name. The package that declares
+  // the code is the one another repository's manifest names.
+  if (name.startsWith('@types/')) {
+    const real = name.slice('@types/'.length);
+    name = real.includes('__') ? '@' + real.replace('__', '/') : real;
+  }
   return name;
+}
+// externalOwner: the class or interface that declares an external member,
+// so a call is keyed Owner.name and two classes of one package with a
+// same-named method do not share a key. A method of an object literal
+// bound to a variable (export const api = { get() {} }) is owned by that
+// variable. undefined for a top-level function or class.
+function externalOwner(checker, sym) {
+  if (sym && sym.flags & ts.SymbolFlags.Alias) sym = checker.getAliasedSymbol(sym);
+  const parent = sym && sym.parent;
+  if (!parent) return undefined;
+  const ident = n => (n && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(n)) ? n : undefined;
+  if (parent.flags & (ts.SymbolFlags.Class | ts.SymbolFlags.Interface)) return ident(parent.getName());
+  if (parent.flags & (ts.SymbolFlags.ObjectLiteral | ts.SymbolFlags.TypeLiteral)) {
+    const d = parent.declarations && parent.declarations[0];
+    const holder = d && d.parent;
+    if (holder && (ts.isVariableDeclaration(holder) || ts.isTypeAliasDeclaration(holder)) && holder.name && ts.isIdentifier(holder.name)) return ident(holder.name.text);
+  }
+  return undefined;
 }
 function declInfo(checker, sym) {
   if (sym && sym.flags & ts.SymbolFlags.Alias) sym = checker.getAliasedSymbol(sym);
@@ -955,6 +1006,20 @@ function visit(checker, options, host, sf, node, stack) {
   const enclosing = currentName(sf, stack);
   const fromName = enclosing && enclosing.name;
   const fromLine = enclosing && enclosing.line;
+  if (fromName && ts.isNewExpression(node)) {
+    // new Box(): constructing another package's class. In-project
+    // construction is left to the passes that already handle it.
+    const expr = ts.isPropertyAccessExpression(node.expression) ? node.expression.name : node.expression;
+    const sym = checker.getSymbolAtLocation(expr);
+    const ext = externalName(checker, sym);
+    const extPkg = ext && (ts.isIdentifier(expr) || ts.isPrivateIdentifier(expr)) ? externalPackage(checker, sym) : undefined;
+    if (extPkg) {
+      const at = sf.getLineAndCharacterOfPosition(expr.getStart(sf));
+      const use = {from: rel(sf.fileName), fromName, fromLine, ext, extPkg, line: at.line + 1, col: at.character + 1};
+      const key = JSON.stringify(use);
+      if (!extKeys.has(key)) { extKeys.add(key); exts.push(use); }
+    }
+  }
   if (fromName && ts.isCallExpression(node)) {
     const expr = ts.isPropertyAccessExpression(node.expression) ? node.expression.name : node.expression;
     const sym = checker.getSymbolAtLocation(expr);
@@ -966,7 +1031,11 @@ function visit(checker, options, host, sf, node, stack) {
       const at = sf.getLineAndCharacterOfPosition(expr.getStart(sf));
       const call = {from: rel(sf.fileName), fromName, fromLine, ext, line: at.line + 1, col: at.character + 1};
       const extPkg = externalPackage(checker, sym);
-      if (extPkg) call.extPkg = extPkg;
+      if (extPkg) {
+        call.extPkg = extPkg;
+        const owner = externalOwner(checker, sym);
+        if (owner) call.extOwner = owner;
+      }
       const key = JSON.stringify(call);
       if (!callKeys.has(key)) { callKeys.add(key); calls.push(call); }
     }
@@ -986,11 +1055,23 @@ function visit(checker, options, host, sf, node, stack) {
   if (fromName && (ts.isTypeReferenceNode(node) || ts.isExpressionWithTypeArguments(node))) {
     const typeNode = ts.isTypeReferenceNode(node) ? node.typeName : node.expression;
     const nameNode = ts.isQualifiedName(typeNode) ? typeNode.right : typeNode;
-    const target = declInfo(checker, checker.getSymbolAtLocation(nameNode));
+    const typeSym = checker.getSymbolAtLocation(nameNode);
+    const target = declInfo(checker, typeSym);
     if (target) {
       const typeUse = {from: rel(sf.fileName), fromName, fromLine, to: target.file, toName: target.name, toLine: target.line};
       const key = JSON.stringify(typeUse);
       if (!typeKeys.has(key)) { typeKeys.add(key); types.push(typeUse); }
+    } else if (ts.isIdentifier(nameNode)) {
+      // A type another package declares: an annotation, or the class or
+      // interface a project type extends or implements.
+      const ext = externalName(checker, typeSym);
+      const extPkg = ext ? externalPackage(checker, typeSym) : undefined;
+      if (extPkg) {
+        const at = sf.getLineAndCharacterOfPosition(nameNode.getStart(sf));
+        const use = {from: rel(sf.fileName), fromName, fromLine, ext, extPkg, line: at.line + 1, col: at.character + 1};
+        const key = JSON.stringify(use);
+        if (!extKeys.has(key)) { extKeys.add(key); exts.push(use); }
+      }
     }
   }
   if (fromName) {
@@ -1137,7 +1218,7 @@ function buildProgram(project) {
 // cannot change: walk only the changed files' directories and carry the rest.
 if (req.warm) {
   for (const project of configs) if (project.parsed.fileNames.length > 0) buildProgram(project);
-  return {warm: true, files: 0, configs: configs.length, timing, edges: [], calls: [], types: [], members: []};
+  return {warm: true, files: 0, configs: configs.length, timing, edges: [], calls: [], types: [], exts: [], members: []};
 }
 let narrowed = false;
 if (visitDirs !== null && Array.isArray(changedRel) && changedRel.length > 0 && !req.fileSetChanged &&
@@ -1217,7 +1298,7 @@ if (uncovered.length > 0) {
 }
 return {files: loadedFiles.size, configs: configs.length, solutionConfigs, inferredFiles, timing, narrowed,
   scopedDirs: visitDirs === null ? null : [...visitDirs],
-  configErrors, edges, calls, types, members, decls};
+  configErrors, edges, calls, types, exts, members, decls};
 }
 if (process.env.GROVE_TS_WORKER === '1') {
   const rl = require('readline').createInterface({input: process.stdin, crlfDelay: Infinity});

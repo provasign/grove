@@ -254,8 +254,8 @@ func KeyFor(root, language, kind, filePath, qualifiedName string) (key string, o
 		}
 	case "typescript", "tsx", "javascript":
 		switch kind {
-		case "function", "method", "class":
-			return NPMKey(root, filePath, qualifiedName)
+		case "function", "method", "class", "interface", "type":
+			return npmKey(root, filePath, qualifiedName, kind)
 		}
 	case "python":
 		if keys := PythonKeys(filePath, qualifiedName); len(keys) > 0 {
@@ -339,16 +339,20 @@ func PythonKeys(filePath, qualifiedName string) []string {
 	return keys
 }
 
-// NPMKey is the key for a JavaScript or TypeScript function, method or
-// class: the name of the nearest package.json at or above the file, and the
-// symbol's own name. The TypeScript pass records a call by the package that
-// declares the callee and the callee's name, without its owner type, so a
-// method is matched by package and method name: two classes of one package
-// with a same-named method share a key.
+// NPMKey is the key for a JavaScript or TypeScript declaration: the name of
+// the nearest package.json at or above the file, and the symbol's name. A
+// member keeps its owner ("Box.open"), which is how the TypeScript pass
+// records a call it resolved to a class or interface member; a top-level
+// function, class, interface or type is its own name. Overloads share a key.
 func NPMKey(root, filePath, qualifiedName string) (key string, ok bool) {
-	name := qualifiedName
-	if i := strings.LastIndexByte(name, '.'); i >= 0 {
-		name = name[i+1:]
+	return npmKey(root, filePath, qualifiedName, "")
+}
+
+func npmKey(root, filePath, qualifiedName, kind string) (key string, ok bool) {
+	segs := strings.Split(qualifiedName, ".")
+	name := segs[len(segs)-1]
+	if kind == "method" && len(segs) >= 2 {
+		name = segs[len(segs)-2] + "." + name
 	}
 	if name == "" {
 		return "", false
