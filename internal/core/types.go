@@ -206,8 +206,13 @@ const (
 	// when the last run finished ("" outside a git work tree, or detached).
 	// An index describes a tree state; these say which one, so a reader of
 	// the index alone can tell it from the state now on disk.
-	MetaIndexHead   = "index-head"
-	MetaIndexRef    = "index-ref"
+	MetaIndexHead = "index-head"
+	MetaIndexRef  = "index-ref"
+	// MetaIndexLinked: a digest of the linked repositories the last run was
+	// given (Config.LinkedRoots). A compiler pass may have read a
+	// dependency's declarations from them, so an index built with a
+	// different set can be missing references the current set would give.
+	MetaIndexLinked = "index-linked"
 	MetaIndexNative = "index-native"
 	// MetaNativeComplete: JSON list of native analyzers that have completed
 	// a full pass on this index (later passes may be incremental).

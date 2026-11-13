@@ -12,6 +12,8 @@ import (
 	"strings"
 
 	"github.com/provasign/grove/internal/core"
+	"github.com/provasign/grove/internal/graph"
+	"github.com/provasign/grove/internal/index"
 	"github.com/provasign/grove/internal/store"
 	"golang.org/x/mod/modfile"
 )
@@ -190,7 +192,18 @@ type IndexState struct {
 	Head     string // commit checked out when the index was last written; "" if unknown
 	Ref      string // branch at that time; "" when detached or unknown
 	Finished string // RFC 3339 time the last run finished; "" while one is running
+	Linked   string // LinkedDigest of the linked repositories the last run was given
+	Resolver string // resolver version that wrote the edges
 }
+
+// LinkedDigest identifies a set of linked repositories, for comparing with
+// IndexState.Linked.
+func LinkedDigest(roots []string) string { return index.LinkedDigest(roots) }
+
+// ResolverVersion is the resolver version this build writes. An index
+// stamped with another version was resolved by different rules; one from
+// before external references existed holds none.
+const ResolverVersion = graph.ResolverVersion
 
 // State reports the tree state the index was built from. An index written
 // before these were recorded has an empty Head: unknown, not unchanged.
@@ -199,6 +212,8 @@ func (r *Reader) State(ctx context.Context) IndexState {
 	st.Head, _, _ = r.st.GetMeta(ctx, core.MetaIndexHead)
 	st.Ref, _, _ = r.st.GetMeta(ctx, core.MetaIndexRef)
 	st.Finished, _, _ = r.st.GetMeta(ctx, core.MetaIndexFinished)
+	st.Linked, _, _ = r.st.GetMeta(ctx, core.MetaIndexLinked)
+	st.Resolver, _, _ = r.st.GetMeta(ctx, "resolver-version")
 	return st
 }
 

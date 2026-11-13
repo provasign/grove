@@ -2,9 +2,12 @@ package index
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -19,8 +22,9 @@ import (
 // failed meta write never fails the index) and throttled to one per second
 // per key, since the call resolver reports every few hundred symbols.
 type indexProgress struct {
-	store *store.Store
-	root  string // repository root, for the git state stamped at finish
+	store  *store.Store
+	root   string   // repository root, for the git state stamped at finish
+	linked []string // linked repositories this run was given
 
 	mu        sync.Mutex
 	lastWrite time.Time
@@ -195,4 +199,17 @@ func (p *indexProgress) finish(runErr error) {
 	head, ref := gitHead(p.root)
 	_ = p.store.SetMeta(ctx, core.MetaIndexHead, head)
 	_ = p.store.SetMeta(ctx, core.MetaIndexRef, ref)
+	_ = p.store.SetMeta(ctx, core.MetaIndexLinked, LinkedDigest(p.linked))
+}
+
+// LinkedDigest identifies a set of linked repositories, whatever their
+// order. The empty set is "".
+func LinkedDigest(roots []string) string {
+	if len(roots) == 0 {
+		return ""
+	}
+	sorted := append([]string(nil), roots...)
+	sort.Strings(sorted)
+	sum := sha256.Sum256([]byte(strings.Join(sorted, "\n")))
+	return hex.EncodeToString(sum[:8])
 }
