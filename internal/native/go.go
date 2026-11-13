@@ -594,6 +594,23 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 	for fi, file := range parsed {
 		relPath := files[fi]
 		ast.Inspect(file, func(node ast.Node) bool {
+			if spec, ok := node.(*ast.TypeSpec); ok {
+				// A package-level type naming another module's types (a
+				// struct field, an embedded type, an alias): recorded on
+				// the declared type, which is what an edit would touch.
+				if owner, ok := symbolIdx.byType[dir+"\x00"+spec.Name.Name]; ok && owner.FilePath == relPath {
+					ast.Inspect(spec.Type, func(inner ast.Node) bool {
+						if id, ok := inner.(*ast.Ident); ok {
+							if key, ok := goExternalTypeKey(dir, info.Uses[id], pkgDirsByImport, pkg); ok {
+								line, col := lines(id.Pos())
+								extRefs.add(owner.ID, key, line, col)
+							}
+						}
+						return true
+					})
+				}
+				return false
+			}
 			fn, ok := node.(*ast.FuncDecl)
 			if !ok {
 				return true

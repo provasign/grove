@@ -143,6 +143,10 @@ import (
 	"example.com/lib/store"
 )
 
+type Wrapper struct {
+	Inner *store.Box
+}
+
 func hold(b *store.Box) func() int {
 	var o store.Opener = b
 	_ = o
@@ -165,8 +169,15 @@ func hold(b *store.Box) func() int {
 			inHold[r.Key] = r.Line
 		}
 	}
-	if inHold["go:example.com/lib/store#Box"] != 8 || inHold["go:example.com/lib/store#Opener"] != 9 || inHold["go:example.com/lib#Helper"] != 11 {
+	if inHold["go:example.com/lib/store#Box"] != 12 || inHold["go:example.com/lib/store#Opener"] != 13 || inHold["go:example.com/lib#Helper"] != 15 {
 		t.Fatalf("type uses and value reference in hold = %v", inHold)
+	}
+	field := false
+	for _, r := range more {
+		field = field || (r.From == "Wrapper" && r.Key == "go:example.com/lib/store#Box" && r.Line == 9)
+	}
+	if !field {
+		t.Fatalf("a struct field of another module's type was not recorded on the struct: %v", more)
 	}
 	typeSyms, _ := lr.SymbolsNamed(ctx, []string{"Box", "Opener"})
 	for _, s := range typeSyms {
