@@ -614,6 +614,26 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 			// signature change breaks just like a call. Inspect visits the
 			// CallExpr before its Fun, so the set is filled in time.
 			called := map[token.Pos]bool{}
+			// Another module's types named in the receiver, parameters
+			// and results: the body walk below does not visit them.
+			var header []ast.Node
+			if fn.Recv != nil {
+				header = append(header, fn.Recv)
+			}
+			if fn.Type != nil {
+				header = append(header, fn.Type)
+			}
+			for _, part := range header {
+				ast.Inspect(part, func(inner ast.Node) bool {
+					if id, ok := inner.(*ast.Ident); ok {
+						if key, ok := goExternalTypeKey(dir, info.Uses[id], pkgDirsByImport, pkg); ok {
+							line, col := lines(id.Pos())
+							extRefs.add(caller.ID, key, line, col)
+						}
+					}
+					return true
+				})
+			}
 			ast.Inspect(fn.Body, func(inner ast.Node) bool {
 				switch n := inner.(type) {
 				case *ast.CallExpr:
@@ -734,8 +754,16 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 							line, col := lines(n.Pos())
 							pe.add(core.Edge{From: caller.ID, To: target.ID, Type: core.EdgeReads,
 								Confidence: 0.99, Source: core.EvidenceSourceNative}, line, col)
+						} else if key, ok := goExternalRefKey(dir, fnObj, pkgDirsByImport, pkg); ok {
+							// Another module's function used as a value.
+							line, col := lines(n.Pos())
+							extRefs.add(caller.ID, key, line, col)
 						}
 						return true
+					}
+					if key, ok := goExternalTypeKey(dir, info.Uses[n], pkgDirsByImport, pkg); ok {
+						line, col := lines(n.Pos())
+						extRefs.add(caller.ID, key, line, col)
 					}
 					if qualified, ok := localTypes[info.Uses[n]]; ok {
 						// A function-local type is declared in this function's
@@ -1172,6 +1200,22 @@ func goExternalRefKey(currentDir string, fn *types.Func, pkgDirsByImport map[str
 		name = recv + "." + name
 	}
 	return "go:" + path + "#" + name, true
+}
+
+// goExternalTypeKey names another module's type that obj refers to:
+// "go:<import path>#<TypeName>". Standard library and project types give
+// no key, as for goExternalRefKey.
+func goExternalTypeKey(currentDir string, obj types.Object, pkgDirsByImport map[string][]string, selfPkg *types.Package) (string, bool) {
+	tn, ok := obj.(*types.TypeName)
+	if !ok || tn.Pkg() == nil || goObjectDirs(currentDir, tn.Pkg(), pkgDirsByImport, selfPkg) != nil {
+		return "", false
+	}
+	path := tn.Pkg().Path()
+	first, _, _ := strings.Cut(path, "/")
+	if !strings.Contains(first, ".") {
+		return "", false
+	}
+	return "go:" + path + "#" + tn.Name(), true
 }
 
 func goReceiverName(fn *ast.FuncDecl) string {

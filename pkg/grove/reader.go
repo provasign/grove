@@ -65,10 +65,12 @@ type ExternalRef struct {
 	Col  int    `json:"col,omitempty"`
 }
 
-// ExternalRefs returns the call sites in this repository whose compiler-
-// resolved target is one of keys, ordered by file and line. Only languages
-// with a compiler pass that records them are covered (Go today), and only
-// calls: a function passed as a value is not listed.
+// ExternalRefs returns the places in this repository where a function
+// names, by call or as a value, a function, method or type another module
+// declares under one of keys, ordered by file and line. Only languages with
+// a compiler pass that records them are covered (Go today). A reference
+// outside any function (a package-level variable's type, a struct field's
+// type) is not recorded.
 func (r *Reader) ExternalRefs(ctx context.Context, keys []string) ([]ExternalRef, error) {
 	records, err := r.st.ExternalRefRecords(ctx, keys)
 	if err != nil {
@@ -122,10 +124,14 @@ func splitSymbolID(id string) (file, qualified string) {
 // or above the file. ok is false for other languages and kinds, and when no
 // go.mod names the module.
 func GoSymbolKey(root string, sym Symbol) (key string, ok bool) {
-	if sym.Language != "go" || (sym.Kind != "function" && sym.Kind != "method") {
+	if sym.Language != "go" {
 		return "", false
 	}
-	return GoKey(root, sym.FilePath, sym.QualifiedName)
+	switch sym.Kind {
+	case "function", "method", "struct", "interface", "type", "class":
+		return GoKey(root, sym.FilePath, sym.QualifiedName)
+	}
+	return "", false
 }
 
 // GoKey is GoSymbolKey for a Go function or method given by its

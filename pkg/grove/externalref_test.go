@@ -135,6 +135,46 @@ func main() { run(nil); _ = lib.Helper() }
 		t.Errorf("got %d sites, want %d: %v", len(got), len(want), got)
 	}
 
+	// Types named in a signature or a body, and a function used as a value.
+	writeTree(t, app, map[string]string{"value.go": `package main
+
+import (
+	"example.com/lib"
+	"example.com/lib/store"
+)
+
+func hold(b *store.Box) func() int {
+	var o store.Opener = b
+	_ = o
+	return lib.Helper
+}
+`})
+	indexRepo(t, app)
+	ar2, err := OpenReader(app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ar2.Close()
+	more, err := ar2.ExternalRefs(ctx, []string{"go:example.com/lib/store#Box", "go:example.com/lib/store#Opener", "go:example.com/lib#Helper"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inHold := map[string]int{}
+	for _, r := range more {
+		if r.File == "value.go" && r.From == "hold" {
+			inHold[r.Key] = r.Line
+		}
+	}
+	if inHold["go:example.com/lib/store#Box"] != 8 || inHold["go:example.com/lib/store#Opener"] != 9 || inHold["go:example.com/lib#Helper"] != 11 {
+		t.Fatalf("type uses and value reference in hold = %v", inHold)
+	}
+	typeSyms, _ := lr.SymbolsNamed(ctx, []string{"Box", "Opener"})
+	for _, s := range typeSyms {
+		if k, ok := GoSymbolKey(lib, s); !ok || k != "go:example.com/lib/store#"+s.Name {
+			t.Fatalf("type declaration key for %s (%s) = %q, %v", s.Name, s.Kind, k, ok)
+		}
+	}
+
 	// Standard library and in-repository calls are not recorded.
 	none, err := ar.ExternalRefs(ctx, []string{"go:fmt#Println", "go:example.com/app#local"})
 	if err != nil || len(none) != 0 {
