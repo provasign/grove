@@ -194,6 +194,11 @@ type IndexState struct {
 	Finished string // RFC 3339 time the last run finished; "" while one is running
 	Linked   string // LinkedDigest of the linked repositories the last run was given
 	Resolver string // resolver version that wrote the edges
+	// NativeComplete names the compiler passes that have completed on this
+	// index ("go", "java", "js-ts", ...). A language whose pass has not run
+	// was resolved by name only, and holds no compiler-resolved external
+	// references: their absence then means "not analysed", not "none".
+	NativeComplete []string
 }
 
 // LinkedDigest identifies a set of linked repositories, for comparing with
@@ -214,6 +219,9 @@ func (r *Reader) State(ctx context.Context) IndexState {
 	st.Finished, _, _ = r.st.GetMeta(ctx, core.MetaIndexFinished)
 	st.Linked, _, _ = r.st.GetMeta(ctx, core.MetaIndexLinked)
 	st.Resolver, _, _ = r.st.GetMeta(ctx, "resolver-version")
+	if raw, ok, _ := r.st.GetMeta(ctx, core.MetaNativeComplete); ok && raw != "" {
+		_ = json.Unmarshal([]byte(raw), &st.NativeComplete)
+	}
 	return st
 }
 
