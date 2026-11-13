@@ -332,3 +332,86 @@ func TestExternalRefsTypeScriptPackages(t *testing.T) {
 		t.Fatalf("a platform call was recorded: %v", none)
 	}
 }
+
+func TestExternalRefsPythonImports(t *testing.T) {
+	ctx := context.Background()
+	parent, _ := filepath.EvalSymlinks(t.TempDir())
+	lib, app := filepath.Join(parent, "lib"), filepath.Join(parent, "app")
+	writeTree(t, lib, map[string]string{
+		"src/extlib/__init__.py": "from .models import Model\n",
+		"src/extlib/models.py":   "class Model:\n    def save(self):\n        pass\n\n\ndef persist(m):\n    pass\n",
+	})
+	writeTree(t, app, map[string]string{
+		"app/__init__.py": "",
+		"app/local.py":    "def helper():\n    pass\n",
+		"app/use.py": `import os
+import extlib.models as em
+from extlib import Model
+from extlib.models import persist as keep
+from .local import helper
+from app.local import helper as again
+
+
+def run():
+    m = Model()
+    keep(m)
+    em.persist(m)
+    helper()
+    again()
+    os.getcwd()
+    return m.save()
+`,
+	})
+	indexRepo(t, lib)
+	indexRepo(t, app)
+
+	lr, err := OpenReader(lib)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lr.Close()
+	syms, _ := lr.SymbolsNamed(ctx, []string{"Model", "persist"})
+	var keys []string
+	for _, s := range syms {
+		keys = append(keys, KeysFor(lib, s.Language, string(s.Kind), s.FilePath, s.QualifiedName)...)
+	}
+	// Model is declared in extlib.models and reachable as extlib.Model.
+	for _, want := range []string{"py:extlib.models#Model", "py:extlib#Model", "py:extlib.models#persist"} {
+		found := false
+		for _, k := range keys {
+			found = found || k == want
+		}
+		if !found {
+			t.Fatalf("declaration keys %v lack %s", keys, want)
+		}
+	}
+	ar, err := OpenReader(app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ar.Close()
+	refs, err := ar.ExternalRefs(ctx, keys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string][]int{}
+	for _, r := range refs {
+		if r.File != "app/use.py" || r.From != "run" {
+			t.Fatalf("unexpected site %+v", r)
+		}
+		got[r.Key] = append(got[r.Key], r.Line)
+	}
+	if len(got["py:extlib#Model"]) != 1 || got["py:extlib#Model"][0] != 10 {
+		t.Fatalf("Model() through the package re-export: %v", got)
+	}
+	if p := got["py:extlib.models#persist"]; len(p) != 2 || p[0] != 11 || p[1] != 12 {
+		t.Fatalf("persist through an alias and through a module alias: %v", got)
+	}
+	// The project's own modules and the standard library are not recorded.
+	all, _ := ar.AllExternalRefs(ctx)
+	for _, r := range all {
+		if r.Key == "py:os#getcwd" || r.Key == "py:app.local#helper" || r.Key == "py:.local#helper" {
+			t.Fatalf("a standard library or project call was recorded: %+v", r)
+		}
+	}
+}

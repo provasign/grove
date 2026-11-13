@@ -2504,6 +2504,8 @@ func resolveCallEdges(idx *edgeIndex, symbol core.SymbolRecord, sat *interfaceSa
 		// Function values flowing through this symbol (pyvalueflow.go),
 		// whether or not it has call sites of its own.
 		edges = append(edges, pyValueFlowMarkers(idx, &symbol)...)
+		// Calls through names imported from another distribution.
+		edges = append(edges, pyExternalRefMarker(&symbol)...)
 	}
 	return edges
 }

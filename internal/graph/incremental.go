@@ -822,7 +822,7 @@ func scopedCalls(idx *edgeIndex, symbols []core.SymbolRecord, sat *interfaceSati
 // analyzer and travel with its rows.
 func resolverMarker(idx *edgeIndex, e core.Edge) bool {
 	switch e.Type {
-	case core.EdgeFuncFieldStore, core.EdgeFuncFieldCall, core.EdgeFuncSlotFlow:
+	case core.EdgeFuncFieldStore, core.EdgeFuncFieldCall, core.EdgeFuncSlotFlow, core.EdgeExternalRef:
 	default:
 		return false
 	}

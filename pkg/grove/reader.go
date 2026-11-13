@@ -239,8 +239,59 @@ func KeyFor(root, language, kind, filePath, qualifiedName string) (key string, o
 		case "function", "method", "class":
 			return NPMKey(root, filePath, qualifiedName)
 		}
+	case "python":
+		if keys := PythonKeys(filePath, qualifiedName); len(keys) > 0 {
+			return keys[0], true
+		}
 	}
 	return "", false
+}
+
+// KeysFor returns every key other repositories may have recorded for a
+// symbol. Most languages have one. Python has several: a consumer records
+// the module it imported the name from, which may be the defining module or
+// any package above it that re-exports the name.
+func KeysFor(root, language, kind, filePath, qualifiedName string) []string {
+	if language == "" && strings.HasSuffix(strings.ToLower(filePath), ".py") {
+		language = "python"
+	}
+	if language == "python" {
+		switch kind {
+		case "", "function", "method", "class":
+			return PythonKeys(filePath, qualifiedName)
+		}
+		return nil
+	}
+	if k, ok := KeyFor(root, language, kind, filePath, qualifiedName); ok {
+		return []string{k}
+	}
+	return nil
+}
+
+// PythonKeys lists the keys a Python function, class or method may be
+// recorded under: "py:<module>#<name>" for its own module and for each
+// package above it, since `from pkg import Name` reaches a name that
+// pkg/__init__.py re-exports from pkg/sub.py. A leading conventional source
+// root (src/, lib/, python/) is not part of the module path. The match is
+// by module and name, not resolved: a different object bound to the same
+// name in a parent package would match too.
+func PythonKeys(filePath, qualifiedName string) []string {
+	p := strings.TrimSuffix(filepath.ToSlash(filePath), ".py")
+	if p == filepath.ToSlash(filePath) || qualifiedName == "" {
+		return nil
+	}
+	parts := strings.Split(p, "/")
+	if len(parts) > 1 && (parts[0] == "src" || parts[0] == "lib" || parts[0] == "python") {
+		parts = parts[1:]
+	}
+	if parts[len(parts)-1] == "__init__" {
+		parts = parts[:len(parts)-1]
+	}
+	var keys []string
+	for n := len(parts); n >= 1; n-- {
+		keys = append(keys, "py:"+strings.Join(parts[:n], ".")+"#"+qualifiedName)
+	}
+	return keys
 }
 
 // NPMKey is the key for a JavaScript or TypeScript function, method or
