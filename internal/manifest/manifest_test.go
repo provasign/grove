@@ -147,3 +147,57 @@ dependencies = [
 		t.Fatal("the PHP platform requirement was reported as a package")
 	}
 }
+
+func TestScanNestedPackagesGradleAndRequirements(t *testing.T) {
+	parent, _ := filepath.EvalSymlinks(t.TempDir())
+	root := filepath.Join(parent, "mono")
+	// An npm workspace: two packages below the root, one requiring the other.
+	write(t, filepath.Join(root, "package.json"), `{"name":"mono","private":true,"workspaces":["packages/*"]}`)
+	write(t, filepath.Join(root, "packages", "core", "package.json"), `{"name":"@acme/core","version":"1.0.0"}`)
+	write(t, filepath.Join(root, "packages", "web", "package.json"), `{"name":"@acme/web","dependencies":{"@acme/core":"workspace:*","react":"^18"}}`)
+	write(t, filepath.Join(root, "node_modules", "junk", "package.json"), `{"name":"junk"}`)
+	// A Gradle service in the same repository, in a composite build with a
+	// sibling checkout.
+	write(t, filepath.Join(root, "service", "build.gradle"), "group = 'com.acme'\nversion = '2.1'\n\ndependencies {\n    implementation 'com.acme:shared:1.4'\n    testImplementation(\"org.junit:junit:5\")\n}\n")
+	write(t, filepath.Join(root, "service", "settings.gradle"), "rootProject.name = 'svc'\nincludeBuild('../../shared')\n")
+	write(t, filepath.Join(parent, "shared", "build.gradle"), "group = 'com.acme'\n")
+	write(t, filepath.Join(parent, "shared", "settings.gradle"), "rootProject.name = 'shared'\n")
+	// A Python tool with an editable sibling.
+	write(t, filepath.Join(root, "tool", "requirements.txt"), "requests==2.31\n-e ../../pylib\n# comment\n")
+	write(t, filepath.Join(parent, "pylib", "pyproject.toml"), "[project]\nname = \"py_lib\"\n")
+
+	r := Scan(root)
+	declared := map[string]string{}
+	for _, p := range r.Packages {
+		declared[p.Ecosystem+":"+p.Name] = p.Manifest
+	}
+	for id, manifest := range map[string]string{
+		"npm:mono": "package.json", "npm:@acme/core": "packages/core/package.json", "npm:@acme/web": "packages/web/package.json",
+		"maven:com.acme:svc": "service/build.gradle",
+	} {
+		if declared[id] != manifest {
+			t.Fatalf("package %s declared by %q, want %q; all: %v", id, declared[id], manifest, declared)
+		}
+	}
+	if declared["npm:junk"] != "" {
+		t.Fatal("a package under node_modules was reported as declared by the repository")
+	}
+	if find(r.Requires, "@acme/core") != nil {
+		t.Fatal("a requirement on a package the repository itself declares was reported as external")
+	}
+	if find(r.Requires, "react") == nil {
+		t.Fatal("a nested package's external requirement was lost")
+	}
+	if s := find(r.Requires, "com.acme:shared"); s == nil || s.LocalPath != filepath.Join(parent, "shared") || s.Version != "1.4" || !strings.Contains(s.Evidence, "includeBuild") {
+		t.Fatalf("Gradle composite build not reported as a local link: %+v", s)
+	}
+	if j := find(r.Requires, "org.junit:junit"); j == nil || j.Version != "5" {
+		t.Fatalf("Gradle dependency in call notation: %+v", j)
+	}
+	if p := find(r.Requires, "py-lib"); p == nil || p.LocalPath != filepath.Join(parent, "pylib") {
+		t.Fatalf("editable requirement not reported as a local link: %+v", p)
+	}
+	if q := find(r.Requires, "requests"); q == nil || q.Version != "==2.31" {
+		t.Fatalf("requirements.txt pin: %+v", q)
+	}
+}

@@ -56,12 +56,44 @@ type Result struct {
 // readable package.json.
 func Scan(root string) Result {
 	var r Result
-	scanGo(root, &r)
-	scanNPM(root, &r)
-	scanCargo(root, &r)
-	scanPython(root, &r)
-	scanMaven(root, &r)
-	scanComposer(root, &r)
+	scanDir(root, &r)
+	// A repository often declares more than one package: npm and pnpm
+	// workspaces, Cargo workspace members, Maven modules, nested Go modules.
+	// Their manifests sit below the root, a few levels down. Each is read
+	// the same way; what it declares belongs to this repository, and a
+	// requirement on a package the repository itself declares is internal.
+	for _, dir := range nestedManifestDirs(root) {
+		var sub Result
+		scanDir(dir, &sub)
+		rel := filepath.ToSlash(relOr(root, dir))
+		for _, p := range sub.Packages {
+			p.Dir, p.Manifest = rel, rel+"/"+p.Manifest
+			r.Packages = append(r.Packages, p)
+		}
+		for _, q := range sub.Requires {
+			if q.CoMember {
+				continue // the go.work above was already read from the root
+			}
+			q.Manifest = rel + "/" + q.Manifest
+			q.Evidence = rel + "/" + q.Evidence
+			r.Requires = append(r.Requires, q)
+		}
+	}
+	own := map[string]bool{}
+	for _, p := range r.Packages {
+		own[p.Ecosystem+":"+p.Name] = true
+	}
+	kept := r.Requires[:0]
+	seen := map[string]bool{}
+	for _, q := range r.Requires {
+		id := q.Ecosystem + ":" + q.Name
+		if own[id] || seen[id+"\x00"+q.Version] {
+			continue
+		}
+		seen[id+"\x00"+q.Version] = true
+		kept = append(kept, q)
+	}
+	r.Requires = kept
 	sort.SliceStable(r.Requires, func(i, j int) bool {
 		a, b := r.Requires[i], r.Requires[j]
 		if a.Ecosystem != b.Ecosystem {
@@ -228,4 +260,58 @@ func relOr(base, target string) string {
 		return rel
 	}
 	return target
+}
+
+func scanDir(dir string, r *Result) {
+	scanGo(dir, r)
+	scanNPM(dir, r)
+	scanCargo(dir, r)
+	scanPython(dir, r)
+	scanMaven(dir, r)
+	scanGradle(dir, r)
+	scanComposer(dir, r)
+}
+
+var manifestNames = []string{"go.mod", "package.json", "Cargo.toml", "pyproject.toml", "requirements.txt", "pom.xml",
+	"build.gradle", "build.gradle.kts", "composer.json"}
+
+// nestedManifestDirs finds directories below root that hold a manifest, to
+// a bounded depth and count, skipping dependency and build output trees.
+func nestedManifestDirs(root string) []string {
+	const maxDepth, maxDirs, maxVisited = 4, 200, 20000
+	var out []string
+	visited := 0
+	var walk func(dir string, depth int)
+	walk = func(dir string, depth int) {
+		if depth > maxDepth || len(out) >= maxDirs || visited >= maxVisited {
+			return
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return
+		}
+		visited += len(entries)
+		if depth > 0 {
+			for _, name := range manifestNames {
+				if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
+					out = append(out, dir)
+					break
+				}
+			}
+		}
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			switch name := e.Name(); {
+			case strings.HasPrefix(name, "."), name == "node_modules", name == "vendor", name == "target",
+				name == "build", name == "dist", name == "out", name == "testdata", name == "__pycache__":
+				continue
+			}
+			walk(filepath.Join(dir, e.Name()), depth+1)
+		}
+	}
+	walk(root, 0)
+	sort.Strings(out)
+	return out
 }

@@ -91,7 +91,130 @@ func tomlField(inline, field string) string {
 // string ("requests>=2", "pkg[extra] ; python_version<'3.9'").
 var pyDistName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*`)
 
+// scanRequirements reads requirements.txt: one requirement per line, and
+// "-e <path>" for a local project installed in development mode.
+func scanRequirements(root string, r *Result) {
+	data, err := os.ReadFile(filepath.Join(root, "requirements.txt"))
+	if err != nil {
+		return
+	}
+	for n, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if rest, ok := strings.CutPrefix(line, "-e "); ok || strings.HasPrefix(line, "--editable ") {
+			if !ok {
+				rest = strings.TrimPrefix(line, "--editable ")
+			}
+			p := strings.TrimSpace(rest)
+			if strings.Contains(p, "://") || strings.HasPrefix(p, "git+") {
+				continue
+			}
+			if !filepath.IsAbs(p) {
+				p = filepath.Join(root, filepath.FromSlash(p))
+			}
+			p = filepath.Clean(p)
+			// The distribution's name is in that directory's own manifest.
+			var other Result
+			scanPython(p, &other)
+			name := filepath.Base(p)
+			if len(other.Packages) > 0 {
+				name = other.Packages[0].Name
+			}
+			r.Requires = append(r.Requires, Require{Manifest: "requirements.txt", Ecosystem: "pypi", Name: normalizePyName(name),
+				LocalPath: p, Evidence: fmt.Sprintf("requirements.txt:%d %s", n+1, line)})
+			continue
+		}
+		if strings.HasPrefix(line, "-") {
+			continue
+		}
+		dist := pyDistName.FindString(line)
+		if dist == "" {
+			continue
+		}
+		r.Requires = append(r.Requires, Require{Manifest: "requirements.txt", Ecosystem: "pypi", Name: normalizePyName(dist),
+			Version: strings.TrimSpace(strings.TrimPrefix(line, dist)), Evidence: fmt.Sprintf("requirements.txt:%d %s", n+1, line)})
+	}
+}
+
+var (
+	gradleDep     = regexp.MustCompile(`(?m)^\s*(?:api|implementation|compileOnly|runtimeOnly|testImplementation|compile|testCompile)\s*\(?\s*["']([\w.-]+):([\w.-]+)(?::([^"']+))?["']`)
+	gradleGroup   = regexp.MustCompile(`(?m)^\s*group\s*=?\s*["']([\w.-]+)["']`)
+	gradleVersion = regexp.MustCompile(`(?m)^\s*version\s*=?\s*["']([^"']+)["']`)
+	gradleName    = regexp.MustCompile(`(?m)^\s*rootProject\.name\s*=\s*["']([^"']+)["']`)
+	gradleInclude = regexp.MustCompile(`(?m)^\s*includeBuild\s*\(?\s*["']([^"']+)["']`)
+)
+
+// scanGradle reads a Gradle build by pattern: the group and version
+// assignments, rootProject.name, string-notation dependencies, and
+// includeBuild (a composite build: another build's directory used in place
+// of its published artifact). Gradle files are programs; anything computed
+// is not seen.
+func scanGradle(root string, r *Result) {
+	var build, manifest string
+	for _, name := range []string{"build.gradle.kts", "build.gradle"} {
+		if data, err := os.ReadFile(filepath.Join(root, name)); err == nil {
+			build, manifest = string(data), name
+			break
+		}
+	}
+	var settings, settingsName string
+	for _, name := range []string{"settings.gradle.kts", "settings.gradle"} {
+		if data, err := os.ReadFile(filepath.Join(root, name)); err == nil {
+			settings, settingsName = string(data), name
+			break
+		}
+	}
+	if build == "" && settings == "" {
+		return
+	}
+	if _, err := os.Stat(filepath.Join(root, "pom.xml")); err != nil && build != "" {
+		if g := gradleGroup.FindStringSubmatch(build); g != nil {
+			name := filepath.Base(root)
+			if m := gradleName.FindStringSubmatch(settings); m != nil {
+				name = m[1]
+			}
+			version := ""
+			if v := gradleVersion.FindStringSubmatch(build); v != nil {
+				version = v[1]
+			}
+			r.Packages = append(r.Packages, Package{Ecosystem: "maven", Name: g[1] + ":" + name, Version: version, Manifest: manifest})
+		}
+	}
+	for _, m := range gradleDep.FindAllStringSubmatch(build, -1) {
+		r.Requires = append(r.Requires, Require{Manifest: manifest, Ecosystem: "maven", Name: m[1] + ":" + m[2], Version: m[3],
+			Evidence: strings.TrimSpace(manifest + " dependency " + m[1] + ":" + m[2] + " " + m[3])})
+	}
+	// A composite build names a directory; what it provides is declared there.
+	for _, m := range gradleInclude.FindAllStringSubmatch(settings, -1) {
+		dir := m[1]
+		if !filepath.IsAbs(dir) {
+			dir = filepath.Join(root, filepath.FromSlash(dir))
+		}
+		dir = filepath.Clean(dir)
+		var other Result
+		scanGradle(dir, &other)
+		scanMaven(dir, &other)
+		for _, p := range other.Packages {
+			found := false
+			for i := range r.Requires {
+				if r.Requires[i].Ecosystem == p.Ecosystem && r.Requires[i].Name == p.Name {
+					r.Requires[i].LocalPath = dir
+					r.Requires[i].Evidence = settingsName + " includeBuild " + m[1] + " (required " + r.Requires[i].Version + ")"
+					found = true
+				}
+			}
+			if !found {
+				r.Requires = append(r.Requires, Require{Manifest: settingsName, Ecosystem: p.Ecosystem, Name: p.Name, LocalPath: dir,
+					Evidence: settingsName + " includeBuild " + m[1]})
+			}
+		}
+	}
+}
+
 func scanPython(root string, r *Result) {
+	scanRequirements(root, r)
 	data, err := os.ReadFile(filepath.Join(root, "pyproject.toml"))
 	if err != nil {
 		return
