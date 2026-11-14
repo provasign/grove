@@ -12,8 +12,8 @@ import (
 	"go/types"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -31,6 +31,10 @@ type goProjectImporter struct {
 	sealed     bool
 	fallback   types.Importer
 	fallbackMu sync.Mutex
+	// root is the repository (for typing dependencies from source when the
+	// export data is unreadable); exportUnreadable is the first such error.
+	root             string
+	exportUnreadable string
 }
 
 // newGoProjectImporter loads project packages from source. Everything else
@@ -101,8 +105,44 @@ func (p *goProjectImporter) Import(path string) (*types.Package, error) {
 	}
 	p.fallbackMu.Lock()
 	defer p.fallbackMu.Unlock()
-	return p.fallback.Import(path)
+	pkg, err, panicked := importRecovering(p.fallback, path)
+	if !panicked {
+		return pkg, err
+	}
+	// The stdlib export-data reader panics on export data from a newer Go
+	// than this binary was built with (a prism built with go1.26 reading a
+	// go1.27 build cache: internal/pkgbits). Type the dependencies from
+	// source for the rest of this pass instead of crashing the index.
+	if p.exportUnreadable == "" {
+		p.exportUnreadable = err.Error()
+		if src := goSourceDeps(context.Background(), p.root); src != nil {
+			p.fallback = src
+		} else {
+			p.fallback = failingImporter{err}
+		}
+	}
+	pkg, err, panicked = importRecovering(p.fallback, path)
+	if panicked {
+		p.fallback = failingImporter{err}
+	}
+	return pkg, err
 }
+
+// importRecovering calls imp.Import and turns a panic into an error.
+func importRecovering(imp types.Importer, path string) (pkg *types.Package, err error, panicked bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			pkg, panicked = nil, true
+			err = fmt.Errorf("export data for %s unreadable by this build (%s): %v", path, runtime.Version(), r)
+		}
+	}()
+	pkg, err = imp.Import(path)
+	return pkg, err, false
+}
+
+type failingImporter struct{ err error }
+
+func (f failingImporter) Import(string) (*types.Package, error) { return nil, f.err }
 
 func (p *goProjectImporter) load(path string) (loaded *types.Package, err error) {
 	if pkg, ok := p.loaded[path]; ok {
@@ -219,9 +259,7 @@ func (e *exportDataImporter) Import(path string) (*types.Package, error) {
 func goListExportPaths(root, path string) map[string]string {
 	ctx, cancel := context.WithTimeout(context.Background(), goExportTimeout())
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "go", "list", "-e", "-deps", "-export", "-json=ImportPath,Export", "--", path)
-	cmd.Dir = root
-	cmd.Env = goAnalyzerEnv(root)
+	cmd := goCommand(ctx, root, "list", "-e", "-deps", "-export", "-json=ImportPath,Export", "--", path)
 	out, err := cmd.Output()
 	if err != nil {
 		return nil

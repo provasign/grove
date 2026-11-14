@@ -66,6 +66,10 @@ type goListPackage struct {
 	// silently drop (blob-SHA endpoints stop resolving).
 	TestImports  []string
 	XTestImports []string
+	// Set only under `go list -e` (workspace mode): the package or one of
+	// its dependencies did not load.
+	Error      *struct{ Err string }
+	DepsErrors []struct{ Err string }
 }
 
 // ensureGOROOT repairs the build-time-baked GOROOT when it does not exist on
@@ -103,6 +107,28 @@ func ensureGOROOT() {
 	})
 }
 
+// goListLoadErrors counts packages `go list -e` reported a load error for,
+// and returns the first error text.
+func goListLoadErrors(pkgs []goListPackage) (int, string) {
+	n, first := 0, ""
+	for _, pkg := range pkgs {
+		var msg string
+		switch {
+		case pkg.Error != nil:
+			msg = pkg.Error.Err
+		case len(pkg.DepsErrors) > 0:
+			msg = pkg.DepsErrors[0].Err
+		default:
+			continue
+		}
+		n++
+		if first == "" {
+			first = strings.Join(strings.Fields(msg), " ")
+		}
+	}
+	return n, first
+}
+
 func (goAnalyzer) Analyze(ctx context.Context, req Request) Result {
 	ensureGOROOT()
 	// go list output depends on module files, the go-file set, and import
@@ -112,22 +138,33 @@ func (goAnalyzer) Analyze(ctx context.Context, req Request) Result {
 	cachePath := filepath.Join(req.Root, ".grove", "golist-cache.json")
 	out, cacheHit := loadGoListCache(cachePath, topoKey)
 	if !cacheHit {
-		cmd := exec.CommandContext(ctx, "go", "list", "-mod=readonly", "-json", "./...")
-		cmd.Dir = req.Root
-		cmd.Env = goAnalyzerEnv(req.Root)
+		args := []string{"list", "-mod=readonly", "-json", "./..."}
+		_, inWorkspace := goWorkspaceFor(req.Root)
+		if inWorkspace {
+			// -e: a workspace often has a few packages whose dependencies
+			// do not resolve (kubo + boxo: 20 of 88 packages hit an
+			// ambiguous genproto import; `go build ./...` fails the same
+			// way). Without -e that one error voids the whole listing and
+			// the retry below analyzes the repository against its pinned
+			// module versions instead of the linked checkout. With -e the
+			// listing stays whole; those packages type-check partially.
+			args = append(args[:1], append([]string{"-e"}, args[1:]...)...)
+		}
+		cmd := goCommand(ctx, req.Root, args...)
 		var stderr strings.Builder
 		cmd.Stderr = &stderr
 		var err error
 		out, err = cmd.Output()
-		if _, inWorkspace := goWorkspaceFor(req.Root); err != nil && inWorkspace {
+		if err == nil && inWorkspace && len(bytes.TrimSpace(out)) == 0 {
+			err = errors.New("go list -e listed no packages in the workspace")
+		}
+		if err != nil && inWorkspace {
 			// The workspace does not load (a member that no longer builds,
 			// a go directive newer than the toolchain). Analyze the
 			// repository alone, as before workspaces were followed.
 			goWorkDisabled.Store(cleanResolved(req.Root), true)
 			topoKey = goListTopologyKey(req.Root, req.Files, req.Symbols)
-			retry := exec.CommandContext(ctx, "go", "list", "-mod=readonly", "-json", "./...")
-			retry.Dir = req.Root
-			retry.Env = goAnalyzerEnv(req.Root)
+			retry := goCommand(ctx, req.Root, "list", "-mod=readonly", "-json", "./...")
 			stderr.Reset()
 			retry.Stderr = &stderr
 			out, err = retry.Output()
@@ -238,6 +275,12 @@ func (goAnalyzer) Analyze(ctx context.Context, req Request) Result {
 	head = append(head,
 		"resolved "+itoa(countEdgesOfType(callSiteEdges, core.EdgeCalls))+" native call-site edge(s)",
 		"resolved "+itoa(countEdgesOfType(typeUseEdges, core.EdgeUsesType))+" native lexical type-use edge(s)")
+	if note := goToolchainNote(req.Root); note != "" {
+		head = append(head, note)
+	}
+	if n, first := goListLoadErrors(pkgs); n > 0 {
+		head = append(head, "go list: "+itoa(n)+" package(s) did not fully load ("+clip(first, 200)+"); they are type-checked partially")
+	}
 	head = append(head, scopeDiag...)
 	return Result{
 		Edges:       edges,
@@ -461,6 +504,7 @@ func goSemanticEdges(ctx context.Context, root string, files []string, symbols [
 	}
 	sort.Strings(dirs)
 	projectImporter := newGoProjectImporter(pkgs, deps)
+	projectImporter.root = root
 	var analyzedImports []string
 	interfacePackages := map[string]bool{}
 	for _, dir := range dirs {
@@ -556,6 +600,17 @@ func goSemanticEdges(ctx context.Context, root string, files []string, symbols [
 		edges = append(edges, o.edges...)
 		decls = append(decls, o.decls...)
 		edges = append(edges, goExternalContracts(o.pkg, units[di].dir, symbolIdx, pkgDirsByImport)...)
+	}
+	if msg := projectImporter.exportUnreadable; msg != "" {
+		// Read with the lock: workers are done, but keep the race detector quiet.
+		projectImporter.fallbackMu.Lock()
+		_, failing := projectImporter.fallback.(failingImporter)
+		projectImporter.fallbackMu.Unlock()
+		if failing {
+			diagnostics = append(diagnostics, "go export data unreadable and the dependency listing failed; dependency types are missing: "+clip(msg, 300))
+		} else {
+			diagnostics = append(diagnostics, "go export data unreadable; dependencies typed from source instead: "+clip(msg, 300))
+		}
 	}
 	diagnostics = append(diagnostics, "resolved "+itoa(countEdgesOfType(edges, core.EdgeCalls))+" native call edge(s)")
 	diagnostics = append(diagnostics, "resolved "+itoa(countEdgesOfType(edges, core.EdgeUsesType))+" native type-use edge(s)")
@@ -1894,9 +1949,7 @@ func goExportTimeout() time.Duration {
 // goExportTimeout. Past it, the command keeps running in the background and
 // saves its listing to the cache when it finishes (until ctx ends).
 func goListExportBounded(ctx context.Context, root, topoKey, cachePath string) ([]byte, bool, error) {
-	cmd := exec.CommandContext(ctx, "go", "list", "-e", "-deps", "-export", "-json=ImportPath,Export", "./...")
-	cmd.Dir = root
-	cmd.Env = goAnalyzerEnv(root)
+	cmd := goCommand(ctx, root, "list", "-e", "-deps", "-export", "-json=ImportPath,Export", "./...")
 	var stdout bytes.Buffer
 	var stderr strings.Builder
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
@@ -1928,9 +1981,7 @@ func goListExportBounded(ctx context.Context, root, topoKey, cachePath string) (
 // goSourceDeps lists the dependency packages' source (`go list -deps`
 // without -export compiles nothing) for goSourceImporter.
 func goSourceDeps(ctx context.Context, root string) types.Importer {
-	cmd := exec.CommandContext(ctx, "go", "list", "-e", "-deps", "-json=ImportPath,Dir,GoFiles,CgoFiles,ImportMap", "./...")
-	cmd.Dir = root
-	cmd.Env = goAnalyzerEnv(root)
+	cmd := goCommand(ctx, root, "list", "-e", "-deps", "-json=ImportPath,Dir,GoFiles,CgoFiles,ImportMap", "./...")
 	out, err := cmd.Output()
 	if err != nil {
 		return nil
