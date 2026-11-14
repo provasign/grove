@@ -107,6 +107,21 @@ func ensureGOROOT() {
 	})
 }
 
+// goListHasLoadErrors reports whether `go list -e -json` output carries a
+// package with a load error of its own or in its dependencies.
+func goListHasLoadErrors(out []byte) bool {
+	dec := json.NewDecoder(bytesReader(out))
+	for {
+		var pkg goListPackage
+		if err := dec.Decode(&pkg); err != nil {
+			return false
+		}
+		if pkg.Error != nil || len(pkg.DepsErrors) > 0 {
+			return true
+		}
+	}
+}
+
 // goListLoadErrors counts packages `go list -e` reported a load error for,
 // and returns the first error text.
 func goListLoadErrors(pkgs []goListPackage) (int, string) {
@@ -158,16 +173,33 @@ func (goAnalyzer) Analyze(ctx context.Context, req Request) Result {
 		if err == nil && inWorkspace && len(bytes.TrimSpace(out)) == 0 {
 			err = errors.New("go list -e listed no packages in the workspace")
 		}
-		if err != nil && inWorkspace {
-			// The workspace does not load (a member that no longer builds,
-			// a go directive newer than the toolchain). Analyze the
-			// repository alone, as before workspaces were followed.
-			goWorkDisabled.Store(cleanResolved(req.Root), true)
-			topoKey = goListTopologyKey(req.Root, req.Files, req.Symbols)
+		if inWorkspace && (err != nil || goListHasLoadErrors(out)) {
+			// The workspace does not load (a member that no longer builds, a
+			// go directive newer than the toolchain), or loads with broken
+			// packages (-e above). Analyze the repository alone, as before
+			// workspaces were followed. When that fails too (kubo at one
+			// commit builds only as a workspace), keep the workspace listing
+			// that -e still produced: partial beats nothing.
+			wsOut, wsErr := out, err
+			wsStderr := stderr.String()
+			disabledBefore := cleanResolved(req.Root)
+			goWorkDisabled.Store(disabledBefore, true)
 			retry := goCommand(ctx, req.Root, "list", "-mod=readonly", "-json", "./...")
 			stderr.Reset()
 			retry.Stderr = &stderr
 			out, err = retry.Output()
+			if err == nil {
+				topoKey = goListTopologyKey(req.Root, req.Files, req.Symbols)
+			} else {
+				goWorkDisabled.Delete(disabledBefore)
+				if wsErr == nil && len(bytes.TrimSpace(wsOut)) > 0 {
+					out, err = wsOut, nil
+				} else if wsErr != nil {
+					stderr.Reset()
+					stderr.WriteString(wsStderr)
+					err = wsErr
+				}
+			}
 		}
 		if err != nil {
 			diagnostic := "go list failed: " + err.Error()
