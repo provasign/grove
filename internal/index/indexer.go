@@ -882,7 +882,7 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 			_ = i.store.SetMeta(ctx, core.MetaNativeComplete, string(raw))
 		}
 	}
-	result.Native = append(result.Native, nativeResult.Diagnostics...)
+	result.Native = append(result.Native, firstIndexWording(storedExtractor == "", nativeResult.Diagnostics)...)
 	if err := i.recordNativeAttempts(ctx, retryState, nativeResult); err != nil {
 		return nil, result, err
 	}
@@ -1283,6 +1283,23 @@ func remapEdgeEndpoints(edges []core.Edge, remap map[string]string) {
 		edges[i].From = fix(edges[i].From)
 		edges[i].To = fix(edges[i].To)
 	}
+}
+
+// firstIndexWording rewords "carried forward" for an index with no
+// previous run: there were no stored edges to carry, and the note read as
+// if there were (BUG-21). The analyzer text itself is left alone because
+// carryForwardVerdict parses it.
+func firstIndexWording(first bool, diags []string) []string {
+	if !first {
+		return diags
+	}
+	out := make([]string, len(diags))
+	for k, d := range diags {
+		d = strings.Replace(d, " (previous native edges carried forward)", " (no native edges yet)", 1)
+		d = strings.Replace(d, " — previous native edges carried forward", " — no native edges yet", 1)
+		out[k] = d
+	}
+	return out
 }
 
 // carryForwardVerdict builds the per-analyzer verdict this run persists.
