@@ -587,7 +587,14 @@ func resolvedCallMarks[K comparable](byKey map[K]core.Edge, order []K) callMarks
 	m := callMarks{}
 	for _, k := range order {
 		e := byKey[k]
-		if e.Type != core.EdgeResolvedCalls || e.Lines == "" {
+		// A call through a library interface (resp.Body.Close() on an
+		// io.ReadCloser) is resolved too: its name-matched guess onto a
+		// project method of the same name is wrong (prism assist
+		// postJSON -> ollamaProvider.Close, 2026-11-22). A project method
+		// that does fulfil the interface still arrives as a dispatch edge
+		// built from these same records (externalIfaceEdges).
+		external := e.Type == core.EdgeExternalIfaceCall
+		if (e.Type != core.EdgeResolvedCalls && !external) || e.Lines == "" {
 			continue
 		}
 		byName := m[e.From]
@@ -599,6 +606,9 @@ func resolvedCallMarks[K comparable](byKey map[K]core.Edge, order []K) callMarks
 			name, pos, ok := strings.Cut(part, "@")
 			if !ok || name == "" || pos == "" {
 				continue
+			}
+			if external {
+				name = name[strings.LastIndexByte(name, '.')+1:] // io.ReadCloser.Close -> Close
 			}
 			if byName[name] == nil {
 				byName[name] = map[string]bool{}

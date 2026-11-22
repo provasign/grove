@@ -1139,3 +1139,17 @@ func TestMergeEdgesNativeTypeUseDropsSameNamedTypeInOtherPackage(t *testing.T) {
 		t.Fatalf("lost a resolved or same-package edge: %v", got)
 	}
 }
+
+// A call the checker resolved through a library interface rules out the
+// name-matched guess onto a same-named project method at that position.
+func TestMergeEdgesExternalIfaceCallDropsNameGuess(t *testing.T) {
+	caller := "internal/assist/provider.go::postJSON@1"
+	guess := "internal/assist/provider.go::ollamaProvider.Close@1"
+	base := []core.Edge{{From: caller, To: guess, Type: core.EdgeCalls, Confidence: 0.95, Source: core.EvidenceSourceASTKit, Reason: core.ReasonASTNarrowed, Lines: "74:18"}}
+	native := []core.Edge{{From: caller, To: caller, Type: core.EdgeExternalIfaceCall, Source: core.EvidenceSourceNative, Lines: "io.ReadCloser.Close@74:18"}}
+	for _, e := range mergeEdges(base, native) {
+		if e.To == guess {
+			t.Fatalf("name guess survived a library-interface resolution at the same position: %+v", e)
+		}
+	}
+}

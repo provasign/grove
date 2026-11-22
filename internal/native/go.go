@@ -739,6 +739,7 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 		Uses:       map[*ast.Ident]types.Object{},
 		Defs:       map[*ast.Ident]types.Object{},
 		Selections: map[*ast.SelectorExpr]*types.Selection{},
+		Types:      map[ast.Expr]types.TypeAndValue{},
 	}
 	conf := types.Config{
 		Importer: projectImporter,
@@ -762,6 +763,9 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 	add := func(edge core.Edge) { pe.add(edge, 0, 0) }
 	lines := goLineReader(fset)
 	for _, edge := range dispatch.contractEdges() {
+		add(edge)
+	}
+	for _, edge := range goClaimedImplements(parsed, info, dir, symbolIdx, pkgDirsByImport, pkg) {
 		add(edge)
 	}
 

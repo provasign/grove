@@ -347,6 +347,12 @@ const (
 	// inst._zod.parse`), recorded as a writes/reads edge to the member's
 	// declaration: a rename or signature change breaks it.
 	ReasonMemberRef EdgeReason = "member-ref"
+	// ReasonUsedAs: an implements edge from a type the compiler sees used
+	// as an interface it does not satisfy (`return &T{}` where the function
+	// returns the interface). Go declares no implements clause, so this is
+	// the type's claim on the contract: after a method is added to the
+	// interface it is how missing-implementations still finds the type.
+	ReasonUsedAs EdgeReason = "used-as"
 )
 
 type EvidenceRef struct {
