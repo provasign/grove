@@ -321,22 +321,8 @@ func (g *CodeGraph) changeImpactScoped(query, file string) (*ChangeImpactResult,
 	for _, id := range g.idsNamed(typeName) {
 		switch g.symbols[id].Kind {
 		case core.KindClass, core.KindInterface, core.KindType, core.KindStruct, core.KindTrait, core.KindEnum:
-			if file != "" && !strings.Contains(g.symbols[id].FilePath, file) {
-				// Go receivers and their methods may be declared in separate
-				// files. A containment edge is evidence for the requested
-				// member's owner; matching the type name alone is not.
-				matchesMember := false
-				if g.symbols[id].Language == "go" {
-					for _, m := range g.containedMethods([]string{id}, methodName) {
-						if strings.Contains(m.FilePath, file) {
-							matchesMember = true
-							break
-						}
-					}
-				}
-				if !matchesMember {
-					continue
-				}
+			if !g.seedInFileLocked(id, methodName, file) {
+				continue
 			}
 			typeIDs = append(typeIDs, id)
 			seenTypeID[id] = true
@@ -1852,4 +1838,23 @@ func filterByParamTypes(cands []core.SymbolRecord, params []string) []core.Symbo
 		}
 	}
 	return out
+}
+
+// seedInFileLocked reports whether a seed type matches a declaring-file
+// fragment ("" matches every type). Go receivers and their methods may be
+// declared in separate files: a containment edge to the member in a matching
+// file is evidence for its owner; matching the type name alone is not.
+func (g *CodeGraph) seedInFileLocked(id, methodName, file string) bool {
+	if file == "" || strings.Contains(g.symbols[id].FilePath, file) {
+		return true
+	}
+	if g.symbols[id].Language != "go" {
+		return false
+	}
+	for _, m := range g.containedMethods([]string{id}, methodName) {
+		if strings.Contains(m.FilePath, file) {
+			return true
+		}
+	}
+	return false
 }

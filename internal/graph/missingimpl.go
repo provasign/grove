@@ -61,12 +61,19 @@ type MissingImplementationsResult struct {
 // ChangeImpact; nominal closure only, so for Go the structural caveat is the
 // same as ChangeImpact's.
 func (g *CodeGraph) MissingImplementations(query string) (*MissingImplementationsResult, error) {
+	return g.MissingImplementationsScoped(query, "")
+}
+
+// MissingImplementationsScoped is MissingImplementations with an optional
+// declaring-file fragment, as ChangeImpactScoped: only types declared in a
+// matching file seed the contract.
+func (g *CodeGraph) MissingImplementationsScoped(query, file string) (*MissingImplementationsResult, error) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 
 	// Same lenient front-end as ChangeImpact: a bare, unambiguous member name
 	// resolves to Type.method; ambiguity errors with candidates.
-	resolved, err := g.resolveLooseQueryLocked(query)
+	resolved, err := g.resolveLooseQueryScopedLocked(query, file)
 	if err != nil {
 		return nil, err
 	}
@@ -86,13 +93,18 @@ func (g *CodeGraph) MissingImplementations(query string) (*MissingImplementation
 	for _, id := range g.idsNamed(typeName) {
 		switch g.symbols[id].Kind {
 		case core.KindClass, core.KindInterface, core.KindType, core.KindStruct, core.KindTrait, core.KindEnum:
-			typeIDs = append(typeIDs, id)
+			if g.seedInFileLocked(id, methodName, file) {
+				typeIDs = append(typeIDs, id)
+			}
 		}
+	}
+	if len(typeIDs) == 0 && file != "" {
+		return nil, fmt.Errorf("missing-implementations: no type named %q declared in a file matching %q — drop file= to search every declaration", typeName, file)
 	}
 	if len(typeIDs) == 0 {
 		return nil, fmt.Errorf("missing-implementations: type %q is not indexed (for an external contract, query a project type that declares it)", typeName)
 	}
-	typeIDs, err = g.selectSeedsLocked("missing-implementations", query, typeName, methodName, "", typeIDs)
+	typeIDs, err = g.selectSeedsLocked("missing-implementations", query, typeName, methodName, file, typeIDs)
 	if err != nil {
 		return nil, err
 	}

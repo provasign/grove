@@ -695,11 +695,17 @@ type RenamePlanResult struct {
 // RenamePlan computes the change-impact set for query and converts it into
 // line edits renaming the member to newName.
 func (e *Engine) RenamePlan(ctx context.Context, query, newName string) (RenamePlanResult, error) {
+	return e.RenamePlanScoped(ctx, query, newName, "")
+}
+
+// RenamePlanScoped is RenamePlan with an optional declaring-file filter for
+// same-named types in distinct packages (see ChangeImpactScoped).
+func (e *Engine) RenamePlanScoped(ctx context.Context, query, newName, file string) (RenamePlanResult, error) {
 	g, err := e.currentGraph()
 	if err != nil {
 		return RenamePlanResult{}, err
 	}
-	raw, err := g.RenamePlan(query, newName)
+	raw, err := g.RenamePlanScoped(query, newName, file)
 	if err != nil {
 		return RenamePlanResult{}, err
 	}
@@ -746,11 +752,17 @@ type MissingImplementationsResult struct {
 // "Type.method(ParamType, ...)" query to every type in the subtype closure
 // that fails to implement the member.
 func (e *Engine) MissingImplementations(ctx context.Context, query string) (MissingImplementationsResult, error) {
+	return e.MissingImplementationsScoped(ctx, query, "")
+}
+
+// MissingImplementationsScoped is MissingImplementations with an optional
+// declaring-file filter for same-named types in distinct packages.
+func (e *Engine) MissingImplementationsScoped(ctx context.Context, query, file string) (MissingImplementationsResult, error) {
 	g, err := e.currentGraph()
 	if err != nil {
 		return MissingImplementationsResult{}, err
 	}
-	raw, err := g.MissingImplementations(query)
+	raw, err := g.MissingImplementationsScoped(query, file)
 	if err != nil {
 		return MissingImplementationsResult{}, err
 	}

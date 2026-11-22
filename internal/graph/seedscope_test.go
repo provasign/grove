@@ -187,3 +187,45 @@ func TestImpactQualifier(t *testing.T) {
 		}
 	}
 }
+
+// BUG-05 (2026-11-22): rename-plan and missing-implementations take the
+// declaring-file scope change-impact takes, so the ambiguity's advice to
+// scope by file works for all three.
+func TestSeedScope_RenamePlanAndMissingImplementationsTakeFileScope(t *testing.T) {
+	withText := func(s core.SymbolRecord) core.SymbolRecord {
+		s.RawText = s.Signature + " { return nil }"
+		return s
+	}
+	g := New()
+	g.Replace([]core.SymbolRecord{
+		goType("internal/graphui/server.go", "Server"),
+		withText(goMethod("internal/graphui/server.go", "Server", "Handler", "func (s *Server) Handler() http.Handler", 73)),
+		goType("internal/httpapi/http.go", "Server"),
+		withText(goMethod("internal/httpapi/http.go", "Server", "Handler", "func (s *Server) Handler() http.Handler", 22)),
+	}, 2)
+
+	plan, err := g.RenamePlanScoped("Server.Handler", "Mux", "internal/httpapi")
+	if err != nil {
+		t.Fatalf("RenamePlanScoped: %v", err)
+	}
+	if len(plan.Edits) == 0 {
+		t.Fatal("scoped rename-plan produced no edits")
+	}
+	for _, e := range plan.Edits {
+		if e.FilePath != "internal/httpapi/http.go" {
+			t.Fatalf("scoped rename-plan edited %s", e.FilePath)
+		}
+	}
+
+	mi, err := g.MissingImplementationsScoped("Server.Handler", "internal/graphui")
+	if err != nil {
+		t.Fatalf("MissingImplementationsScoped: %v", err)
+	}
+	if len(mi.Contract) != 1 || mi.Contract[0].FilePath != "internal/graphui/server.go" {
+		t.Fatalf("scoped contract = %+v, want graphui's Handler", mi.Contract)
+	}
+
+	if _, err := g.MissingImplementationsScoped("Server.Handler", "no/such"); err == nil || !strings.Contains(err.Error(), "drop file=") {
+		t.Fatalf("a scope matching nothing must error, not widen: %v", err)
+	}
+}

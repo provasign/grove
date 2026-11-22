@@ -46,7 +46,13 @@ type RenamePlanResult struct {
 // RenamePlan computes ChangeImpact(query) and converts it to line edits
 // renaming the method to newName.
 func (g *CodeGraph) RenamePlan(query, newName string) (*RenamePlanResult, error) {
-	ci, err := g.ChangeImpact(query)
+	return g.RenamePlanScoped(query, newName, "")
+}
+
+// RenamePlanScoped is RenamePlan over ChangeImpactScoped: file names the
+// declaring file of one of several same-named types.
+func (g *CodeGraph) RenamePlanScoped(query, newName, file string) (*RenamePlanResult, error) {
+	ci, err := g.ChangeImpactScoped(query, file)
 	if err != nil {
 		return nil, err
 	}
