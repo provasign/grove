@@ -97,10 +97,16 @@ func (jsTSAnalyzer) Available(_ context.Context, root string) Availability {
 	if untrustedMode() {
 		cwd = neutralNodeCWD()
 	}
-	cmd := exec.Command("node", "-e", "require.resolve('typescript')")
+	cmd := exec.Command("node", "-e", "process.stdout.write(require.resolve('typescript'))")
 	cmd.Dir = cwd
 	cmd.Env = scrubbedEnv()
-	if err := cmd.Run(); err != nil {
+	resolved, err := cmd.Output()
+	if err == nil {
+		if v := typescriptVersion(string(resolved)); tsMajor(v) >= 7 {
+			return Availability{Reason: fmt.Sprintf(tsNativeCompilerReason, v)}
+		}
+	}
+	if err != nil {
 		if untrustedMode() {
 			return Availability{Reason: tsUntrustedSkipReason}
 		}
@@ -110,6 +116,70 @@ func (jsTSAnalyzer) Available(_ context.Context, root string) Availability {
 		return Availability{Reason: "typescript not resolvable in the project"}
 	}
 	return Availability{Available: true}
+}
+
+// tsNativeCompilerReason: TypeScript 7 is the Go port; its package has no
+// JavaScript compiler API, and loading it crashed the analyzer with a raw
+// stack trace (BUG-06).
+const tsNativeCompilerReason = "typescript %s is the native (Go) compiler and has no JavaScript compiler API; install typescript@5 as a dev dependency for compiler-backed analysis"
+
+// typescriptVersion reads the version from the package.json of the
+// typescript package that holds the resolved entry file, or "".
+func typescriptVersion(entry string) string {
+	dir := filepath.Dir(strings.TrimSpace(entry))
+	for i := 0; i < 6 && dir != filepath.Dir(dir); i++ {
+		data, err := os.ReadFile(filepath.Join(dir, "package.json"))
+		if err == nil {
+			var pkg struct {
+				Name    string `json:"name"`
+				Version string `json:"version"`
+			}
+			if unmarshalJSON(data, &pkg) == nil && pkg.Name == "typescript" {
+				return pkg.Version
+			}
+		}
+		dir = filepath.Dir(dir)
+	}
+	return ""
+}
+
+// tsMajor returns the major version number, or 0 when v does not parse.
+func tsMajor(v string) int {
+	n := 0
+	for _, r := range v {
+		if r < '0' || r > '9' {
+			break
+		}
+		n = n*10 + int(r-'0')
+	}
+	return n
+}
+
+// tsBootstrapFailure turns a failed Node child into one diagnostic line:
+// the first error line of its output, plus the path of a log holding the
+// whole output. A raw stack trace used to be printed in full.
+func tsBootstrapFailure(root string, err error, output string) string {
+	output = strings.TrimSpace(output)
+	if output == "" {
+		return "typescript language service bootstrap failed: " + err.Error()
+	}
+	first := ""
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.Contains(line, "Error") || strings.HasPrefix(line, "error") {
+			first = line
+			break
+		}
+	}
+	if first == "" {
+		first = strings.TrimSpace(strings.SplitN(output, "\n", 2)[0])
+	}
+	msg := "typescript language service bootstrap failed: " + err.Error() + ": " + clip(first, 300)
+	logPath := filepath.Join(root, ".grove", "ts-bootstrap.log")
+	if werr := os.WriteFile(logPath, []byte(output+"\n"), 0o600); werr == nil {
+		msg += " (full output: " + logPath + ")"
+	}
+	return msg
 }
 
 // tsPlainJSReason marks a repo where the TypeScript checker does not apply:
@@ -218,11 +288,7 @@ func (jsTSAnalyzer) Analyze(ctx context.Context, req Request) Result {
 		out = stdout.Bytes()
 		stdoutText, stderrText = stdout.String(), stderr.String()
 		if err != nil {
-			detail := strings.TrimSpace(stderr.String() + "\n" + stdout.String())
-			if detail != "" {
-				return Result{Diagnostics: []string{"typescript language service bootstrap failed: " + err.Error() + ": " + detail}}
-			}
-			return Result{Diagnostics: []string{"typescript language service bootstrap failed: " + err.Error()}}
+			return Result{Diagnostics: []string{tsBootstrapFailure(req.Root, err, stderr.String()+"\n"+stdout.String())}}
 		}
 	}
 	var payload struct {
