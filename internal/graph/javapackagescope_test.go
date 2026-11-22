@@ -1,6 +1,7 @@
 package graph
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/provasign/grove/internal/core"
@@ -97,13 +98,22 @@ func TestChangeImpactScoped_FileDisambiguatesSameNamedTypes(t *testing.T) {
 			Signature: "func (e *Engine) Query(v []float32) []int"},
 	}, 3)
 
-	// Unscoped: both same-named types seed (existing behavior, unchanged).
-	r, err := g.ChangeImpact("Engine.Query")
-	if err != nil {
-		t.Fatalf("ChangeImpact: %v", err)
+	// Unscoped: two packages are two candidates, never one merged change set
+	// (they used to merge into one "closed" family; 2026-11-22).
+	_, err := g.ChangeImpact("Engine.Query")
+	if err == nil || !strings.Contains(err.Error(), "is ambiguous — 2 candidates") ||
+		!strings.Contains(err.Error(), "g.Engine.Query  (pkg/g/g.go:") ||
+		!strings.Contains(err.Error(), "emb.Engine.Query  (internal/emb/model.go:") {
+		t.Fatalf("unscoped error = %v, want a 2-candidate ambiguity naming both packages", err)
 	}
-	if len(r.Declarations) != 2 {
-		t.Fatalf("unscoped declarations = %d, want 2 (both types)", len(r.Declarations))
+
+	// The package qualifier the ambiguity offers resolves to one type.
+	r, err := g.ChangeImpact("emb.Engine.Query")
+	if err != nil {
+		t.Fatalf("qualified ChangeImpact: %v", err)
+	}
+	if len(r.Declarations) != 1 || r.Declarations[0].FilePath != "internal/emb/model.go" {
+		t.Fatalf("qualified declarations = %+v, want exactly internal/emb/model.go", r.Declarations)
 	}
 
 	// Scoped: only the matching file's type.

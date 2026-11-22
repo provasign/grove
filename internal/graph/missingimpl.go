@@ -92,7 +92,8 @@ func (g *CodeGraph) MissingImplementations(query string) (*MissingImplementation
 	if len(typeIDs) == 0 {
 		return nil, fmt.Errorf("missing-implementations: type %q is not indexed (for an external contract, query a project type that declares it)", typeName)
 	}
-	if err := g.rejectCrossLanguageSeedsLocked("missing-implementations", query, typeIDs); err != nil {
+	typeIDs, err = g.selectSeedsLocked("missing-implementations", query, typeName, methodName, "", typeIDs)
+	if err != nil {
 		return nil, err
 	}
 

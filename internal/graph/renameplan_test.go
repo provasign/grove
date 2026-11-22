@@ -218,15 +218,23 @@ func TestRenamePlanSameNamedJavaOwnersAcrossPackagesAreAmbiguous(t *testing.T) {
 		{ID: "src/main/java/com/ex/b/Leaf.java::Leaf", FilePath: "src/main/java/com/ex/b/Leaf.java", Language: "java", Kind: core.KindClass, Name: "Leaf", QualifiedName: "Leaf", Signature: "class Leaf", RawText: "class Leaf { void work() {} }", Span: core.LineRange{Start: 1, End: 3}},
 		{ID: "src/main/java/com/ex/b/Leaf.java::Leaf.work", FilePath: "src/main/java/com/ex/b/Leaf.java", Language: "java", Kind: core.KindMethod, Name: "work", QualifiedName: "Leaf.work", ParentSymbol: "Leaf", Signature: "void work()", RawText: "void work() {}", Span: core.LineRange{Start: 2, End: 2}},
 	}, nil, 1)
-	r, err := g.RenamePlan("Leaf.work", "newWork")
+	// Two packages are two candidates; no plan is built from a merge.
+	_, err := g.RenamePlan("Leaf.work", "newWork")
+	if err == nil || !strings.Contains(err.Error(), "is ambiguous — 2 candidates") {
+		t.Fatalf("want a 2-candidate ambiguity, got %v", err)
+	}
+	// Each offered candidate re-runs to one package's edits.
+	r, err := g.RenamePlan("a.Leaf.work", "newWork")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(r.Edits) != 0 {
-		t.Fatalf("ambiguous package-colliding seed produced confirmed edits: %+v", r.Edits)
+	if len(r.Edits) == 0 {
+		t.Fatal("qualified re-run produced no edits")
 	}
-	if len(r.Ambiguous) != 2 {
-		t.Fatalf("Ambiguous=%d want 2: %+v", len(r.Ambiguous), r.Ambiguous)
+	for _, e := range r.Edits {
+		if !strings.Contains(e.FilePath, "/a/") {
+			t.Fatalf("qualified re-run edited another package: %+v", e)
+		}
 	}
 }
 

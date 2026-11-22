@@ -64,7 +64,17 @@ func newGoProjectImporter(packages []goListPackage, deps goDeps) *goProjectImpor
 	return p
 }
 
-func (p *goProjectImporter) preloadInterfaceImports(importPaths []string, interfacePackages map[string]bool) []string {
+// preloadProjectImports type-checks, from source, every project package an
+// analyzed package imports, then seals the importer so the parallel
+// per-package checks only read it.
+//
+// It used to load only packages that declare an interface (2026-09-06, for
+// imported interface contracts). Every other project import then failed
+// ("not selected for interface loading"), so a call on a value of another
+// project package's type had no selection: the compiler pass resolved no
+// cross-package method call, and name matching linked each one to every
+// same-named method (prism: graphui and httpapi Server.Handler, 2026-11-22).
+func (p *goProjectImporter) preloadProjectImports(importPaths []string) []string {
 	defer func() { p.sealed = true }()
 	paths := append([]string(nil), importPaths...)
 	sort.Strings(paths)
@@ -77,7 +87,7 @@ func (p *goProjectImporter) preloadInterfaceImports(importPaths []string, interf
 		imports := append(append([]string(nil), pkg.Imports...), pkg.TestImports...)
 		sort.Strings(imports)
 		for _, imported := range imports {
-			if _, local := p.packages[imported]; !local || !interfacePackages[imported] {
+			if _, local := p.packages[imported]; !local {
 				continue
 			}
 			if _, err := p.load(imported); err != nil {

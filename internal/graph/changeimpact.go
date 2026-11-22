@@ -370,7 +370,8 @@ func (g *CodeGraph) changeImpactScoped(query, file string) (*ChangeImpactResult,
 		// whose declared extends/implements clause names it, transitively.
 		return g.externalRootedImpact(query, typeName, methodName, queryParams)
 	}
-	if err := g.rejectCrossLanguageSeedsLocked("change-impact", query, typeIDs); err != nil {
+	typeIDs, err = g.selectSeedsLocked("change-impact", query, typeName, methodName, file, typeIDs)
+	if err != nil {
 		return nil, err
 	}
 
@@ -1050,6 +1051,10 @@ func (g *CodeGraph) typeDeclaresMember(t *core.SymbolRecord, method string) bool
 // the given type symbol IDs via contains edges.
 func (g *CodeGraph) containedMethods(typeIDs []string, methodName string) []core.SymbolRecord {
 	var out []core.SymbolRecord
+	// Go joins a receiver's methods to every same-named type in its package
+	// (build-tag twins), so two seeds can contain the same method; list it
+	// once.
+	seen := map[string]bool{}
 	for _, tid := range typeIDs {
 		for _, ei := range g.outbound[tid] {
 			edge := g.edges[ei]
@@ -1057,9 +1062,10 @@ func (g *CodeGraph) containedMethods(typeIDs []string, methodName string) []core
 				continue
 			}
 			s, ok := g.symbols[edge.To]
-			if !ok || s.Name != methodName {
+			if !ok || s.Name != methodName || seen[s.ID] {
 				continue
 			}
+			seen[s.ID] = true
 			// Constructors count: Rust's Type::new and C#/Java constructors
 			// are KindConstructor, and "GlobSetBuilder.new declares no
 			// method new" while listing new among its members was the

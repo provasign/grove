@@ -538,23 +538,15 @@ func goSemanticEdges(ctx context.Context, root string, files []string, symbols [
 	projectImporter := newGoProjectImporter(pkgs, deps)
 	projectImporter.root = root
 	var analyzedImports []string
-	interfacePackages := map[string]bool{}
 	for _, dir := range dirs {
 		if path := importPathByDir[dir]; path != "" {
 			analyzedImports = append(analyzedImports, path)
 		}
 	}
-	for _, symbol := range symbols {
-		if symbol.Language == "go" && symbol.Kind == core.KindInterface {
-			if path := importPathByDir[packageDir(symbol.FilePath)]; path != "" {
-				interfacePackages[path] = true
-			}
-		}
-	}
 	// One line per distinct problem: the same partially-checked import is
 	// reached from every package that imports it (grafana: 14 copies).
 	seenDiag := map[string]bool{}
-	for _, d := range projectImporter.preloadInterfaceImports(analyzedImports, interfacePackages) {
+	for _, d := range projectImporter.preloadProjectImports(analyzedImports) {
 		if !seenDiag[d] {
 			seenDiag[d] = true
 			diagnostics = append(diagnostics, d)

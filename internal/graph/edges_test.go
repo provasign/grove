@@ -1085,3 +1085,57 @@ func TestJavaOverloadedConstructorsAttachToTheirClass(t *testing.T) {
 		}
 	}
 }
+
+// A same-named method in another package is not a build-tag twin: where the
+// checker resolved the call position to one package, the name-based guess
+// into the other is dropped (prism graphui/httpapi Server.Handler,
+// 2026-11-22). A guess at a position the checker never saw survives.
+func TestMergeEdgesNativeCallDropsSameNamedMethodInOtherPackage(t *testing.T) {
+	caller := "internal/cli/graphcmd.go::cmdGraph@1"
+	own := "internal/graphui/server.go::Server.Handler@1"
+	other := "internal/httpapi/http.go::Server.Handler@1"
+	native := []core.Edge{{From: caller, To: own, Type: core.EdgeCalls, Confidence: 0.99, Source: core.EvidenceSourceNative, Lines: "136:38"}}
+
+	resolvedSite := []core.Edge{{From: caller, To: other, Type: core.EdgeCalls, Confidence: 0.95, Source: core.EvidenceSourceASTKit, Lines: "136:38"}}
+	for _, e := range mergeEdges(resolvedSite, native) {
+		if e.To == other {
+			t.Fatalf("guess into another package survived a resolved call position: %+v", e)
+		}
+	}
+
+	unseenSite := []core.Edge{{From: caller, To: other, Type: core.EdgeCalls, Confidence: 0.95, Source: core.EvidenceSourceASTKit, Lines: "140:5"}}
+	kept := false
+	for _, e := range mergeEdges(unseenSite, native) {
+		if e.To == other {
+			kept = true
+		}
+	}
+	if !kept {
+		t.Fatal("guess at a position the checker did not resolve was dropped")
+	}
+}
+
+// A Go type reference the checker resolved to its own package rules out the
+// name-matched reference to a same-named type in another package; a
+// same-named type in the same package (build-tag twin) is kept.
+func TestMergeEdgesNativeTypeUseDropsSameNamedTypeInOtherPackage(t *testing.T) {
+	from := "internal/graphui/server.go::Server.Handler@1"
+	own := "internal/graphui/server.go::Server@1"
+	other := "internal/httpapi/http.go::Server@1"
+	twin := "internal/graphui/server_windows.go::Server@1"
+	base := []core.Edge{
+		{From: from, To: other, Type: core.EdgeUsesType, Confidence: 0.5, Source: core.EvidenceSourceHeuristic, Reason: core.ReasonTypeRef},
+		{From: from, To: twin, Type: core.EdgeUsesType, Confidence: 0.5, Source: core.EvidenceSourceHeuristic, Reason: core.ReasonTypeRef},
+	}
+	native := []core.Edge{{From: from, To: own, Type: core.EdgeUsesType, Confidence: 0.98, Source: core.EvidenceSourceNative}}
+	got := map[string]bool{}
+	for _, e := range mergeEdges(base, native) {
+		got[e.To] = true
+	}
+	if got[other] {
+		t.Fatal("name-matched type in another package survived the checker's resolution")
+	}
+	if !got[own] || !got[twin] {
+		t.Fatalf("lost a resolved or same-package edge: %v", got)
+	}
+}

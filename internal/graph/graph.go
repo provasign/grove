@@ -246,6 +246,9 @@ func mergeEdges(base, enriched []core.Edge) []core.Edge {
 		// not pick (gson value(1) -> value(long), not value(float)).
 		files  map[string]map[string]bool
 		static bool // a direct, non-dispatch concrete resolution
+		// positions holds every call position ("line:col") the checker
+		// resolved for this callee name from this caller.
+		positions map[string]bool
 	}
 	resolved := map[string]map[string]*calleeSet{} // caller -> callee name -> native targets
 	implements := map[string]map[string]bool{}     // type qual -> interface quals
@@ -270,8 +273,13 @@ func mergeEdges(base, enriched []core.Edge) []core.Edge {
 		name := calleeNameOf(e.To)
 		set := byName[name]
 		if set == nil {
-			set = &calleeSet{quals: map[string]bool{}, ifaceOwners: map[string]bool{}, files: map[string]map[string]bool{}}
+			set = &calleeSet{quals: map[string]bool{}, ifaceOwners: map[string]bool{}, files: map[string]map[string]bool{}, positions: map[string]bool{}}
 			byName[name] = set
+		}
+		for _, pos := range strings.Split(e.Lines, ",") {
+			if pos != "" {
+				set.positions[pos] = true
+			}
 		}
 		qual, anchor := symbolQual(e.To)
 		set.quals[qual] = true
@@ -286,6 +294,38 @@ func mergeEdges(base, enriched []core.Edge) []core.Edge {
 			set.static = true
 		}
 	}
+	// Go type references the checker resolved, per referencing symbol and
+	// type name: the directories (packages) of the resolved types. A
+	// name-matched reference from the same symbol to a same-named type in
+	// another package is ruled out: graphui's own Server methods were also
+	// linked to httpapi.Server, a false graphui -> httpapi dependency in
+	// prism map and arch (2026-11-22).
+	typeDirs := map[string]map[string]map[string]bool{}
+	for _, k := range ordered {
+		e := byKey[k]
+		if e.Type != core.EdgeUsesType || e.Source != core.EvidenceSourceNative || !goSymbolID(e.From) {
+			continue
+		}
+		byName := typeDirs[e.From]
+		if byName == nil {
+			byName = map[string]map[string]bool{}
+			typeDirs[e.From] = byName
+		}
+		name := calleeNameOf(e.To)
+		if byName[name] == nil {
+			byName[name] = map[string]bool{}
+		}
+		toFile, _, _ := strings.Cut(e.To, "::")
+		byName[name][path.Dir(toFile)] = true
+	}
+	typeRuledOut := func(e core.Edge) bool {
+		dirs := typeDirs[e.From][calleeNameOf(e.To)]
+		if dirs == nil {
+			return false
+		}
+		toFile, _, _ := strings.Cut(e.To, "::")
+		return !dirs[path.Dir(toFile)]
+	}
 	marked := resolvedCallMarks(byKey, ordered)
 	superseded := func(e core.Edge) bool {
 		if marked.covers(e) {
@@ -298,7 +338,22 @@ func mergeEdges(base, enriched []core.Edge) []core.Edge {
 		qual := calleeQualOf(e.To)
 		if set.quals[qual] {
 			toFile, _, _ := strings.Cut(e.To, "::")
-			return set.files[qual][toFile] // same file: an overload the checker did not pick
+			if set.files[qual][toFile] {
+				return true // same file: an overload the checker did not pick
+			}
+			// Another file in a resolved target's directory is a build-tag
+			// twin in the same package: kept. A same-named method in
+			// another directory is another package's type (prism graphui
+			// and httpapi Server.Handler, 2026-11-22): dropped where the
+			// checker resolved every one of the guess's call positions to
+			// something else, kept where it saw none of them (code under a
+			// disabled build tag or cfg).
+			for f := range set.files[qual] {
+				if path.Dir(f) == path.Dir(toFile) {
+					return false
+				}
+			}
+			return positionsResolved(e.Lines, set.positions)
 		}
 		if len(set.ifaceOwners) > 0 {
 			for iface := range set.ifaceOwners {
@@ -328,6 +383,9 @@ func mergeEdges(base, enriched []core.Edge) []core.Edge {
 		// Handle::try_current callers) has only the parser's resolution;
 		// dropping every guess in an analyzed file lost those callers.
 		if e.Type == core.EdgeCalls && e.Source != core.EvidenceSourceNative && superseded(e) {
+			continue
+		}
+		if e.Type == core.EdgeUsesType && e.Source != core.EvidenceSourceNative && typeRuledOut(e) {
 			continue
 		}
 		out = append(out, e)
@@ -582,6 +640,20 @@ func (m callMarks) covers(e core.Edge) bool {
 	return true
 }
 
+// positionsResolved reports whether the guess names call positions and the
+// checker resolved every one of them.
+func positionsResolved(lines string, resolved map[string]bool) bool {
+	if lines == "" || len(resolved) == 0 {
+		return false
+	}
+	for _, pos := range strings.Split(lines, ",") {
+		if !resolved[pos] {
+			return false
+		}
+	}
+	return true
+}
+
 // markedOnLine reports whether set holds a position on line ("line" or
 // "line:col").
 func markedOnLine(set map[string]bool, line string) bool {
@@ -618,6 +690,13 @@ func calleeQualOf(id string) string {
 func compilerResolvedNode(id string) bool {
 	file, _, _ := strings.Cut(id, "::")
 	return strings.HasSuffix(file, ".go") || strings.HasSuffix(file, ".java") || strings.HasSuffix(file, ".rs")
+}
+
+// goSymbolID reports whether a symbol ID is declared in a Go file, where
+// go/types checks every type reference in a body it analyzes.
+func goSymbolID(id string) bool {
+	file, _, _ := strings.Cut(id, "::")
+	return strings.HasSuffix(file, ".go")
 }
 
 // symbolQual splits a symbol ID into its qualified name and whether it is a
