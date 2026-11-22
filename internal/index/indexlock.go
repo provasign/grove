@@ -55,3 +55,35 @@ func acquireIndexLock(ctx context.Context, root string) (func() error, error) {
 		}
 	}
 }
+
+// indexFiles are the files under .grove that a rebuild deletes: the store
+// and its SQLite sidecars, and the Go analyzer caches derived from it. The
+// lock file and .gitignore stay.
+var indexFiles = []string{
+	"grove.db", "grove.db-wal", "grove.db-shm", "grove.db-journal",
+	"golist-cache.json", "goexport-cache.json",
+}
+
+// RemoveIndex deletes root's index files while holding the index lock, so
+// it never runs in the middle of another process's index cycle. A process
+// that still has the old store open keeps reading its unlinked copy until
+// it reopens. It returns the names it removed.
+func RemoveIndex(ctx context.Context, root string) ([]string, error) {
+	release, err := acquireIndexLock(ctx, root)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = release() }()
+	var removed []string
+	for _, name := range indexFiles {
+		err := os.Remove(filepath.Join(root, ".grove", name))
+		if err == nil {
+			removed = append(removed, name)
+			continue
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return removed, fmt.Errorf("remove index file: %w", err)
+		}
+	}
+	return removed, nil
+}

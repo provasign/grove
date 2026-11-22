@@ -125,7 +125,7 @@ func (i *Indexer) noopRetries(ctx context.Context, root string, completed map[st
 		}
 		if now.UnixNano() < r.Next {
 			wait := time.Duration(r.Next - now.UnixNano()).Round(time.Second)
-			notes = append(notes, fmt.Sprintf("%s has no completed pass (%s); next retry in %s, or use --force to retry now", name, r.Reason, wait))
+			notes = append(notes, fmt.Sprintf("%s has no completed pass (%s); next retry in %s, or run index --force to retry now", name, r.Reason, wait))
 			continue
 		}
 		if !r.Unavailable {

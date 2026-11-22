@@ -53,7 +53,7 @@ func TestNoopRechecksUnavailableNativePass(t *testing.T) {
 	}
 	joined := strings.Join(next.Native, "\n")
 	if !strings.Contains(joined, "js-ts has no completed pass (typescript not resolvable in the project); next retry in 15s") ||
-		strings.Contains(joined, "use --force to re-run analyzers") {
+		strings.Contains(joined, "run index --force to re-run analyzers") {
 		t.Fatalf("pending retry not reported accurately: %v", next.Native)
 	}
 
@@ -129,7 +129,7 @@ func TestNoopRetryRecoversNativePass(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(strings.Join(settled.Native, "\n"), "no file changes since last index (use --force") {
+	if !strings.Contains(strings.Join(settled.Native, "\n"), "no file changes since last index (run index --force") {
 		t.Fatalf("expected a settled no-op: %v", settled.Native)
 	}
 }

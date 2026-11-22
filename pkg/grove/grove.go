@@ -149,6 +149,18 @@ type Engine struct {
 	graph *graph.CodeGraph
 }
 
+// RemoveIndex deletes the index under <repoRoot>/.grove (the store, its
+// SQLite sidecars and the Go analyzer caches) while holding the index lock,
+// so the next Open starts from an empty index. It is the repair for an
+// index that will not open or fails an integrity check. Call it with no
+// Engine open on repoRoot in this process. It returns the files removed.
+func RemoveIndex(ctx context.Context, repoRoot string) ([]string, error) {
+	if repoRoot == "" {
+		return nil, errors.New("grove: RepoRoot is required")
+	}
+	return index.RemoveIndex(ctx, repoRoot)
+}
+
 // Open initialises the on-disk store, runs migrations, and rebuilds the
 // in-memory graph from whatever symbols are already persisted.
 func Open(ctx context.Context, cfg Config) (*Engine, error) {

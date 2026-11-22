@@ -734,7 +734,7 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 			if len(pending) > 0 {
 				msg += "; " + strings.Join(pending, "; ")
 			} else {
-				msg += " (use --force to re-run analyzers)"
+				msg += " (run index --force to re-run analyzers)"
 			}
 			result.Native = append(result.Native, msg)
 		}
