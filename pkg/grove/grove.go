@@ -315,6 +315,33 @@ func (e *Engine) currentGraphContext(ctx context.Context) (*graph.CodeGraph, err
 // Index walks dir (defaults to RepoRoot), parses changed files via delta SHA,
 // updates the persistent store, and refreshes the in-memory graph.
 func (e *Engine) Index(ctx context.Context, dir string) (IndexResult, error) {
+	return e.index(ctx, dir, nil)
+}
+
+// IndexIfStale indexes dir only if IndexNeedsRefresh still reports it
+// stale once this process holds the cross-process index lock. Parallel
+// first commands on an unindexed repository then build it once: the rest
+// wait on the lock, see a current index and return with AlreadyCurrent
+// set and the stored counts (BUG-11). onRun, if set, is called just before
+// this process starts indexing.
+func (e *Engine) IndexIfStale(ctx context.Context, dir string, onRun func(Status)) (IndexResult, error) {
+	res, err := e.index(ctx, dir, func(ctx context.Context) (bool, error) {
+		stale, err := e.IndexNeedsRefresh(ctx)
+		if err == nil && stale && onRun != nil {
+			st, _ := e.store.Status(ctx)
+			onRun(st)
+		}
+		return stale, err
+	})
+	if err == nil && res.AlreadyCurrent {
+		if st, serr := e.store.Status(ctx); serr == nil {
+			res.SymbolCount, res.EdgeCount, res.FilesSeen = st.SymbolCount, st.EdgeCount, st.FilesIndexed
+		}
+	}
+	return res, err
+}
+
+func (e *Engine) index(ctx context.Context, dir string, stillNeeded func(context.Context) (bool, error)) (IndexResult, error) {
 	if dir == "" {
 		dir = e.root
 	}
@@ -327,6 +354,7 @@ func (e *Engine) Index(ctx context.Context, dir string) (IndexResult, error) {
 	// exists yet, the first query rehydrates lazily via currentGraph.
 	resident := !e.cfg.OneShot
 	opts := index.Options{SkipNoopGraph: true, Force: e.force, Vacuum: e.cfg.VacuumAfterIndex, DeferSpliceCheck: resident, Resident: resident}
+	opts.StillNeeded = stillNeeded
 	if e.cfg.MinEdgeConfidence != nil {
 		opts.MinConfidence, opts.MinConfidenceSet = *e.cfg.MinEdgeConfidence, true
 	}

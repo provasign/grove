@@ -83,6 +83,11 @@ type Options struct {
 	// answering and before their next index run.
 	DeferSpliceCheck bool
 
+	// StillNeeded, when set, is asked once the index lock is held. A false
+	// answer ends the run with Result.AlreadyCurrent: another process built
+	// the index while this one waited (parallel first commands, BUG-11).
+	StillNeeded func(ctx context.Context) (bool, error)
+
 	// Resident marks a long-lived caller: native analyzers may keep worker
 	// processes and caches between runs (see native.Config.Resident).
 	Resident bool
@@ -384,6 +389,16 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 		return nil, result, err
 	}
 	defer releaseIndexLock()
+	if opts.StillNeeded != nil {
+		needed, err := opts.StillNeeded(ctx)
+		if err != nil {
+			return nil, result, err
+		}
+		if !needed {
+			result.AlreadyCurrent = true
+			return nil, result, nil
+		}
+	}
 	// Only the lock holder writes run state: a second process queued on
 	// the lock must not overwrite the running index's phase.
 	prog.start(ctx)

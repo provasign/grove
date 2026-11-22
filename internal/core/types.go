@@ -234,6 +234,9 @@ type IndexResult struct {
 	EdgeCount    int      `json:"edgeCount"`
 	Errors       []string `json:"errors,omitempty"`
 	Native       []string `json:"native,omitempty"`
+	// AlreadyCurrent: the run was skipped because Options.StillNeeded
+	// reported the index current once the lock was held.
+	AlreadyCurrent bool `json:"alreadyCurrent,omitempty"`
 }
 
 type IsolatedChangeRegion struct {

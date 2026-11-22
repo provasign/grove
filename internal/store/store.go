@@ -77,6 +77,51 @@ func Open(root string) (*Store, error) {
 	}
 	ignoreItself(groveDir)
 	dbPath := filepath.Join(groveDir, "grove.db")
+	store, err := openRetryingBusy(groveDir, dbPath)
+	if err != nil {
+		return nil, err
+	}
+	// SQLite creates the db 0644 and WAL/SHM sidecars inherit its mode;
+	// tighten all three (best-effort) since they hold indexed source bodies.
+	// Unix-only for the same reason as the directory chmod above.
+	if runtime.GOOS != "windows" {
+		for _, name := range []string{"grove.db", "grove.db-wal", "grove.db-shm"} {
+			p := filepath.Join(groveDir, name)
+			if _, statErr := os.Stat(p); statErr == nil {
+				_ = os.Chmod(p, 0o600)
+			}
+		}
+	}
+	return store, nil
+}
+
+// openBusyWait bounds how long Open retries a database another process is
+// creating: the same 30 s as busy_timeout. Changing the journal mode of a
+// new file returns SQLITE_BUSY at once instead of waiting, so parallel
+// first commands on an unindexed repository failed (BUG-11).
+var openBusyWait = 30 * time.Second
+
+func openRetryingBusy(groveDir, dbPath string) (*Store, error) {
+	deadline := time.Now().Add(openBusyWait)
+	delay := 25 * time.Millisecond
+	for {
+		store, err := openOnce(groveDir, dbPath)
+		if err == nil || !isBusy(err) || time.Now().After(deadline) {
+			return store, err
+		}
+		time.Sleep(delay)
+		if delay < 500*time.Millisecond {
+			delay *= 2
+		}
+	}
+}
+
+func isBusy(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "SQLITE_BUSY") || strings.Contains(msg, "database is locked")
+}
+
+func openOnce(groveDir, dbPath string) (*Store, error) {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, diagnoseOpenErr(groveDir, dbPath, err)
@@ -105,17 +150,6 @@ func Open(root string) (*Store, error) {
 	if err := store.Migrate(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, diagnoseOpenErr(groveDir, dbPath, err)
-	}
-	// SQLite creates the db 0644 and WAL/SHM sidecars inherit its mode;
-	// tighten all three (best-effort) since they hold indexed source bodies.
-	// Unix-only for the same reason as the directory chmod above.
-	if runtime.GOOS != "windows" {
-		for _, name := range []string{"grove.db", "grove.db-wal", "grove.db-shm"} {
-			p := filepath.Join(groveDir, name)
-			if _, statErr := os.Stat(p); statErr == nil {
-				_ = os.Chmod(p, 0o600)
-			}
-		}
 	}
 	return store, nil
 }
