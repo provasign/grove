@@ -58,8 +58,9 @@ type goListPackage struct {
 	// thirdparty/tsobjc), and loading GoFiles alone made it an empty
 	// package named "" (stack audit 2026-10-20 #4).
 	CgoFiles    []string
-	TestGoFiles []string
-	Imports     []string
+	TestGoFiles  []string
+	XTestGoFiles []string
+	Imports      []string
 	// Test-file imports are reported separately by go list; the scoped-delta
 	// reverse-importer closure must include them or packages whose TESTS
 	// import a changed package are never re-analyzed and their test edges
@@ -231,30 +232,7 @@ func (goAnalyzer) Analyze(ctx context.Context, req Request) Result {
 		}
 	}
 
-	var edges []core.Edge
-	for _, pkg := range pkgs {
-		fromFiles := packageFiles(req.Root, pkg)
-		for _, imp := range pkg.Imports {
-			target, ok := pkgByImport[imp]
-			if !ok {
-				continue
-			}
-			for _, from := range fromFiles {
-				for _, to := range packageFiles(req.Root, target) {
-					if from == to {
-						continue
-					}
-					edges = append(edges, core.Edge{
-						From:       "file:" + from,
-						To:         "file:" + to,
-						Type:       core.EdgeImports,
-						Confidence: 0.98,
-						Source:     core.EvidenceSourceNative,
-					})
-				}
-			}
-		}
-	}
+	edges := goFileImportEdges(req.Root, pkgs, pkgByImport)
 	// Scope the expensive passes (per-package type-check, symbol sweeps) to
 	// the packages containing changed files plus their transitive reverse
 	// importers — an exported-signature change propagates to everything that
@@ -2260,4 +2238,67 @@ func groupFieldStores(stores []core.Edge) []core.Edge {
 		out = append(out, e)
 	}
 	return out
+}
+
+// goFileImportEdges links each Go file to the project packages it imports:
+// one edge per file of the imported package's library (test files excluded,
+// importing a package does not depend on its tests), carrying the import
+// spec's position. It reads only each file's import block.
+//
+// The edges were package-level until 2026-11-22: every file of a package,
+// tests included, imported every file of every package any of them
+// imported, with no position. prism arch then cited a test file that never
+// imported the package as the crossing, and could not say which line.
+func goFileImportEdges(root string, pkgs []goListPackage, pkgByImport map[string]goListPackage) []core.Edge {
+	libraryFiles := func(pkg goListPackage) []string {
+		var out []string
+		for _, name := range append(append([]string{}, pkg.GoFiles...), pkg.CgoFiles...) {
+			if rel, ok := relFile(root, filepath.Join(pkg.Dir, name)); ok {
+				out = append(out, rel)
+			}
+		}
+		return out
+	}
+	var edges []core.Edge
+	fset := token.NewFileSet()
+	for _, pkg := range pkgs {
+		names := append(append(append(append([]string{}, pkg.GoFiles...), pkg.CgoFiles...), pkg.TestGoFiles...), pkg.XTestGoFiles...)
+		for _, name := range names {
+			abs := filepath.Join(pkg.Dir, name)
+			from, ok := relFile(root, abs)
+			if !ok {
+				continue
+			}
+			f, _ := parser.ParseFile(fset, abs, nil, parser.ImportsOnly)
+			if f == nil {
+				continue
+			}
+			for _, spec := range f.Imports {
+				imp, err := strconv.Unquote(spec.Path.Value)
+				if err != nil {
+					continue
+				}
+				target, ok := pkgByImport[imp]
+				if !ok {
+					continue
+				}
+				pos := fset.Position(spec.Path.Pos())
+				lines := strconv.Itoa(pos.Line) + ":" + strconv.Itoa(pos.Column)
+				for _, to := range libraryFiles(target) {
+					if to == from {
+						continue
+					}
+					edges = append(edges, core.Edge{
+						From:       "file:" + from,
+						To:         "file:" + to,
+						Type:       core.EdgeImports,
+						Confidence: 0.98,
+						Source:     core.EvidenceSourceNative,
+						Lines:      lines,
+					})
+				}
+			}
+		}
+	}
+	return edges
 }
