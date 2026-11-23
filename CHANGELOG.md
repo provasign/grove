@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.64.1 - 2026-11-23
+
+**Fixes**
+- **The analysed Go package reports its own type errors.** Only imported packages used to say they were type-checked partially; a package whose edit broke it gave edges from a partial check with nothing to say so. Its first type error is now a `type-checked partially` diagnostic (cgo packages excepted). Prism flags such answers.
+- The Java external-reference test no longer needs Maven downloads (CI).
+
 ## v0.64.0 - 2026-11-23
 
 **Multi-repository support** (used by Prism's linked repositories)
