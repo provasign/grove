@@ -57,7 +57,7 @@ type goListPackage struct {
 	// all use cgo has GoFiles=[] and only CgoFiles (astkit's
 	// thirdparty/tsobjc), and loading GoFiles alone made it an empty
 	// package named "" (stack audit 2026-10-20 #4).
-	CgoFiles    []string
+	CgoFiles     []string
 	TestGoFiles  []string
 	XTestGoFiles []string
 	Imports      []string
@@ -538,6 +538,9 @@ func goSemanticEdges(ctx context.Context, root string, files []string, symbols [
 		decls []compilerDecl
 		pkg   *types.Package
 		err   error
+		// typeErr: the package's first type error; its edges come from a
+		// partial type-check (BUG-03).
+		typeErr string
 	}
 	// One type-check per package, not per directory: a directory holds its
 	// package and, beside it, the external test package (package x_test)
@@ -584,8 +587,8 @@ func goSemanticEdges(ctx context.Context, root string, files []string, symbols [
 					continue
 				}
 				u := units[di]
-				e, d, pkg, err := goSemanticPackageEdges(root, u.pkgPath, u.dir, u.files, symbolIdx, pkgDirsByImport, projectImporter)
-				outcomes[di] = dirOutcome{edges: e, decls: d, pkg: pkg, err: err}
+				e, d, pkg, typeErr, err := goSemanticPackageEdges(root, u.pkgPath, u.dir, u.files, symbolIdx, pkgDirsByImport, projectImporter)
+				outcomes[di] = dirOutcome{edges: e, decls: d, pkg: pkg, typeErr: typeErr, err: err}
 			}
 		}()
 	}
@@ -598,6 +601,11 @@ func goSemanticEdges(ctx context.Context, root string, files []string, symbols [
 		if o.err != nil {
 			diagnostics = append(diagnostics, "semantic package "+units[di].dir+" skipped: "+o.err.Error())
 			continue
+		}
+		if o.typeErr != "" {
+			// Same form as an imported package's partial check, so readers
+			// (prism's partialTypeCheck) see the analysed package too.
+			diagnostics = append(diagnostics, "project import "+units[di].pkgPath+" type-checked partially: "+clip(o.typeErr, 300))
 		}
 		edges = append(edges, o.edges...)
 		decls = append(decls, o.decls...)
@@ -617,6 +625,18 @@ func goSemanticEdges(ctx context.Context, root string, files []string, symbols [
 	diagnostics = append(diagnostics, "resolved "+itoa(countEdgesOfType(edges, core.EdgeCalls))+" native call edge(s)")
 	diagnostics = append(diagnostics, "resolved "+itoa(countEdgesOfType(edges, core.EdgeUsesType))+" native type-use edge(s)")
 	return edges, decls, diagnostics
+}
+
+// importsC reports whether any file imports "C" (cgo).
+func importsC(files []*ast.File) bool {
+	for _, f := range files {
+		for _, imp := range f.Imports {
+			if imp.Path != nil && imp.Path.Value == `"C"` {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // goPackageGroup is the files of one package clause in a directory.
@@ -695,7 +715,7 @@ func goPackageGroups(root string, files []string) []goPackageGroup {
 // (goExternalContracts), which runs once every type-check goroutine is
 // done: imported packages are shared and their scopes fill in lazily while
 // other goroutines type-check.
-func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx goSymbolIndex, pkgDirsByImport map[string][]string, projectImporter types.Importer) ([]core.Edge, []compilerDecl, *types.Package, error) {
+func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx goSymbolIndex, pkgDirsByImport map[string][]string, projectImporter types.Importer) ([]core.Edge, []compilerDecl, *types.Package, string, error) {
 	fset := token.NewFileSet()
 	parsed := make([]*ast.File, 0, len(files))
 	for _, file := range files {
@@ -709,7 +729,7 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 			if err == nil {
 				err = fmt.Errorf("%s: no syntax tree", file)
 			}
-			return nil, nil, nil, err
+			return nil, nil, nil, "", err
 		}
 		parsed = append(parsed, f)
 	}
@@ -719,9 +739,14 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 		Selections: map[*ast.SelectorExpr]*types.Selection{},
 		Types:      map[ast.Expr]types.TypeAndValue{},
 	}
+	firstTypeErr := ""
 	conf := types.Config{
 		Importer: projectImporter,
-		Error:    func(error) {},
+		Error: func(err error) {
+			if firstTypeErr == "" {
+				firstTypeErr = err.Error()
+			}
+		},
 		// cgo files are checked as written, so positions stay those of the
 		// user's source (no cgo-generated files): `import "C"` declares an
 		// empty package and C.x references are untyped, as the dependency
@@ -993,7 +1018,12 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 	}
 	out = append(out, ifaceCalls.edgesOf(core.EdgeExternalIfaceCall)...)
 	out = append(out, extRefs.edgesOf(core.EdgeExternalRef)...)
-	return append(out, groupFieldStores(fieldStores)...), decls, pkg, nil
+	if importsC(parsed) {
+		// FakeImportC leaves every C.x reference untyped, so a cgo package
+		// always has type errors; they are not a partial analysis.
+		firstTypeErr = ""
+	}
+	return append(out, groupFieldStores(fieldStores)...), decls, pkg, firstTypeErr, nil
 }
 
 // goExternalIfaceCallKey names a call through a library interface's method
