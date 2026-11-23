@@ -42,7 +42,7 @@ func CurrentCapabilities() CapabilityManifest {
 			{Language: "javascript", Indexing: "precise", Resolution: "measured", NativeCeiling: "precise", Limitations: "native ceiling requires a project-local TypeScript compiler"},
 			{Language: "typescript", Indexing: "precise", Resolution: "measured", NativeCeiling: "precise", Limitations: "native ceiling requires a project-local TypeScript compiler"},
 			{Language: "tsx", Indexing: "precise", Resolution: "measured", Limitations: "JSX component usage and path aliases are incomplete"},
-			{Language: "java", Indexing: "precise", Resolution: "measured", Limitations: "native analysis is structural, not compiler call resolution"},
+			{Language: "java", Indexing: "precise", Resolution: "measured", Limitations: "calls resolve through javac attribution when the project's Maven or Gradle classpath resolves (trusted repositories only); otherwise analysis is structural"},
 			{Language: "rust", Indexing: "precise", Resolution: "measured", Limitations: "cargo metadata is structural, not compiler call resolution"},
 			{Language: "c", Indexing: "precise", Resolution: "measured", Limitations: "native analysis is structural unless compiler evidence is available"},
 			{Language: "cpp", Indexing: "precise", Resolution: "measured", Limitations: "templates, overloads, and macros can degrade resolution"},
