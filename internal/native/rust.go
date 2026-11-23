@@ -131,6 +131,15 @@ func (rustAnalyzer) Analyze(ctx context.Context, req Request) Result {
 		edges = append(edges, cached...)
 		res.Diagnostics = append(res.Diagnostics, "rust-analyzer edges reused from the last run ("+why+"): "+itoa(len(cached)))
 	}
+	if untrustedMode(req.Root) {
+		// rust-analyzer (resident or scip) runs the crate's build scripts and
+		// proc macros: repository code. Untrusted mode keeps the cargo
+		// metadata and parser edges only (SEC-01).
+		res.Diagnostics = append(res.Diagnostics, "rust-analyzer pass skipped: untrusted mode will not run this repository's build scripts or proc macros")
+		reuse("untrusted mode")
+		res.Edges = edges
+		return rustPartialAll(req, res)
+	}
 	macroFiles := rustItemMacroFiles(req.Root, req.Files, req.Symbols)
 	if workerEdges, why, ok := rustWorkerUpdate(ctx, req, record, macroFiles); ok {
 		edges = append(edges, workerEdges...)

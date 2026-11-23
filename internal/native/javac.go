@@ -138,7 +138,7 @@ func (j *jdk) env() []string {
 // gwt module needs a test jar the reactor has not built) used to fail the
 // whole command and leave every module without library types.
 func javacClasspath(ctx context.Context, j *jdk, root, tmp string) (string, string) {
-	if untrustedMode() {
+	if untrustedMode(root) {
 		// Maven and Gradle both execute repository-defined build logic.
 		return "", "build-tool classpath skipped in untrusted mode; external types unresolved"
 	}

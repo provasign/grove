@@ -32,8 +32,12 @@ func (pythonAnalyzer) Analyze(ctx context.Context, req Request) Result {
 		return Result{Diagnostics: []string{"failed to encode file list: " + err.Error()}}
 	}
 	name := firstExistingExecutable("python3", "python")
-	cmd := exec.CommandContext(ctx, name, "-c", `
-import ast, json, os, sys
+	// -I (isolated): python -c puts the working directory, the repository,
+	// first on sys.path, so a repository file named json.py or ast.py was
+	// imported in place of the standard library (SEC-01). The script reads
+	// the root from os.getcwd() and inserts it for resolution only.
+	cmd := exec.CommandContext(ctx, name, "-I", "-c", `
+import ast, functools, json, os, sys
 from importlib.machinery import PathFinder
 root = os.getcwd()
 files = json.loads(os.environ.get("GROVE_FILES", "[]"))
@@ -139,7 +143,6 @@ def add_types(rel, from_name, from_line, node, seen, imported_names, imported_mo
             types.append({"from": rel, "fromName": from_name, "fromLine": from_line,
                           "to": target_file, "toName": target_name,
                           "localImport": imported is not None})
-import functools
 @functools.lru_cache(maxsize=None)
 def find_spec_no_import(mod):
     # importlib.util.find_spec imports parent packages for dotted names,

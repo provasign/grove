@@ -32,7 +32,7 @@ var goWorkDisabled sync.Map
 // repository and was never honored here. Untrusted mode never follows a
 // file outside the repository.
 func goWorkspaceFor(root string) (goWorkspace, bool) {
-	if untrustedMode() {
+	if untrustedMode(root) {
 		return goWorkspace{}, false
 	}
 	root = cleanResolved(root)

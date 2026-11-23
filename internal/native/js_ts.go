@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/provasign/grove/internal/core"
@@ -74,9 +75,35 @@ func (jsTSAnalyzer) Languages() []string {
 // toolchains (a hostile node_modules/typescript executes on require()) and
 // cuts network access. Set GROVE_UNTRUSTED=1 (or prism's --untrusted).
 // Independent of this, secrets are ALWAYS scrubbed from analyzer subprocesses.
-func untrustedMode() bool {
+func untrustedMode(root string) bool {
 	v := strings.ToLower(strings.TrimSpace(os.Getenv("GROVE_UNTRUSTED")))
-	return v == "1" || v == "true" || v == "yes" || v == "on"
+	if v == "1" || v == "true" || v == "yes" || v == "on" {
+		return true
+	}
+	return untrustedRoot(root)
+}
+
+// untrustedRoots holds repository roots an engine opened as untrusted
+// (Config.Untrusted). Trust is per root: a process may hold engines for a
+// trusted repository and an untrusted linked one (SEC-01).
+var untrustedRoots sync.Map
+
+// SetUntrusted marks root as untrusted (or clears it) for every analyzer.
+func SetUntrusted(root string, untrusted bool) {
+	key := filepath.Clean(root)
+	if untrusted {
+		untrustedRoots.Store(key, true)
+	} else {
+		untrustedRoots.Delete(key)
+	}
+}
+
+func untrustedRoot(root string) bool {
+	if root == "" {
+		return false
+	}
+	_, ok := untrustedRoots.Load(filepath.Clean(root))
+	return ok
 }
 
 // tsUntrustedSkipReason explains why type-analysis is skipped in untrusted
@@ -94,7 +121,7 @@ func (jsTSAnalyzer) Available(_ context.Context, root string) Availability {
 	// tool. Untrusted: resolve from a neutral cwd so a repo-resident typescript
 	// is never on the module path.
 	cwd := root
-	if untrustedMode() {
+	if untrustedMode(root) {
 		cwd = neutralNodeCWD()
 	}
 	cmd := exec.Command("node", "-e", "process.stdout.write(require.resolve('typescript'))")
@@ -107,7 +134,7 @@ func (jsTSAnalyzer) Available(_ context.Context, root string) Availability {
 		}
 	}
 	if err != nil {
-		if untrustedMode() {
+		if untrustedMode(root) {
 			return Availability{Reason: tsUntrustedSkipReason}
 		}
 		if plainJavaScriptProject(root) {
@@ -237,7 +264,7 @@ func (jsTSAnalyzer) Analyze(ctx context.Context, req Request) Result {
 	// reaches the script via GROVE_ROOT. appendEnv scrubs grove's secrets from
 	// the subprocess environment in BOTH modes.
 	dir := req.Root
-	if untrustedMode() {
+	if untrustedMode(req.Root) {
 		dir = neutralNodeCWD()
 	}
 	var out []byte
@@ -1409,7 +1436,7 @@ func WarmTSWorker(ctx context.Context, root string, files []string) {
 		return
 	}
 	dir := root
-	if untrustedMode() {
+	if untrustedMode(root) {
 		dir = neutralNodeCWD()
 	}
 	request, err := jsonMarshal(map[string]any{"root": root, "files": files, "warm": true})

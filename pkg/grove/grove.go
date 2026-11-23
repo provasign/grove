@@ -91,6 +91,11 @@ type Config struct {
 	// rebuilt binary whose stamps were not bumped is otherwise scored against
 	// the previous run's persisted edges.
 	ForceIndex bool
+	// Untrusted: analyzers must not run anything the repository supplies
+	// (its gradlew or Maven build, its own typescript, rust-analyzer build
+	// scripts and proc macros, a go toolchain switch, module downloads).
+	// Per root; GROVE_UNTRUSTED=1 still forces it process-wide (SEC-01).
+	Untrusted bool
 	// VacuumAfterIndex compacts the database after every Index write.
 	VacuumAfterIndex bool
 	// MinEdgeConfidence, when non-nil, sets (or with 0 clears) the persisted
@@ -167,6 +172,7 @@ func Open(ctx context.Context, cfg Config) (*Engine, error) {
 	if cfg.RepoRoot == "" {
 		return nil, errors.New("grove: RepoRoot is required")
 	}
+	native.SetUntrusted(cfg.RepoRoot, cfg.Untrusted)
 	// store.Open runs schema migrations itself; no second Migrate needed.
 	st, err := store.Open(cfg.RepoRoot)
 	if err != nil {

@@ -404,7 +404,7 @@ func goAnalyzerEnv(root string) []string {
 		gowork = "GOWORK=" + ws.file
 	}
 	env := scrubbedEnv("GOTOOLCHAIN=local", "GOFLAGS=-mod=readonly", gowork)
-	if untrustedMode() {
+	if untrustedMode(root) {
 		// Cut network module fetches so a hostile go.mod cannot drive egress to
 		// attacker-named modules. In trusted mode the operator's GOPROXY (from
 		// the allowlist) is honored so dependency resolution works normally.

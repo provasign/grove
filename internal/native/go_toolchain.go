@@ -102,7 +102,7 @@ type goToolchain struct {
 // oldest cached one that does. ok=false keeps the go on PATH (it is new
 // enough, nothing suitable is cached, or the repository is untrusted).
 func goToolchainFor(root string) (goToolchain, bool) {
-	if untrustedMode() {
+	if untrustedMode(root) {
 		return goToolchain{}, false
 	}
 	loadGoLocalEnv()
