@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.64.0 - 2026-11-23
+
+**Multi-repository support** (used by Prism's linked repositories)
+- **External references:** Go, TypeScript, Java and Python record calls, type uses and value references into other modules, npm packages, artifacts and distributions as external references, so a consumer in another repository can be found from the symbol it uses.
+- **Build manifests:** go.mod, package.json, Cargo, Python (pyproject, requirements.txt), Maven, Gradle and Composer manifests, including packages below the root, are read for declared packages and requirements.
+- **Read-only index reader:** lists every external reference and symbol (for link bundles), the methods implementing another module's interface, and which compiler passes completed.
+- **Stamps:** an index records the commit, branch and linked-repository set it was built from; the Go pass re-runs when the workspace it was built against changes, and follows a go.work above the repository.
+
+**Security**
+- **Untrusted mode per root:** for a repository the user has not trusted, the repository's own build tools (Maven/Gradle, TypeScript, rust-analyzer build scripts, a pinned Go toolchain) do not run; the Python pass is isolated.
+- **FIFOs no longer hang indexing:** the walk skips FIFOs, sockets and devices, and the language sniffer opens regular files only.
+
+**Fixes**
+- Go: same-named types in different packages no longer merge; a type used as an interface stays in its family after it gains a method; each package clause type-checks on its own; import edges are per file and skip the imported package's tests; export-data panics are recovered; a clean standalone listing beats a workspace with load errors.
+- Parallel first commands open and build the index once; `RemoveIndex` runs under the index lock, and hints name `index --force`.
+- rename-plan and missing-implementations take the declaring-file scope.
+- A first index says "no native edges yet", not "carried forward"; TypeScript 7 is skipped by name.
+- The capability manifest says Java resolves through javac when the project's classpath does.
+
 ## v0.63.27 - 2026-11-05
 
 **Fixes**
