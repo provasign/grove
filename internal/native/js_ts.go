@@ -108,7 +108,7 @@ func untrustedRoot(root string) bool {
 
 // tsUntrustedSkipReason explains why type-analysis is skipped in untrusted
 // mode, so an operator does not mistake the tree-sitter degrade for a bug.
-const tsUntrustedSkipReason = "TypeScript type-analysis skipped: untrusted mode will not load this repo's own typescript (it could run code on load). Tree-sitter symbol/structure analysis IS active. For full type-resolved edges, index this repo without GROVE_UNTRUSTED, or install typescript outside the repo."
+const tsUntrustedSkipReason = "TypeScript type-analysis skipped: untrusted mode will not load this repo's own typescript (it could run code on load). Tree-sitter symbol/structure analysis IS active. For full type-resolved edges, mark the repository trusted (prism trust) and unset GROVE_UNTRUSTED, or install typescript outside the repo."
 
 func (jsTSAnalyzer) Available(_ context.Context, root string) Availability {
 	if !anyFile(root, "package.json", "tsconfig.json", "jsconfig.json") {
