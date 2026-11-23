@@ -156,6 +156,11 @@ func DetectLanguageFile(path string) string {
 	if strings.HasPrefix(base, ".") {
 		return "" // dotfiles are config, not PDS members
 	}
+	// Open only regular files: opening a FIFO for reading blocks until a
+	// writer appears, which hung every index of a repository holding one.
+	if fi, err := os.Stat(path); err != nil || !fi.Mode().IsRegular() {
+		return ""
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return ""

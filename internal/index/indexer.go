@@ -507,6 +507,10 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 				return nil
 			}
 		}
+		// Sockets, FIFOs and devices are not source; opening a FIFO blocks.
+		if t := entry.Type(); t&(os.ModeNamedPipe|os.ModeSocket|os.ModeDevice|os.ModeCharDevice|os.ModeIrregular) != 0 {
+			return nil
+		}
 		if !parser.SupportedFile(path) {
 			return nil
 		}
