@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -544,6 +545,7 @@ func TestExternalRefsJava(t *testing.T) {
 	if !native.HasJDK() {
 		t.Skip("no JDK")
 	}
+	noMaven(t)
 	ctx := context.Background()
 	parent, _ := filepath.EvalSymlinks(t.TempDir())
 	lib, app := filepath.Join(parent, "lib"), filepath.Join(parent, "app")
@@ -723,4 +725,21 @@ func TestExternalRefsExternalTestPackageFirst(t *testing.T) {
 			t.Errorf("missing reference at %s; got %v", w, got)
 		}
 	}
+}
+
+// noMaven puts a failing mvn first on PATH. The fixtures' pom.xml needs no
+// library classpath (javac reads the linked library's sources), and on a
+// fresh CI runner the online classpath fetch downloaded Maven plugins for
+// longer than the test timeout.
+func noMaven(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	name, body := "mvn", "#!/bin/sh\nexit 1\n"
+	if runtime.GOOS == "windows" {
+		name, body = "mvn.cmd", "@exit /b 1\r\n"
+	}
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
