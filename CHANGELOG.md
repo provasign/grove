@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.64.2 - 2026-11-25
+
+**Added**
+- **`CheckIntegrity`** opens an index read-only, runs SQLite's `integrity_check` and compares the stamped extractor and resolver versions with this build's. Prism's `doctor --integrity` uses it.
+- **`WalkFilter`** exposes the indexer's rules for which directories and files it reads (`.gitignore` and `.groveignore` at every level, the built-in skip list, Python environments, sensitive paths). The indexer now uses the same type, so a watcher built on it reacts to exactly the files `Index` reads.
+
 ## v0.64.1 - 2026-11-23
 
 **Fixes**

@@ -408,8 +408,7 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 	// before walking, so they are neither indexed nor left to grow.
 	native.CleanupLegacyCaches(root)
 	currentFiles := map[string]bool{}
-	ignore := newIgnoreMatcher(root)
-	skipDirs := parser.NewDirSkipper(root)
+	filter := NewDirFilter(root)
 
 	// Phase 1 (serial): walk the tree, apply ignore/sensitivity rules, and
 	// collect the files whose content hash changed since the last index.
@@ -463,15 +462,11 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 		relPath = filepath.ToSlash(relPath)
 
 		if entry.IsDir() {
-			if path != root && (skipDirs.Skip(relPath, entry.Name()) ||
-				ignore.Ignored(relPath, true) || isPythonEnvDir(path, entry.Name())) {
-				return filepath.SkipDir
-			}
-			// Nested ignore files apply from this directory downward;
+			// Enter loads nested ignore files from this directory downward;
 			// WalkDir visits parents first, so deeper rules land later and
 			// override (gitignore last-match-wins).
-			if path != root {
-				ignore.LoadDir(path, relPath)
+			if path != root && !filter.Enter(path) {
+				return filepath.SkipDir
 			}
 			return nil
 		}
@@ -486,7 +481,7 @@ func (i *Indexer) indexWithOptions(ctx context.Context, root string, opts Option
 				compilerInputs[relPath] = info
 			}
 		}
-		if ignore.Ignored(relPath, false) {
+		if filter.ignore.Ignored(relPath, false) {
 			return nil
 		}
 		// A symlinked FILE entry inside root can point anywhere; WalkDir

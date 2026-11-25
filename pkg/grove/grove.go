@@ -491,6 +491,49 @@ func QuickStatus(ctx context.Context, repoRoot string) (Status, error) {
 	return st.Status(ctx)
 }
 
+// IntegrityReport is the result of CheckIntegrity.
+type IntegrityReport struct {
+	// Problems lists what SQLite's integrity_check found; empty when the
+	// database file is sound.
+	Problems []string `json:"problems"`
+	// The engine versions stamped into the index, and the ones this build
+	// writes. A mismatch means the next index rebuilds the graph.
+	ExtractorVersion     string `json:"extractorVersion"`
+	WantExtractorVersion string `json:"wantExtractorVersion"`
+	ResolverVersion      string `json:"resolverVersion"`
+	WantResolverVersion  string `json:"wantResolverVersion"`
+}
+
+// Stale reports whether the index was built by a different engine version.
+func (r IntegrityReport) Stale() bool {
+	return r.ExtractorVersion != r.WantExtractorVersion || r.ResolverVersion != r.WantResolverVersion
+}
+
+// CheckIntegrity opens repoRoot's index read-only, runs SQLite's integrity
+// check on it and compares its stamped engine versions with this build's. It
+// writes nothing and fails when the repository has no index.
+func CheckIntegrity(ctx context.Context, repoRoot string) (IntegrityReport, error) {
+	if repoRoot == "" {
+		return IntegrityReport{}, errors.New("grove: RepoRoot is required")
+	}
+	st, err := store.OpenReadOnly(repoRoot)
+	if err != nil {
+		return IntegrityReport{}, err
+	}
+	defer func() { _ = st.Close() }()
+	r := IntegrityReport{WantExtractorVersion: parser.ExtractorVersion, WantResolverVersion: graph.ResolverVersion}
+	if r.Problems, err = st.IntegrityCheck(ctx); err != nil {
+		return r, err
+	}
+	if r.ExtractorVersion, _, err = st.GetMeta(ctx, "extractor-version"); err != nil {
+		return r, err
+	}
+	if r.ResolverVersion, _, err = st.GetMeta(ctx, "resolver-version"); err != nil {
+		return r, err
+	}
+	return r, nil
+}
+
 // Symbols returns symbols whose name/qualified-name matches query (substring).
 // This is the only lexical/name search Engine exposes: the embedding-based
 // Query/Semantic ops were removed (measured: an agent guessing one keyword

@@ -460,6 +460,30 @@ func (s *Store) GetMeta(ctx context.Context, key string) (string, bool, error) {
 	return v, true, nil
 }
 
+// IntegrityCheck runs SQLite's PRAGMA integrity_check and returns the
+// problems it reports, or nil when the database file is sound.
+func (s *Store) IntegrityCheck(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `PRAGMA integrity_check`)
+	if err != nil {
+		return nil, fmt.Errorf("integrity check: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var problems []string
+	for rows.Next() {
+		var line string
+		if err := rows.Scan(&line); err != nil {
+			return nil, fmt.Errorf("integrity check: %w", err)
+		}
+		if line != "ok" {
+			problems = append(problems, line)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("integrity check: %w", err)
+	}
+	return problems, nil
+}
+
 // SetMeta writes one key into the meta table.
 func (s *Store) SetMeta(ctx context.Context, key, value string) error {
 	_, err := s.db.ExecContext(ctx,
