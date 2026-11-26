@@ -188,7 +188,14 @@ func FileBlobSHA(path string) (string, error) {
 	// into RAM (OOM the indexer) and a named pipe / device named x.go blocks
 	// os.ReadFile forever (hang the index) — both trivially plantable in an
 	// untrusted repo. Reject non-regular files and cap the read.
-	info, err := os.Lstat(path)
+	//
+	// os.Stat, not Lstat: the walker indexes a symlinked file whose target
+	// stays inside root (it rejects escaping links before this), and the
+	// target is what must be a regular file. Lstat refused every such link
+	// as "not a regular file", so a repo's symlinked README.md or CLAUDE.md
+	// was reported as an index failure on every refresh (zod, 2026-11-26).
+	// A link to a FIFO or device still fails here: Stat reports the target.
+	info, err := os.Stat(path)
 	if err != nil {
 		return "", err
 	}
