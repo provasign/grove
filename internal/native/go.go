@@ -721,8 +721,34 @@ func goPackageGroups(root string, files []string) []goPackageGroup {
 // (goExternalContracts), which runs once every type-check goroutine is
 // done: imported packages are shared and their scopes fill in lazily while
 // other goroutines type-check.
+// goHostBuildOrder puts the files the host build includes first and returns
+// the absolute paths of those it excludes (//go:build lines, _GOOS/_GOARCH
+// name suffixes). Every file is still analysed, so a platform variant keeps
+// its edges, but go/types declares the host's version of a per-platform
+// function first: the variant's duplicate is the one reported as
+// redeclared, and errors in files the host build excludes are not type
+// errors of the package the host builds.
+func goHostBuildOrder(root string, files []string) ([]string, map[string]bool) {
+	var host, other []string
+	offHost := map[string]bool{}
+	for _, file := range files {
+		abs := filepath.Join(root, file)
+		if ok, err := build.Default.MatchFile(filepath.Dir(abs), filepath.Base(abs)); err == nil && !ok {
+			other = append(other, file)
+			offHost[abs] = true
+			continue
+		}
+		host = append(host, file)
+	}
+	if len(other) == 0 {
+		return files, nil
+	}
+	return append(host, other...), offHost
+}
+
 func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx goSymbolIndex, pkgDirsByImport map[string][]string, projectImporter types.Importer) ([]core.Edge, []compilerDecl, *types.Package, string, error) {
 	fset := token.NewFileSet()
+	files, offHost := goHostBuildOrder(root, files)
 	parsed := make([]*ast.File, 0, len(files))
 	for _, file := range files {
 		abs := filepath.Join(root, file)
@@ -749,6 +775,13 @@ func goSemanticPackageEdges(root, pkgPath, dir string, files []string, symbolIdx
 	conf := types.Config{
 		Importer: projectImporter,
 		Error: func(err error) {
+			if te, ok := err.(types.Error); ok {
+				// A continuation ("\tother declaration of X") belongs to
+				// the error before it, which is reported or dropped on its own.
+				if strings.HasPrefix(te.Msg, "\t") || offHost[fset.Position(te.Pos).Filename] {
+					return
+				}
+			}
 			if firstTypeErr == "" {
 				firstTypeErr = err.Error()
 			}

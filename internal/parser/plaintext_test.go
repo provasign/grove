@@ -144,8 +144,8 @@ func TestExtractPlaintext_BasicMarkdown(t *testing.T) {
 	if r.Span.Start != 1 {
 		t.Errorf("Span.Start = %d, want 1", r.Span.Start)
 	}
-	if r.Span.End != 4 { // 4 lines: "# My Document", "", "Some content here.", ""
-		t.Errorf("Span.End = %d, want 4", r.Span.End)
+	if r.Span.End != 3 { // 3 lines: "# My Document", "", "Some content here."; the final newline ends line 3
+		t.Errorf("Span.End = %d, want 3", r.Span.End)
 	}
 	if r.TokenEstimate == 0 {
 		t.Error("TokenEstimate should be non-zero for non-empty content")
@@ -203,7 +203,9 @@ func TestExtractPlaintext_LineCount(t *testing.T) {
 	}{
 		{"line1\nline2\nline3", 3},
 		{"single line", 1},
-		{"a\nb\nc\nd\n", 5}, // trailing newline creates empty final element
+		{"a\nb\nc\nd\n", 4}, // a final newline ends the last line; it does not start a new one
+		{"one line\n", 1},
+		{"a\n\n", 2}, // a blank last line still counts
 		{"", 1},             // empty string splits to [""], giving 1 line
 	}
 	for _, c := range cases {

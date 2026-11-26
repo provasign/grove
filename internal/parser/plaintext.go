@@ -53,9 +53,20 @@ func ExtractPlaintext(relPath, blobSHA string, content []byte) []core.SymbolReco
 		Signature:     plaintextSignature(lines),
 		Docstring:     docstring,
 		RawText:       rawText,
-		Span:          core.LineRange{Start: 1, End: len(lines)},
+		Span:          core.LineRange{Start: 1, End: plaintextLineCount(lines)},
 		TokenEstimate: len(content) / 4,
 	}}
+}
+
+// plaintextLineCount counts lines the way an editor does: the empty element
+// strings.Split leaves after a final newline is not a line. An empty file is
+// still one (empty) line, so the span stays valid.
+func plaintextLineCount(lines []string) int {
+	n := len(lines)
+	if n > 1 && lines[n-1] == "" {
+		n--
+	}
+	return n
 }
 
 // plaintextSignature returns the first meaningful content line, stripped of

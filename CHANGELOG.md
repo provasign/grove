@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.64.4 - 2026-11-26
+
+**Fixes**
+- **A per-platform Go function is not a redeclaration.** Files for another platform (`//go:build !unix`, `_windows.go`) are analysed with the host's files, so their edges are kept, but they were type-checked as one package with the host's: the same function declared once per platform read as "redeclared in this block" and the package as type-checked partially (prism's `handoff_check_unix.go`). Host files are now checked first, and type errors located in files the host build excludes are not the package's errors.
+- **A plaintext document's span ends at its last line.** A final newline counted as one more line, so a one-line markdown file spanned 1-2. The extractor version changes, so existing indexes rebuild.
+
 ## v0.64.3 - 2026-11-25
 
 **Fixes**

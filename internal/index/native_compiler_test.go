@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -702,8 +703,8 @@ func TestGoUnlistedDirectoryImportsProjectPackages(t *testing.T) {
 		t.Skip("go not found")
 	}
 	_, diags, _ := compilerFixture(t, map[string]string{
-		"go.mod": "module example.com/chi\n\ngo 1.22\n",
-		"mux.go": "package chi\n\nfunc NewRouter() int { return 1 }\n",
+		"go.mod":               "module example.com/chi\n\ngo 1.22\n",
+		"mux.go":               "package chi\n\nfunc NewRouter() int { return 1 }\n",
 		"middleware/logger.go": "package middleware\n\nfunc Logger() string { return \"log\" }\n",
 		"_examples/hello/main.go": `package main
 
@@ -720,4 +721,30 @@ func main() { _ = chi.NewRouter(); _ = middleware.Logger() }
 			t.Errorf("unlisted directory's project import refused: %s", d)
 		}
 	}
+}
+
+// Files for other platforms are analysed with the host's files, so their
+// edges are kept, but they are not part of the host build: the same function
+// declared once per platform is not a "redeclared" type error, and a call in
+// a host file still resolves to the host declaration.
+func TestGoPlatformFilesAreNotRedeclarations(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go not found")
+	}
+	other, host := "!unix", "unix"
+	if runtime.GOOS == "windows" {
+		other, host = "unix", "!unix"
+	}
+	got, diags, _ := compilerFixture(t, map[string]string{
+		"go.mod":     "module example.com/h\n\ngo 1.22\n",
+		"a_other.go": "//go:build " + other + "\n\npackage h\n\nfunc binaryOK() bool { return false }\n",
+		"b_host.go":  "//go:build " + host + "\n\npackage h\n\nfunc binaryOK() bool { return check() }\n\nfunc check() bool { return true }\n",
+		"use.go":     "package h\n\nfunc Use() bool { return binaryOK() }\n",
+	})
+	for _, d := range diags {
+		if strings.Contains(d, "redeclared") || strings.Contains(d, "type-checked partially") {
+			t.Errorf("platform variant reported as a type error: %s", d)
+		}
+	}
+	wantEdges(t, got, diags, "Use→binaryOK calls", "binaryOK→check calls")
 }
