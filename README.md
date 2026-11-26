@@ -25,7 +25,7 @@ curl -fsSL https://raw.githubusercontent.com/provasign/grove/main/install.sh | b
 irm https://raw.githubusercontent.com/provasign/grove/main/install.ps1 | iex
 
 # Pin the current release
-curl -fsSL https://raw.githubusercontent.com/provasign/grove/v0.64.2/install.sh | VERSION=v0.64.2 bash
+curl -fsSL https://raw.githubusercontent.com/provasign/grove/v0.64.3/install.sh | VERSION=v0.64.3 bash
 ```
 
 The installer writes to `~/bin` by default. Set `INSTALL_DIR` to choose another location.

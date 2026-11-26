@@ -15,7 +15,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
-	"strings"
 	"sync"
 )
 
@@ -47,10 +46,7 @@ func newGoProjectImporter(packages []goListPackage, deps goDeps) *goProjectImpor
 	var fallback types.Importer = importer.Default()
 	exports := deps.exports
 	if len(exports) > 0 {
-		fallback = &exportDataImporter{exports: exports, fallback: fallback, root: deps.root, listed: map[string]bool{},
-			gc: importer.ForCompiler(token.NewFileSet(), "gc", func(path string) (io.ReadCloser, error) {
-				return os.Open(exports[path])
-			})}
+		fallback = newExportDataImporter(exports, deps.root, fallback)
 	} else if deps.source != nil {
 		fallback = deps.source
 	}
@@ -74,17 +70,27 @@ func newGoProjectImporter(packages []goListPackage, deps goDeps) *goProjectImpor
 // project package's type had no selection: the compiler pass resolved no
 // cross-package method call, and name matching linked each one to every
 // same-named method (prism: graphui and httpapi Server.Handler, 2026-11-22).
-func (p *goProjectImporter) preloadProjectImports(importPaths []string) []string {
+//
+// unlistedImports are the imports of analyzed directories go list does not
+// list (a directory go ignores, such as chi's _examples): they are checked
+// too, and their project imports were refused once sealed, which read as
+// missing module downloads (2026-11-25).
+func (p *goProjectImporter) preloadProjectImports(importPaths, unlistedImports []string) []string {
 	defer func() { p.sealed = true }()
 	paths := append([]string(nil), importPaths...)
 	sort.Strings(paths)
 	var diagnostics []string
+	importSets := [][]string{}
 	for _, path := range paths {
 		pkg, ok := p.packages[path]
 		if !ok {
 			continue
 		}
-		imports := append(append([]string(nil), pkg.Imports...), pkg.TestImports...)
+		importSets = append(importSets, append(append([]string(nil), pkg.Imports...), pkg.TestImports...))
+	}
+	importSets = append(importSets, unlistedImports)
+	for _, imports := range importSets {
+		imports = append([]string(nil), imports...)
 		sort.Strings(imports)
 		for _, imported := range imports {
 			if _, local := p.packages[imported]; !local {
@@ -238,6 +244,14 @@ func (p *goProjectImporter) load(path string) (loaded *types.Package, err error)
 // api/prometheus/v1/example_test.go importing prometheus/common/config,
 // 2026-11-13) left that test untyped. Such a path is listed on first use,
 // with its own dependencies; that compiles only what the tests add.
+//
+// One compiler importer reads all export data, so every package has one
+// instance. A standard-library package only tests import (net/http/httptest)
+// used to go to importer.Default, which keeps its own packages: its net/http
+// was a second copy, and passing a project http.Handler to
+// httptest.NewServer failed to type-check ("*Mux does not implement
+// http.Handler", chi and prism, 2026-11-25). The default importer is now
+// only for a path go list cannot produce export data for.
 // Not safe for concurrent use; the project importer calls it under a mutex.
 type exportDataImporter struct {
 	exports  map[string]string
@@ -247,8 +261,17 @@ type exportDataImporter struct {
 	listed   map[string]bool
 }
 
-func (e *exportDataImporter) Import(path string) (*types.Package, error) {
-	if e.exports[path] == "" && e.root != "" && !e.listed[path] && strings.Contains(strings.SplitN(path, "/", 2)[0], ".") {
+func newExportDataImporter(exports map[string]string, root string, fallback types.Importer) *exportDataImporter {
+	e := &exportDataImporter{exports: exports, fallback: fallback, root: root, listed: map[string]bool{}}
+	e.gc = importer.ForCompiler(token.NewFileSet(), "gc", e.lookup)
+	return e
+}
+
+// lookup opens a package's export data, listing the path first when the
+// build-graph listing did not cover it. The compiler importer calls it for
+// every package it reads, dependencies of export data included.
+func (e *exportDataImporter) lookup(path string) (io.ReadCloser, error) {
+	if e.exports[path] == "" && e.root != "" && !e.listed[path] && path != "C" && path != "unsafe" {
 		e.listed[path] = true
 		for p, file := range goListExportPaths(e.root, path) {
 			if e.exports[p] == "" {
@@ -256,10 +279,15 @@ func (e *exportDataImporter) Import(path string) (*types.Package, error) {
 			}
 		}
 	}
-	if e.exports[path] != "" {
-		if pkg, err := e.gc.Import(path); err == nil {
-			return pkg, nil
-		}
+	if file := e.exports[path]; file != "" {
+		return os.Open(file)
+	}
+	return nil, fmt.Errorf("no export data for %s", path)
+}
+
+func (e *exportDataImporter) Import(path string) (*types.Package, error) {
+	if pkg, err := e.gc.Import(path); err == nil {
+		return pkg, nil
 	}
 	return e.fallback.Import(path)
 }

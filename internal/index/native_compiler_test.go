@@ -644,3 +644,80 @@ public class Util {
 		t.Errorf("body-only edit was not scoped to its own package: %v", bodyDiags)
 	}
 }
+
+// A test-only standard-library import (net/http/httptest, which no
+// non-test file imports, so it is missing from the `go list -export`
+// listing) must share the package instances the rest of the check uses. It
+// used to load through a second importer with its own copy of net/http, so
+// passing a project http.Handler to httptest.NewServer failed with
+// "*Mux does not implement http.Handler (wrong type for method ServeHTTP)"
+// and the package read as type-checked partially (chi, prism, 2026-11-25).
+func TestGoTestOnlyStdImportSharesPackages(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go not found")
+	}
+	_, diags, _ := compilerFixture(t, map[string]string{
+		"go.mod": "module muxer\n\ngo 1.22\n",
+		"mux.go": `package muxer
+
+import "net/http"
+
+type Mux struct{}
+
+func (m *Mux) ServeHTTP(w http.ResponseWriter, r *http.Request) {}
+`,
+		"app/app.go": `package app
+
+import "muxer"
+
+func New() *muxer.Mux { return &muxer.Mux{} }
+`,
+		"mux_test.go": `package muxer
+
+import (
+	"net/http/httptest"
+	"testing"
+)
+
+func TestServe(t *testing.T) {
+	m := &Mux{}
+	srv := httptest.NewServer(m)
+	defer srv.Close()
+}
+`,
+	})
+	for _, d := range diags {
+		if strings.Contains(d, "does not implement") || strings.Contains(d, "type-checked partially") {
+			t.Errorf("test-only std import loaded a second net/http: %s", d)
+		}
+	}
+}
+
+// A directory go list skips (chi's _examples) is still type-checked; its
+// imports of project packages must be loaded for it. They were refused as
+// "not selected for interface loading", which prism read as a missing
+// module download, and chi's index exited degraded (2026-11-25).
+func TestGoUnlistedDirectoryImportsProjectPackages(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go not found")
+	}
+	_, diags, _ := compilerFixture(t, map[string]string{
+		"go.mod": "module example.com/chi\n\ngo 1.22\n",
+		"mux.go": "package chi\n\nfunc NewRouter() int { return 1 }\n",
+		"middleware/logger.go": "package middleware\n\nfunc Logger() string { return \"log\" }\n",
+		"_examples/hello/main.go": `package main
+
+import (
+	"example.com/chi"
+	"example.com/chi/middleware"
+)
+
+func main() { _ = chi.NewRouter(); _ = middleware.Logger() }
+`,
+	})
+	for _, d := range diags {
+		if strings.Contains(d, "not selected") || strings.Contains(d, "type-checked partially") || strings.Contains(d, "could not import") {
+			t.Errorf("unlisted directory's project import refused: %s", d)
+		}
+	}
+}

@@ -524,7 +524,13 @@ func goSemanticEdges(ctx context.Context, root string, files []string, symbols [
 	// One line per distinct problem: the same partially-checked import is
 	// reached from every package that imports it (grafana: 14 copies).
 	seenDiag := map[string]bool{}
-	for _, d := range projectImporter.preloadProjectImports(analyzedImports) {
+	var unlistedImports []string
+	for _, dir := range dirs {
+		if importPathByDir[dir] == "" {
+			unlistedImports = append(unlistedImports, goFileImports(root, filesByDir[dir])...)
+		}
+	}
+	for _, d := range projectImporter.preloadProjectImports(analyzedImports, unlistedImports) {
 		if !seenDiag[d] {
 			seenDiag[d] = true
 			diagnostics = append(diagnostics, d)
@@ -2331,4 +2337,23 @@ func goFileImportEdges(root string, pkgs []goListPackage, pkgByImport map[string
 		}
 	}
 	return edges
+}
+
+// goFileImports lists the import paths of files (repository-relative),
+// reading only their import clauses.
+func goFileImports(root string, files []string) []string {
+	var out []string
+	fset := token.NewFileSet()
+	for _, f := range files {
+		file, err := parser.ParseFile(fset, filepath.Join(root, f), nil, parser.ImportsOnly)
+		if file == nil || err != nil && len(file.Imports) == 0 {
+			continue
+		}
+		for _, imp := range file.Imports {
+			if p, err := strconv.Unquote(imp.Path.Value); err == nil {
+				out = append(out, p)
+			}
+		}
+	}
+	return out
 }

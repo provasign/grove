@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.64.3 - 2026-11-25
+
+**Fixes**
+- **A standard-library package only tests import shares the check's packages.** `net/http/httptest` (not in the `go list -export` listing, because no non-test file imports it) loaded through a second importer with its own `net/http`, so `httptest.NewServer(mux)` failed with "`*Mux` does not implement `http.Handler`" and the package read as type-checked partially (chi, prism). One compiler importer now reads all export data and lists a missing path on demand.
+- **Directories `go list` skips import project packages.** A directory go ignores (chi's `_examples`) is still type-checked; its imports of project packages were refused ("not selected for interface loading"). They are loaded with the rest now.
+
 ## v0.64.2 - 2026-11-25
 
 **Added**
