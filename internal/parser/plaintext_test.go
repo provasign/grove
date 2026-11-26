@@ -206,7 +206,7 @@ func TestExtractPlaintext_LineCount(t *testing.T) {
 		{"a\nb\nc\nd\n", 4}, // a final newline ends the last line; it does not start a new one
 		{"one line\n", 1},
 		{"a\n\n", 2}, // a blank last line still counts
-		{"", 1},             // empty string splits to [""], giving 1 line
+		{"", 1},      // empty string splits to [""], giving 1 line
 	}
 	for _, c := range cases {
 		records := ExtractPlaintext("test.txt", "sha", []byte(c.content))
