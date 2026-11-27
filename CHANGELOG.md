@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.64.6 - 2026-11-27
+
+**Fixes**
+- **A Java build with no dependencies resolves.** Maven's `dependency:build-classpath` succeeds and writes an empty classpath for a project with no dependencies, and Gradle writes no file. Both were reported as "Maven classpath not resolvable", so a dependency-free library's index read as degraded and Prism's `prism index` exited 3. A successful run with no entries is now an empty, resolved classpath; a failing run is still a failure.
+
 ## v0.64.5 - 2026-11-27
 
 **Fixes**
