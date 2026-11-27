@@ -128,3 +128,34 @@ func TestJavacClasspathCacheFollowsBuildFiles(t *testing.T) {
 		t.Fatal("a project without build files must not get a key")
 	}
 }
+
+// A Maven project with no dependencies: mvn succeeds and writes an empty
+// classpath. That is a resolved classpath with nothing on it, not a
+// failure; a failing mvn with no output still is one.
+func TestMavenWithNoDependenciesIsResolved(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell stand-in for mvn")
+	}
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "pom.xml"), []byte("<project/>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	mvn := func(exit string) {
+		script := "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in -Dmdep.outputFile=*) : > \"${a#-Dmdep.outputFile=}\";; esac; done\nexit " + exit + "\n"
+		if err := os.WriteFile(filepath.Join(bin, "mvn"), []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	j := &jdk{home: fakeJDK(t, "21")}
+
+	mvn("0")
+	if cp, note := javacClasspath(context.Background(), j, root, t.TempDir()); cp != "" || note != "" {
+		t.Fatalf("no dependencies: classpath %q, note %q; want both empty", cp, note)
+	}
+	mvn("1")
+	if _, note := javacClasspath(context.Background(), j, root, t.TempDir()); !strings.Contains(note, "not resolvable") {
+		t.Fatalf("failing mvn: note %q", note)
+	}
+}

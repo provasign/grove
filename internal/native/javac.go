@@ -7,7 +7,9 @@ import (
 	_ "embed"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -173,6 +175,12 @@ func javacClasspath(ctx context.Context, j *jdk, root, tmp string) (string, stri
 			}
 			return cp, ""
 		}
+		if runErr == nil && strings.TrimSpace(string(b)) == "" {
+			// Maven succeeded and listed nothing: the project has no
+			// dependencies, so there is nothing to resolve. Reporting it as
+			// "not resolvable" degraded a dependency-free library's index.
+			return "", ""
+		}
 	}
 	return "", "Maven classpath not resolvable; external types unresolved"
 }
@@ -234,6 +242,11 @@ func gradleClasspathWith(ctx context.Context, j *jdk, runner, root, script, out 
 		runErr := cmd.Run()
 		b, err := os.ReadFile(out)
 		if err != nil {
+			if runErr == nil && errors.Is(err, fs.ErrNotExist) {
+				// The task ran and wrote no entry (the init script creates
+				// the file on the first one): no dependencies.
+				return "", "", true
+			}
 			continue
 		}
 		if cp := normalizeClasspath(string(b)); cp != "" {
@@ -241,6 +254,9 @@ func gradleClasspathWith(ctx context.Context, j *jdk, runner, root, script, out 
 				return cp, "Gradle classpath resolved for some projects only; types from the rest are unresolved", true
 			}
 			return cp, "", true
+		}
+		if runErr == nil && strings.TrimSpace(string(b)) == "" {
+			return "", "", true
 		}
 	}
 	return "", "", false
