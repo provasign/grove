@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.64.5 - 2026-11-27
+
+**Fixes**
+- **A symlinked file inside the repository is indexed.** The walker keeps a link whose target stays inside the root, but hashing it used `Lstat`, which refused every such link as "not a regular file": a repository's symlinked `README.md` or `CLAUDE.md` was reported as an index failure on every refresh (zod), and Prism warned that the result was incomplete. The target is hashed now; a link to a FIFO or device still fails.
+
 ## v0.64.4 - 2026-11-26
 
 **Fixes**
