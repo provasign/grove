@@ -368,6 +368,7 @@ func (jsTSAnalyzer) Analyze(ctx context.Context, req Request) Result {
 			To       string `json:"to"`
 			ToName   string `json:"toName"`
 			ToLine   int    `json:"toLine"`
+			Heritage string `json:"heritage"` // "extends" or "implements": the use is the type's own heritage clause
 		} `json:"types"`
 		Members []struct {
 			From     string `json:"from"`
@@ -450,6 +451,12 @@ func (jsTSAnalyzer) Analyze(ctx context.Context, req Request) Result {
 		to, okTo := symbols.at(edge.To, edge.ToName, edge.ToLine)
 		if okFrom && okTo && from.ID != to.ID {
 			edges = append(edges, symbolEdge(from, to, core.EdgeUsesType, 0.96))
+			switch edge.Heritage {
+			case "extends":
+				edges = append(edges, symbolEdge(from, to, core.EdgeExtends, 0.96))
+			case "implements":
+				edges = append(edges, symbolEdge(from, to, core.EdgeImplements, 0.96))
+			}
 		}
 	}
 	// Member references: property reads/writes and object-literal properties
@@ -1152,6 +1159,14 @@ function visit(checker, options, host, sf, node, stack) {
     const target = declInfo(checker, typeSym);
     if (target) {
       const typeUse = {from: rel(sf.fileName), fromName, fromLine, to: target.file, toName: target.name, toLine: target.line};
+      // A class's or interface's own extends/implements clause: the checker
+      // resolved the base through any alias (hono's 'export { Hono as
+      // HonoBase }'), which a name-based heritage edge cannot follow.
+      const clause = ts.isExpressionWithTypeArguments(node) && node.parent && ts.isHeritageClause(node.parent) ? node.parent : undefined;
+      const owner = clause && clause.parent;
+      if (owner && (ts.isClassDeclaration(owner) || ts.isInterfaceDeclaration(owner)) && owner.name && owner.name.text === fromName) {
+        typeUse.heritage = clause.token === ts.SyntaxKind.ExtendsKeyword ? 'extends' : 'implements';
+      }
       const key = JSON.stringify(typeUse);
       if (!typeKeys.has(key)) { typeKeys.add(key); types.push(typeUse); }
     } else if (ts.isIdentifier(nameNode)) {
