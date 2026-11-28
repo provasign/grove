@@ -134,9 +134,14 @@ func openOnce(groveDir, dbPath string) (*Store, error) {
 	pragmas := []string{
 		// 30 s retry window covers slow Relay pipelines and multi-agent bursts.
 		`PRAGMA busy_timeout=30000`,
-		// Cap WAL file at ~1 000 pages (~4 MB) to avoid unbounded WAL growth
-		// when long-running agents issue many small writes without checkpoints.
+		// Checkpoint every ~1 000 pages so long-running agents' many small
+		// writes do not pile up uncheckpointed. This does not shrink the WAL
+		// file: SQLite reuses it at its largest size.
 		`PRAGMA wal_autocheckpoint=1000`,
+		// After a checkpoint resets the WAL, truncate the file to 4 MiB: a
+		// full index left a 36-50 MB WAL beside a 36-50 MB database for good
+		// (IDX-01, 2026-11-28).
+		`PRAGMA journal_size_limit=4194304`,
 	}
 	for _, p := range pragmas {
 		if _, err := db.Exec(p); err != nil {
