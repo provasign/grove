@@ -49,6 +49,49 @@ var implicitNames = map[string]bool{
 	"constructor": true, // TS/JS
 }
 
+// entryPointAnnotations are annotations whose method a framework invokes:
+// no call edge reaches it, so it is a root. Spring's package-private
+// @GetMapping, @EventListener and @Scheduled methods were reported dead
+// (MKT-04, 2026-11-28). Matched on the annotation's simple name.
+var entryPointAnnotations = map[string]bool{
+	// Spring MVC / WebFlux / messaging
+	"RequestMapping": true, "GetMapping": true, "PostMapping": true, "PutMapping": true,
+	"DeleteMapping": true, "PatchMapping": true, "ExceptionHandler": true, "ModelAttribute": true,
+	"InitBinder": true, "MessageMapping": true, "SubscribeMapping": true,
+	// Spring events, scheduling, listeners, beans and lifecycle
+	"EventListener": true, "TransactionalEventListener": true, "Scheduled": true,
+	"KafkaListener": true, "KafkaHandler": true, "RabbitListener": true, "RabbitHandler": true,
+	"JmsListener": true, "SqsListener": true, "StreamListener": true,
+	"Bean": true, "PostConstruct": true, "PreDestroy": true, "Autowired": true, "Inject": true,
+	// JAX-RS / Jakarta REST, Micronaut
+	"GET": true, "POST": true, "PUT": true, "DELETE": true, "PATCH": true, "HEAD": true, "OPTIONS": true, "Path": true,
+	"Get": true, "Post": true, "Put": true, "Delete": true, "Patch": true,
+	// ASP.NET attributes
+	"HttpGet": true, "HttpPost": true, "HttpPut": true, "HttpDelete": true, "HttpPatch": true, "Route": true,
+	// Jackson serialization hooks
+	"JsonCreator": true, "JsonValue": true, "JsonAnyGetter": true, "JsonAnySetter": true,
+	"JsonGetter": true, "JsonSetter": true,
+}
+
+// frameworkEntryPoint reports whether one of a symbol's annotations names a
+// framework entry point. An annotation is stored as written, without the
+// "@": `GetMapping("/orders")`, `org.springframework...KafkaListener(...)`.
+func frameworkEntryPoint(annotations []string) bool {
+	for _, a := range annotations {
+		name := strings.TrimPrefix(strings.TrimSpace(a), "@")
+		if i := strings.IndexByte(name, '('); i >= 0 {
+			name = name[:i]
+		}
+		if i := strings.LastIndexByte(name, '.'); i >= 0 {
+			name = name[i+1:]
+		}
+		if entryPointAnnotations[strings.TrimSpace(name)] {
+			return true
+		}
+	}
+	return false
+}
+
 var identTokenRe = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_-]*`)
 
 // DeadCode computes forward reachability from every entry point — main/init
@@ -80,6 +123,8 @@ func (g *CodeGraph) DeadCode(extraRoots []string) *DeadCodeResult {
 			roots[id] = true
 		case s.Language == "python" && strings.HasPrefix(s.Name, "__") && strings.HasSuffix(s.Name, "__"):
 			roots[id] = true // dunder methods: runtime-invoked
+		case frameworkEntryPoint(s.Annotations):
+			roots[id] = true // a framework calls it: route, listener, job, lifecycle hook
 		}
 	}
 
