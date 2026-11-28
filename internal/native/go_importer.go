@@ -86,7 +86,9 @@ func (p *goProjectImporter) preloadProjectImports(importPaths, unlistedImports [
 		if !ok {
 			continue
 		}
-		importSets = append(importSets, append(append([]string(nil), pkg.Imports...), pkg.TestImports...))
+		// XTestImports: an external test package (package x_test) may be the
+		// only importer of a project package (echo v5's echotest, 2026-11-28).
+		importSets = append(importSets, append(append(append([]string(nil), pkg.Imports...), pkg.TestImports...), pkg.XTestImports...))
 	}
 	importSets = append(importSets, unlistedImports)
 	for _, imports := range importSets {

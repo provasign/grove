@@ -723,6 +723,29 @@ func main() { _ = chi.NewRouter(); _ = middleware.Logger() }
 	}
 }
 
+// A package imported only by external test packages (package x_test) is
+// still loaded for them. echo v5's echotest is imported by nothing but its
+// own context_external_test.go and reader_external_test.go; it was refused as
+// "not selected for interface loading", and prism's index exited rc=3 on a
+// repository that builds (2026-11-28).
+func TestGoPackageImportedOnlyByExternalTests(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go not found")
+	}
+	got, diags, _ := compilerFixture(t, map[string]string{
+		"go.mod":                       "module example.com/echo\n\ngo 1.22\n",
+		"echo.go":                      "package echo\n\nfunc New() int { return 1 }\n",
+		"echotest/context.go":          "package echotest\n\nfunc Context() int { return 2 }\n",
+		"echotest/context_ext_test.go": "package echotest_test\n\nimport (\n\t\"testing\"\n\n\t\"example.com/echo/echotest\"\n)\n\nfunc TestContext(t *testing.T) { _ = echotest.Context() }\n",
+	})
+	for _, d := range diags {
+		if strings.Contains(d, "not selected") || strings.Contains(d, "type-checked partially") || strings.Contains(d, "could not import") {
+			t.Errorf("external test's project import refused: %s", d)
+		}
+	}
+	wantEdges(t, got, diags, "TestContext→Context calls")
+}
+
 // Files for other platforms are analysed with the host's files, so their
 // edges are kept, but they are not part of the host build: the same function
 // declared once per platform is not a "redeclared" type error, and a call in
