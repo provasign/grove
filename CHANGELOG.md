@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+**Fixes**
+- **A Go package only external tests import is loaded.** A project package imported by nothing but `package x_test` files (echo v5's `echotest`) was not preloaded before the importer was sealed, so the external test package's import was refused ("not selected for interface loading") and the package read as type-checked partially: Prism's `prism index` exited 3 on a repository that builds. External test imports are preloaded with the rest now.
+- **A TypeScript class extending an aliased export is in its base's family.** hono's `hono-base.ts` exports `Hono as HonoBase`, and `hono.ts` declares `class Hono extends HonoBase`. The extends edge was resolved by name, and no symbol is named `HonoBase`, so the edge was missing and every override below `hono.ts`'s `Hono` (a test's `class ExtendedHono extends Hono { basePath() }`) was left out of `HonoBase.basePath`'s family. The TypeScript checker's resolution of a class's or interface's own `extends`/`implements` clause now adds the edge. The resolver version changes, so existing indexes rebuild.
+- **A framework-invoked method is not dead code.** `dead-code` reported Spring's package-private `@GetMapping`, `@EventListener` and `@Scheduled` methods as dead: a framework calls them, so no call edge reaches them. Methods annotated as routes, listeners, scheduled jobs, bean and lifecycle hooks (Spring, JAX-RS, Micronaut, ASP.NET attributes, Jackson creators and accessors) are roots now.
+
 ## v0.64.6 - 2026-11-27
 
 **Fixes**
