@@ -22,6 +22,7 @@ import (
 	"github.com/provasign/grove/internal/index"
 	"github.com/provasign/grove/internal/native"
 	"github.com/provasign/grove/internal/parser"
+	"github.com/provasign/grove/internal/scipexport"
 	"github.com/provasign/grove/internal/store"
 )
 
@@ -897,6 +898,19 @@ func (e *Engine) DeadCode(ctx context.Context, extraRoots []string) (DeadCodeRes
 		ExportedUnreferenced: raw.ExportedUnreferenced,
 		Caveats:              raw.Caveats,
 	}, nil
+}
+
+// ExportSCIP encodes the current graph as a SCIP index (scip.proto): a
+// document per file, definition and reference occurrences, and
+// implementation relationships (MKT-10). toolName and toolVersion go into
+// the index metadata.
+func (e *Engine) ExportSCIP(ctx context.Context, toolName, toolVersion string) ([]byte, error) {
+	g, err := e.currentGraphContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	symbols, edges := g.Snapshot()
+	return scipexport.Export(symbols, edges, scipexport.Options{Root: e.root, ToolName: toolName, ToolVersion: toolVersion})
 }
 
 // Neighbor is a symbol reached from a seed by one typed edge.
