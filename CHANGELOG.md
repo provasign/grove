@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+**Fixes**
+- **SCIP export: enclosing ranges contain their definition.** Each definition's enclosing range was written as `[start, 0, end, 0]`: empty for a one-line function and short of the last line otherwise, so it did not contain the symbol's name, which scip.proto requires (found by Codex in v0.64.7). It now runs from the first non-blank column of the declaration's first line to the end of its last line.
+- **SCIP export: overloads have their own symbols.** Same-named methods in one file (Java overloads, a TypeScript getter and setter) shared one SCIP symbol, so the index held duplicate symbol information; they now get SCIP's method disambiguator in source order (`read().`, `read(+1).`). Go's blank identifier `_` gets no symbol. Exports of gin, jackson-databind and hono pass a check against the official SCIP types and symbol grammar (`eval/cmd/scip-check`).
+- **The WAL is truncated after a checkpoint.** `wal_autocheckpoint` checkpoints but never shrinks the WAL file, so a long-running process (an MCP server, the graph explorer) kept a WAL as large as the database (52 MB beside 52 MB). `journal_size_limit` now truncates it to 4 MiB when a checkpoint resets it. A process that exits cleanly already removed it.
+
 ## v0.64.7 - 2026-11-28
 
 **Features**
