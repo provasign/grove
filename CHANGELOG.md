@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.64.8 - 2026-11-28
 
 **Fixes**
 - **SCIP export: enclosing ranges contain their definition.** Each definition's enclosing range was written as `[start, 0, end, 0]`: empty for a one-line function and short of the last line otherwise, so it did not contain the symbol's name, which scip.proto requires (found by Codex in v0.64.7). It now runs from the first non-blank column of the declaration's first line to the end of its last line.
