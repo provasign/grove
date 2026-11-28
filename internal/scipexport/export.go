@@ -83,7 +83,9 @@ type occurrence struct {
 	line, col, endCol int // 0-based; one-line ranges
 	symbol            string
 	roles             uint64
-	enclosing         [2]int // 0-based start/end line, or {-1,-1}
+	// enclosing is the declaration around a definition, 0-based
+	// [startLine, startCol, endLine, endCol]; startLine < 0 when absent.
+	enclosing [4]int
 }
 
 type document struct {
@@ -104,12 +106,7 @@ func Export(symbols []core.SymbolRecord, edges []core.Edge, opt Options) ([]byte
 	for i := range symbols {
 		byID[symbols[i].ID] = &symbols[i]
 	}
-	names := map[string]string{} // grove ID -> SCIP symbol
-	for i := range symbols {
-		if exported(&symbols[i]) {
-			names[symbols[i].ID] = symbolName(&symbols[i])
-		}
-	}
+	names := assignNames(symbols) // grove ID -> SCIP symbol
 	src := newSources(opt.Root)
 	docs := map[string]*document{}
 	doc := func(s *core.SymbolRecord) *document {
@@ -129,12 +126,14 @@ func Export(symbols []core.SymbolRecord, edges []core.Edge, opt Options) ([]byte
 			}
 		}
 	}
+	infoDone := map[string]bool{}
 	for i := range symbols {
 		s := &symbols[i]
 		name := names[s.ID]
-		if name == "" {
+		if name == "" || infoDone[name] {
 			continue
 		}
+		infoDone[name] = true
 		d := doc(s)
 		info := symbolInfo{symbol: name, display: s.Name, kind: scipKind[s.Kind], implements: dedupe(implements[s.ID])}
 		if s.ParentSymbol != "" {
@@ -143,7 +142,7 @@ func Export(symbols []core.SymbolRecord, edges []core.Edge, opt Options) ([]byte
 		d.infos = append(d.infos, info)
 		if line, col := src.namePosition(s.FilePath, s.Span.Start, s.Name); line >= 0 {
 			d.occs = append(d.occs, occurrence{line: line, col: col, endCol: col + len(s.Name), symbol: name,
-				roles: roleDefinition, enclosing: [2]int{s.Span.Start - 1, s.Span.End - 1}})
+				roles: roleDefinition, enclosing: src.enclosingRange(s.FilePath, s.Span, line, col, col+len(s.Name))})
 		}
 	}
 	for _, e := range edges {
@@ -162,7 +161,7 @@ func Export(symbols []core.SymbolRecord, edges []core.Edge, opt Options) ([]byte
 		case core.EdgeUsesType, core.EdgeExtends, core.EdgeImplements:
 			for _, p := range src.wordPositions(from.FilePath, from.Span.Start, from.Span.End, to.Name) {
 				if from.ID != to.ID {
-					doc(from).occs = append(doc(from).occs, occurrence{line: p[0], col: p[1], endCol: p[1] + len(to.Name), symbol: target, enclosing: [2]int{-1, -1}})
+					doc(from).occs = append(doc(from).occs, occurrence{line: p[0], col: p[1], endCol: p[1] + len(to.Name), symbol: target, enclosing: noEnclosing})
 				}
 			}
 			continue
@@ -170,7 +169,7 @@ func Export(symbols []core.SymbolRecord, edges []core.Edge, opt Options) ([]byte
 			continue
 		}
 		for _, p := range edgePositions(e, from, to, src) {
-			doc(from).occs = append(doc(from).occs, occurrence{line: p[0], col: p[1], endCol: p[1] + len(to.Name), symbol: target, roles: roles, enclosing: [2]int{-1, -1}})
+			doc(from).occs = append(doc(from).occs, occurrence{line: p[0], col: p[1], endCol: p[1] + len(to.Name), symbol: target, roles: roles, enclosing: noEnclosing})
 		}
 	}
 	paths := make([]string, 0, len(docs))
@@ -188,10 +187,48 @@ func Export(symbols []core.SymbolRecord, edges []core.Edge, opt Options) ([]byte
 	return out, nil
 }
 
+// assignNames gives each exported symbol its SCIP symbol. Same-named
+// callables in one file (Java overloads, a TypeScript getter and setter) get
+// SCIP's method disambiguator in source order: name()., name(+1)., ...; a
+// second same-named non-callable shares the first one's symbol. Without
+// this every overload shared one symbol and the index held duplicate
+// SymbolInformation (ObjectMapper.readValue, 2026-11-28).
+func assignNames(symbols []core.SymbolRecord) map[string]string {
+	order := make([]int, 0, len(symbols))
+	for i := range symbols {
+		if exported(&symbols[i]) {
+			order = append(order, i)
+		}
+	}
+	sort.SliceStable(order, func(a, b int) bool {
+		x, y := &symbols[order[a]], &symbols[order[b]]
+		if x.FilePath != y.FilePath {
+			return x.FilePath < y.FilePath
+		}
+		if x.Span.Start != y.Span.Start {
+			return x.Span.Start < y.Span.Start
+		}
+		return x.ID < y.ID
+	})
+	names := make(map[string]string, len(order))
+	seen := map[string]int{}
+	for _, i := range order {
+		s := &symbols[i]
+		base := symbolName(s)
+		n := seen[base]
+		seen[base] = n + 1
+		if n > 0 && strings.HasSuffix(base, "().") {
+			base = strings.TrimSuffix(base, "().") + "(+" + strconv.Itoa(n) + ")."
+		}
+		names[s.ID] = base
+	}
+	return names
+}
+
 // exported reports whether a symbol gets a SCIP symbol: declarations, not
 // Grove's synthetic file, module-body and document nodes.
 func exported(s *core.SymbolRecord) bool {
-	if s.FilePath == "" || s.Name == "" || strings.HasPrefix(s.Name, "<") {
+	if s.FilePath == "" || s.Name == "" || s.Name == "_" || strings.HasPrefix(s.Name, "<") {
 		return false
 	}
 	switch s.Kind {
@@ -320,6 +357,39 @@ func (s *sources) lines(path string) []string {
 	}
 	s.files[path] = l
 	return l
+}
+
+var noEnclosing = [4]int{-1, -1, -1, -1}
+
+// enclosingRange is a definition's enclosing range: from the first non-blank
+// column of the span's first line to the end of its last line, widened to
+// contain the name occurrence (scip.proto: the enclosing range must contain
+// the occurrence). It used to be written as [start, 0, end, 0], an empty
+// range on a one-line function that excluded the name (Codex, v0.64.7).
+func (s *sources) enclosingRange(path string, span core.LineRange, nameLine, nameCol, nameEnd int) [4]int {
+	src := s.lines(path)
+	start, end := span.Start-1, span.End-1
+	if start < 0 || start >= len(src) {
+		start = nameLine
+	}
+	if end < start || end >= len(src) {
+		end = max(start, nameLine)
+	}
+	if nameLine < start {
+		start = nameLine
+	}
+	if nameLine > end {
+		end = nameLine
+	}
+	startCol := len(src[start]) - len(strings.TrimLeft(src[start], " \t"))
+	endCol := len(strings.TrimRight(src[end], "\r"))
+	if start == nameLine && nameCol < startCol {
+		startCol = nameCol
+	}
+	if end == nameLine && nameEnd > endCol {
+		endCol = nameEnd
+	}
+	return [4]int{start, startCol, end, endCol}
 }
 
 // namePosition finds a declaration's name at or just after its span start.
@@ -458,9 +528,13 @@ func encodeOccurrence(o occurrence) []byte {
 		out = protowire.AppendTag(out, occRoles, protowire.VarintType)
 		out = protowire.AppendVarint(out, o.roles)
 	}
-	if o.enclosing[0] >= 0 && o.enclosing[1] >= o.enclosing[0] {
+	if e := o.enclosing; e[0] >= 0 {
 		out = protowire.AppendTag(out, occEnclosingRange, protowire.BytesType)
-		out = protowire.AppendBytes(out, packed(o.enclosing[0], 0, o.enclosing[1], 0))
+		if e[0] == e[2] {
+			out = protowire.AppendBytes(out, packed(e[0], e[1], e[3]))
+		} else {
+			out = protowire.AppendBytes(out, packed(e[0], e[1], e[2], e[3]))
+		}
 	}
 	return out
 }

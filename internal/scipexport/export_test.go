@@ -12,9 +12,9 @@ import (
 )
 
 type decodedOcc struct {
-	rng    []int
-	symbol string
-	roles  uint64
+	rng, enc []int
+	symbol   string
+	roles    uint64
 }
 
 type decodedDoc struct {
@@ -82,6 +82,12 @@ func decode(t *testing.T, raw []byte) (tool string, docs []decodedDoc) {
 							for len(v) > 0 {
 								x, m := protowire.ConsumeVarint(v)
 								o.rng = append(o.rng, int(x))
+								v = v[m:]
+							}
+						case occEnclosingRange:
+							for len(v) > 0 {
+								x, m := protowire.ConsumeVarint(v)
+								o.enc = append(o.enc, int(x))
 								v = v[m:]
 							}
 						case occSymbol:
@@ -196,11 +202,90 @@ func TestExportSCIP(t *testing.T) {
 	if sq.kinds[helper] != 17 || docs[0].kinds[shape] != 21 {
 		t.Errorf("kinds = %v %v", sq.kinds, docs[0].kinds)
 	}
+	// Every definition's enclosing range contains the definition (scip.proto).
+	// v0.64.7 wrote [line, 0, line, 0] for a one-line function: empty.
+	expand := func(r []int) [4]int {
+		if len(r) == 3 {
+			return [4]int{r[0], r[1], r[0], r[2]}
+		}
+		return [4]int{r[0], r[1], r[2], r[3]}
+	}
+	before := func(l1, c1, l2, c2 int) bool { return l1 < l2 || (l1 == l2 && c1 <= c2) }
+	defs := 0
+	for _, d := range docs {
+		for _, o := range d.occs {
+			if o.roles&roleDefinition == 0 {
+				continue
+			}
+			defs++
+			if len(o.enc) != 3 && len(o.enc) != 4 {
+				t.Errorf("%s: definition %s has no enclosing range", d.path, o.symbol)
+				continue
+			}
+			e, r := expand(o.enc), expand(o.rng)
+			if !before(e[0], e[1], r[0], r[1]) || !before(r[2], r[3], e[2], e[3]) || !before(e[0], e[1], e[2], e[3]) || (e[0] == e[2] && e[1] == e[3]) {
+				t.Errorf("%s: enclosing %v does not contain %s at %v", d.path, o.enc, o.symbol, o.rng)
+			}
+		}
+	}
+	if defs != 6 {
+		t.Errorf("definitions = %d, want 6", defs)
+	}
+	if e := expand(func() []int {
+		for _, o := range docs[0].occs {
+			if o.symbol == shape && o.roles&roleDefinition != 0 {
+				return o.enc
+			}
+		}
+		return []int{0, 0, 0}
+	}()); e != [4]int{2, 0, 4, 1} {
+		t.Errorf("Shape's enclosing range = %v, want the whole declaration [2 0 4 1]", e)
+	}
 	for _, d := range docs {
 		for s := range d.infos {
 			if strings.Contains(s, "file:") || strings.Contains(s, "<") {
 				t.Errorf("synthetic symbol exported: %s", s)
 			}
+		}
+	}
+}
+
+// Overloads (same qualified name, one file) get SCIP's method disambiguator in
+// source order, and Go's blank identifier gets no symbol: the index had
+// duplicate SymbolInformation for every Java overload set and every `var _ X`.
+func TestExportSCIPOverloadsAndBlank(t *testing.T) {
+	root := t.TempDir()
+	src := "class M {\n  void read(int a) {}\n  void read(String s) {}\n  void read() {}\n}\n"
+	if err := os.WriteFile(filepath.Join(root, "M.java"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "b.go"), []byte("package b\n\nvar _ = 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := func(id string, line int) core.SymbolRecord {
+		return core.SymbolRecord{ID: id, FilePath: "M.java", Language: "java", Kind: core.KindMethod, Name: "read",
+			QualifiedName: "M.read", ParentSymbol: "M", Span: core.LineRange{Start: line, End: line}}
+	}
+	syms := []core.SymbolRecord{
+		m("M.java::M.read#3", 3), m("M.java::M.read#2", 2), m("M.java::M.read#4", 4),
+		{ID: "b.go::_", FilePath: "b.go", Language: "go", Kind: core.KindVariable, Name: "_", QualifiedName: "_", Span: core.LineRange{Start: 3, End: 3}},
+	}
+	raw, err := Export(syms, nil, Options{Root: root, ToolName: "prism"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, docs := decode(t, raw)
+	if len(docs) != 1 {
+		t.Fatalf("docs = %+v (the blank identifier must not make a document)", docs)
+	}
+	for _, want := range []string{"M#read().", "M#read(+1).", "M#read(+2)."} {
+		if _, ok := docs[0].infos["prism . . . `M.java`/"+want]; !ok {
+			t.Errorf("missing %s in %v", want, docs[0].infos)
+		}
+	}
+	for _, o := range docs[0].occs {
+		if o.symbol == "prism . . . `M.java`/M#read()." && o.rng[0] != 1 {
+			t.Errorf("read() is the first overload by line, got line %d", o.rng[0])
 		}
 	}
 }
